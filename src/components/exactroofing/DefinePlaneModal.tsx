@@ -1,13 +1,20 @@
 import React, { useState, useEffect } from 'react';
-import { PlanEdge, RoofPlane } from '../../types/exactRoofing';
-import { X, ArrowRight, ArrowLeft, Check, PenTool } from 'lucide-react';
+import { EdgeType, PlanEdge, RoofPlane } from '../../types/exactRoofing';
+import { dist } from '../../utils/exactRoofingEngine';
+import { X, ArrowRight, ArrowLeft, Check, PenTool, Tag, Compass, AlignJustify } from 'lucide-react';
 
 interface Props {
   edge: PlanEdge | null;
+  outlineEdges?: PlanEdge[];
   existingPlane?: RoofPlane | null;
+  existingPlanes?: RoofPlane[];
   isOpen: boolean;
   onClose: () => void;
+  onClassifyEdge?: (edgeId: string, edgeType: EdgeType) => void;
   onSavePlane: (options: {
+    edgeType: EdgeType;
+    eaveEdgeId: string;
+    sheetRunEdgeId: string;
     pitchDeg: number;
     underlapSide: 'left' | 'right';
     eaveHeightM: number;
@@ -31,14 +38,60 @@ const COMMON_SETBACKS = [
   { label: '0.6m Deep', value: 0.6 }
 ];
 
+const EDGE_CLASSIFICATIONS: Array<{
+  type: EdgeType;
+  label: string;
+  code: string;
+  activeClass: string;
+}> = [
+  { type: 'outline', label: 'Eave', code: 'E', activeClass: 'bg-emerald-600 text-white border-emerald-400' },
+  { type: 'ridge', label: 'Ridge', code: 'R', activeClass: 'bg-purple-600 text-white border-purple-400' },
+  { type: 'hip', label: 'Hip', code: 'H', activeClass: 'bg-sky-600 text-white border-sky-400' },
+  { type: 'valley', label: 'Valley', code: 'V', activeClass: 'bg-amber-600 text-white border-amber-400' },
+  { type: 'verge', label: 'Barge / Verge', code: 'B', activeClass: 'bg-indigo-600 text-white border-indigo-400' },
+  { type: 'wall', label: 'Wall', code: 'W', activeClass: 'bg-orange-600 text-white border-orange-400' }
+];
+
+function getEdgeCodeBadge(t: EdgeType): string {
+  switch (t) {
+    case 'outline':
+      return 'E';
+    case 'ridge':
+      return 'R';
+    case 'hip':
+      return 'H';
+    case 'valley':
+      return 'V';
+    case 'verge':
+      return 'B';
+    case 'wall':
+      return 'W';
+    default:
+      return '?';
+  }
+}
+
+function getEdgeShortLabel(e: PlanEdge, index: number): string {
+  const len = dist(e.from, e.to).toFixed(2);
+  const code = getEdgeCodeBadge(e.type);
+  return `Side ${index + 1} [${code}] · ${len}m`;
+}
+
 export const DefinePlaneModal: React.FC<Props> = ({
   edge,
+  outlineEdges,
   existingPlane,
+  existingPlanes = [],
   isOpen,
   onClose,
+  onClassifyEdge,
   onSavePlane,
   onAssignFlashing
 }) => {
+  const [edgeType, setEdgeType] = useState<EdgeType>('unclassified');
+  const [eaveEdgeId, setEaveEdgeId] = useState<string>('');
+  const [sheetRunEdgeId, setSheetRunEdgeId] = useState<string>('');
+  const [sheetFollowsEave, setSheetFollowsEave] = useState<boolean>(true);
   const [pitch, setPitch] = useState<number>(22.5);
   const [underlap, setUnderlap] = useState<'left' | 'right'>('left');
   const [eaveHeight, setEaveHeight] = useState<number>(2.7);
@@ -47,34 +100,112 @@ export const DefinePlaneModal: React.FC<Props> = ({
   const [eaveSetbackM, setEaveSetbackM] = useState<number>(0);
   const [name, setName] = useState<string>('');
 
+  const availableEdges = outlineEdges && outlineEdges.length > 0 ? outlineEdges : edge ? [edge] : [];
+
   useEffect(() => {
     if (!isOpen || !edge) return;
-    const rawLen = +Math.hypot(edge.to.x - edge.from.x, edge.to.y - edge.from.y).toFixed(2);
-    setPitch(existingPlane?.pitchDeg ?? 22.5);
-    setUnderlap(existingPlane?.underlapSide ?? 'left');
-    setEaveHeight(existingPlane?.eaveHeightM ?? edge.eaveHeightM ?? 2.7);
+    const edgesList = outlineEdges && outlineEdges.length > 0 ? outlineEdges : [edge];
+
+    const initialType: EdgeType = edge.type || 'unclassified';
+    const matchingPlaneForEdge =
+      existingPlane ||
+      existingPlanes.find((p) => p.eaveEdgeId === edge.id) ||
+      null;
+
+    let initialEaveId = matchingPlaneForEdge?.eaveEdgeId;
+    if (!initialEaveId) {
+      if (initialType === 'outline') {
+        initialEaveId = edge.id;
+      } else {
+        const firstExistingEave = edgesList.find((e) => e.type === 'outline');
+        initialEaveId = firstExistingEave?.id || edge.id;
+      }
+    }
+
+    const activePlaneForEave =
+      matchingPlaneForEdge ||
+      existingPlanes.find((p) => p.eaveEdgeId === initialEaveId) ||
+      null;
+
+    const targetEaveObj = edgesList.find((e) => e.id === initialEaveId) || edge;
+    const rawLen = +dist(targetEaveObj.from, targetEaveObj.to).toFixed(2);
+    const initialSheetEdgeId = activePlaneForEave?.sheetRunEdgeId || initialEaveId;
+
+    setEdgeType(initialType);
+    setEaveEdgeId(initialEaveId);
+    setSheetRunEdgeId(initialSheetEdgeId);
+    setSheetFollowsEave(initialSheetEdgeId === initialEaveId);
+    setPitch(activePlaneForEave?.pitchDeg ?? 22.5);
+    setUnderlap(activePlaneForEave?.underlapSide ?? 'left');
+    setEaveHeight(activePlaneForEave?.eaveHeightM ?? targetEaveObj.eaveHeightM ?? 2.7);
     setEaveLength(rawLen);
-    setHasWall(edge.hasWall !== false);
+    setHasWall(targetEaveObj.hasWall !== false);
     setEaveSetbackM(
-      typeof edge.eaveSetbackM === 'number' && Number.isFinite(edge.eaveSetbackM)
-        ? edge.eaveSetbackM
+      typeof targetEaveObj.eaveSetbackM === 'number' && Number.isFinite(targetEaveObj.eaveSetbackM)
+        ? targetEaveObj.eaveSetbackM
         : 0
     );
     setName(
-      existingPlane?.name ||
-        `Roof Area [${edge.id.replace(/^l\d+__/, '').replace('edge-out-', 'Side ')}]`
+      activePlaneForEave?.name ||
+        `Roof Area [${targetEaveObj.id.replace(/^l\d+__/, '').replace('edge-out-', 'Side ')}]`
     );
-  }, [isOpen, edge, existingPlane]);
+  }, [isOpen, edge, outlineEdges, existingPlane, existingPlanes]);
 
   if (!isOpen || !edge) return null;
 
-  const originalEdgeLenM = +Math.hypot(edge.to.x - edge.from.x, edge.to.y - edge.from.y).toFixed(2);
+  const selectedEaveObj = availableEdges.find((e) => e.id === eaveEdgeId) || edge;
+  const originalEdgeLenM = +dist(selectedEaveObj.from, selectedEaveObj.to).toFixed(2);
   const effectiveLenM = Math.max(0.5, Number.isFinite(eaveLength) ? eaveLength : originalEdgeLenM);
   const slopeMultiplier = +(1 / Math.cos((pitch * Math.PI) / 180)).toFixed(3);
   const estimatedSlopeM = +(effectiveLenM * 0.45 * slopeMultiplier).toFixed(2);
+  const clickedEdgeIndex = Math.max(
+    0,
+    availableEdges.findIndex((e) => e.id === edge.id)
+  );
+
+  const handleSelectEave = (nextEaveId: string) => {
+    setEaveEdgeId(nextEaveId);
+    const targetEave = availableEdges.find((e) => e.id === nextEaveId);
+    if (targetEave) {
+      setEaveLength(+dist(targetEave.from, targetEave.to).toFixed(2));
+      setHasWall(targetEave.hasWall !== false);
+      setEaveSetbackM(
+        typeof targetEave.eaveSetbackM === 'number' && Number.isFinite(targetEave.eaveSetbackM)
+          ? targetEave.eaveSetbackM
+          : 0
+      );
+      const planeForTarget = existingPlanes.find((p) => p.eaveEdgeId === nextEaveId);
+      if (planeForTarget) {
+        setPitch(planeForTarget.pitchDeg);
+        setUnderlap(planeForTarget.underlapSide);
+        setEaveHeight(planeForTarget.eaveHeightM ?? targetEave.eaveHeightM ?? 2.7);
+        setName(planeForTarget.name);
+      } else {
+        setEaveHeight(targetEave.eaveHeightM ?? 2.7);
+        setName(`Roof Area [${nextEaveId.replace(/^l\d+__/, '').replace('edge-out-', 'Side ')}]`);
+      }
+    }
+    if (sheetFollowsEave) {
+      setSheetRunEdgeId(nextEaveId);
+    }
+  };
+
+  const handleSelectSheetRunEdge = (nextSheetEdgeId: string) => {
+    setSheetRunEdgeId(nextSheetEdgeId);
+    setSheetFollowsEave(nextSheetEdgeId === eaveEdgeId);
+  };
+
+  const handleClassifyOnly = () => {
+    if (!onClassifyEdge) return;
+    onClassifyEdge(edge.id, edgeType);
+    onClose();
+  };
 
   const handleSave = () => {
     onSavePlane({
+      edgeType,
+      eaveEdgeId: eaveEdgeId || edge.id,
+      sheetRunEdgeId: sheetRunEdgeId || eaveEdgeId || edge.id,
       pitchDeg: pitch,
       underlapSide: underlap,
       eaveHeightM: Math.max(0.5, Math.min(20, Number(eaveHeight) || 2.7)),
@@ -82,29 +213,31 @@ export const DefinePlaneModal: React.FC<Props> = ({
         Math.abs(effectiveLenM - originalEdgeLenM) > 0.02 ? +effectiveLenM.toFixed(2) : undefined,
       hasWall,
       eaveSetbackM: +Math.max(0, Math.min(3.0, Number(eaveSetbackM) || 0)).toFixed(2),
-      name: name.trim() || `Roof Area [${edge.id}]`
+      name: name.trim() || `Roof Area [${eaveEdgeId || edge.id}]`
     });
     onClose();
   };
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
-      <div className="bg-slate-900 border border-slate-800 text-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl flex flex-col shadow-2xl overflow-hidden">
-        {/* Header - Plain Language */}
+      <div className="bg-slate-900 border border-slate-800 text-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-3xl flex flex-col shadow-2xl overflow-hidden">
+        {/* Header */}
         <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
-          <div>
-            <h3 className="text-base font-extrabold text-white">
-              Set Pitch, Wall &amp; Height
+          <div className="min-w-0">
+            <h3 className="text-base font-extrabold text-white truncate">
+              Roof Edge &amp; Plane Setup
             </h3>
-            <p className="text-xs text-slate-400 tabular-nums">
-              Eave Wall: <span className="font-mono text-white font-bold">{effectiveLenM}m</span> · Height Z:{' '}
+            <p className="text-xs text-slate-400 tabular-nums truncate">
+              Clicked Side {clickedEdgeIndex + 1} · Eave{' '}
+              <span className="font-mono text-white font-bold">{effectiveLenM}m</span> · Z:{' '}
               <span className="font-mono text-amber-400 font-bold">{eaveHeight.toFixed(1)}m</span> · Slope:{' '}
               <span className="font-mono text-sky-400 font-bold">~{estimatedSlopeM}m</span>
             </p>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="w-9 h-9 rounded-full bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-slate-300 font-bold transition-colors cursor-pointer"
+            className="w-9 h-9 rounded-full bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-slate-300 font-bold transition-colors cursor-pointer shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
@@ -112,11 +245,95 @@ export const DefinePlaneModal: React.FC<Props> = ({
 
         {/* Content */}
         <div className="p-4 sm:p-5 space-y-4 text-xs max-h-[75vh] overflow-y-auto">
-          {/* 1. EAVE WALL LENGTH & Z-HEIGHT */}
+          {/* STEP 1: CLASSIFY CLICKED BOUNDARY EDGE */}
+          <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-[11px] font-bold text-white">
+                <Tag className="w-3.5 h-3.5 text-sky-400" />
+                <span>1. Classify Clicked Boundary Edge (Side {clickedEdgeIndex + 1})</span>
+              </div>
+              <span className="text-[10px] font-mono text-slate-400 tabular-nums">
+                {dist(edge.from, edge.to).toFixed(2)}m
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5">
+              {EDGE_CLASSIFICATIONS.map((cls) => {
+                const isActive = edgeType === cls.type;
+                return (
+                  <button
+                    key={cls.type}
+                    type="button"
+                    onClick={() => setEdgeType(cls.type)}
+                    className={`py-2 px-2 rounded-xl border text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                      isActive
+                        ? `${cls.activeClass} shadow-xs`
+                        : 'bg-slate-800/80 border-slate-700/60 text-slate-300 hover:bg-slate-800'
+                    }`}
+                  >
+                    <span className="font-mono font-black">{cls.code}</span>
+                    <span>{cls.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-[10px] text-slate-400">
+              Classifying a boundary edge labels its CAD type without changing downhill fall until you select the eave below.
+            </p>
+          </div>
+
+          {/* STEP 2 & 3: EXACTROOF EAVE CHOICE (FALL) & SHEET RUN DIRECTION */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="p-3 rounded-2xl bg-slate-950/70 border border-emerald-500/30 space-y-1.5">
+              <label className="text-[10px] text-emerald-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                <Compass className="w-3.5 h-3.5" />
+                <span>2. Which Edge is the Eave?</span>
+              </label>
+              <select
+                value={eaveEdgeId}
+                onChange={(e) => handleSelectEave(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-2.5 py-2 text-white font-semibold text-xs focus:outline-hidden focus:border-emerald-400 cursor-pointer tabular-nums"
+              >
+                {availableEdges.map((ed, idx) => (
+                  <option key={ed.id} value={ed.id}>
+                    {getEdgeShortLabel(ed, idx)}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[10px] text-slate-400">
+                Sets downhill fall &amp; gutter line for this roof plane.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-2xl bg-slate-950/70 border border-sky-500/30 space-y-1.5">
+              <label className="text-[10px] text-sky-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                <AlignJustify className="w-3.5 h-3.5" />
+                <span>3. Sheets Perpendicular To?</span>
+              </label>
+              <select
+                value={sheetRunEdgeId}
+                onChange={(e) => handleSelectSheetRunEdge(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-2.5 py-2 text-white font-semibold text-xs focus:outline-hidden focus:border-sky-400 cursor-pointer tabular-nums"
+              >
+                {availableEdges.map((ed, idx) => (
+                  <option key={ed.id} value={ed.id}>
+                    {getEdgeShortLabel(ed, idx)}
+                    {ed.id === eaveEdgeId ? ' (Eave Default)' : ''}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[10px] text-slate-400">
+                {sheetRunEdgeId === eaveEdgeId
+                  ? 'Standard: sheets lay 90° to eave.'
+                  : 'Custom rib angle perpendicular to chosen edge.'}
+              </p>
+            </div>
+          </div>
+
+          {/* 4. EAVE WALL LENGTH & Z-HEIGHT */}
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1">
               <label className="text-[10px] text-slate-400 font-bold block uppercase tracking-wider">
-                Eave / Edge Length (m)
+                Eave Edge Length (m)
               </label>
               <input
                 type="number"
@@ -163,7 +380,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
             ))}
           </div>
 
-          {/* 1B. WALL BELOW ROOF & EAVE WIDTH SETBACK */}
+          {/* WALL BELOW ROOF & EAVE WIDTH SETBACK */}
           <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-2.5">
             <div className="flex items-center justify-between gap-2">
               <div>
@@ -221,11 +438,11 @@ export const DefinePlaneModal: React.FC<Props> = ({
             )}
           </div>
 
-          {/* 2. PITCH SELECTOR */}
+          {/* PITCH SELECTOR */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                Roof Pitch: <span className="text-white font-mono text-sm">{pitch}°</span>
+                Roof Pitch: <span className="text-white font-mono text-sm tabular-nums">{pitch}°</span>
               </label>
               <span className="text-[10px] text-slate-400 tabular-nums">
                 Rise / Run 1:{Math.round(1 / Math.tan((pitch * Math.PI) / 180))} (×{slopeMultiplier})
@@ -238,7 +455,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
                   key={deg}
                   type="button"
                   onClick={() => setPitch(deg)}
-                  className={`py-2 rounded-xl font-bold font-mono text-xs transition-all cursor-pointer ${
+                  className={`py-2 rounded-xl font-bold font-mono text-xs tabular-nums transition-all cursor-pointer ${
                     pitch === deg
                       ? 'bg-blue-600 text-white shadow-xs'
                       : 'bg-slate-800/80 text-slate-300 hover:bg-slate-800 border border-slate-700/60'
@@ -260,7 +477,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
             />
           </div>
 
-          {/* 3. LAY DIRECTION (LEFT / RIGHT) */}
+          {/* LAY DIRECTION (LEFT / RIGHT) */}
           <div className="space-y-2">
             <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
               Lay Direction
@@ -310,7 +527,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
             </div>
           </div>
 
-          {/* 4. ROOF AREA NAME */}
+          {/* ROOF AREA NAME */}
           <div className="space-y-1">
             <label className="text-[10px] text-slate-400 font-bold block uppercase tracking-wider">
               Roof Area Name
@@ -326,37 +543,46 @@ export const DefinePlaneModal: React.FC<Props> = ({
         </div>
 
         {/* Footer */}
-        <div className="p-4 bg-slate-950/80 border-t border-slate-800 flex items-center justify-between gap-2.5">
-          {onAssignFlashing ? (
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-                onAssignFlashing(edge);
-              }}
-              className="px-3.5 py-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 text-emerald-300 font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
-            >
-              <PenTool className="w-3.5 h-3.5" />
-              <span>Eave Flashing</span>
-            </button>
-          ) : (
-            <div />
-          )}
+        <div className="p-4 bg-slate-950/80 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            {onAssignFlashing && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onAssignFlashing(edge);
+                }}
+                className="px-3 py-2 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/40 text-emerald-300 font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <PenTool className="w-3.5 h-3.5" />
+                <span>Flashing</span>
+              </button>
+            )}
+            {onClassifyEdge && (
+              <button
+                type="button"
+                onClick={handleClassifyOnly}
+                className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 font-bold text-xs transition-colors cursor-pointer"
+              >
+                Save Edge Type Only
+              </button>
+            )}
+          </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2 ml-auto">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition-colors cursor-pointer"
+              className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="button"
               onClick={handleSave}
-              className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 font-extrabold text-white text-xs shadow-md transition-all cursor-pointer"
+              className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 font-extrabold text-white text-xs shadow-md transition-all cursor-pointer"
             >
-              Apply
+              Apply Plane
             </button>
           </div>
         </div>
@@ -364,3 +590,4 @@ export const DefinePlaneModal: React.FC<Props> = ({
     </div>
   );
 };
+

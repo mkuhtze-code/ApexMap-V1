@@ -1,6 +1,7 @@
 import {
   Point2D,
   Point3D,
+  EdgeType,
   PlanEdge,
   RoofOutline,
   SkeletonLine,
@@ -147,22 +148,86 @@ export function buildOutlineFromPoints(
     levelId?: string;
     idPrefix?: string;
     defaultEaveHeightM?: number;
+    initialEdgeType?: EdgeType;
   }
 ): RoofOutline {
   const prefix = options?.idPrefix ? `${options.idPrefix}__` : '';
+  const edgeType: EdgeType = options?.initialEdgeType ?? 'outline';
   const edges: PlanEdge[] = points.map((p, idx) => {
     const next = points[(idx + 1) % points.length];
     return {
       id: `${prefix}edge-out-${idx + 1}`,
       from: { ...p },
       to: { ...next },
-      type: 'outline',
+      type: edgeType,
       ...(options?.defaultEaveHeightM !== undefined ? { eaveHeightM: options.defaultEaveHeightM } : {}),
       ...(options?.levelId ? { levelId: options.levelId } : {})
     };
   });
 
   return { id, points, edges, ...(options?.levelId ? { levelId: options.levelId } : {}) };
+}
+
+/**
+ * Builds a closed roof outline attached to an existing wall/gutter edge.
+ * Preserves the attachment edge's role when it was a wall (or marks it unclassified),
+ * and leaves all newly drawn outer edges unclassified for ExactRoof setup.
+ */
+export function buildAttachedOutlineFromEdge(
+  attachedEdge: PlanEdge,
+  points: Point2D[],
+  id = `outline-attached-${Date.now()}`,
+  options?: {
+    levelId?: string;
+    idPrefix?: string;
+    defaultEaveHeightM?: number;
+    initialEdgeType?: EdgeType;
+  }
+): RoofOutline {
+  const base = buildOutlineFromPoints(points, id, {
+    ...options,
+    defaultEaveHeightM: options?.defaultEaveHeightM ?? attachedEdge.eaveHeightM,
+    initialEdgeType: options?.initialEdgeType ?? 'unclassified'
+  });
+
+  return {
+    ...base,
+    edges: base.edges.map((e) => {
+      const matchesAttached =
+        (pointsClose(e.from, attachedEdge.from, 0.12) &&
+          pointsClose(e.to, attachedEdge.to, 0.12)) ||
+        (pointsClose(e.from, attachedEdge.to, 0.12) &&
+          pointsClose(e.to, attachedEdge.from, 0.12));
+      if (!matchesAttached) return e;
+      return {
+        ...e,
+        type: attachedEdge.type === 'wall' ? 'wall' : options?.initialEdgeType ?? 'unclassified',
+        hasWall: attachedEdge.type === 'wall' ? true : e.hasWall
+      };
+    })
+  };
+}
+
+/**
+ * Classifies a single boundary edge without altering skeleton geometry or fall direction of other edges.
+ */
+export function classifyOutlineEdge(
+  outline: RoofOutline,
+  edgeId: string,
+  edgeType: EdgeType
+): RoofOutline {
+  return {
+    ...outline,
+    edges: outline.edges.map((e) =>
+      e.id === edgeId
+        ? {
+            ...e,
+            type: edgeType,
+            ...(edgeType === 'wall' ? { hasWall: true } : {})
+          }
+        : e
+    )
+  };
 }
 
 function getLevelIdPrefixFromOutline(outline: RoofOutline): string | undefined {
@@ -1110,10 +1175,43 @@ export function generateSkeletonLines(outline: RoofOutline): SkeletonLine[] {
     return true;
   };
 
+  // Collapse collinear same-direction equal-speed vertices formed when dormer/bay wings merge
+  // back into a straight main eave, so valleys terminate cleanly at the junction instead of
+  // propagating a phantom ridge seam through the upper roof slope.
+  const pruneCollinearSeamVertices = (list: WaveVertex[]): WaveVertex[] => {
+    const cur = [...list];
+    let changed = true;
+    let guard = 0;
+    while (changed && cur.length >= 3 && guard++ < cur.length * 2) {
+      changed = false;
+      const len = cur.length;
+      for (let i = 0; i < len; i++) {
+        const v = cur[i];
+        if (v.isOpposingParallel) continue;
+        const nL = v.prevEdge.normal;
+        const nR = v.nextEdge.normal;
+        const dot = nL.x * nR.x + nL.y * nR.y;
+        const det = nL.x * nR.y - nL.y * nR.x;
+        const speedDiff = Math.abs(v.prevEdge.speed - v.nextEdge.speed);
+        if (dot > 0.995 && Math.abs(det) < 0.08 && speedDiff < 0.05) {
+          const nextIdx = (i + 1) % len;
+          cur[nextIdx] = {
+            ...cur[nextIdx],
+            prevEdge: v.prevEdge
+          };
+          cur.splice(i, 1);
+          changed = true;
+          break;
+        }
+      }
+    }
+    return cur;
+  };
+
   // STEP 2: Event-driven Straight Skeleton Wavefront Propagation
   // Handles convex N-gons, rectangles, L/T/U/H/Bay wings, courtyards, arbitrary gable/verge edges, and stepped roofs.
   const queue: { vertices: WaveVertex[]; currentT: number }[] = [
-    { vertices: initialVertices, currentT: 0 }
+    { vertices: pruneCollinearSeamVertices(initialVertices), currentT: 0 }
   ];
 
   const MAX_GLOBAL_STEPS = n * 30 + 120;
@@ -1121,13 +1219,14 @@ export function generateSkeletonLines(outline: RoofOutline): SkeletonLine[] {
 
   while (queue.length > 0 && globalSteps < MAX_GLOBAL_STEPS) {
     const loop = queue.shift()!;
-    let verts = loop.vertices;
+    let verts = pruneCollinearSeamVertices(loop.vertices);
     let currentT = loop.currentT;
 
     let loopSteps = 0;
     const maxLoopSteps = verts.length * 15 + 40;
 
     while (verts.length >= 2 && loopSteps++ < maxLoopSteps && globalSteps++ < MAX_GLOBAL_STEPS) {
+      verts = pruneCollinearSeamVertices(verts);
       const m = verts.length;
 
       // Guard if all remaining wavefront vertices are stationary (e.g. 100% verge perimeter)
@@ -1779,7 +1878,7 @@ export function syncPlanesWithOutlineAndSkeleton(
   const result: RoofPlane[] = [];
 
   outline.edges.forEach((edge, idx) => {
-    if (edge.type === 'verge' || edge.type === 'wall') return; // Gable verge & abutment wall have no outward roof slope sheet plane
+    if (edge.type !== 'outline') return; // Only classified Eave ('outline') edges generate automatic slope sheet planes
     const existing = prevByEdge.get(edge.id);
     const resolvedEaveHeight =
       edge.eaveHeightM ?? existing?.eaveHeightM ?? levelMeta?.defaultEaveHeightM ?? 2.7;
@@ -1791,6 +1890,7 @@ export function syncPlanesWithOutlineAndSkeleton(
           underlapSide: existing.underlapSide,
           eaveHeightM: resolvedEaveHeight,
           orderedSheetLengthM: existing.orderedSheetLengthM,
+          sheetRunEdgeId: existing.sheetRunEdgeId,
           name: existing.name,
           existingId: existing.id,
           isStartEdge: existing.isStartEdge,
@@ -1827,6 +1927,7 @@ export function createPlaneFromEdge(
     underlapSide?: 'left' | 'right';
     eaveHeightM?: number;
     orderedSheetLengthM?: number;
+    sheetRunEdgeId?: string;
     name?: string;
     existingPlanesCount?: number;
     existingId?: string;
@@ -1839,12 +1940,22 @@ export function createPlaneFromEdge(
   const pitchDeg = options.pitchDeg ?? 22.5;
   const underlapSide = options.underlapSide ?? 'left';
   const eaveHeightM = +(options.eaveHeightM ?? eaveEdge.eaveHeightM ?? 2.7).toFixed(2);
+  const sheetRunEdge =
+    (options.sheetRunEdgeId
+      ? outline.edges.find((e) => e.id === options.sheetRunEdgeId)
+      : undefined) || eaveEdge;
 
   // Build polygon cycle around eave edge
   const polygon = traceFacePolygon(outline, skeleton, eaveEdge);
 
-  // Developed geometry: unfold along true slope length
-  const { developedPolygon, slopeLength, runDirection } = computeDevelopedGeometry(polygon, eaveEdge, pitchDeg);
+  // Developed geometry: unfold along true slope length & chosen sheet run perpendicular edge
+  const { developedPolygon, slopeLength, runDirection } = computeDevelopedGeometry(
+    polygon,
+    eaveEdge,
+    pitchDeg,
+    undefined,
+    sheetRunEdge
+  );
 
   // Area of developed polygon
   const area = polygonArea(developedPolygon);
@@ -1872,6 +1983,7 @@ export function createPlaneFromEdge(
     color: colorDef.hex,
     planPolygon: polygon,
     eaveEdgeId: eaveEdge.id,
+    sheetRunEdgeId: sheetRunEdge.id,
     pitchDeg,
     underlapSide,
     eaveHeightM,
@@ -2053,14 +2165,22 @@ function traceFacePolygon(
   skeleton: SkeletonLine[],
   eaveEdge: PlanEdge
 ): Point2D[] {
-  const activeEavesCount = outline.edges.filter(
-    (e) => e.type !== 'verge' && e.type !== 'wall'
-  ).length;
+  const activeEavesCount = outline.edges.filter((e) => e.type === 'outline').length;
+
+  // When skeleton lines exist (manual or auto), always trace closed planar faces first
+  if (skeleton.length > 0) {
+    const planarPoly = traceFacePolygonPlanar(outline, skeleton, eaveEdge);
+    if (planarPoly && planarPoly.length >= 3) {
+      return planarPoly;
+    }
+  }
+
+  // True single-slope / monopitch sweep across full footprint ONLY when <= 1 eave exists and no skeleton splits it
   if (
     outline.points.length >= 3 &&
-    (activeEavesCount <= 1 || skeleton.length === 0)
+    skeleton.length === 0 &&
+    activeEavesCount <= 1
   ) {
-    // Single-slope / monopitch terrace roof: the single eave sweeps continuously across the full footprint
     const startIdx = outline.points.findIndex((pt) => pointsClose(pt, eaveEdge.from, 0.08));
     if (startIdx >= 0) {
       const nextPt = outline.points[(startIdx + 1) % outline.points.length];
@@ -2076,11 +2196,6 @@ function traceFacePolygon(
         return [...rev.slice(revIdx), ...rev.slice(0, revIdx)];
       }
     }
-  }
-
-  const planarPoly = traceFacePolygonPlanar(outline, skeleton, eaveEdge);
-  if (planarPoly && planarPoly.length >= 3) {
-    return planarPoly;
   }
 
   const pA = eaveEdge.from;
@@ -2160,12 +2275,17 @@ function traceFacePolygon(
     return [pA, pB, ...topVertices];
   }
 
-  const defaultDepth = 5.0;
+  // Fallback for skeleton-free multi-eave outline: clamp upslope strip to half of outline's span
+  const inwardSpans = outline.points.map(
+    (pt) => (pt.x - pA.x) * inwardNorm.x + (pt.y - pA.y) * inwardNorm.y
+  );
+  const maxSpan = inwardSpans.length > 0 ? Math.max(...inwardSpans) : 5.0;
+  const defaultDepth = +Math.max(0.6, Math.min(5.0, maxSpan * 0.5)).toFixed(3);
   return [
     pA,
     pB,
-    { x: pB.x + inwardNorm.x * defaultDepth, y: pB.y + inwardNorm.y * defaultDepth },
-    { x: pA.x + inwardNorm.x * defaultDepth, y: pA.y + inwardNorm.y * defaultDepth }
+    { x: +(pB.x + inwardNorm.x * defaultDepth).toFixed(3), y: +(pB.y + inwardNorm.y * defaultDepth).toFixed(3) },
+    { x: +(pA.x + inwardNorm.x * defaultDepth).toFixed(3), y: +(pA.y + inwardNorm.y * defaultDepth).toFixed(3) }
   ];
 }
 
@@ -2173,26 +2293,56 @@ function computeDevelopedGeometry(
   planPolygon: Point2D[],
   eaveEdge: PlanEdge,
   pitchDeg: number,
-  forcedInward?: Point2D
+  forcedInward?: Point2D,
+  sheetRunEdge?: PlanEdge
 ): { developedPolygon: Point2D[]; slopeLength: number; runDirection: Point2D } {
   const pA = eaveEdge.from;
   const pB = eaveEdge.to;
-  const dx = pB.x - pA.x;
-  const dy = pB.y - pA.y;
-  const eaveLen = Math.hypot(dx, dy) || 1;
-
-  const uVec: Point2D = { x: dx / eaveLen, y: dy / eaveLen };
-  const vPlan: Point2D = { x: -uVec.y, y: uVec.x };
+  const eaveDx = pB.x - pA.x;
+  const eaveDy = pB.y - pA.y;
+  const eaveLen = Math.hypot(eaveDx, eaveDy) || 1;
+  const eaveU: Point2D = { x: eaveDx / eaveLen, y: eaveDy / eaveLen };
+  const eavePerp: Point2D = { x: -eaveU.y, y: eaveU.x };
 
   const cx = planPolygon.reduce((acc, p) => acc + p.x, 0) / planPolygon.length;
   const cy = planPolygon.reduce((acc, p) => acc + p.y, 0) / planPolygon.length;
-  const dotToCentroid = (cx - pA.x) * vPlan.x + (cy - pA.y) * vPlan.y;
-  const vInward: Point2D = forcedInward || (dotToCentroid >= 0 ? vPlan : { x: -vPlan.x, y: -vPlan.y });
+  const dotToCentroidEave = (cx - pA.x) * eavePerp.x + (cy - pA.y) * eavePerp.y;
+  const fallInward: Point2D =
+    dotToCentroidEave >= 0 ? eavePerp : { x: -eavePerp.x, y: -eavePerp.y };
+
+  let uVec = eaveU;
+  let vInward = fallInward;
+
+  if (sheetRunEdge && sheetRunEdge.id !== eaveEdge.id) {
+    const rDx = sheetRunEdge.to.x - sheetRunEdge.from.x;
+    const rDy = sheetRunEdge.to.y - sheetRunEdge.from.y;
+    const rLen = Math.hypot(rDx, rDy);
+    if (rLen > 0.05) {
+      let candU = { x: rDx / rLen, y: rDy / rLen };
+      if (candU.x * eaveU.x + candU.y * eaveU.y < 0) {
+        candU = { x: -candU.x, y: -candU.y };
+      }
+      uVec = candU;
+      const candV = { x: -uVec.y, y: uVec.x };
+      const dotCentroid = (cx - pA.x) * candV.x + (cy - pA.y) * candV.y;
+      const dotFall = candV.x * fallInward.x + candV.y * fallInward.y;
+      vInward =
+        forcedInward ||
+        (dotFall >= 0.05 || (Math.abs(dotFall) <= 0.05 && dotCentroid >= 0)
+          ? candV
+          : { x: -candV.x, y: -candV.y });
+    }
+  } else if (forcedInward) {
+    vInward = forcedInward;
+  }
 
   const rad = (pitchDeg * Math.PI) / 180;
-  const slopeMultiplier = 1 / Math.max(0.1, Math.cos(rad));
+  // When sheet run direction differs by skew angle from fallInward, compute true sloped run multiplier along vInward
+  const fallAlign = Math.abs(vInward.x * fallInward.x + vInward.y * fallInward.y);
+  const slopeMultiplier = Math.hypot(1, fallAlign * Math.tan(rad));
 
-  let maxSlopeLen = 0;
+  let maxVSlope = -Infinity;
+  let minVSlope = Infinity;
   const developedPolygon: Point2D[] = planPolygon.map((p) => {
     const px = p.x - pA.x;
     const py = p.y - pA.y;
@@ -2200,13 +2350,15 @@ function computeDevelopedGeometry(
     const vPlanDist = px * vInward.x + py * vInward.y;
     const vSlope = vPlanDist * slopeMultiplier;
 
-    if (vSlope > maxSlopeLen) maxSlopeLen = vSlope;
+    if (vSlope > maxVSlope) maxVSlope = vSlope;
+    if (vSlope < minVSlope) minVSlope = vSlope;
     return { x: +u.toFixed(3), y: +vSlope.toFixed(3) };
   });
 
+  const spanSlope = Math.max(0, maxVSlope - Math.min(0, minVSlope));
   return {
     developedPolygon,
-    slopeLength: +maxSlopeLen.toFixed(3),
+    slopeLength: +spanSlope.toFixed(3),
     runDirection: vInward
   };
 }
@@ -2233,26 +2385,28 @@ function classifyFaceEdges(
     }
 
     if (outline) {
-      const onWall = outline.edges.some(
+      const matchedOutline = outline.edges.find(
         (oe) =>
-          oe.type === 'wall' &&
           distToSegment(p1, oe.from, oe.to) < 0.15 &&
           distToSegment(p2, oe.from, oe.to) < 0.15
       );
-      if (onWall) {
-        result.push({ edgeId, type: 'wall' });
-        continue;
-      }
-
-      const onVerge = outline.edges.some(
-        (oe) =>
-          oe.type === 'verge' &&
-          distToSegment(p1, oe.from, oe.to) < 0.15 &&
-          distToSegment(p2, oe.from, oe.to) < 0.15
-      );
-      if (onVerge) {
-        result.push({ edgeId, type: 'verge' });
-        continue;
+      if (matchedOutline) {
+        if (matchedOutline.type === 'wall') {
+          result.push({ edgeId, type: 'wall' });
+          continue;
+        }
+        if (matchedOutline.type === 'verge') {
+          result.push({ edgeId, type: 'verge' });
+          continue;
+        }
+        if (
+          matchedOutline.type === 'ridge' ||
+          matchedOutline.type === 'hip' ||
+          matchedOutline.type === 'valley'
+        ) {
+          result.push({ edgeId, type: matchedOutline.type });
+          continue;
+        }
       }
     }
 
@@ -2935,13 +3089,19 @@ export function developedToPlanPoint(
   const dx = eaveP2.x - eaveP1.x;
   const dy = eaveP2.y - eaveP1.y;
   const len = Math.hypot(dx, dy) || 1;
-  const uVec = { x: dx / len, y: dy / len };
+  const eaveU = { x: dx / len, y: dy / len };
+  const rLen = Math.hypot(runDirection.x, runDirection.y) || 1;
+  const vUnit = { x: runDirection.x / rLen, y: runDirection.y / rLen };
+  const candA = { x: vUnit.y, y: -vUnit.x };
+  const candB = { x: -vUnit.y, y: vUnit.x };
+  const uVec = candA.x * eaveU.x + candA.y * eaveU.y >= 0 ? candA : candB;
+
   const rad = (pitchDeg * Math.PI) / 180;
   const vPlanDist = pt.y * Math.cos(rad);
 
   return {
-    x: +(eaveP1.x + pt.x * uVec.x + vPlanDist * runDirection.x).toFixed(3),
-    y: +(eaveP1.y + pt.x * uVec.y + vPlanDist * runDirection.y).toFixed(3)
+    x: +(eaveP1.x + pt.x * uVec.x + vPlanDist * vUnit.x).toFixed(3),
+    y: +(eaveP1.y + pt.x * uVec.y + vPlanDist * vUnit.y).toFixed(3)
   };
 }
 
@@ -3281,10 +3441,16 @@ export function generateCuttingLayout(
     colIndex: number;
     segIndex: number;
     uCenter: number;
+    colWidth: number;
     minV: number;
     maxV: number;
-    cutLength: number;
+    cutLength: number; // required factory blank length across [u0, u1] including overhang
+    shortLength: number; // shortest edge across [u0, u1] including overhang
+    midLength: number; // centerline run length including overhang
+    geomMidLength: number; // centerline length inside developedPolygon (no overhang)
+    planeMaxCutLen: number;
     hasOrderedOverride?: boolean;
+    targetOrderedLen?: number;
     isTriangularRake: boolean;
     splitFromAssetId?: string;
     zoneRole: 'entry' | 'exit' | 'body';
@@ -3303,7 +3469,8 @@ export function generateCuttingLayout(
     const prog = planeProgression.get(plane.id)!;
     const uMin = prog.uMin;
     const uMax = prog.uMax;
-    const colsCount = Math.max(1, Math.ceil((uMax - uMin) / cover));
+    const totalU = Math.max(0, uMax - uMin);
+    const colsCount = Math.max(1, Math.ceil(totalU / cover));
     const midU = (uMin + uMax) / 2;
 
     const eaveP1 = plane.planPolygon[0];
@@ -3323,26 +3490,95 @@ export function generateCuttingLayout(
       colIdx: number;
       segIdx: number;
       uMid: number;
+      colWidth: number;
       vBot: number;
       vTop: number;
-      rawLen: number;
+      rawLongLen: number;
+      rawShortLen: number;
+      rawMidLen: number;
+      geomMidLen: number;
       isRake: boolean;
       splitAssetId?: string;
     }[] = [];
 
     colIndices.forEach((c) => {
-      const u0 = uMin + c * cover;
-      const u1 = u0 + cover;
-      const uMid = (u0 + u1) / 2;
+      const colStartU = Math.max(uMin, uMin + c * cover);
+      const colEndU = Math.min(uMax, uMin + (c + 1) * cover);
+      const colWidth = +(colEndU - colStartU).toFixed(4);
+      if (colWidth < 0.04 && colsCount > 1) return;
 
+      const uMid = (colStartU + colEndU) / 2;
       const vSegments = polygonVSegmentsAtU(poly, planeApertures, uMid, cover * 0.35);
+      if (vSegments.length === 0) return;
+
+      const sampleXs = [colStartU + 0.005, uMid, colEndU - 0.005].filter(
+        (x) => x > colStartU + 0.0005 && x < colEndU - 0.0005
+      );
+      if (sampleXs.length === 0) sampleXs.push(uMid);
+      poly.forEach((pt) => {
+        if (pt.x > colStartU + 0.005 && pt.x < colEndU - 0.005) {
+          sampleXs.push(pt.x);
+        }
+      });
+
       vSegments.forEach(([segBot, segTop, isRake, splitAssetId], segIdx) => {
         const isBaseEave = segIdx === 0 && segBot <= 0.05;
-        const vBot = isBaseEave ? Math.max(0, segBot - sheetSpec.overhang) : segBot;
-        const vTop = segTop;
-        const rawLen = +(vTop - vBot).toFixed(3);
-        if (rawLen > 0.2) {
-          rawSegments.push({ colIdx: c, segIdx, uMid, vBot, vTop, rawLen, isRake, splitAssetId });
+        // Include real eave gutter overhang (do NOT clamp to 0 when segBot === 0)
+        const vBotMid = isBaseEave ? segBot - sheetSpec.overhang : segBot;
+        const rawMidLen = +(segTop - vBotMid).toFixed(3);
+        const geomMidLen = +Math.max(0, segTop - segBot).toFixed(3);
+
+        let vBotMin = vBotMid;
+        let vTopMax = segTop;
+        let vTopMin = segTop;
+        let rakeDetected = isRake;
+
+        if (!splitAssetId) {
+          for (const sx of sampleXs) {
+            const polyRange = polygonVRangeAtU(poly, sx);
+            if (!polyRange) continue;
+            const [sBot, sTop, sHasRake] = polyRange;
+            const effBot = isBaseEave && sBot <= 0.05 ? sBot - sheetSpec.overhang : sBot;
+            vBotMin = Math.min(vBotMin, effBot);
+            vTopMax = Math.max(vTopMax, sTop);
+            vTopMin = Math.min(vTopMin, sTop);
+            if (sHasRake) rakeDetected = true;
+          }
+        } else if (segBot > 0.05) {
+          // Upper piece split above an opening/dormer valley: sample envelope only across columns keeping split
+          for (const sx of sampleXs) {
+            const sSegs = polygonVSegmentsAtU(poly, planeApertures, sx, cover * 0.12);
+            const upperMatch = sSegs.find(
+              ([sb, st, , sAsset]) =>
+                (sAsset === splitAssetId && sb > 0.05) || (sSegs.length > 1 && sb > 0.05 && st > segBot)
+            );
+            if (upperMatch) {
+              vBotMin = Math.min(vBotMin, upperMatch[0]);
+              vTopMax = Math.max(vTopMax, upperMatch[1]);
+              vTopMin = Math.min(vTopMin, upperMatch[1]);
+              if (upperMatch[2]) rakeDetected = true;
+            }
+          }
+        }
+
+        const rawLongLen = +Math.max(rawMidLen, vTopMax - vBotMin).toFixed(3);
+        const rawShortLen = +Math.max(0.02, Math.min(rawMidLen, vTopMin - vBotMid)).toFixed(3);
+
+        if (rawLongLen > 0.2) {
+          rawSegments.push({
+            colIdx: c,
+            segIdx,
+            uMid,
+            colWidth,
+            vBot: vBotMin,
+            vTop: vTopMax,
+            rawLongLen,
+            rawShortLen,
+            rawMidLen,
+            geomMidLen,
+            isRake: rakeDetected || rawLongLen - rawShortLen >= 0.08,
+            splitAssetId
+          });
         }
       });
     });
@@ -3350,64 +3586,119 @@ export function generateCuttingLayout(
     const hasOverride = Boolean(plane.orderedSheetLengthM && plane.orderedSheetLengthM > 0.2);
     const maxRawLen =
       rawSegments.length > 0
-        ? Math.max(...rawSegments.map((s) => s.rawLen))
+        ? Math.max(...rawSegments.map((s) => s.rawLongLen))
         : plane.slopeLength || 0.2;
     const targetOrderedLen = hasOverride ? +plane.orderedSheetLengthM!.toFixed(3) : 0;
     const overrideScale = hasOverride && maxRawLen > 0.2 ? targetOrderedLen / maxRawLen : 1;
 
-    rawSegments.forEach(({ colIdx: c, segIdx, uMid, vBot, vTop, rawLen, isRake, splitAssetId }) => {
-      const effectiveLen = hasOverride
-        ? rawLen >= maxRawLen - 0.004
-          ? targetOrderedLen
-          : +Math.max(0.2, rawLen * overrideScale).toFixed(3)
-        : Math.min(rawLen, maxLen);
+    const planeMaxCutLen = hasOverride
+      ? targetOrderedLen
+      : +Math.min(maxLen, maxRawLen).toFixed(3);
 
-      const isLeftRake = uMid < midU;
+    rawSegments.forEach(
+      ({
+        colIdx: c,
+        segIdx,
+        uMid,
+        colWidth,
+        vBot,
+        vTop,
+        rawLongLen,
+        rawShortLen,
+        rawMidLen,
+        geomMidLen,
+        isRake,
+        splitAssetId
+      }) => {
+        const isFullBodySeg = rawLongLen >= maxRawLen - 0.004;
+        const effectiveLongLen = hasOverride
+          ? isFullBodySeg
+            ? targetOrderedLen
+            : +Math.max(0.2, rawLongLen * overrideScale).toFixed(3)
+          : +Math.min(rawLongLen, maxLen).toFixed(3);
 
-      // Determine whether this column sits on the ENTRY hip side or EXIT hip side
-      let zoneRole: 'entry' | 'exit' | 'body' = 'body';
-      if (isRake) {
-        const onU0Half = uMid <= midU;
-        if (prog.entryAtU0) {
-          zoneRole = onU0Half ? 'entry' : 'exit';
-        } else {
-          zoneRole = onU0Half ? 'exit' : 'entry';
+        const effectiveShortLen = hasOverride
+          ? isFullBodySeg && rawLongLen - rawShortLen < 0.04
+            ? targetOrderedLen
+            : +Math.max(0.02, rawShortLen * overrideScale).toFixed(3)
+          : +Math.min(rawShortLen, effectiveLongLen, maxLen).toFixed(3);
+
+        const effectiveMidLen = hasOverride
+          ? isFullBodySeg && rawLongLen - rawMidLen < 0.04
+            ? targetOrderedLen
+            : +Math.max(0.1, rawMidLen * overrideScale).toFixed(3)
+          : +Math.min(rawMidLen, maxLen).toFixed(3);
+
+        const isLeftRake = uMid < midU;
+
+        // Determine whether this column sits on the ENTRY hip side or EXIT hip side
+        let zoneRole: 'entry' | 'exit' | 'body' = 'body';
+        if (isRake) {
+          const onU0Half = uMid <= midU;
+          if (prog.entryAtU0) {
+            zoneRole = onU0Half ? 'entry' : 'exit';
+          } else {
+            zoneRole = onU0Half ? 'exit' : 'entry';
+          }
         }
+
+        const planCenter = developedToPlanPoint(
+          { x: uMid, y: (vBot + vTop) / 2 },
+          eaveP1,
+          eaveP2,
+          plane.pitchDeg,
+          runDir
+        );
+
+        allNeededPieces.push({
+          planeId: plane.id,
+          planeName: plane.name || `Section ${plane.code || plane.id.slice(-4)}`,
+          sequenceIndex: plane.sequenceIndex || 1,
+          seqPos: prog.seqPos,
+          colIndex: c + 1,
+          segIndex: segIdx,
+          uCenter: +uMid.toFixed(2),
+          colWidth,
+          minV: +vBot.toFixed(2),
+          maxV: +vTop.toFixed(2),
+          cutLength: effectiveLongLen,
+          shortLength: effectiveShortLen,
+          midLength: effectiveMidLen,
+          geomMidLength: geomMidLen,
+          planeMaxCutLen,
+          hasOrderedOverride: hasOverride,
+          targetOrderedLen: hasOverride ? targetOrderedLen : undefined,
+          isTriangularRake: isRake,
+          splitFromAssetId: splitAssetId,
+          zoneRole,
+          isLeftRake,
+          pitchDeg: plane.pitchDeg,
+          underlapSide: plane.underlapSide,
+          planCenter
+        });
       }
-
-      const planCenter = developedToPlanPoint(
-        { x: uMid, y: (vBot + vTop) / 2 },
-        eaveP1,
-        eaveP2,
-        plane.pitchDeg,
-        runDir
-      );
-
-      allNeededPieces.push({
-        planeId: plane.id,
-        planeName: plane.name || `Section ${plane.code || plane.id.slice(-4)}`,
-        sequenceIndex: plane.sequenceIndex || 1,
-        seqPos: prog.seqPos,
-        colIndex: c + 1,
-        segIndex: segIdx,
-        uCenter: +uMid.toFixed(2),
-        minV: +vBot.toFixed(2),
-        maxV: +vTop.toFixed(2),
-        cutLength: effectiveLen,
-        hasOrderedOverride: hasOverride,
-        isTriangularRake: isRake,
-        splitFromAssetId: splitAssetId,
-        zoneRole,
-        isLeftRake,
-        pitchDeg: plane.pitchDeg,
-        underlapSide: plane.underlapSide,
-        planCenter
-      });
-    });
+    );
   });
 
-  // Step 2: Progressive Natural Pairing (True Roofer Workflow)
+  // Baseline standalone ordered metres (1 parent sheet per needed piece at true cutLength — zero artificial inflation)
+  const standaloneOrderedMetres = +allNeededPieces
+    .reduce((sum, item) => sum + item.cutLength, 0)
+    .toFixed(3);
+
+  // Step 2: True Ordered Parents + Separate Offcut Repress Pass
+  // - Never manufactures longer higher-waste mother blanks (e.g. no 4.0m/2.0m artificial floors)
+  // - Only represses when:
+  //   (A) Linear leftover tail on an ordered sheet covers another piece (remaining >= cutLength + 0.02m), OR
+  //   (B) Diagonal hip/valley complementary cutoff saves >= 0.12m AND fits within practical body run <= maxLen
   const parentSheets: ParentSheet[] = [];
+  const parentMetaByIndex: Array<{
+    linearRemaining: number;
+    hasOrderedOverride?: boolean;
+    targetOrderedLen?: number;
+    pitchDeg: number;
+    underlapSide: 'left' | 'right';
+    midSum: number;
+  }> = [];
   const placedPieces: CutPiece[] = [];
   const placementMap: LayoutResult['placementMap'] = orderedPlanes.map((p) => ({
     planeId: p.id,
@@ -3441,9 +3732,53 @@ export function generateCuttingLayout(
   }
   const offcutTransfers: TransferredPieceInfo[] = [];
 
-  const commitPair = (
+  const quantizeMm = (lenM: number) => +(Math.round(lenM * 1000) / 1000).toFixed(3);
+  const KERF_LIN = 0.02;
+
+  const evalDiagonalRepress = (
+    p1: NeededSheetStrip,
+    p2: NeededSheetStrip
+  ): { parentBlankLen: number; savings: number } | null => {
+    if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) return null;
+    const canFlip180 = p1.underlapSide !== p2.underlapSide || p1.planeId !== p2.planeId;
+    if (!canFlip180) return null;
+
+    // Protect site-measured full body runs from being altered or swallowed
+    if (p2.hasOrderedOverride && !p2.isTriangularRake) return null;
+
+    const p1Taper = p1.cutLength - p1.shortLength;
+    const p2Taper = p2.cutLength - p2.shortLength;
+    if (p1Taper < 0.08 && p2Taper < 0.08) return null;
+
+    const diagKerf = p1.shortLength > 0.25 && p2.shortLength > 0.25 ? 0.015 : 0;
+    const nestedRaw = Math.max(
+      p1.cutLength + p2.shortLength,
+      p1.shortLength + p2.cutLength + diagKerf
+    );
+    const parentBlankLen = quantizeMm(Math.max(p1.cutLength, nestedRaw));
+
+    if (parentBlankLen > maxLen + 0.001) return null;
+    if (p1.hasOrderedOverride && p1.targetOrderedLen && parentBlankLen > p1.targetOrderedLen + 0.001) {
+      return null;
+    }
+
+    const practicalCap = Math.min(
+      maxLen,
+      Math.max(p1.planeMaxCutLen, p2.planeMaxCutLen, p1.cutLength, p2.cutLength) + 0.05
+    );
+    if (parentBlankLen > practicalCap + 0.001) return null;
+
+    const standalonePairLen = p1.cutLength + p2.cutLength;
+    const savings = +(standalonePairLen - parentBlankLen).toFixed(3);
+    if (savings < 0.12) return null;
+
+    return { parentBlankLen, savings };
+  };
+
+  const commitRepressPair = (
     p1Idx: number,
     p2Idx: number,
+    parentBlankLen: number,
     ruleApplied: TransferredPieceInfo['ruleApplied']
   ) => {
     const p1 = allNeededPieces[p1Idx];
@@ -3451,56 +3786,24 @@ export function generateCuttingLayout(
     pairedPieceIndices.add(p1Idx);
     pairedPieceIndices.add(p2Idx);
 
-    if (p1.planeId !== p2.planeId) {
-      transferMatrix[p1.planeId][p2.planeId] = (transferMatrix[p1.planeId][p2.planeId] || 0) + 1;
-      offcutTransfers.push({
-        sourcePlaneId: p1.planeId,
-        targetPlaneId: p2.planeId,
-        sourcePlanCenter: p1.planCenter,
-        targetPlanCenter: p2.planCenter,
-        piece: {
-          id: `piece-${p2.planeId}-${p2.colIndex}-${p2.segIndex}`,
-          parentSheetId: `parent-sheet-${sheetNumberCounter}`,
-          length: p2.cutLength,
-          width: cover,
-          cutFrom: p1.cutLength,
-          orientation: 'flipped180',
-          targetPlaneId: p2.planeId,
-          placement: { origin: { x: p2.uCenter, y: p2.minV }, rotation: 180, flipped: true },
-          underlapSide: p2.underlapSide,
-          facetName: p2.planeName,
-          colIndex: p2.colIndex,
-          minV: p2.minV,
-          maxV: p2.maxV,
-          splitFromAssetId: p2.splitFromAssetId,
-          note: `Flipped 180° offcut from ${p1.planeName}`
-        },
-        uCenter: p2.uCenter,
-        width: cover,
-        cutLength: p2.cutLength,
-        ruleApplied
-      });
-    }
-
-    const parentBlankLen = Math.min(maxLen, Math.max(p1.cutLength + p2.cutLength + 0.05, 4.0));
     const parentId = `parent-sheet-${sheetNumberCounter}`;
     const color = PARENT_PALETTE[(sheetNumberCounter - 1) % PARENT_PALETTE.length];
 
     const piece1Note =
       ruleApplied === 'adjacent_hip_run' || ruleApplied === 'next_sequence_slope'
-        ? `Stock run cut on hip – offcut feeds ${p2.planeName}`
-        : `Stock run piece from Parent #${sheetNumberCounter}`;
+        ? `Ordered run on ${p1.planeName} – diagonal offcut repressed into ${p2.planeName}`
+        : `Ordered sheet #${sheetNumberCounter} (offcut reused)`;
 
     const piece2Note =
       p1.planeId !== p2.planeId
-        ? `Flipped 180° offcut from ${p1.planeName}`
-        : `Opposite hip cut & flip from ${p1.planeName}`;
+        ? `Repressed 180° offcut from ${p1.planeName}`
+        : `Opposite hip 180° offcut from ${p1.planeName}`;
 
     const piece1: CutPiece = {
       id: `piece-${p1.planeId}-${p1.colIndex}-${p1.segIndex}`,
       parentSheetId: parentId,
       length: p1.cutLength,
-      width: cover,
+      width: p1.colWidth,
       cutFrom: 0,
       orientation: 'normal',
       targetPlaneId: p1.planeId,
@@ -3518,8 +3821,8 @@ export function generateCuttingLayout(
       id: `piece-${p2.planeId}-${p2.colIndex}-${p2.segIndex}`,
       parentSheetId: parentId,
       length: p2.cutLength,
-      width: cover,
-      cutFrom: p1.cutLength,
+      width: p2.colWidth,
+      cutFrom: quantizeMm(Math.max(0, parentBlankLen - p2.cutLength)),
       orientation: 'flipped180',
       targetPlaneId: p2.planeId,
       placement: { origin: { x: p2.uCenter, y: p2.minV }, rotation: 180, flipped: true },
@@ -3532,18 +3835,42 @@ export function generateCuttingLayout(
       note: piece2Note
     };
 
-    const remaining = +(parentBlankLen - p1.cutLength - p2.cutLength).toFixed(3);
+    if (p1.planeId !== p2.planeId) {
+      transferMatrix[p1.planeId][p2.planeId] = (transferMatrix[p1.planeId][p2.planeId] || 0) + 1;
+      offcutTransfers.push({
+        sourcePlaneId: p1.planeId,
+        targetPlaneId: p2.planeId,
+        sourcePlanCenter: p1.planCenter,
+        targetPlanCenter: p2.planCenter,
+        piece: piece2,
+        uCenter: p2.uCenter,
+        width: p2.colWidth,
+        cutLength: p2.cutLength,
+        ruleApplied
+      });
+    }
+
+    const midSum = p1.midLength + p2.midLength;
+    const naturalDrop = +Math.max(0, parentBlankLen - midSum).toFixed(3);
     const parentSheet: ParentSheet = {
       id: parentId,
       sheetNumber: sheetNumberCounter++,
-      length: +parentBlankLen.toFixed(3),
+      length: parentBlankLen,
       color,
       pieces: [piece1, piece2],
-      remaining: Math.max(0, remaining),
-      utilization: +(((p1.cutLength + p2.cutLength) / parentBlankLen) * 100).toFixed(1)
+      remaining: naturalDrop,
+      utilization: +Math.min(100, (midSum / parentBlankLen) * 100).toFixed(1)
     };
 
     parentSheets.push(parentSheet);
+    parentMetaByIndex.push({
+      linearRemaining: +Math.max(0, parentBlankLen - (p1.cutLength + p2.cutLength)).toFixed(3),
+      hasOrderedOverride: p1.hasOrderedOverride,
+      targetOrderedLen: p1.targetOrderedLen,
+      pitchDeg: p1.pitchDeg,
+      underlapSide: p1.underlapSide,
+      midSum
+    });
     placedPieces.push(piece1, piece2);
 
     addToPlacementMap(placementMap, p1.planeId, {
@@ -3570,7 +3897,7 @@ export function generateCuttingLayout(
   };
 
   // PASS 1: Strict Progressive Perimeter Flow per roof level ring (P_k.exit -> P_{(k+1)%N}.entry)
-  // Models laying along main/current face into exit hip, then flipping offcuts across the hip into next face's entry side!
+  // Models laying along main/current face into exit hip, then flipping offcuts across the hip into next face's entry side
   const levelRings = new Map<string, RoofPlane[]>();
   orderedMain.forEach((p) => {
     const key = p.levelId || 'level-1';
@@ -3597,60 +3924,60 @@ export function generateCuttingLayout(
             item.planeId === srcPlane.id &&
             item.isTriangularRake &&
             item.zoneRole === 'exit'
-        );
+        )
+        .sort((a, b) => b.item.cutLength - a.item.cutLength);
 
       for (const { item: p1, idx: p1Idx } of srcExitIndices) {
         if (pairedPieceIndices.has(p1Idx)) continue;
 
         let bestIdx = -1;
-        let bestWaste = Infinity;
+        let bestBlankLen = 0;
+        let bestScore = -Infinity;
 
         for (let j = 0; j < allNeededPieces.length; j++) {
           if (pairedPieceIndices.has(j)) continue;
           const p2 = allNeededPieces[j];
           if (p2.planeId !== tgtPlane.id || !p2.isTriangularRake || p2.zoneRole !== 'entry') continue;
 
-          const combined = p1.cutLength + p2.cutLength;
-          if (combined <= maxLen) {
-            const waste = maxLen - combined;
-            if (waste < bestWaste) {
-              bestWaste = waste;
-              bestIdx = j;
-            }
+          const fit = evalDiagonalRepress(p1, p2);
+          if (!fit) continue;
+
+          // Prioritize highest material saved and smallest natural drop
+          const score = fit.savings * 100 - (fit.parentBlankLen - (p1.midLength + p2.midLength)) * 10;
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = j;
+            bestBlankLen = fit.parentBlankLen;
           }
         }
 
         if (bestIdx >= 0) {
-          commitPair(p1Idx, bestIdx, 'adjacent_hip_run');
+          commitRepressPair(p1Idx, bestIdx, bestBlankLen, 'adjacent_hip_run');
         }
       }
     }
   });
 
-  // PASS 2: Cleanup / Mixed-Pitch & Unpaired Rakes
-  // Handles mixed-pitch adjacent edges (e.g. 15°/25° L-shape), valley sides, or leftover asymmetric rakes
+  // PASS 2: Cleanup / Mixed-Pitch & Remaining Unpaired Rakes
   const remainingRakeIndices = allNeededPieces
     .map((item, idx) => ({ item, idx }))
-    .filter(({ item, idx }) => item.isTriangularRake && !pairedPieceIndices.has(idx));
+    .filter(({ item, idx }) => item.isTriangularRake && !pairedPieceIndices.has(idx))
+    .sort((a, b) => b.item.cutLength - a.item.cutLength);
 
   for (const { item: p1, idx: p1Idx } of remainingRakeIndices) {
     if (pairedPieceIndices.has(p1Idx)) continue;
 
     let bestIdx = -1;
+    let bestBlankLen = 0;
     let highestScore = -Infinity;
     let bestRule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
 
     for (const { item: p2, idx: p2Idx } of remainingRakeIndices) {
       if (p2Idx === p1Idx || pairedPieceIndices.has(p2Idx)) continue;
-      if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) continue;
 
-      const canFlip180 = p1.underlapSide !== p2.underlapSide || p1.planeId !== p2.planeId;
-      if (!canFlip180) continue;
+      const fit = evalDiagonalRepress(p1, p2);
+      if (!fit) continue;
 
-      const combined = p1.cutLength + p2.cutLength;
-      if (combined > maxLen) continue;
-
-      const waste = maxLen - combined;
       const plane1 = orderedPlanes[p1.seqPos];
       const plane2 = orderedPlanes[p2.seqPos];
       const isAdjacentHip = plane1 && plane2 && arePlanesAdjacentAtHip(plane1, plane2);
@@ -3664,7 +3991,6 @@ export function generateCuttingLayout(
         tierScore = 140000 - (forwardDiff === 1 ? 0 : forwardDiff * 3000);
         rule = 'adjacent_hip_run';
       } else if (p1.planeId === p2.planeId && p1.zoneRole !== p2.zoneRole) {
-        // Same-face opposite hip pair avoids scattered 1-piece jumps across mixed-pitch valleys
         tierScore = 110000;
         rule = 'opposite_hip_same_slope';
       } else if (p1.planeId !== p2.planeId && isEndSlopeMatch && forwardDiff > 0 && forwardDiff <= 2) {
@@ -3678,21 +4004,21 @@ export function generateCuttingLayout(
         rule = 'geometric_fallback';
       }
 
-      const score = tierScore - waste * 150;
+      const score = tierScore + fit.savings * 2000;
       if (score > highestScore) {
         highestScore = score;
         bestIdx = p2Idx;
+        bestBlankLen = fit.parentBlankLen;
         bestRule = rule;
       }
     }
 
     if (bestIdx >= 0) {
-      commitPair(p1Idx, bestIdx, bestRule);
+      commitRepressPair(p1Idx, bestIdx, bestBlankLen, bestRule);
     }
   }
 
-  // PASS 2B: Aperture / Short Split Pieces & Dormer/Apron Offcut Pairing
-  // Pairs short pieces created around skylights/chimneys/dormers or derived dormer/apron cuts with compatible short cuts
+  // PASS 2B: Aperture / Short Split Pieces & Dormer/Apron Diagonal Repress
   const derivedOrSplitPlaneIds = new Set(
     orderedPlanes
       .filter((p) => p.isVirtualAssetPlane || p.pitchZoneRole === 'lower_apron' || p.pitchZoneRole === 'upper_main')
@@ -3708,46 +4034,128 @@ export function generateCuttingLayout(
         ({ item, idx }) =>
           !pairedPieceIndices.has(idx) &&
           (isAssetSplitOrDerived(item) || item.cutLength <= maxLen * 0.58)
-      );
+      )
+      .sort((a, b) => b.item.cutLength - a.item.cutLength);
 
     for (const { item: p1, idx: p1Idx } of shortSplitCandidates) {
       if (pairedPieceIndices.has(p1Idx)) continue;
       let bestIdx = -1;
-      let bestWaste = Infinity;
+      let bestBlankLen = 0;
+      let bestSavings = 0;
 
       for (const { item: p2, idx: p2Idx } of shortSplitCandidates) {
         if (p2Idx === p1Idx || pairedPieceIndices.has(p2Idx)) continue;
         if (!isAssetSplitOrDerived(p1) && !isAssetSplitOrDerived(p2)) continue;
-        if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) continue;
-        const combined = p1.cutLength + p2.cutLength;
-        if (combined > maxLen) continue;
-        const waste = maxLen - combined;
-        if (waste < bestWaste) {
-          bestWaste = waste;
+        const fit = evalDiagonalRepress(p1, p2);
+        if (fit && fit.savings > bestSavings) {
+          bestSavings = fit.savings;
+          bestBlankLen = fit.parentBlankLen;
           bestIdx = p2Idx;
         }
       }
 
       if (bestIdx >= 0) {
-        commitPair(p1Idx, bestIdx, 'geometric_fallback');
+        commitRepressPair(p1Idx, bestIdx, bestBlankLen, 'geometric_fallback');
       }
     }
   }
 
-  // Step 3: Handle Remaining Pieces (Full-length body runs + any unpaired end rakes)
-  const remainingPieces = allNeededPieces.filter((_, idx) => !pairedPieceIndices.has(idx));
-  remainingPieces.sort((a, b) => b.cutLength - a.cutLength);
+  // Step 3: Allocate Standalone Ordered Parents for Remaining Pieces + Linear Leftover Tail Repress
+  const remainingIndices = allNeededPieces
+    .map((item, idx) => ({ item, idx }))
+    .filter(({ idx }) => !pairedPieceIndices.has(idx))
+    .sort((a, b) => b.item.cutLength - a.item.cutLength);
 
-  remainingPieces.forEach((item) => {
+  for (const { item, idx: itemIdx } of remainingIndices) {
+    if (pairedPieceIndices.has(itemIdx)) continue;
+
+    // First try straight linear leftover tail repress into an already ordered ParentSheet (without lengthening it)
+    let linearDonorIdx = -1;
+    let bestWasteLeft = Infinity;
+    for (let pi = 0; pi < parentSheets.length; pi++) {
+      const meta = parentMetaByIndex[pi];
+      if (!meta || meta.linearRemaining < item.cutLength + KERF_LIN) continue;
+      if (Math.abs(meta.pitchDeg - item.pitchDeg) > 0.5) continue;
+      const wasteLeft = meta.linearRemaining - (item.cutLength + KERF_LIN);
+      if (wasteLeft < bestWasteLeft) {
+        bestWasteLeft = wasteLeft;
+        linearDonorIdx = pi;
+      }
+    }
+
+    if (linearDonorIdx >= 0) {
+      const donorParent = parentSheets[linearDonorIdx];
+      const donorMeta = parentMetaByIndex[linearDonorIdx];
+      const primary = donorParent.pieces[0];
+      const cutFrom = quantizeMm(donorParent.length - donorMeta.linearRemaining);
+
+      const repressedPiece: CutPiece = {
+        id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
+        parentSheetId: donorParent.id,
+        length: item.cutLength,
+        width: item.colWidth,
+        cutFrom,
+        orientation: 'flipped180',
+        targetPlaneId: item.planeId,
+        placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 180, flipped: true },
+        underlapSide: item.underlapSide,
+        facetName: item.planeName,
+        colIndex: item.colIndex,
+        minV: item.minV,
+        maxV: item.maxV,
+        splitFromAssetId: item.splitFromAssetId,
+        note: `Repressed from leftover tail of Stock #${donorParent.sheetNumber} (${primary?.facetName || 'Main'})`
+      };
+
+      donorParent.pieces.push(repressedPiece);
+      donorMeta.linearRemaining = +Math.max(0, donorMeta.linearRemaining - item.cutLength - KERF_LIN).toFixed(3);
+      donorMeta.midSum += item.midLength;
+      donorParent.remaining = +Math.max(0, donorParent.length - donorMeta.midSum).toFixed(3);
+      donorParent.utilization = +Math.min(100, (donorMeta.midSum / donorParent.length) * 100).toFixed(1);
+
+      placedPieces.push(repressedPiece);
+      pairedPieceIndices.add(itemIdx);
+
+      addToPlacementMap(placementMap, item.planeId, {
+        pieceId: repressedPiece.id,
+        parentId: donorParent.id,
+        parentSheetNumber: donorParent.sheetNumber,
+        length: repressedPiece.length,
+        isOffcut: true,
+        orientation: 'flipped180',
+        note: `➔ ${repressedPiece.note}`,
+        color: donorParent.color || '#3b82f6'
+      });
+
+      if (primary && primary.targetPlaneId !== item.planeId) {
+        transferMatrix[primary.targetPlaneId][item.planeId] =
+          (transferMatrix[primary.targetPlaneId][item.planeId] || 0) + 1;
+        const srcPlane = orderedPlanes.find((p) => p.id === primary.targetPlaneId);
+        offcutTransfers.push({
+          sourcePlaneId: primary.targetPlaneId,
+          targetPlaneId: item.planeId,
+          sourcePlanCenter: srcPlane ? polygonCentroid(srcPlane.planPolygon) : item.planCenter,
+          targetPlanCenter: item.planCenter,
+          piece: repressedPiece,
+          uCenter: item.uCenter,
+          width: item.colWidth,
+          cutLength: item.cutLength,
+          ruleApplied: 'geometric_fallback'
+        });
+      }
+      continue;
+    }
+
+    // Otherwise order 1 parent sheet for this piece at its exact cutLength (no 2.0m artificial floor)
     const parentId = `parent-sheet-${sheetNumberCounter}`;
     const color = PARENT_PALETTE[(sheetNumberCounter - 1) % PARENT_PALETTE.length];
-    const orderLength = item.hasOrderedOverride ? item.cutLength : Math.max(item.cutLength, 2.0);
+    const orderLength = quantizeMm(item.cutLength);
 
     const piece: CutPiece = {
       id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
       parentSheetId: parentId,
       length: item.cutLength,
-      width: cover,
+      width: item.colWidth,
       cutFrom: 0,
       orientation: 'normal',
       targetPlaneId: item.planeId,
@@ -3758,21 +4166,31 @@ export function generateCuttingLayout(
       minV: item.minV,
       maxV: item.maxV,
       splitFromAssetId: item.splitFromAssetId,
-      note: item.splitFromAssetId ? `Cut around opening (#${sheetNumberCounter})` : `Full run sheet #${sheetNumberCounter}`
+      note: item.splitFromAssetId
+        ? `Cut around opening (#${sheetNumberCounter})`
+        : `Direct run sheet #${sheetNumberCounter}`
     };
 
-    const remaining = +(orderLength - item.cutLength).toFixed(3);
+    const naturalDrop = +Math.max(0, orderLength - item.midLength).toFixed(3);
     const parentSheet: ParentSheet = {
       id: parentId,
       sheetNumber: sheetNumberCounter++,
-      length: +orderLength.toFixed(3),
+      length: orderLength,
       color,
       pieces: [piece],
-      remaining: Math.max(0, remaining),
-      utilization: +((item.cutLength / orderLength) * 100).toFixed(1)
+      remaining: naturalDrop,
+      utilization: +Math.min(100, (item.midLength / orderLength) * 100).toFixed(1)
     };
 
     parentSheets.push(parentSheet);
+    parentMetaByIndex.push({
+      linearRemaining: +Math.max(0, orderLength - item.cutLength).toFixed(3),
+      hasOrderedOverride: item.hasOrderedOverride,
+      targetOrderedLen: item.targetOrderedLen,
+      pitchDeg: item.pitchDeg,
+      underlapSide: item.underlapSide,
+      midSum: item.midLength
+    });
     placedPieces.push(piece);
 
     addToPlacementMap(placementMap, item.planeId, {
@@ -3782,22 +4200,37 @@ export function generateCuttingLayout(
       length: piece.length,
       isOffcut: false,
       orientation: 'normal',
-      note: `Full mill stock sheet #${parentSheet.sheetNumber}`,
+      note: `Ordered blank #${parentSheet.sheetNumber}`,
       color
     });
-  });
+  }
 
-  // Calculate Metrics
-  const totalRoofMetres = +allNeededPieces.reduce((sum, p) => sum + p.cutLength, 0).toFixed(2);
+  // Calculate Reconciled Metrics (Honest & Reconciled 100% with ParentSheet[] and Roof Geometry)
+  const totalRoofMetres = +allNeededPieces.reduce((sum, p) => sum + p.midLength, 0).toFixed(2);
   const totalOrderedMetres = +parentSheets.reduce((sum, s) => sum + s.length, 0).toFixed(2);
-  const totalRoofArea = +(totalRoofMetres * cover).toFixed(2);
+
+  // Compute net developed roof area from unfolded planes minus apertures (exact physical roof m²)
+  const netRoofAreaM2 = orderedPlanes.reduce((acc, p) => {
+    const devArea =
+      p.developedPolygon && p.developedPolygon.length >= 3
+        ? polygonArea(p.developedPolygon)
+        : p.area || 0;
+    const appArea = (p.apertures || []).reduce((apAcc, app) => {
+      if (app.developedPolygon && app.developedPolygon.length >= 3) {
+        return apAcc + polygonArea(app.developedPolygon);
+      }
+      return apAcc + Math.max(0, (app.uMax - app.uMin) * (app.vMax - app.vMin));
+    }, 0);
+    return acc + Math.max(0, devArea - appArea);
+  }, 0);
+  const totalRoofArea = +(netRoofAreaM2 > 0 ? netRoofAreaM2 : totalRoofMetres * cover).toFixed(2);
   const totalOrderedArea = +(totalOrderedMetres * cover).toFixed(2);
 
-  const scrapMetres = Math.max(0, totalOrderedMetres - totalRoofMetres);
-  const wastePercent = totalOrderedMetres > 0 ? +((scrapMetres / totalOrderedMetres) * 100).toFixed(1) : 4.5;
-  const savedMetres = +(pairedPieceIndices.size * 1.15).toFixed(1);
+  const scrapMetres = Math.max(0, +(totalOrderedMetres - totalRoofMetres).toFixed(2));
+  const wastePercent = totalOrderedMetres > 0 ? +((scrapMetres / totalOrderedMetres) * 100).toFixed(1) : 0;
+  const totalOffcutsReused = parentSheets.reduce((sum, s) => sum + Math.max(0, s.pieces.length - 1), 0);
+  const savedMetres = +Math.max(0, standaloneOrderedMetres - totalOrderedMetres).toFixed(2);
   const dollarValueSavedNZD = Math.round(savedMetres * 21.5);
-  const totalOffcutsReused = pairedPieceIndices.size / 2;
 
   // Step 4: SECTION-BASED PRESENTATION WITH SEQUENTIAL LAYING ORDER
   const sections: SectionSummary[] = orderedPlanes.map((plane) => {
@@ -4672,7 +5105,8 @@ export function createRoofLevel(
     { x: 10, y: 5 },
     { x: 0, y: 5 }
   ],
-  edgeTypes?: ('outline' | 'verge' | 'wall')[]
+  edgeTypes?: EdgeType[],
+  options?: { autoGenerateSkeleton?: boolean; initialEdgeType?: EdgeType }
 ): RoofLevel {
   const levelId = `level-${index}`;
   const code = `L${index}`;
@@ -4680,7 +5114,8 @@ export function createRoofLevel(
   const rawOutline = buildOutlineFromPoints(points, `outline-${levelId}`, {
     levelId,
     idPrefix,
-    defaultEaveHeightM: eaveHeightM
+    defaultEaveHeightM: eaveHeightM,
+    initialEdgeType: options?.initialEdgeType
   });
 
   const outline: RoofOutline = edgeTypes
@@ -4693,7 +5128,8 @@ export function createRoofLevel(
       }
     : rawOutline;
 
-  const skeleton = generateSkeletonLines(outline);
+  const skeleton =
+    options?.autoGenerateSkeleton === false ? [] : generateSkeletonLines(outline);
   return {
     id: levelId,
     code,
@@ -5413,6 +5849,32 @@ export function scaleOutlineUniformly(
       to: scaledPoints[(i + 1) % scaledPoints.length]
     }))
   };
+}
+
+/**
+ * Uniformly scales existing skeleton lines (manual or auto) around an anchor point
+ * during 2-point outline rescaling without regenerating or wiping skeleton geometry.
+ */
+export function scaleSkeletonUniformly(
+  skeleton: SkeletonLine[],
+  scaleFactor: number,
+  anchor?: Point2D
+): SkeletonLine[] {
+  if (!Number.isFinite(scaleFactor) || scaleFactor <= 0 || Math.abs(scaleFactor - 1) < 1e-5) {
+    return skeleton;
+  }
+  const ref = anchor || { x: 0, y: 0 };
+  return skeleton.map((s) => ({
+    ...s,
+    from: {
+      x: +(ref.x + (s.from.x - ref.x) * scaleFactor).toFixed(3),
+      y: +(ref.y + (s.from.y - ref.y) * scaleFactor).toFixed(3)
+    },
+    to: {
+      x: +(ref.x + (s.to.x - ref.x) * scaleFactor).toFixed(3),
+      y: +(ref.y + (s.to.y - ref.y) * scaleFactor).toFixed(3)
+    }
+  }));
 }
 
 

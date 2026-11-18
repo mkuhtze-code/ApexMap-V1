@@ -10,6 +10,7 @@ export interface Point3D {
 }
 
 export type EdgeType =
+  | 'unclassified'
   | 'outline'
   | 'hip'
   | 'valley'
@@ -132,6 +133,8 @@ export interface RoofPlane {
   color: string; // e.g. "#3b82f6"
   planPolygon: Point2D[];
   eaveEdgeId: string;
+  /** Edge that sheets run perpendicular to (defaults to eaveEdgeId) */
+  sheetRunEdgeId?: string;
   pitchDeg: number;
   underlapSide: 'left' | 'right';
   eaveHeightM?: number;
@@ -453,6 +456,7 @@ export interface RoofBomSummary {
   totalOrderedLm: number;
   totalNetRoofLm: number;
   savedOffcutLm: number;
+  totalOffcutsReused?: number;
   wastePercent: number;
   sheetGroups: RoofBomSheetGroup[];
   totalCutPiecesCount: number;
@@ -485,6 +489,59 @@ export interface RoofPlanUnderlay {
   planId?: string;
 }
 
+export type WallCladdingType =
+  | 'profiled_metal'
+  | 'weatherboard'
+  | 'brick'
+  | 'plaster'
+  | 'fibre_cement'
+  | 'other'
+  | 'none';
+
+export type WallOpeningType = 'window' | 'door' | 'garage' | 'void';
+
+export interface WallOpening {
+  id: string;
+  type: WallOpeningType;
+  /** Horizontal offset from facet start point (metres) */
+  distFromStartM: number;
+  /** Height from facet bottomZ to opening sill (metres) */
+  sillHeightM: number;
+  widthM: number;
+  heightM: number;
+  label?: string;
+}
+
+export interface WallFacet {
+  id: string;
+  code: string; // A, B, C...
+  name?: string;
+  from: Point2D;
+  to: Point2D;
+  lengthM: number;
+  heightM: number;
+  bottomZ: number;
+  topZ: number;
+  claddingType: WallCladdingType;
+  openings: WallOpening[];
+  /** Optional link to matching PlanEdge in the roof footprint */
+  roofEdgeId?: string;
+}
+
+export interface WallPlanEdge {
+  id: string;
+  from: Point2D;
+  to: Point2D;
+}
+
+export interface WallPlan {
+  points: Point2D[];
+  edges: WallPlanEdge[];
+  defaultHeightM: number;
+  facets: WallFacet[];
+  builtAt?: string;
+}
+
 export interface ExactRoofModelSnapshot {
   version: 2;
   stage: RoofLifecycleStage;
@@ -503,6 +560,7 @@ export interface ExactRoofModelSnapshot {
   flashingAssignments: RoofFlashingAssignment[];
   installProgress: RoofInstallProgress;
   planUnderlay?: RoofPlanUnderlay | null;
+  wallPlan?: WallPlan | null;
   layout?: LayoutResult;
   bom?: RoofBomSummary;
   lastUpdatedAt: string;

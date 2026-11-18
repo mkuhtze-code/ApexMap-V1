@@ -8,7 +8,10 @@ import {
   PitchBreakLine,
   AssignableRoofLine,
   RoofFlashingAssignment,
-  RoofLifecycleStage
+  RoofLifecycleStage,
+  WallCladdingType,
+  WallFacet,
+  WallPlan
 } from '../../types/exactRoofing';
 import {
   X,
@@ -21,7 +24,8 @@ import {
   ShoppingCart,
   Check,
   Layers,
-  Plus
+  Plus,
+  Building2
 } from 'lucide-react';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
@@ -30,6 +34,12 @@ import {
   isEdgeWallEnabled,
   dist
 } from '../../utils/exactRoofingEngine';
+import {
+  computeWallFacetMetrics,
+  computeWallTakeoffSummary,
+  getWallCladdingMeta,
+  WALL_CLADDING_OPTIONS
+} from '../../utils/wallCladdingEngine';
 import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBridge';
 
 interface Props {
@@ -75,6 +85,12 @@ interface Props {
   onOpenOrderModal?: () => void;
   lifecycleStage?: RoofLifecycleStage;
   readOnlyGeometry?: boolean;
+  wallPlan?: WallPlan | null;
+  selectedWallFacetId?: string | null;
+  onSelectWallFacet?: (facetId: string | null) => void;
+  onOpenWallElevation?: (facetId: string) => void;
+  onUpdateWallFacet?: (facet: WallFacet) => void;
+  onBuildWallFaces?: () => void;
 }
 
 export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
@@ -119,11 +135,27 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   onSelectLineForFlashing,
   onOpenOrderModal,
   lifecycleStage = 'measuring',
-  readOnlyGeometry = false
+  readOnlyGeometry = false,
+  wallPlan,
+  selectedWallFacetId,
+  onSelectWallFacet,
+  onOpenWallElevation,
+  onUpdateWallFacet,
+  onBuildWallFaces
 }) => {
   const { isMobile } = useDeviceDetection();
   const isInstalling = lifecycleStage === 'installing';
   const isLockedView = readOnlyGeometry || isInstalling;
+
+  const wallFacets = wallPlan?.facets || [];
+  const selectedWallFacet = React.useMemo(
+    () => wallFacets.find((f) => f.id === selectedWallFacetId) || null,
+    [wallFacets, selectedWallFacetId]
+  );
+  const wallSummary = React.useMemo(
+    () => computeWallTakeoffSummary(wallFacets),
+    [wallFacets]
+  );
 
   const [sheetLenDraftMm, setSheetLenDraftMm] = React.useState<string>('');
   React.useEffect(() => {
@@ -824,6 +856,106 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
             </div>
           )}
         </>
+      ) : selectedWallFacet ? (
+        <div className="space-y-3">
+          <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span
+                  className="w-6 h-6 rounded-lg flex items-center justify-center font-mono font-black text-xs text-white border border-white/20 shrink-0"
+                  style={{
+                    backgroundColor: getWallCladdingMeta(selectedWallFacet.claddingType).hex
+                  }}
+                >
+                  {selectedWallFacet.code}
+                </span>
+                <span className="font-black text-sm text-white">
+                  Wall Face {selectedWallFacet.code}
+                </span>
+              </div>
+              <button
+                onClick={() => onSelectWallFacet?.(null)}
+                className="text-[10px] font-bold text-sky-400 hover:text-sky-300 cursor-pointer"
+              >
+                All Faces
+              </button>
+            </div>
+            <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+              {selectedWallFacet.lengthM.toFixed(2)}m L × {selectedWallFacet.heightM.toFixed(2)}m H ·{' '}
+              {computeWallFacetMetrics(selectedWallFacet).netCladdingAreaM2.toFixed(2)} m² net
+            </div>
+          </div>
+
+          <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
+            <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
+              Cladding Material
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {WALL_CLADDING_OPTIONS.map((opt) => {
+                const active = selectedWallFacet.claddingType === opt.type;
+                return (
+                  <button
+                    key={opt.type}
+                    type="button"
+                    disabled={isLockedView || !onUpdateWallFacet}
+                    onClick={() =>
+                      onUpdateWallFacet?.({
+                        ...selectedWallFacet,
+                        claddingType: opt.type as WallCladdingType
+                      })
+                    }
+                    className={`px-2 py-1.5 rounded-xl border text-left text-[11px] font-bold flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-60 ${
+                      active
+                        ? 'bg-sky-600/25 border-sky-400 text-white'
+                        : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    <span
+                      className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/20"
+                      style={{ backgroundColor: opt.hex }}
+                    />
+                    <span className="truncate">{opt.shortLabel}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 text-xs tabular-nums">
+            <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl">
+              <div className="text-[10px] text-slate-500 font-bold uppercase">Gross</div>
+              <div className="font-mono font-black text-white mt-0.5">
+                {computeWallFacetMetrics(selectedWallFacet).grossAreaM2.toFixed(1)}m²
+              </div>
+            </div>
+            <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl">
+              <div className="text-[10px] text-slate-500 font-bold uppercase">Openings</div>
+              <div className="font-mono font-black text-amber-400 mt-0.5">
+                {selectedWallFacet.openings.length} pcs
+              </div>
+            </div>
+            <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl">
+              <div className="text-[10px] text-slate-500 font-bold uppercase">Net Wall</div>
+              <div className="font-mono font-black text-emerald-400 mt-0.5">
+                {computeWallFacetMetrics(selectedWallFacet).netCladdingAreaM2.toFixed(1)}m²
+              </div>
+            </div>
+          </div>
+
+          {onOpenWallElevation && (
+            <button
+              type="button"
+              onClick={() => {
+                onOpenWallElevation(selectedWallFacet.id);
+                if (isMobile) onClose();
+              }}
+              className="w-full py-2.5 px-3.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <Building2 className="w-3.5 h-3.5" />
+              <span>Open Elevation Workbench</span>
+            </button>
+          )}
+        </div>
       ) : (
         /* Project Overview when nothing is clicked */
         <div className="space-y-3">
@@ -842,7 +974,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
           </div>
 
           {layout && (
-            <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="grid grid-cols-2 gap-2 text-xs tabular-nums">
               <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl">
                 <div className="text-[10px] text-slate-500 uppercase font-bold">Total Area</div>
                 <div className="text-base font-black text-white font-mono mt-0.5">
@@ -850,29 +982,29 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 </div>
               </div>
               <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl">
-                <div className="text-[10px] text-slate-500 uppercase font-bold">Steel Saved</div>
-                <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
-                  +{layout.savedMetres} m
+                <div className="text-[10px] text-slate-500 uppercase font-bold">Ordered Sheets</div>
+                <div className="text-base font-black text-sky-400 font-mono mt-0.5">
+                  {layout.parents.length} sht · {layout.totalOrderedMetres.toFixed(1)}m
                 </div>
               </div>
               <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl">
                 <div className="text-[10px] text-slate-500 uppercase font-bold">Sheet Yield</div>
-                <div className="text-base font-black text-sky-400 font-mono mt-0.5">
+                <div className="text-base font-black text-white font-mono mt-0.5">
                   {100 - layout.wastePercent}%
                 </div>
               </div>
               {isInstalling ? (
                 <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl">
-                  <div className="text-[10px] text-slate-500 uppercase font-bold">Stock Sheets</div>
-                  <div className="text-base font-black text-white font-mono mt-0.5">
-                    {layout.parents.length} pcs
+                  <div className="text-[10px] text-slate-500 uppercase font-bold">Repressed Offcuts</div>
+                  <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
+                    {layout.totalOffcutsReused} pcs
                   </div>
                 </div>
               ) : (
                 <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl">
-                  <div className="text-[10px] text-slate-500 uppercase font-bold">Dollar Value</div>
-                  <div className="text-base font-black text-white font-mono mt-0.5">
-                    ${layout.dollarValueSavedNZD}
+                  <div className="text-[10px] text-slate-500 uppercase font-bold">Repress Saved</div>
+                  <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
+                    +{layout.savedMetres}m (${layout.dollarValueSavedNZD})
                   </div>
                 </div>
               )}
@@ -1241,6 +1373,111 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
             );
           })()}
 
+          {/* Single-Storey Wall Cladding Schedule */}
+          {(wallFacets.length > 0 || onBuildWallFaces) && (
+            <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-bold text-slate-300 uppercase tracking-wider">
+                  <Building2 className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Wall Faces ({wallFacets.length})</span>
+                </div>
+                {wallFacets.length > 0 ? (
+                  <span className="font-mono text-[11px] font-bold text-emerald-400 tabular-nums">
+                    {wallSummary.totalNetAreaM2.toFixed(1)} m² net
+                  </span>
+                ) : (
+                  !isLockedView &&
+                  onBuildWallFaces && (
+                    <button
+                      type="button"
+                      onClick={onBuildWallFaces}
+                      className="px-2 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/35 border border-amber-500/40 text-amber-300 text-[10px] font-bold cursor-pointer"
+                    >
+                      Build Faces
+                    </button>
+                  )
+                )}
+              </div>
+
+              {wallFacets.length > 0 && (
+                <>
+                  <div className="space-y-1 max-h-44 overflow-y-auto pr-0.5">
+                    {wallFacets.map((wf) => {
+                      const meta = getWallCladdingMeta(wf.claddingType);
+                      const m = computeWallFacetMetrics(wf);
+                      const isUndetailed = wf.claddingType === 'none';
+                      return (
+                        <button
+                          key={wf.id}
+                          type="button"
+                          onClick={() => {
+                            onSelectWallFacet?.(wf.id);
+                          }}
+                          className={`w-full text-left p-2 rounded-xl border flex items-center justify-between gap-2 text-xs cursor-pointer transition-colors ${
+                            isUndetailed
+                              ? 'bg-amber-950/20 border-amber-500/30 hover:border-amber-400/60'
+                              : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span
+                              className="w-5 h-5 rounded-md flex items-center justify-center font-mono font-black text-[10px] text-white border border-white/20 shrink-0"
+                              style={{ backgroundColor: meta.hex }}
+                            >
+                              {wf.code}
+                            </span>
+                            <div className="min-w-0">
+                              <div className="font-bold text-slate-200 truncate text-[11px] tabular-nums">
+                                {wf.lengthM.toFixed(2)}m × {wf.heightM.toFixed(2)}m · {meta.shortLabel}
+                              </div>
+                              <div className="text-[10px] text-slate-400 font-mono tabular-nums">
+                                {wf.openings.length} openings · {m.netCladdingAreaM2.toFixed(1)} m²
+                              </div>
+                            </div>
+                          </div>
+                          {onOpenWallElevation && (
+                            <span
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                onOpenWallElevation(wf.id);
+                                if (isMobile) onClose();
+                              }}
+                              className="text-[10px] font-bold text-sky-400 hover:text-sky-300 shrink-0"
+                            >
+                              Detail
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {wallSummary.byCladding.length > 0 && (
+                    <div className="pt-1.5 border-t border-slate-800/80 space-y-1 text-[11px] tabular-nums">
+                      {wallSummary.byCladding.map((grp) => (
+                        <div
+                          key={grp.claddingType}
+                          className="flex items-center justify-between gap-2 text-slate-300"
+                        >
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span
+                              className="w-2 h-2 rounded-xs shrink-0"
+                              style={{ backgroundColor: grp.hex }}
+                            />
+                            <span className="truncate">{grp.shortLabel}</span>
+                          </div>
+                          <span className="font-mono text-slate-400 shrink-0">
+                            {grp.linealM.toFixed(1)}m · {grp.netAreaM2.toFixed(1)} m²
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           {/* Tools Shortcuts */}
           <div className="pt-1 space-y-2">
             {onOpenCutList && (
@@ -1298,7 +1535,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               <div className="flex items-center gap-2">
                 <Sliders className="w-4 h-4 text-blue-400" />
                 <h3 className="font-extrabold text-xs uppercase tracking-wider text-slate-200">
-                  {selectedPlane ? 'Area Inspector' : 'Roof Overview'}
+                  {selectedPlane ? 'Area Inspector' : selectedWallFacet ? `Wall ${selectedWallFacet.code} Inspector` : 'Roof & Wall Overview'}
                 </h3>
               </div>
               <button
@@ -1324,7 +1561,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
         <div className="flex items-center gap-2">
           <Sliders className="w-4 h-4 text-blue-400" />
           <h3 className="font-extrabold text-xs uppercase tracking-wider text-slate-300">
-            {selectedPlane ? 'Roof Area Inspector' : 'Roof Overview'}
+            {selectedPlane ? 'Roof Area Inspector' : selectedWallFacet ? `Wall ${selectedWallFacet.code} Inspector` : 'Roof & Wall Overview'}
           </h3>
         </div>
 

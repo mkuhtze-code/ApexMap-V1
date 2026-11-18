@@ -325,7 +325,7 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
     return map;
   }, [layout.sections]);
 
-  // Exact per-face sheet quantities & sheet lengths summary from placementMap + roofingPacks
+  // Honest per-face ordered blanks (from layout.parents) separated from repressed offcuts & piece cuts
   const faceSheetSummaryByPlaneId = useMemo(() => {
     const map = new Map<
       string,
@@ -333,11 +333,29 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
         totalPieces: number;
         freshCount: number;
         offcutCount: number;
-        lengthGroups: { count: number; lengthM: number; lengthMm: number; isOffcutOnly: boolean }[];
+        orderedCount: number;
+        orderedLm: number;
+        lengthGroups: { count: number; lengthM: number; lengthMm: number; totalLm: number; isOffcutOnly: boolean }[];
         qtyLengthShort: string;
         offcutShort: string;
       }
     >();
+
+    const parentsByPrimaryPlane = new Map<string, typeof layout.parents>();
+    layout.parents.forEach((par) => {
+      const primary = par.pieces[0];
+      if (!primary) return;
+      const pid = primary.targetPlaneId;
+      const list = parentsByPrimaryPlane.get(pid) || [];
+      list.push(par);
+      parentsByPrimaryPlane.set(pid, list);
+      const basePid = pid.split('__')[0];
+      if (basePid !== pid) {
+        const bList = parentsByPrimaryPlane.get(basePid) || [];
+        bList.push(par);
+        parentsByPrimaryPlane.set(basePid, bList);
+      }
+    });
 
     displayPlanes.forEach((plane) => {
       const baseId = plane.id.split('__')[0];
@@ -350,17 +368,16 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
       const sec = sectionById.get(plane.id) || sectionById.get(baseId);
 
       const pieces = placementEntry?.pieces || [];
-      const bucketMap = new Map<number, { count: number; offcutCount: number; lengthM: number }>();
+      const faceParents = parentsByPrimaryPlane.get(plane.id) || parentsByPrimaryPlane.get(baseId) || [];
+      const bucketMap = new Map<number, { count: number; lengthM: number }>();
 
-      pieces.forEach((pc) => {
-        const exactMm = Math.max(100, Math.round((pc.length || 0) * 1000));
+      faceParents.forEach((par) => {
+        const exactMm = Math.max(100, Math.round((par.length || 0) * 1000));
         const existing = bucketMap.get(exactMm) || {
           count: 0,
-          offcutCount: 0,
           lengthM: +(exactMm / 1000).toFixed(3)
         };
         existing.count += 1;
-        if (pc.isOffcut) existing.offcutCount += 1;
         bucketMap.set(exactMm, existing);
       });
 
@@ -369,7 +386,8 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
           lengthMm,
           lengthM: val.lengthM,
           count: val.count,
-          isOffcutOnly: val.offcutCount === val.count
+          totalLm: +(val.count * val.lengthM).toFixed(3),
+          isOffcutOnly: false
         }))
         .sort((a, b) => b.lengthMm - a.lengthMm);
 
@@ -378,10 +396,13 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
           lengthMm: g.lengthMm,
           lengthM: +g.lengthM.toFixed(3),
           count: g.count,
+          totalLm: +(g.count * g.lengthM).toFixed(3),
           isOffcutOnly: false
         }));
       }
 
+      const orderedCount = lengthGroups.reduce((s, g) => s + g.count, 0);
+      const orderedLm = +lengthGroups.reduce((s, g) => s + g.count * g.lengthM, 0).toFixed(2);
       const totalPieces =
         pieces.length > 0
           ? pieces.length
@@ -390,19 +411,16 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
         pieces.length > 0
           ? pieces.filter((pc) => pc.isOffcut).length
           : pack?.offcutsReceived.reduce((s, r) => s + r.count, 0) || sec?.offcutsReused || 0;
-      const freshCount = Math.max(0, totalPieces - offcutCount);
+      const freshCount = orderedCount > 0 ? orderedCount : Math.max(0, totalPieces - offcutCount);
 
       const fmtM = (mm: number, m: number) => (mm % 10 !== 0 ? m.toFixed(3) : m.toFixed(2));
       let qtyLengthShort = '';
-      if (lengthGroups.length === 1) {
-        qtyLengthShort = `${totalPieces}×${fmtM(lengthGroups[0].lengthMm, lengthGroups[0].lengthM)}m`;
-      } else if (lengthGroups.length > 1) {
-        const minGrp = lengthGroups[lengthGroups.length - 1];
-        const maxGrp = lengthGroups[0];
-        qtyLengthShort =
-          Math.abs(maxGrp.lengthM - minGrp.lengthM) < 0.08
-            ? `${totalPieces}×${fmtM(maxGrp.lengthMm, maxGrp.lengthM)}m`
-            : `${totalPieces} sht · ${minGrp.lengthM.toFixed(1)}–${maxGrp.lengthM.toFixed(1)}m`;
+      if (lengthGroups.length === 1 && orderedCount > 0) {
+        qtyLengthShort = `${orderedCount}×${fmtM(lengthGroups[0].lengthMm, lengthGroups[0].lengthM)}m`;
+      } else if (lengthGroups.length > 1 && orderedCount > 0) {
+        qtyLengthShort = `${orderedCount} sht · ${orderedLm.toFixed(1)}m`;
+      } else if (totalPieces > 0 && orderedCount === 0 && offcutCount > 0) {
+        qtyLengthShort = `${offcutCount} offcuts`;
       } else if (totalPieces > 0 && (sec?.slopeLengthM || plane.orderedSheetLengthM || plane.slopeLength)) {
         const len = plane.orderedSheetLengthM || sec?.slopeLengthM || plane.slopeLength || 0;
         const mm = Math.round(len * 1000);
@@ -413,14 +431,45 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
         totalPieces,
         freshCount,
         offcutCount,
+        orderedCount,
+        orderedLm,
         lengthGroups,
         qtyLengthShort,
-        offcutShort: offcutCount > 0 ? `+${offcutCount} off` : ''
+        offcutShort: orderedCount > 0 && offcutCount > 0 ? `+${offcutCount} off` : ''
       });
     });
 
     return map;
-  }, [displayPlanes, layout.placementMap, roofingPacks, sectionById]);
+  }, [displayPlanes, layout.parents, layout.placementMap, roofingPacks, sectionById]);
+
+  // Exact reconciled mill order groups directly from layout.parents
+  const orderedSheetGroups = useMemo(() => {
+    const gMap = new Map<
+      number,
+      { lengthMm: number; lengthM: number; count: number; totalLm: number; repressedCount: number }
+    >();
+    layout.parents.forEach((par) => {
+      const lengthMm = Math.max(100, Math.round((par.length || 0) * 1000));
+      const lengthM = +(lengthMm / 1000).toFixed(3);
+      const cur = gMap.get(lengthMm) || {
+        lengthMm,
+        lengthM,
+        count: 0,
+        totalLm: 0,
+        repressedCount: 0
+      };
+      cur.count += 1;
+      cur.totalLm = +(cur.count * lengthM).toFixed(3);
+      cur.repressedCount += Math.max(0, par.pieces.length - 1);
+      gMap.set(lengthMm, cur);
+    });
+    return Array.from(gMap.values()).sort((a, b) => b.lengthMm - a.lengthMm);
+  }, [layout.parents]);
+
+  const reconciledTotalOrderedLm = useMemo(
+    () => +orderedSheetGroups.reduce((s, g) => s + g.count * g.lengthM, 0).toFixed(2),
+    [orderedSheetGroups]
+  );
 
   // CSV Export for Roll-Former
   const handleExportCsv = () => {
@@ -1126,13 +1175,13 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                         <div className="text-sm font-extrabold text-sky-400 font-mono tabular-nums">
                           {layout.parents.length}
                         </div>
-                        <div className="text-[10px] text-slate-400">Stock</div>
+                        <div className="text-[10px] text-slate-400">Sheets</div>
                       </div>
                       <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
                         <div className="text-sm font-extrabold text-white font-mono tabular-nums">
                           {layout.totalOffcutsReused}
                         </div>
-                        <div className="text-[10px] text-slate-400">Offcuts</div>
+                        <div className="text-[10px] text-slate-400">Repressed</div>
                       </div>
                       <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
                         <div className="text-sm font-extrabold text-emerald-400 font-mono tabular-nums truncate">
@@ -1144,32 +1193,57 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                   ) : (
                     <>
                       <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
-                        <div className="text-sm font-extrabold text-sky-400 font-mono tabular-nums">
-                          +{layout.savedMetres}m
+                        <div className="text-sm font-extrabold text-white font-mono tabular-nums">
+                          {layout.parents.length}
                         </div>
-                        <div className="text-[10px] text-slate-400">Saved</div>
+                        <div className="text-[10px] text-slate-400">Ordered Sht</div>
                       </div>
                       <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
-                        <div className="text-sm font-extrabold text-white font-mono tabular-nums">
+                        <div className="text-sm font-extrabold text-sky-400 font-mono tabular-nums">
+                          {reconciledTotalOrderedLm.toFixed(1)}m
+                        </div>
+                        <div className="text-[10px] text-slate-400">Total lm</div>
+                      </div>
+                      <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
+                        <div className="text-sm font-extrabold text-emerald-400 font-mono tabular-nums">
+                          {layout.totalOffcutsReused}
+                        </div>
+                        <div className="text-[10px] text-slate-400">Repressed</div>
+                      </div>
+                      <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
+                        <div className="text-sm font-extrabold text-white font-mono tabular-nums truncate">
                           {100 - layout.wastePercent}%
                         </div>
                         <div className="text-[10px] text-slate-400">Yield</div>
                       </div>
-                      <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
-                        <div className="text-sm font-extrabold text-white font-mono tabular-nums">
-                          {layout.totalOffcutsReused}
-                        </div>
-                        <div className="text-[10px] text-slate-400">Offcuts</div>
-                      </div>
-                      <div className="bg-slate-900 border border-slate-800 p-2 rounded-xl">
-                        <div className="text-sm font-extrabold text-sky-400 font-mono tabular-nums truncate">
-                          ${layout.dollarValueSavedNZD}
-                        </div>
-                        <div className="text-[10px] text-slate-400">Value</div>
-                      </div>
                     </>
                   )}
                 </div>
+
+                {orderedSheetGroups.length > 0 && (
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-bold text-slate-400">
+                      <span>Ordered Sheets Schedule</span>
+                      <span className="font-mono text-sky-300 tabular-nums">
+                        {layout.parents.length} sheets · {reconciledTotalOrderedLm.toFixed(1)} lm
+                      </span>
+                    </div>
+                    <div className="max-h-28 overflow-y-auto divide-y divide-slate-800/70 font-mono text-[11px] tabular-nums">
+                      {orderedSheetGroups.map((g) => (
+                        <div key={g.lengthMm} className="py-1 flex items-center justify-between">
+                          <span className="text-white font-bold">
+                            {g.count} @ {g.lengthMm} mm
+                          </span>
+                          <span className="text-slate-400">{(g.count * g.lengthM).toFixed(1)} lm</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="pt-1 border-t border-slate-800 flex items-center justify-between text-[10px] text-slate-400 font-mono tabular-nums">
+                      <span>Offcuts repressed: {layout.totalOffcutsReused} pcs</span>
+                      <span className="text-emerald-400">+{layout.savedMetres} lm saved</span>
+                    </div>
+                  </div>
+                )}
 
                 {orderedPlanes.length > 0 && (
                   <div className="space-y-1">
@@ -1319,17 +1393,17 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                         <div className="text-xs font-extrabold text-white truncate flex items-center gap-1.5 tabular-nums">
                           <span>Face {activeMobilePack.code}</span>
                           <span className="text-[10px] font-mono text-emerald-300 font-bold">
-                            {activeMobilePack.totalPiecesNeeded} sheets
+                            {summary?.orderedCount ?? activeMobilePack.freshSheetCount} ordered
                           </span>
                           {summary && summary.offcutCount > 0 && (
                             <span className="text-[10px] font-mono text-sky-300">
-                              (+{summary.offcutCount} off)
+                              +{summary.offcutCount} repressed
                             </span>
                           )}
                         </div>
                         <div className="text-[11px] font-mono font-bold text-sky-300 truncate tabular-nums">
                           {chipList.length > 0
-                            ? chipList.map((g) => `${g.count}×${g.lengthMm % 10 !== 0 ? g.lengthM.toFixed(3) : g.lengthM.toFixed(2)}m`).join(' · ')
+                            ? chipList.map((g) => `${g.count} @ ${g.lengthMm}mm`).join(', ')
                             : activeMobilePack.packLabel}
                         </div>
                       </div>
@@ -1526,20 +1600,14 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                           const summary = faceSheetSummaryByPlaneId.get(pack.planeId);
                           const groups = summary?.lengthGroups || [];
                           return (
-                            <div className="p-2 rounded-xl bg-slate-900 border border-slate-800 space-y-1.5">
+                            <div className="p-2 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
                               <div className="text-xs font-mono font-bold text-sky-300 tabular-nums">
                                 {pack.packLabel}
                               </div>
                               {groups.length > 0 && (
-                                <div className="flex flex-wrap gap-1">
-                                  {groups.map((g, gi) => (
-                                    <span
-                                      key={gi}
-                                      className="px-2 py-0.5 rounded-lg bg-slate-950 border border-slate-800 text-[10px] font-mono font-bold text-white tabular-nums"
-                                    >
-                                      {g.count}×{g.lengthMm % 10 !== 0 ? g.lengthM.toFixed(3) : g.lengthM.toFixed(2)}m
-                                    </span>
-                                  ))}
+                                <div className="text-[11px] font-mono text-slate-300 tabular-nums">
+                                  {groups.map((g) => `${g.count} @ ${g.lengthMm}mm`).join(' · ')}
+                                  {summary ? ` · ${summary.orderedLm.toFixed(1)} lm` : ''}
                                 </div>
                               )}
                             </div>
@@ -1676,31 +1744,33 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
           )}
 
           {/* 2. COMPACT KPI STATS BAR (Zero financial metrics during Installing stage) */}
-          <div className="grid grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             {lifecycleStage === 'installing' ? (
               <>
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
                   <div className="text-3xl font-extrabold text-white font-mono tabular-nums tracking-tight">
+                    {layout.parents.length}
+                  </div>
+                  <div className="text-xs text-slate-400 font-semibold mt-1">
+                    Ordered Sheets ({reconciledTotalOrderedLm.toFixed(1)} lm)
+                  </div>
+                </div>
+
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
+                  <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight">
                     {roofingPacks.length}
                   </div>
                   <div className="text-xs text-slate-400 font-semibold mt-1">Roof Faces</div>
                 </div>
 
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
-                  <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight">
-                    {layout.parents.length}
-                  </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Stock Sheets</div>
-                </div>
-
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
                   <div className="text-3xl font-extrabold text-white font-mono tabular-nums tracking-tight">
                     {layout.totalOffcutsReused}
                   </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Offcuts Reused</div>
+                  <div className="text-xs text-slate-400 font-semibold mt-1">Offcuts Repressed</div>
                 </div>
 
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
                   <div className="text-3xl font-extrabold text-emerald-400 font-mono tabular-nums tracking-tight">
                     {completedSet.size}/{roofingPacks.length}
                   </div>
@@ -1709,36 +1779,110 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
               </>
             ) : (
               <>
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
+                  <div className="text-3xl font-extrabold text-white font-mono tabular-nums tracking-tight truncate">
+                    {layout.parents.length}
+                  </div>
+                  <div className="text-xs text-slate-400 font-semibold mt-1">
+                    Ordered Sheets · {reconciledTotalOrderedLm.toFixed(1)} lm
+                  </div>
+                </div>
+
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
                   <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight truncate">
                     +{layout.savedMetres}m
                   </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Saved</div>
+                  <div className="text-xs text-slate-400 font-semibold mt-1">
+                    Repress Saved ({layout.totalOffcutsReused} pcs)
+                  </div>
                 </div>
 
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
                   <div className="text-3xl font-extrabold text-white font-mono tabular-nums tracking-tight">
                     {100 - layout.wastePercent}%
                   </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Yield</div>
-                </div>
-
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
-                  <div className="text-3xl font-extrabold text-white font-mono tabular-nums tracking-tight">
-                    {layout.totalOffcutsReused}
+                  <div className="text-xs text-slate-400 font-semibold mt-1">
+                    Yield ({layout.wastePercent}% waste)
                   </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Offcuts</div>
                 </div>
 
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl shadow-lg">
+                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
                   <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight truncate">
                     ${layout.dollarValueSavedNZD}
                   </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Value</div>
+                  <div className="text-xs text-slate-400 font-semibold mt-1">Repress Value</div>
                 </div>
               </>
             )}
           </div>
+
+          {/* 2.2 RECONCILED ORDERED SHEETS SCHEDULE + SEPARATE OFFCUT REPRESS NOTE */}
+          {orderedSheetGroups.length > 0 && (
+            <div className="bg-[#101726] border border-slate-800/90 rounded-2xl p-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="lg:col-span-2 space-y-2">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <h3 className="text-xs font-bold text-slate-200 tracking-tight">
+                    Ordered Sheets Schedule
+                  </h3>
+                  <span className="text-xs font-mono text-slate-400 tabular-nums">
+                    {layout.totalRoofArea.toFixed(1)} m² roof area
+                  </span>
+                </div>
+                <div className="divide-y divide-slate-800/70 font-mono text-xs tabular-nums">
+                  {orderedSheetGroups.map((g) => (
+                    <div
+                      key={g.lengthMm}
+                      className="py-1.5 flex items-center justify-between gap-4"
+                    >
+                      <span className="font-bold text-white">
+                        {g.count} @ {g.lengthMm} mm
+                      </span>
+                      <span className="text-slate-400">
+                        {(g.count * g.lengthM).toFixed(1)} lm
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="pt-2 border-t border-slate-700 flex items-center justify-between font-mono text-xs font-extrabold tabular-nums">
+                  <span className="text-sky-300">
+                    {layout.parents.length} sheets · {reconciledTotalOrderedLm.toFixed(1)} lm ordered
+                  </span>
+                  <span className="text-slate-400 font-normal">
+                    Exact sum of ordered lengths
+                  </span>
+                </div>
+              </div>
+
+              <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between space-y-2.5">
+                <div className="text-xs font-bold text-slate-200">
+                  Offcut Repress (Separate Calculation)
+                </div>
+                <div className="space-y-1.5 font-mono text-xs tabular-nums">
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-slate-400">Required roof cuts</span>
+                    <span className="text-white font-bold">{layout.pieces.length} pcs</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-slate-400">Net roof lineal metres</span>
+                    <span className="text-slate-200">{layout.totalRoofMetres.toFixed(1)} lm</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-slate-400">Offcuts repressed</span>
+                    <span className="text-emerald-400 font-bold">
+                      {layout.totalOffcutsReused} pcs (+{layout.savedMetres} lm)
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="font-sans text-slate-400">Natural waste</span>
+                    <span className="text-slate-300">{layout.wastePercent}%</span>
+                  </div>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed pt-1 border-t border-slate-800/80">
+                  Natural offcuts from ordered sheets are repressed onto compatible runs; order quantities drop only when a real remnant covers the full piece.
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* 2.5 NATURAL LAYING ORDER SEQUENCE BAR */}
           {planes.length > 0 && (
@@ -2148,23 +2292,29 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                   }`}
               </div>
 
-              {/* Exact Sheet Quantities & Sheet Lengths for Selected Face */}
+              {/* Exact Ordered Blanks & Repressed Offcuts for Selected Face */}
               {(() => {
                 const summary = faceSheetSummaryByPlaneId.get(selectedPlane.id);
-                if (!summary || summary.lengthGroups.length === 0) return null;
+                if (!summary) return null;
                 return (
-                  <div className="flex flex-wrap items-center gap-1.5 mt-2">
-                    <span className="text-[11px] font-bold text-sky-300 font-mono tabular-nums mr-1">
-                      {summary.totalPieces} Sheets:
-                    </span>
-                    {summary.lengthGroups.map((g, gi) => (
-                      <span
-                        key={gi}
-                        className="px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-[11px] font-mono font-bold text-white tabular-nums"
-                      >
-                        {g.count}×{g.lengthMm % 10 !== 0 ? g.lengthM.toFixed(3) : g.lengthM.toFixed(2)}m
-                      </span>
-                    ))}
+                  <div className="mt-2 space-y-1 font-mono text-[11px] tabular-nums">
+                    <div className="text-sky-300 font-bold">
+                      {summary.orderedCount > 0
+                        ? `Ordered: ${summary.orderedCount} sheets (${summary.orderedLm.toFixed(1)} lm)`
+                        : `0 ordered blanks · Clad via ${summary.offcutCount} repressed offcuts`}
+                      {summary.orderedCount > 0 && summary.offcutCount > 0 && (
+                        <span className="text-emerald-300 ml-2">
+                          + {summary.offcutCount} repressed offcut{summary.offcutCount === 1 ? '' : 's'}
+                        </span>
+                      )}
+                    </div>
+                    {summary.lengthGroups.length > 0 && (
+                      <div className="text-slate-300">
+                        {summary.lengthGroups
+                          .map((g) => `${g.count} @ ${g.lengthMm}mm`)
+                          .join(' · ')}
+                      </div>
+                    )}
                   </div>
                 );
               })()}
@@ -2245,10 +2395,10 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                 </div>
                 <div>
                   <h3 className="text-base font-extrabold text-white">
-                    Stock Lengths &amp; Cuts
+                    Ordered Sheets &amp; Repress Schedule ({layout.parents.length} sheets · {reconciledTotalOrderedLm.toFixed(1)} lm)
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Stock lengths ordered from factory and where offcuts go
+                    Exact mill cut lengths ordered ({layout.totalOffcutsReused} offcuts repressed separately)
                   </p>
                 </div>
               </div>
@@ -2296,79 +2446,77 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                       s.pieces.some((p) => p.targetPlaneId === cutListFilterPlaneId)
                   )
                   .map((sheet) => {
-                  const hasFlip = sheet.pieces.some((p) => p.orientation === 'flipped180');
-                  return (
-                    <div
-                      key={sheet.id}
-                      className="bg-slate-950/70 border border-slate-800 rounded-2xl p-3 space-y-2"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2 font-bold text-white">
-                          <span
-                            className="w-3 h-3 rounded-full shrink-0"
-                            style={{ backgroundColor: sheet.color }}
-                          />
-                          <span>Stock #{sheet.sheetNumber}</span>
-                          <span className="font-mono text-sky-400">
-                            ({Math.round(sheet.length * 1000) % 10 !== 0 ? sheet.length.toFixed(3) : sheet.length.toFixed(2)}m)
-                          </span>
-                        </div>
-                        <span
-                          className={`px-2 py-0.5 rounded-full font-bold text-[10px] font-mono ${
-                            sheet.utilization >= 90
-                              ? 'bg-emerald-500/20 text-emerald-300'
-                              : 'bg-amber-500/20 text-amber-300'
-                          }`}
+                      const hasRepress = sheet.pieces.length > 1;
+                      const repressTargets = sheet.pieces
+                        .slice(1)
+                        .map((p) => p.facetName)
+                        .join(', ');
+                      return (
+                        <div
+                          key={sheet.id}
+                          className="bg-slate-950/70 border border-slate-800 rounded-2xl p-3 space-y-2"
                         >
-                          {sheet.utilization}% Yield
-                        </span>
-                      </div>
-
-                      <div className="space-y-1 pl-2 text-[11px]">
-                        {sheet.pieces.map((p, idx) => {
-                          const pDone = completedPiecesSet.has(p.id);
-                          return (
-                            <div
-                              key={p.id}
-                              onClick={() => onUpdateInstallProgress && handleTogglePieceDone(p.id)}
-                              className={`flex items-center justify-between py-1 px-2 rounded-lg cursor-pointer ${
-                                pDone ? 'bg-emerald-950/60 text-emerald-300' : 'text-slate-300'
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2 font-bold text-white">
+                              <span>Sheet #{sheet.sheetNumber}</span>
+                              <span className="font-mono text-sky-400 tabular-nums">
+                                ({Math.round(sheet.length * 1000)} mm)
+                              </span>
+                            </div>
+                            <span
+                              className={`font-bold text-[11px] font-mono tabular-nums ${
+                                sheet.utilization >= 90 ? 'text-emerald-300' : 'text-amber-300'
                               }`}
                             >
-                              <span className="flex items-center gap-1.5">
-                                {onUpdateInstallProgress && (
-                                  <CheckCircle2
-                                    className={`w-3.5 h-3.5 shrink-0 ${
-                                      pDone ? 'text-emerald-400' : 'text-slate-600'
-                                    }`}
-                                  />
-                                )}
-                                <span>
-                                  #{idx + 1}: <strong className="text-white">{p.length}m</strong> ➔{' '}
-                                  {p.facetName}
-                                </span>
-                              </span>
-                              {p.orientation === 'flipped180' && (
-                                <span className="text-[10px] text-purple-300 font-semibold">
-                                  Flipped
-                                </span>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
+                              {sheet.utilization}% Yield
+                            </span>
+                          </div>
 
-                      <div className="pt-1.5 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400">
-                        <span>
-                          Drop: {sheet.remaining > 0.05 ? `${sheet.remaining}m` : '0m'}
-                        </span>
-                        <span className={hasFlip ? 'text-purple-300 font-semibold' : ''}>
-                          {hasFlip ? 'Offcut goes to matching hip/valley' : 'Straight run'}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
+                          <div className="space-y-1 pl-2 text-[11px]">
+                            {sheet.pieces.map((p, idx) => {
+                              const pDone = completedPiecesSet.has(p.id);
+                              return (
+                                <div
+                                  key={p.id}
+                                  onClick={() => onUpdateInstallProgress && handleTogglePieceDone(p.id)}
+                                  className={`flex items-center justify-between py-1 px-2 rounded-lg cursor-pointer ${
+                                    pDone ? 'bg-emerald-950/60 text-emerald-300' : 'text-slate-300'
+                                  }`}
+                                >
+                                  <span className="flex items-center gap-1.5">
+                                    {onUpdateInstallProgress && (
+                                      <CheckCircle2
+                                        className={`w-3.5 h-3.5 shrink-0 ${
+                                          pDone ? 'text-emerald-400' : 'text-slate-600'
+                                        }`}
+                                      />
+                                    )}
+                                    <span>
+                                      #{idx + 1}: <strong className="text-white tabular-nums">{Math.round(p.length * 1000)}mm</strong> ➔{' '}
+                                      {p.facetName}
+                                    </span>
+                                  </span>
+                                  {(idx > 0 || p.orientation === 'flipped180') && (
+                                    <span className="text-[10px] text-purple-300 font-semibold">
+                                      {p.orientation === 'flipped180' ? 'Repressed 180°' : 'Repressed tail'}
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <div className="pt-1.5 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400 tabular-nums">
+                            <span>
+                              Drop: {sheet.remaining > 0.02 ? `${sheet.remaining.toFixed(2)}m` : '0m'}
+                            </span>
+                            <span className={hasRepress ? 'text-purple-300 font-semibold' : ''}>
+                              {hasRepress ? `Offcut repressed to ${repressTargets}` : 'Single direct cut'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
               </div>
 
               {/* Desktop Table */}
@@ -2392,18 +2540,18 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                           s.pieces.some((p) => p.targetPlaneId === cutListFilterPlaneId)
                       )
                       .map((sheet) => {
-                      const hasFlip = sheet.pieces.some((p) => p.orientation === 'flipped180');
+                      const hasRepress = sheet.pieces.length > 1;
+                      const repressTargets = sheet.pieces
+                        .slice(1)
+                        .map((p) => p.facetName)
+                        .join(', ');
                       return (
-                        <tr key={sheet.id} className="hover:bg-slate-800/30 transition-colors">
-                          <td className="py-2.5 px-3 font-bold text-white flex items-center gap-2">
-                            <span
-                              className="w-3 h-3 rounded-full shrink-0 shadow-xs"
-                              style={{ backgroundColor: sheet.color }}
-                            />
-                            <span>Stock #{sheet.sheetNumber}</span>
+                        <tr key={sheet.id} className="hover:bg-slate-800/30 transition-colors tabular-nums">
+                          <td className="py-2.5 px-3 font-bold text-white">
+                            <span>Sheet #{sheet.sheetNumber}</span>
                           </td>
                           <td className="py-2.5 px-3 font-bold text-sky-400">
-                            {Math.round(sheet.length * 1000) % 10 !== 0 ? sheet.length.toFixed(3) : sheet.length.toFixed(2)} m
+                            {Math.round(sheet.length * 1000)} mm ({sheet.length.toFixed(3)} m)
                           </td>
                           <td className="py-2.5 px-3 text-white font-sans text-[11px]">
                             {sheet.pieces.map((p, idx) => {
@@ -2428,34 +2576,34 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                                   <span className="font-mono text-slate-400 font-semibold">
                                     #{idx + 1}:
                                   </span>
-                                  <span className="font-bold text-white">{p.length}m</span>
+                                  <span className="font-mono font-bold text-white tabular-nums">
+                                    {Math.round(p.length * 1000)}mm
+                                  </span>
                                   <span className="text-[10px] text-slate-400">➔ {p.facetName}</span>
                                 </div>
                               );
                             })}
                           </td>
                           <td className="py-2.5 px-3 text-slate-400">
-                            {sheet.remaining > 0.05 ? `${sheet.remaining} m drop` : '0 m (0% scrap)'}
+                            {sheet.remaining > 0.02 ? `${sheet.remaining.toFixed(2)} m drop` : '0 m (0% scrap)'}
                           </td>
                           <td className="py-2.5 px-3">
                             <span
-                              className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
-                                sheet.utilization >= 90
-                                  ? 'bg-emerald-500/20 text-emerald-300'
-                                  : 'bg-amber-500/20 text-amber-300'
+                              className={`font-bold text-[11px] ${
+                                sheet.utilization >= 90 ? 'text-emerald-300' : 'text-amber-300'
                               }`}
                             >
                               {sheet.utilization}%
                             </span>
                           </td>
                           <td className="py-2.5 px-3 font-sans text-[11px]">
-                            {hasFlip ? (
+                            {hasRepress ? (
                               <span className="text-purple-300 font-bold flex items-center gap-1">
                                 <RotateCw className="w-3.5 h-3.5 text-purple-400 shrink-0" />
-                                <span>Offcut goes to matching hip/valley</span>
+                                <span>Repressed to {repressTargets}</span>
                               </span>
                             ) : (
-                              <span className="text-slate-400">Straight direct run</span>
+                              <span className="text-slate-400">Direct run</span>
                             )}
                           </td>
                         </tr>

@@ -17,7 +17,8 @@ import {
   RoofLevel,
   RoofOutline,
   RoofPlane,
-  SkeletonLine
+  SkeletonLine,
+  WallPlan
 } from '../../types/exactRoofing';
 import {
   COLORSTEEL_SWATCHES,
@@ -35,6 +36,10 @@ import {
   computeRoof3DBounds,
   Roof3DBounds
 } from './three/roofMeshBuilder';
+import {
+  computeWallFacetMetrics,
+  getWallCladdingMeta
+} from '../../utils/wallCladdingEngine';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 
 interface Props {
@@ -44,8 +49,11 @@ interface Props {
   levels?: RoofLevel[];
   assets?: RoofAsset[];
   pitchBreaks?: PitchBreakLine[];
+  wallPlan?: WallPlan | null;
   selectedPlaneId?: string | null;
   onSelectPlane?: (planeId: string | null) => void;
+  selectedWallFacetId?: string | null;
+  onSelectWallFacet?: (facetId: string | null) => void;
   roofProfileName?: string;
   coilColorName?: string;
 }
@@ -59,8 +67,11 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
   levels,
   assets = [],
   pitchBreaks = [],
+  wallPlan,
   selectedPlaneId,
   onSelectPlane,
+  selectedWallFacetId,
+  onSelectWallFacet,
   roofProfileName,
   coilColorName
 }) => {
@@ -82,6 +93,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
   const [isDockOpen, setIsDockOpen] = useState<boolean>(() => !isMobile);
   const [compassDeg, setCompassDeg] = useState<number>(-42);
   const [hoveredPlaneId, setHoveredPlaneId] = useState<string | null>(null);
+  const [hoveredWallFacetId, setHoveredWallFacetId] = useState<string | null>(null);
   const [webglError, setWebglError] = useState<string | null>(null);
 
   // Sync defaults if parent project changes
@@ -112,13 +124,18 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
   }, [levels, outline, skeleton]);
 
   const bounds = useMemo<Roof3DBounds>(
-    () => computeRoof3DBounds(allLevels, planes),
-    [allLevels, planes]
+    () => computeRoof3DBounds(allLevels, planes, wallPlan),
+    [allLevels, planes, wallPlan]
   );
 
   const selectedPlane = useMemo(
     () => planes.find((p) => p.id === selectedPlaneId) || null,
     [planes, selectedPlaneId]
+  );
+
+  const selectedWallFacet = useMemo(
+    () => wallPlan?.facets.find((f) => f.id === selectedWallFacetId) || null,
+    [wallPlan, selectedWallFacetId]
   );
 
   // Mutable Three.js refs kept isolated from React render cycle
@@ -143,6 +160,8 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
 
   const onSelectPlaneRef = useRef(onSelectPlane);
   onSelectPlaneRef.current = onSelectPlane;
+  const onSelectWallFacetRef = useRef(onSelectWallFacet);
+  onSelectWallFacetRef.current = onSelectWallFacet;
 
   // 1. Initialize Three.js WebGL Studio Renderer, Environment IBL, 3-Point Lights & Controls
   useEffect(() => {
@@ -379,16 +398,25 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     const pointerNdc = new THREE.Vector2();
     let downPt = { x: 0, y: 0 };
 
-    const getHitPlaneId = (clientX: number, clientY: number): string | null => {
+    const getHitTarget = (
+      clientX: number,
+      clientY: number
+    ): { planeId: string | null; wallFacetId: string | null } => {
       const ctx = sceneCtxRef.current;
-      if (!ctx || ctx.selectableMeshes.length === 0) return null;
+      if (!ctx || ctx.selectableMeshes.length === 0) {
+        return { planeId: null, wallFacetId: null };
+      }
       const rect = renderer.domElement.getBoundingClientRect();
       pointerNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
       pointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointerNdc, camera);
       const hits = raycaster.intersectObjects(ctx.selectableMeshes, false);
-      if (hits.length === 0) return null;
-      return (hits[0].object.userData?.planeId as string) || null;
+      if (hits.length === 0) return { planeId: null, wallFacetId: null };
+      const ud = hits[0].object.userData || {};
+      return {
+        planeId: (ud.planeId as string) || null,
+        wallFacetId: (ud.wallFacetId as string) || null
+      };
     };
 
     const handlePointerDown = (ev: PointerEvent) => {
@@ -397,17 +425,20 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
 
     const handlePointerMove = (ev: PointerEvent) => {
       if (ev.buttons > 0) return;
-      const hitId = getHitPlaneId(ev.clientX, ev.clientY);
-      renderer.domElement.style.cursor = hitId ? 'pointer' : 'grab';
-      setHoveredPlaneId((prev) => (prev === hitId ? prev : hitId));
+      const hit = getHitTarget(ev.clientX, ev.clientY);
+      renderer.domElement.style.cursor = hit.planeId || hit.wallFacetId ? 'pointer' : 'grab';
+      setHoveredPlaneId((prev) => (prev === hit.planeId ? prev : hit.planeId));
+      setHoveredWallFacetId((prev) => (prev === hit.wallFacetId ? prev : hit.wallFacetId));
     };
 
     const handlePointerUp = (ev: PointerEvent) => {
       const moved = Math.hypot(ev.clientX - downPt.x, ev.clientY - downPt.y);
       if (moved > 7) return;
-      const hitId = getHitPlaneId(ev.clientX, ev.clientY);
-      if (hitId) {
-        onSelectPlaneRef.current?.(hitId);
+      const hit = getHitTarget(ev.clientX, ev.clientY);
+      if (hit.wallFacetId) {
+        onSelectWallFacetRef.current?.(hit.wallFacetId);
+      } else if (hit.planeId) {
+        onSelectPlaneRef.current?.(hit.planeId);
       }
     };
 
@@ -522,7 +553,9 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       levels,
       assets,
       pitchBreaks,
+      wallPlan,
       selectedPlaneId,
+      selectedWallFacetId,
       shadingMode,
       swatch: activeSwatch,
       textures: ctx.profileTextures,
@@ -558,7 +591,9 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     levels,
     assets,
     pitchBreaks,
+    wallPlan,
     selectedPlaneId,
+    selectedWallFacetId,
     shadingMode,
     activeSwatch,
     profileKey,
@@ -588,7 +623,9 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     ctx.selectableMeshes.forEach((mesh) => {
       const mat = mesh.material as THREE.MeshStandardMaterial;
       if (!mat) return;
-      const isHovered = hoveredPlaneId && mesh.userData?.planeId === hoveredPlaneId;
+      const isHovered =
+        (hoveredPlaneId && mesh.userData?.planeId === hoveredPlaneId) ||
+        (hoveredWallFacetId && mesh.userData?.wallFacetId === hoveredWallFacetId);
       const baseHex = mesh.userData?.baseEmissiveHex || '#000000';
       const baseInt = mesh.userData?.baseEmissiveIntensity || 0;
       if (isHovered && baseInt === 0) {
@@ -600,13 +637,18 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       }
     });
     ctx.requestRender();
-  }, [hoveredPlaneId]);
+  }, [hoveredPlaneId, hoveredWallFacetId]);
 
   const hoveredPlane = useMemo(
     () => planes.find((p) => p.id === hoveredPlaneId) || null,
     [planes, hoveredPlaneId]
   );
-  const badgePlane = hoveredPlane || selectedPlane;
+  const hoveredWallFacet = useMemo(
+    () => wallPlan?.facets.find((f) => f.id === hoveredWallFacetId) || null,
+    [wallPlan, hoveredWallFacetId]
+  );
+  const badgePlane = hoveredPlane || (!hoveredWallFacet ? selectedPlane : null);
+  const badgeWallFacet = hoveredWallFacet || (!hoveredPlane && !selectedPlane ? selectedWallFacet : null);
 
   return (
     <div className="relative w-full h-full flex-1 min-h-[360px] sm:min-h-[480px] rounded-2xl sm:rounded-3xl overflow-hidden bg-[#09101e] border border-slate-800 shadow-2xl select-none">
@@ -646,6 +688,22 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
             </span>
           </div>
         )}
+
+        {badgeWallFacet && (() => {
+          const wallMeta = getWallCladdingMeta(badgeWallFacet.claddingType);
+          const metrics = computeWallFacetMetrics(badgeWallFacet);
+          return (
+            <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-[#0b101d]/92 border border-amber-500/45 text-[11px] font-bold text-slate-100 shadow-md w-fit tabular-nums">
+              <span
+                className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/25"
+                style={{ backgroundColor: wallMeta.hex }}
+              />
+              <span className="truncate">
+                Wall {badgeWallFacet.code} · {badgeWallFacet.lengthM.toFixed(2)}×{badgeWallFacet.heightM.toFixed(2)}m · {wallMeta.shortLabel} · {metrics.netCladdingAreaM2.toFixed(1)} m² net
+              </span>
+            </div>
+          );
+        })()}
       </div>
 
       {/* Top-Right Compass Rose */}

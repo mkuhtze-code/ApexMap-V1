@@ -6,7 +6,8 @@ import {
   RoofLevel,
   RoofOutline,
   RoofPlane,
-  SkeletonLine
+  SkeletonLine,
+  WallPlan
 } from '../../../types/exactRoofing';
 import {
   computeGableDormerGeometry,
@@ -19,6 +20,7 @@ import {
   ProceduralRoofTextureSet,
   Roof3DShadingMode
 } from './roofMaterials';
+import { buildWallPlan3DGroup } from './wallMeshBuilder';
 
 export interface Roof3DBounds {
   minX: number;
@@ -304,8 +306,15 @@ function buildFlashingStripMesh(
   return mesh;
 }
 
-export function computeRoof3DBounds(allLevels: RoofLevel[], planes: RoofPlane[]): Roof3DBounds {
-  const pts = allLevels.flatMap((l) => l.outline.points);
+export function computeRoof3DBounds(
+  allLevels: RoofLevel[],
+  planes: RoofPlane[],
+  wallPlan?: WallPlan | null
+): Roof3DBounds {
+  const pts = [
+    ...allLevels.flatMap((l) => l.outline.points),
+    ...(wallPlan?.points || [])
+  ];
   const xs = pts.map((p) => p.x);
   const ys = pts.map((p) => p.y);
   const minX = xs.length ? Math.min(...xs) : 0;
@@ -317,7 +326,8 @@ export function computeRoof3DBounds(allLevels: RoofLevel[], planes: RoofPlane[])
   const maxLevelH = Math.max(
     2.7,
     ...allLevels.map((l) => l.eaveHeightM),
-    ...planes.map((p) => p.eaveHeightM ?? 2.7)
+    ...planes.map((p) => p.eaveHeightM ?? 2.7),
+    ...(wallPlan?.facets || []).map((f) => f.topZ)
   );
   const maxZ = maxLevelH + 3.0;
   const midZ = maxZ * 0.42;
@@ -332,7 +342,9 @@ export function buildRoofSceneGroup(params: {
   levels?: RoofLevel[];
   assets?: RoofAsset[];
   pitchBreaks?: PitchBreakLine[];
+  wallPlan?: WallPlan | null;
   selectedPlaneId?: string | null;
+  selectedWallFacetId?: string | null;
   shadingMode: Roof3DShadingMode;
   swatch: ColorsteelSwatch;
   textures: ProceduralRoofTextureSet;
@@ -348,7 +360,9 @@ export function buildRoofSceneGroup(params: {
     levels,
     assets = [],
     pitchBreaks = [],
+    wallPlan,
     selectedPlaneId,
+    selectedWallFacetId,
     shadingMode,
     swatch,
     textures,
@@ -372,7 +386,7 @@ export function buildRoofSceneGroup(params: {
           }
         ];
 
-  const bounds = computeRoof3DBounds(allLevels, planes);
+  const bounds = computeRoof3DBounds(allLevels, planes, wallPlan);
   const effectivePlanes =
     assets.length === 0 && pitchBreaks.length === 0
       ? planes
@@ -783,7 +797,36 @@ export function buildRoofSceneGroup(params: {
 
   // 3. Build Grounded Architectural Walls & Subtle Foundation Plinth (never piercing roof plane!)
   if (showWalls) {
-    const wallSegments = deriveRoofWallSegments(allLevels, structuralPlanes);
+    const hasWallPlanFacets = Boolean(wallPlan && wallPlan.facets && wallPlan.facets.length > 0);
+    if (hasWallPlanFacets && wallPlan) {
+      buildWallPlan3DGroup({
+        wallPlan,
+        bounds,
+        selectedWallFacetId,
+        shadingMode,
+        wallNormalMap,
+        rootGroup,
+        selectableMeshes,
+        trackGeo,
+        trackMat
+      });
+    }
+
+    const linkedRoofEdgeIds = new Set(
+      (wallPlan?.facets || [])
+        .map((f) => f.roofEdgeId)
+        .filter((id): id is string => Boolean(id))
+    );
+
+    const wallSegments = deriveRoofWallSegments(allLevels, structuralPlanes).filter((wall) => {
+      if (!hasWallPlanFacets) return true;
+      // When detailed WallPlan facets exist, skip exterior single-storey strips & matched roofEdgeId
+      // to avoid Z-fighting, while keeping gable triangle infills / multi-storey step risers.
+      if (wall.wallKind === 'exterior_eave') return false;
+      if (linkedRoofEdgeIds.has(wall.edgeId) && wall.bottomZ < 0.2) return false;
+      return true;
+    });
+
     wallSegments.forEach((wall) => {
       if (wall.topZ <= wall.bottomZ + 0.04) return;
       const clampedTopProfile = wall.topProfilePoints3D.map((tp) => ({
@@ -813,7 +856,7 @@ export function buildRoofSceneGroup(params: {
 
     // Subtle concrete foundation slab under primary ground-level footprint
     const baseLevel = allLevels[0];
-    if (baseLevel && baseLevel.outline.points.length >= 3) {
+    if ((!hasWallPlanFacets || (wallPlan?.points?.length || 0) < 3) && baseLevel && baseLevel.outline.points.length >= 3) {
       const shapePts = baseLevel.outline.points.map(
         (pt) => new THREE.Vector2(pt.x - bounds.midX, pt.y - bounds.midY)
       );

@@ -445,10 +445,10 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
           <div>
             <h3 className="text-sm font-black text-white flex items-center gap-2">
               <Scissors className="w-4 h-4 text-sky-400" />
-              <span>Section 2: Ordered Sheet Lengths ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} m)</span>
+              <span>Section 2: Ordered Sheet Lengths ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} lm ordered)</span>
             </h3>
-            <p className="text-xs text-slate-400">
-              {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'} · Waste {bom.wastePercent}% (+{bom.savedOffcutLm.toFixed(1)}m offcuts reused)
+            <p className="text-xs text-slate-400 font-mono tabular-nums">
+              {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'} · Net roof {bom.totalNetRoofLm.toFixed(1)} lm · Waste {bom.wastePercent}% · {bom.totalOffcutsReused ?? 0} offcuts repressed (+{bom.savedOffcutLm.toFixed(1)} lm saved)
             </p>
           </div>
           {!measureLocked && (
@@ -467,24 +467,34 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
             No sheet groups calculated yet. Tap Recalculate Cuts above or open Offcuts.
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-            {bom.sheetGroups.map((grp) => (
-              <div
-                key={grp.lengthMm}
-                className="bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2 font-mono text-xs tabular-nums"
-              >
-                <div>
-                  <div className="text-sm font-black text-white">
-                    {grp.count} sheets @ <span className="text-sky-400">{grp.lengthMm}mm</span>
+          <div className="space-y-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+              {bom.sheetGroups.map((grp) => (
+                <div
+                  key={grp.lengthMm}
+                  className="bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2 font-mono text-xs tabular-nums"
+                >
+                  <div>
+                    <div className="text-sm font-black text-white">
+                      {grp.count} @ <span className="text-sky-400">{grp.lengthMm} mm</span>
+                    </div>
+                    <div className="text-[11px] font-sans text-slate-400">
+                      Faces {grp.targetCodes.join(', ') || 'Main'}
+                      {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
+                    </div>
                   </div>
-                  <div className="text-[11px] font-sans text-slate-400">
-                    For Faces {grp.targetCodes.join(', ') || 'Main'}
-                    {grp.hasOffcutHarvest ? ' · includes 180° offcut' : ''}
-                  </div>
+                  <span className="text-slate-300 font-bold shrink-0">{(grp.count * grp.lengthM).toFixed(1)} lm</span>
                 </div>
-                <span className="text-slate-300 font-bold shrink-0">{grp.totalLm.toFixed(1)} m</span>
-              </div>
-            ))}
+              ))}
+            </div>
+            <div className="pt-2 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 font-mono text-xs tabular-nums">
+              <span className="font-bold text-sky-300">
+                {bom.totalSheetsCount} sheets · {bom.totalOrderedLm.toFixed(1)} lm ordered
+              </span>
+              <span className="text-slate-400">
+                {bom.totalOffcutsReused ?? 0} offcuts repressed separately (+{bom.savedOffcutLm.toFixed(1)} lm saved)
+              </span>
+            </div>
           </div>
         )}
       </div>

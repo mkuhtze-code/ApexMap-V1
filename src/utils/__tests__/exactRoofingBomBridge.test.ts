@@ -176,5 +176,60 @@ assert.ok(
   `Pack label must show exact 5435mm, got ${overridePacks[0].packLabel}`
 );
 
+// 6. Strict Sheet-Group <-> Ordered Lineal Metres Reconciliation (incl. ExactRoof 29.67x6.55 @ 15 deg benchmark)
+import { generateSkeletonLines as genSkel } from '../exactRoofingEngine';
+
+const benchOut = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 29.67, y: 0 },
+  { x: 29.67, y: 6.55 },
+  { x: 0, y: 6.55 }
+]);
+const benchSkel = genSkel(benchOut);
+const benchPlanes = benchOut.edges.map((e, i) =>
+  createPlaneFromEdge(benchOut, benchSkel, e, {
+    pitchDeg: 15,
+    underlapSide: i % 2 === 0 ? 'left' : 'right'
+  })
+);
+const benchLayout = generateCuttingLayout(benchPlanes, sheetSpec, { startPlaneId: benchPlanes[0].id });
+const benchBom = buildRoofBillOfMaterials({
+  planes: benchPlanes,
+  layout: benchLayout,
+  assignments: []
+});
+const benchPacks = computeRoofingPacks({ layout: benchLayout, planes: benchPlanes });
+
+const bomGroupSumLm = +benchBom.sheetGroups.reduce((s, g) => s + g.count * g.lengthM, 0).toFixed(2);
+const bomGroupCountSum = benchBom.sheetGroups.reduce((s, g) => s + g.count, 0);
+assert.equal(bomGroupCountSum, benchBom.totalSheetsCount, 'BOM group counts must sum to totalSheetsCount');
+assert.equal(benchBom.totalSheetsCount, benchLayout.parents.length, 'BOM sheet count must equal layout.parents.length');
+assert.ok(
+  Math.abs(bomGroupSumLm - benchBom.totalOrderedLm) <= 0.02,
+  `sum(group.count * group.lengthM) (${bomGroupSumLm}) must equal bom.totalOrderedLm (${benchBom.totalOrderedLm})`
+);
+assert.ok(
+  Math.abs(benchBom.totalOrderedLm - benchLayout.totalOrderedMetres) <= 0.02,
+  `bom.totalOrderedLm (${benchBom.totalOrderedLm}) must reconcile with layout.totalOrderedMetres (${benchLayout.totalOrderedMetres})`
+);
+assert.equal(
+  benchBom.totalOffcutsReused,
+  benchLayout.totalOffcutsReused,
+  'BOM totalOffcutsReused must match layout.totalOffcutsReused'
+);
+
+const packsFreshCount = benchPacks.reduce((s, p) => s + p.freshSheetCount, 0);
+const packsFreshLm = +benchPacks
+  .reduce(
+    (s, p) => s + p.freshLengthGroups.reduce((gs, g) => gs + g.count * g.lengthM, 0),
+    0
+  )
+  .toFixed(2);
+assert.equal(packsFreshCount, benchBom.totalSheetsCount, 'Packs fresh sheet count must match total ordered sheets');
+assert.ok(
+  Math.abs(packsFreshLm - benchBom.totalOrderedLm) <= 0.02,
+  `Packs fresh ordered metres (${packsFreshLm}) must reconcile with bom.totalOrderedLm (${benchBom.totalOrderedLm})`
+);
+
 console.log('✓ exactRoofingBomBridge unit tests passed');
 

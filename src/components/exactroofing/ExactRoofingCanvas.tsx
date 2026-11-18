@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
+  EdgeType,
   RoofOutline,
   RoofLevel,
   SkeletonLine,
@@ -19,6 +20,7 @@ import {
   moveVertex,
   insertVertexOnEdge,
   buildOutlineFromPoints,
+  buildAttachedOutlineFromEdge,
   updateEdgeLength,
   updateSkeletonLineLength,
   getRoofJunctionNodes,
@@ -65,7 +67,9 @@ import {
   Star,
   FileImage,
   Undo2,
-  Crosshair
+  Crosshair,
+  Link2,
+  GitBranch
 } from 'lucide-react';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
@@ -109,7 +113,16 @@ interface Props {
   onSetStartPlane?: (planeId: string) => void;
   onSelectPlane: (planeId: string | null) => void;
   onUpdatePlaneOrderedSheetLength?: (planeId: string, lengthM: number | undefined) => void;
-  onUpdateOutline: (outline: RoofOutline, options?: { autoGenerateSkeleton?: boolean }) => void;
+  onUpdateOutline: (
+    outline: RoofOutline,
+    options?: {
+      autoGenerateSkeleton?: boolean;
+      mode?: 'replace' | 'add';
+      attachedEdgeId?: string;
+      scaleFactor?: number;
+      scaleAnchor?: Point2D;
+    }
+  ) => void;
   onUpdateSkeleton: (skeleton: SkeletonLine[]) => void;
   onSelectEdgeToDefine: (edge: PlanEdge) => void;
   onDeletePlane: (planeId: string) => void;
@@ -197,8 +210,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const [showAllDims, setShowAllDims] = useState<boolean>(false);
   const [inspectedLine, setInspectedLine] = useState<{ kind: 'edge' | 'skeleton'; id: string } | null>(null);
 
-  // Freehand drawing & scaling state
+  // Freehand drawing, attach-to-edge & scaling state
   const [draftPoints, setDraftPoints] = useState<Point2D[]>([]);
+  const [drawSubMode, setDrawSubMode] = useState<'free' | 'attach_edge'>('free');
+  const [attachedEdge, setAttachedEdge] = useState<PlanEdge | null>(null);
   const [lockedDraftBounds, setLockedDraftBounds] = useState<PlanViewportBounds | null>(null);
   const [draftScaleReady, setDraftScaleReady] = useState<boolean>(false);
   const [orthoSnap, setOrthoSnap] = useState<boolean>(true);
@@ -208,6 +223,39 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const [isPlanModalOpen, setIsPlanModalOpen] = useState<boolean>(false);
   const [mousePos, setMousePos] = useState<Point2D | null>(null);
 
+  const hasExistingFootprint = useMemo(
+    () =>
+      outline.points.length >= 3 ||
+      Boolean(levels && levels.some((l) => l.outline.points.length >= 3)),
+    [outline.points.length, levels]
+  );
+
+  const hasEstablishedScale = Boolean(planUnderlay?.isCalibrated || hasExistingFootprint);
+
+  const allDisplayEdges = useMemo(
+    () =>
+      levels && levels.length > 0
+        ? levels.flatMap((l) => l.outline.edges)
+        : outline.edges,
+    [levels, outline.edges]
+  );
+
+  const allDisplayOutlinePoints = useMemo(
+    () =>
+      levels && levels.length > 0
+        ? levels.flatMap((l) => l.outline.points)
+        : outline.points,
+    [levels, outline.points]
+  );
+
+  const displaySkeleton = useMemo(
+    () =>
+      activeLevelId === 'all' && levels && levels.length > 1
+        ? levels.flatMap((l) => l.skeleton)
+        : skeleton,
+    [activeLevelId, levels, skeleton]
+  );
+
   const lastOutlineIdRef = useRef<string>(outline.id);
   const lastPlanIdRef = useRef<string | null>(planUnderlay?.id || null);
 
@@ -216,6 +264,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       lastOutlineIdRef.current = outline.id;
       if (outline.points.length === 0) {
         setDraftPoints([]);
+        setAttachedEdge(null);
+        setDrawSubMode('free');
         setLockedDraftBounds(null);
         setDraftScaleReady(Boolean(planUnderlay?.isCalibrated));
         setIsFirstLineModalOpen(false);
@@ -231,6 +281,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       if (planUnderlay && !planUnderlay.isCalibrated) {
         setScalePoints([]);
         setDraftPoints([]);
+        setAttachedEdge(null);
+        setDrawSubMode('free');
         setLockedDraftBounds(null);
         setDraftScaleReady(false);
         setActiveTool('scale_plan');
@@ -246,9 +298,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     }
   }, [openPlanModalSignal]);
 
-  // Add internal roof line state
+  // Add internal roof line state (polyline chain + 3-pt angle bisector)
   const [newLineType, setNewLineType] = useState<'ridge' | 'hip' | 'valley'>('hip');
   const [lineStartPt, setLineStartPt] = useState<Point2D | null>(null);
+  const [chainLineMode, setChainLineMode] = useState<boolean>(true);
+  const [bisectMode, setBisectMode] = useState<boolean>(false);
+  const [bisectPts, setBisectPts] = useState<Point2D[]>([]);
 
   // Add feature / dormer / skylight / pitch break state
   const [featureType, setFeatureType] = useState<FeaturePlacementType>('skylight');
@@ -258,6 +313,22 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   // Dragging vertex state
   const [draggedVertexIdx, setDraggedVertexIdx] = useState<number | null>(null);
+
+  // Shared tool guards: geometry/drawing tools must not trigger plane/junction/ghost selection
+  const isDrawingOrGeometryTool =
+    activeTool === 'add_line' ||
+    activeTool === 'draw_roof' ||
+    activeTool === 'add_feature' ||
+    activeTool === 'scale_plan' ||
+    activeTool === 'adjust_shape' ||
+    activeTool === 'delete_line';
+
+  // Canvas-tap tools where clicks over roof faces/edges/assets pass through to the SVG canvas
+  const isCanvasTapTool =
+    activeTool === 'add_line' ||
+    activeTool === 'draw_roof' ||
+    activeTool === 'scale_plan' ||
+    activeTool === 'add_feature';
 
   // Zoom & Pan state for precision on mobile & desktop CAD screens
   const [zoom, setZoom] = useState<number>(1);
@@ -439,16 +510,19 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   // Snap to step grid (0.05m when plan underlay calibrated, 0.25m/0.5m default)
   const snap = (val: number, step = planUnderlay ? 0.05 : 0.25) => Math.round(val / step) * step;
 
-  // Magnetic vertex/junction snap for exact Add Roof Line placement
+  // Magnetic vertex/junction/midpoint/edge snap for exact manual roof line placement
   const getSnappedLinePoint = (rawPt: Point2D): { pt: Point2D; snapped: boolean } => {
-    const snapRadiusM = Math.max(0.22, Math.min(0.65, 14 / Math.max(scale, 10)));
-    const candidates: Point2D[] = [
-      ...outline.points,
-      ...skeleton.flatMap((s) => [s.from, s.to])
+    const snapPx = isTouchDevice ? 22 : 14;
+    const snapRadiusM = Math.max(0.22, Math.min(0.85, snapPx / Math.max(scale, 10)));
+
+    // Priority 1: Existing outline corners (all levels) & skeleton endpoints
+    const primaryCandidates: Point2D[] = [
+      ...allDisplayOutlinePoints,
+      ...displaySkeleton.flatMap((s) => [s.from, s.to])
     ];
     let bestPt: Point2D | null = null;
     let bestD = snapRadiusM;
-    for (const c of candidates) {
+    for (const c of primaryCandidates) {
       const d = dist(rawPt, c);
       if (d < bestD) {
         bestD = d;
@@ -458,7 +532,74 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     if (bestPt) {
       return { pt: { x: +bestPt.x.toFixed(3), y: +bestPt.y.toFixed(3) }, snapped: true };
     }
+
+    // Priority 2: Outline edge & skeleton midpoints
+    const midCandidates: Point2D[] = [
+      ...allDisplayEdges.map((e) => ({
+        x: (e.from.x + e.to.x) / 2,
+        y: (e.from.y + e.to.y) / 2
+      })),
+      ...displaySkeleton.map((s) => ({
+        x: (s.from.x + s.to.x) / 2,
+        y: (s.from.y + s.to.y) / 2
+      }))
+    ];
+    bestD = snapRadiusM * 0.85;
+    for (const c of midCandidates) {
+      const d = dist(rawPt, c);
+      if (d < bestD) {
+        bestD = d;
+        bestPt = c;
+      }
+    }
+    if (bestPt) {
+      return { pt: { x: +bestPt.x.toFixed(3), y: +bestPt.y.toFixed(3) }, snapped: true };
+    }
+
+    // Priority 3: Perpendicular projection onto outline / skeleton segments
+    let bestProj: Point2D | null = null;
+    let bestSegDist = snapRadiusM * 0.65;
+    const allSegs = [
+      ...allDisplayEdges.map((e) => ({ from: e.from, to: e.to })),
+      ...displaySkeleton.map((s) => ({ from: s.from, to: s.to }))
+    ];
+    for (const seg of allSegs) {
+      const vx = seg.to.x - seg.from.x;
+      const vy = seg.to.y - seg.from.y;
+      const lenSq = vx * vx + vy * vy;
+      if (lenSq < 1e-6) continue;
+      const t = Math.max(
+        0,
+        Math.min(1, ((rawPt.x - seg.from.x) * vx + (rawPt.y - seg.from.y) * vy) / lenSq)
+      );
+      const proj = { x: seg.from.x + vx * t, y: seg.from.y + vy * t };
+      const d = dist(rawPt, proj);
+      if (d < bestSegDist) {
+        bestSegDist = d;
+        bestProj = proj;
+      }
+    }
+    if (bestProj) {
+      return { pt: { x: +bestProj.x.toFixed(3), y: +bestProj.y.toFixed(3) }, snapped: true };
+    }
+
     return { pt: { x: +snap(rawPt.x).toFixed(2), y: +snap(rawPt.y).toFixed(2) }, snapped: false };
+  };
+
+  // Snap draft clicks onto existing corners across levels so multi-body roofs join cleanly
+  const snapDraftPointToExisting = (pt: Point2D): Point2D => {
+    const snapPx = isTouchDevice ? 20 : 12;
+    const snapRadiusM = Math.max(0.18, Math.min(0.65, snapPx / Math.max(scale, 10)));
+    let best: Point2D | null = null;
+    let bestD = snapRadiusM;
+    for (const c of allDisplayOutlinePoints) {
+      const d = dist(pt, c);
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    return best ? { x: +best.x.toFixed(3), y: +best.y.toFixed(3) } : pt;
   };
 
   // Convert pointer event to world coordinates accurately under object-contain
@@ -560,6 +701,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           setInspectedLine(null);
           return;
         }
+        if (bisectPts.length > 0) {
+          setBisectPts([]);
+          return;
+        }
         if (lineStartPt) {
           setLineStartPt(null);
           return;
@@ -576,9 +721,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           return;
         }
         if (activeTool === 'draw_roof' && draftPoints.length > 0) {
+          if (attachedEdge && draftPoints.length <= 2) {
+            setDraftPoints([]);
+            setAttachedEdge(null);
+            setLockedDraftBounds(null);
+            return;
+          }
           const next = draftPoints.slice(0, -1);
           setDraftPoints(next);
-          if (next.length < 2 && !planUnderlay?.isCalibrated) setDraftScaleReady(false);
+          if (next.length < 2 && !hasEstablishedScale) setDraftScaleReady(false);
           if (next.length === 0) setLockedDraftBounds(null);
           return;
         }
@@ -597,9 +748,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       } else if (!readOnlyGeometry) {
         if (key === 'd') {
           setActiveTool('draw_roof');
-          setDraftScaleReady(Boolean(planUnderlay?.isCalibrated));
+          setAttachedEdge(null);
+          setDrawSubMode('free');
+          setDraftScaleReady(hasEstablishedScale);
         } else if (key === 'l') {
           setActiveTool('add_line');
+          setBisectPts([]);
         } else if (key === 'f') {
           setActiveTool('add_feature');
         } else if (key === 'e') {
@@ -628,12 +782,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     isPlanModalOpen,
     editingMeasurement,
     inspectedLine,
+    bisectPts.length,
     lineStartPt,
     dragBoxStart,
     activeTool,
     draftPoints,
+    attachedEdge,
     outline.points.length,
-    planUnderlay?.isCalibrated,
+    hasEstablishedScale,
     readOnlyGeometry
   ]);
 
@@ -711,6 +867,65 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     onSelectAsset?.(newAsset.id);
   };
 
+  const resolveContainingLevelId = (ptA: Point2D, ptB: Point2D): string | undefined => {
+    const mid = { x: (ptA.x + ptB.x) / 2, y: (ptA.y + ptB.y) / 2 };
+    if (levels && levels.length > 0) {
+      const hit = levels.find((l) => l.outline.points.length >= 3 && isPointInPolygon(mid, l.outline.points));
+      if (hit) return hit.id;
+      if (activeLevelId !== 'all') return activeLevelId;
+      return levels[levels.length - 1]?.id;
+    }
+    return outline.levelId;
+  };
+
+  // Compute an interior angle bisector ray from 3 clicked points: Prev -> Corner -> Next
+  const computeAngleBisectorEndPoint = (prevPt: Point2D, cornerPt: Point2D, nextPt: Point2D): Point2D => {
+    const v1x = prevPt.x - cornerPt.x;
+    const v1y = prevPt.y - cornerPt.y;
+    const l1 = Math.hypot(v1x, v1y) || 1;
+    const v2x = nextPt.x - cornerPt.x;
+    const v2y = nextPt.y - cornerPt.y;
+    const l2 = Math.hypot(v2x, v2y) || 1;
+    const u1x = v1x / l1;
+    const u1y = v1y / l1;
+    const u2x = v2x / l2;
+    const u2y = v2y / l2;
+    let bx = u1x + u2x;
+    let by = u1y + u2y;
+    const bLen = Math.hypot(bx, by);
+    if (bLen < 1e-4) {
+      bx = -u1y;
+      by = u1x;
+    } else {
+      bx /= bLen;
+      by /= bLen;
+    }
+    // Intersect forward ray (cornerPt + t * b, t > 0.1) against outline edges; fallback 3.5m
+    let bestT = 3.5;
+    let foundHit = false;
+    for (const seg of allDisplayEdges) {
+      const rx = seg.to.x - seg.from.x;
+      const ry = seg.to.y - seg.from.y;
+      const denom = bx * ry - by * rx;
+      if (Math.abs(denom) < 1e-6) continue;
+      const qpx = seg.from.x - cornerPt.x;
+      const qpy = seg.from.y - cornerPt.y;
+      const tRay = (qpx * ry - qpy * rx) / denom;
+      const tSeg = (qpx * by - qpy * bx) / denom;
+      if (tRay > 0.15 && tSeg >= -0.02 && tSeg <= 1.02) {
+        if (!foundHit || tRay < bestT) {
+          bestT = tRay;
+          foundHit = true;
+        }
+      }
+    }
+    const clampedT = foundHit ? Math.min(bestT, 18) : 3.5;
+    return {
+      x: +(cornerPt.x + bx * clampedT).toFixed(3),
+      y: +(cornerPt.y + by * clampedT).toFixed(3)
+    };
+  };
+
   // Handle Canvas Tap/Click for 2-Pt Plan Scale, Freehand Drawing, or Adding Roof Lines
   const handleCanvasClick = (e: React.MouseEvent<SVGSVGElement>) => {
     if (activeTool === 'scale_plan') {
@@ -736,9 +951,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     if (activeTool === 'draw_roof') {
       if (readOnlyGeometry) return;
       if (isFirstLineModalOpen) return;
+      if (drawSubMode === 'attach_edge' && !attachedEdge) return;
 
       const prevPt = draftPoints.length > 0 ? draftPoints[draftPoints.length - 1] : null;
-      const pt = getPlanPointFromPointer(e.clientX, e.clientY, 'draft', prevPt);
+      const snappedDraft = getPlanPointFromPointer(e.clientX, e.clientY, 'draft', prevPt);
+      const pt = snapDraftPointToExisting(snappedDraft);
 
       if (draftPoints.length === 0 && !lockedDraftBounds) {
         setLockedDraftBounds({ ...bounds });
@@ -767,26 +984,56 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       const nextDraft = [...draftPoints, pt];
       setDraftPoints(nextDraft);
 
-      // Require first-line scale length popup when drawing freehand without an already-calibrated scale
-      if (nextDraft.length === 2 && !draftScaleReady && !planUnderlay?.isCalibrated) {
+      // Require first-line scale length popup ONLY when scale has not already been established
+      if (nextDraft.length === 2 && !draftScaleReady && !hasEstablishedScale) {
         setIsFirstLineModalOpen(true);
       }
     } else if (activeTool === 'add_line') {
+      if (readOnlyGeometry) return;
       const rawPt = getPlanPointFromPointer(e.clientX, e.clientY, 'raw');
       const { pt } = getSnappedLinePoint(rawPt);
-      if (!lineStartPt) {
-        setLineStartPt(pt);
+      commitAddLinePoint(pt);
+    }
+  };
+
+  const commitAddLinePoint = (pt: Point2D) => {
+    if (readOnlyGeometry) return;
+    if (bisectMode) {
+      if (bisectPts.length === 0) {
+        setBisectPts([pt]);
+      } else if (bisectPts.length === 1) {
+        if (dist(bisectPts[0], pt) < 0.08) return;
+        setBisectPts([bisectPts[0], pt]);
       } else {
-        if (dist(lineStartPt, pt) < 0.08) return;
+        const [pPrev, pCorner] = bisectPts;
+        if (dist(pCorner, pt) < 0.08) return;
+        const endPt = computeAngleBisectorEndPoint(pPrev, pCorner, pt);
         const newLine: SkeletonLine = {
-          id: `line-${Date.now()}`,
-          from: lineStartPt,
-          to: pt,
-          suggestedType: newLineType
+          id: `line-bisect-${Date.now()}`,
+          from: pCorner,
+          to: endPt,
+          suggestedType: newLineType,
+          levelId: resolveContainingLevelId(pCorner, endPt)
         };
-        onUpdateSkeleton([...skeleton, newLine]);
-        setLineStartPt(null);
+        onUpdateSkeleton([...displaySkeleton, newLine]);
+        setBisectPts([]);
       }
+      return;
+    }
+
+    if (!lineStartPt) {
+      setLineStartPt(pt);
+    } else {
+      if (dist(lineStartPt, pt) < 0.08) return;
+      const newLine: SkeletonLine = {
+        id: `line-${Date.now()}`,
+        from: lineStartPt,
+        to: pt,
+        suggestedType: newLineType,
+        levelId: resolveContainingLevelId(lineStartPt, pt)
+      };
+      onUpdateSkeleton([...displaySkeleton, newLine]);
+      setLineStartPt(chainLineMode ? pt : null);
     }
   };
 
@@ -839,30 +1086,56 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       return;
     }
 
-    // No architectural plan loaded: 2-point uniform rescale of drawn roof outline
+    // No architectural plan loaded: 2-point uniform rescale of drawn roof outline without auto-skeleton reset
     if (outline.points.length >= 3) {
       const curDist = dist(pA, pB);
       if (curDist > 0.05) {
         const factor = knownDistanceM / curDist;
         const scaledOutline = scaleOutlineUniformly(outline, factor, pA);
-        onUpdateOutline(scaledOutline, { autoGenerateSkeleton: true });
+        onUpdateOutline(scaledOutline, {
+          autoGenerateSkeleton: false,
+          scaleFactor: factor,
+          scaleAnchor: pA
+        });
       }
     }
     setIsTwoPointScaleModalOpen(false);
     setScalePoints([]);
     setLockedDraftBounds(null);
+    setDraftScaleReady(true);
     setZoom(1);
     setPan({ x: 0, y: 0 });
     setActiveTool('set_pitch');
   };
 
+  const handlePickAttachEdge = (edge: PlanEdge) => {
+    setAttachedEdge(edge);
+    setDraftPoints([{ ...edge.from }, { ...edge.to }]);
+    setLockedDraftBounds({ ...bounds });
+    setDraftScaleReady(true);
+  };
+
   const finishCustomOutline = () => {
     if (draftPoints.length >= 3) {
-      const newOutline = buildOutlineFromPoints(draftPoints, `roof-custom-${Date.now()}`);
-      onUpdateOutline(newOutline, { autoGenerateSkeleton: true });
+      const customId = `roof-custom-${Date.now()}`;
+      const newOutline = attachedEdge
+        ? buildAttachedOutlineFromEdge(attachedEdge, draftPoints, customId, {
+            initialEdgeType: 'unclassified'
+          })
+        : buildOutlineFromPoints(draftPoints, customId, {
+            initialEdgeType: 'unclassified'
+          });
+
+      onUpdateOutline(newOutline, {
+        autoGenerateSkeleton: false,
+        mode: hasExistingFootprint ? 'add' : 'replace',
+        attachedEdgeId: attachedEdge?.id
+      });
       setDraftPoints([]);
+      setAttachedEdge(null);
+      setDrawSubMode('free');
       setLockedDraftBounds(null);
-      setDraftScaleReady(false);
+      setDraftScaleReady(true);
       setZoom(1);
       setPan({ x: 0, y: 0 });
       setActiveTool('set_pitch');
@@ -901,6 +1174,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       }
     }
 
+    const targetOutline =
+      (type === 'edge' && levels
+        ? levels.find((l) => l.outline.edges.some((ed) => ed.id === id))?.outline
+        : undefined) || outline;
+
     setEditingMeasurement({
       type,
       id,
@@ -909,11 +1187,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       leftPx,
       topPx,
       baseOutline: {
-        ...outline,
-        points: outline.points.map((p) => ({ ...p })),
-        edges: outline.edges.map((ed) => ({ ...ed, from: { ...ed.from }, to: { ...ed.to } }))
+        ...targetOutline,
+        points: targetOutline.points.map((p) => ({ ...p })),
+        edges: targetOutline.edges.map((ed) => ({ ...ed, from: { ...ed.from }, to: { ...ed.to } }))
       },
-      baseSkeleton: skeleton.map((s) => ({
+      baseSkeleton: displaySkeleton.map((s) => ({
         ...s,
         from: { ...s.from },
         to: { ...s.to }
@@ -947,6 +1225,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   };
 
   const handleEdgeClick = (edge: PlanEdge, e: React.MouseEvent) => {
+    if (isCanvasTapTool) return;
     e.stopPropagation();
     if (activeTool === 'assign_flashing' && onSelectLineForFlashing) {
       onSelectLineForFlashing(edge.id);
@@ -975,25 +1254,21 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   };
 
   const handleVertexPointerDown = (idx: number, e: React.PointerEvent) => {
+    if (readOnlyGeometry || activeTool !== 'adjust_shape') return;
     e.stopPropagation();
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    setDraggedVertexIdx(idx);
+  };
+
+  const handleVertexClick = (idx: number, e: React.MouseEvent) => {
     if (readOnlyGeometry) return;
     if (activeTool === 'adjust_shape') {
-      (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
-      setDraggedVertexIdx(idx);
-    } else if (activeTool === 'add_line') {
-      const pt = outline.points[idx];
-      if (!lineStartPt) {
-        setLineStartPt(pt);
-      } else {
-        const newLine: SkeletonLine = {
-          id: `line-${Date.now()}`,
-          from: lineStartPt,
-          to: pt,
-          suggestedType: newLineType
-        };
-        onUpdateSkeleton([...skeleton, newLine]);
-        setLineStartPt(null);
-      }
+      e.stopPropagation();
+      return;
+    }
+    if (activeTool === 'add_line') {
+      e.stopPropagation();
+      commitAddLinePoint(outline.points[idx]);
     }
   };
 
@@ -1038,6 +1313,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       const pt = getPlanPointFromPointer(e.clientX, e.clientY);
       setDragBoxStart(pt);
       setDragBoxCurrent(pt);
+    } else if (activeTool === 'add_line' && activePointersRef.current.size === 1) {
+      const rawPt = getPlanPointFromPointer(e.clientX, e.clientY, 'raw');
+      setMousePos(getSnappedLinePoint(rawPt).pt);
     }
   };
 
@@ -1128,11 +1406,16 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     }
     setDraggedVertexIdx(null);
     setDraggedAssetId(null);
+    if (e.pointerType === 'touch') {
+      setMousePos(null);
+    }
   };
 
   // Start Drawing from Scratch (Clear outline)
   const handleStartBlank = () => {
     setDraftPoints([]);
+    setAttachedEdge(null);
+    setDrawSubMode('free');
     setScalePoints([]);
     setLockedDraftBounds(null);
     setDraftScaleReady(Boolean(planUnderlay?.isCalibrated));
@@ -1154,7 +1437,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       onClick: () => {
         setActiveTool('set_pitch');
         setDraftPoints([]);
+        setAttachedEdge(null);
         setLineStartPt(null);
+        setBisectPts([]);
         setDragBoxStart(null);
       }
     },
@@ -1169,7 +1454,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             onClick: () => {
               setActiveTool('assign_flashing');
               setDraftPoints([]);
+              setAttachedEdge(null);
               setLineStartPt(null);
+              setBisectPts([]);
               setDragBoxStart(null);
             }
           }
@@ -1177,16 +1464,19 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       : []),
     {
       id: 'draw_roof' as const,
-      label: 'Draw Roof',
-      shortLabel: 'Draw',
+      label: hasExistingFootprint ? 'Add / Attach Roof' : 'Draw Roof',
+      shortLabel: hasExistingFootprint ? 'Add Roof' : 'Draw',
       icon: Plus,
       activeClass: 'bg-emerald-600 text-white shadow-md',
       onClick: () => {
         setActiveTool('draw_roof');
         setScalePoints([]);
         setLineStartPt(null);
+        setBisectPts([]);
         setDragBoxStart(null);
-        setDraftScaleReady(Boolean(planUnderlay?.isCalibrated));
+        setAttachedEdge(null);
+        setDrawSubMode('free');
+        setDraftScaleReady(hasEstablishedScale);
       }
     },
     {
@@ -1202,9 +1492,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
         }
         setActiveTool('scale_plan');
         setDraftPoints([]);
+        setAttachedEdge(null);
         setScalePoints([]);
         setLockedDraftBounds({ ...bounds });
         setLineStartPt(null);
+        setBisectPts([]);
         setDragBoxStart(null);
       }
     },
@@ -1219,16 +1511,18 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     },
     {
       id: 'add_line' as const,
-      label: 'Add Roof Line',
+      label: 'Draw Roof Line',
       shortLabel: 'Lines',
       icon: ArrowRight,
       activeClass: 'bg-purple-600 text-white shadow-md',
       onClick: () => {
         setActiveTool('add_line');
         setDraftPoints([]);
+        setAttachedEdge(null);
         setScalePoints([]);
         setLockedDraftBounds(null);
         setLineStartPt(null);
+        setBisectPts([]);
         setDragBoxStart(null);
       }
     },
@@ -1334,7 +1628,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               activeTool === 'add_feature') && (
               <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1.5 w-[calc(100%-16px)] max-w-sm pointer-events-none">
                 {activeTool === 'add_line' && (
-                  <div className="pointer-events-auto bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex items-center gap-1 animate-in fade-in slide-in-from-bottom-2">
+                  <div className="pointer-events-auto bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex flex-wrap justify-center items-center gap-1 animate-in fade-in slide-in-from-bottom-2">
                     {[
                       { type: 'ridge' as const, label: 'Ridge', color: 'bg-purple-400', activeBg: 'bg-purple-600' },
                       { type: 'hip' as const, label: 'Hip', color: 'bg-sky-400', activeBg: 'bg-sky-600' },
@@ -1342,8 +1636,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     ].map((item) => (
                       <button
                         key={item.type}
+                        type="button"
                         onClick={() => setNewLineType(item.type)}
-                        className={`min-h-[36px] px-3 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                        className={`min-h-[34px] px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
                           newLineType === item.type
                             ? `${item.activeBg} text-white shadow-xs`
                             : 'text-slate-300 hover:bg-slate-800'
@@ -1353,19 +1648,76 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         <span>{item.label}</span>
                       </button>
                     ))}
+                    <div className="w-px h-5 bg-slate-700 mx-0.5" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setChainLineMode((v) => !v);
+                        setBisectMode(false);
+                        setBisectPts([]);
+                      }}
+                      className={`min-h-[34px] px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer flex items-center gap-1 ${
+                        !bisectMode && chainLineMode
+                          ? 'bg-emerald-600/80 text-white'
+                          : 'text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <Link2 className="w-3 h-3" />
+                      <span>Chain</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBisectMode((v) => !v);
+                        setLineStartPt(null);
+                        setBisectPts([]);
+                      }}
+                      className={`min-h-[34px] px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer flex items-center gap-1 ${
+                        bisectMode ? 'bg-amber-600 text-white' : 'text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <GitBranch className="w-3 h-3" />
+                      <span>Bisect</span>
+                    </button>
                   </div>
                 )}
 
-                {activeTool === 'add_line' && lineStartPt && (
+                {activeTool === 'add_line' && (
                   <div className="pointer-events-auto flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-purple-500/45 shadow-xl text-[11px]">
                     <Crosshair className="w-3.5 h-3.5 text-purple-400 shrink-0" />
-                    <span className="text-purple-100 font-semibold">Tap end point</span>
-                    <button
-                      onClick={() => setLineStartPt(null)}
-                      className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-semibold"
-                    >
-                      Cancel
-                    </button>
+                    <span className="text-purple-100 font-semibold">
+                      {bisectMode
+                        ? bisectPts.length === 0
+                          ? 'Bisect (1/3): Tap side pt 1'
+                          : bisectPts.length === 1
+                          ? 'Bisect (2/3): Tap corner vertex'
+                          : 'Bisect (3/3): Tap side pt 2'
+                        : lineStartPt
+                        ? chainLineMode
+                          ? 'Pinned · Tap next point (Chain ON)'
+                          : 'Start pinned · Tap end point'
+                        : 'Tap start point → tap end point'}
+                    </span>
+                    {lineStartPt || bisectPts.length > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLineStartPt(null);
+                          setBisectPts([]);
+                        }}
+                        className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-semibold cursor-pointer"
+                      >
+                        Break
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setActiveTool('set_pitch')}
+                        className="px-2 py-0.5 rounded bg-slate-900 text-slate-400 font-semibold cursor-pointer"
+                      >
+                        Done
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -1402,13 +1754,49 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
                 {activeTool === 'draw_roof' && (
                   <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-emerald-500/45 shadow-xl text-[11px] max-w-full">
+                    {hasExistingFootprint && draftPoints.length === 0 && (
+                      <div className="w-full flex items-center justify-center gap-1 pb-1 border-b border-slate-800">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDrawSubMode('free');
+                            setAttachedEdge(null);
+                          }}
+                          className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                            drawSubMode === 'free'
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-slate-800 text-slate-300'
+                          }`}
+                        >
+                          Add Roof
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDrawSubMode('attach_edge');
+                            setAttachedEdge(null);
+                          }}
+                          className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                            drawSubMode === 'attach_edge'
+                              ? 'bg-amber-600 text-white'
+                              : 'bg-slate-800 text-slate-300'
+                          }`}
+                        >
+                          From Wall / Eave
+                        </button>
+                      </div>
+                    )}
                     <Crosshair className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                     <span className="text-emerald-200 font-bold truncate">
-                      {draftPoints.length === 0
-                        ? planUnderlay && !planUnderlay.isCalibrated
+                      {drawSubMode === 'attach_edge' && !attachedEdge
+                        ? 'Tap an existing wall or eave edge'
+                        : draftPoints.length === 0
+                        ? planUnderlay && !planUnderlay.isCalibrated && !hasEstablishedScale
                           ? 'Draw line 1 or use 2-Pt Scale'
+                          : hasExistingFootprint
+                          ? 'Tap corner 1 for new roof'
                           : 'Tap corner 1 to start'
-                        : draftPoints.length === 1 && !draftScaleReady && !planUnderlay?.isCalibrated
+                        : draftPoints.length === 1 && !draftScaleReady && !hasEstablishedScale
                         ? 'Tap corner 2 (scale prompt next)'
                         : `${draftPoints.length} pts · Tap green start`}
                     </span>
@@ -1427,9 +1815,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       <button
                         type="button"
                         onClick={() => {
+                          if (attachedEdge && draftPoints.length <= 2) {
+                            setDraftPoints([]);
+                            setAttachedEdge(null);
+                            setLockedDraftBounds(null);
+                            return;
+                          }
                           const next = draftPoints.slice(0, -1);
                           setDraftPoints(next);
-                          if (next.length < 2 && !planUnderlay?.isCalibrated) {
+                          if (next.length < 2 && !hasEstablishedScale) {
                             setDraftScaleReady(false);
                           }
                           if (next.length === 0) setLockedDraftBounds(null);
@@ -1450,13 +1844,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         <span>Close</span>
                       </button>
                     )}
-                    {draftPoints.length > 0 && (
+                    {(draftPoints.length > 0 || attachedEdge) && (
                       <button
                         type="button"
                         onClick={() => {
                           setDraftPoints([]);
+                          setAttachedEdge(null);
                           setLockedDraftBounds(null);
-                          setDraftScaleReady(Boolean(planUnderlay?.isCalibrated));
+                          setDraftScaleReady(hasEstablishedScale);
                         }}
                         className="px-2 py-0.5 rounded-lg bg-slate-900 text-slate-400 font-semibold shrink-0 cursor-pointer"
                       >
@@ -1529,7 +1924,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 <div key={btn.id} className="relative">
                   {buttonEl}
                   {activeTool === 'add_line' && (
-                    <div className="absolute left-full ml-2 top-0 bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex items-center gap-1 z-30 animate-in fade-in slide-in-from-left-2">
+                    <div className="absolute left-full ml-2 top-0 bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex items-center gap-1 z-30 animate-in fade-in slide-in-from-left-2 whitespace-nowrap">
                       {[
                         { type: 'ridge' as const, label: 'Ridge', color: 'bg-purple-400', activeBg: 'bg-purple-600' },
                         { type: 'hip' as const, label: 'Hip', color: 'bg-sky-400', activeBg: 'bg-sky-600' },
@@ -1537,6 +1932,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       ].map((item) => (
                         <button
                           key={item.type}
+                          type="button"
                           onClick={() => setNewLineType(item.type)}
                           className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
                             newLineType === item.type
@@ -1548,6 +1944,41 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           <span>{item.label}</span>
                         </button>
                       ))}
+                      <div className="w-px h-5 bg-slate-700 mx-0.5" />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setChainLineMode((v) => !v);
+                          setBisectMode(false);
+                          setBisectPts([]);
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[11px] font-bold cursor-pointer flex items-center gap-1 ${
+                          !bisectMode && chainLineMode
+                            ? 'bg-emerald-600 text-white'
+                            : 'text-slate-300 hover:bg-slate-800'
+                        }`}
+                        title="Polyline Chain Mode"
+                      >
+                        <Link2 className="w-3 h-3" />
+                        <span>Chain</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBisectMode((v) => !v);
+                          setLineStartPt(null);
+                          setBisectPts([]);
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[11px] font-bold cursor-pointer flex items-center gap-1 ${
+                          bisectMode
+                            ? 'bg-amber-600 text-white'
+                            : 'text-slate-300 hover:bg-slate-800'
+                        }`}
+                        title="3-Point Interior Angle Bisector"
+                      >
+                        <GitBranch className="w-3 h-3" />
+                        <span>Bisect 3pt</span>
+                      </button>
                     </div>
                   )}
                 </div>
@@ -1889,14 +2320,50 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       )}
 
       {!isMobile && activeTool === 'draw_roof' && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2.5 px-4 py-2 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-emerald-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-2 px-3.5 py-2 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-emerald-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
+          {hasExistingFootprint && draftPoints.length === 0 && (
+            <div className="flex items-center gap-1 p-0.5 rounded-xl bg-slate-900 border border-slate-800">
+              <button
+                type="button"
+                onClick={() => {
+                  setDrawSubMode('free');
+                  setAttachedEdge(null);
+                }}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                  drawSubMode === 'free'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                New Footprint
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDrawSubMode('attach_edge');
+                  setAttachedEdge(null);
+                }}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                  drawSubMode === 'attach_edge'
+                    ? 'bg-amber-600 text-white'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                From Wall / Eave
+              </button>
+            </div>
+          )}
           <Crosshair className="w-4 h-4 text-emerald-400 shrink-0" />
           <span className="text-emerald-200 font-bold">
-            {draftPoints.length === 0
-              ? planUnderlay && !planUnderlay.isCalibrated
+            {drawSubMode === 'attach_edge' && !attachedEdge
+              ? 'Click an existing wall or eave edge to attach new roof'
+              : draftPoints.length === 0
+              ? planUnderlay && !planUnderlay.isCalibrated && !hasEstablishedScale
                 ? 'Click first corner (or use 2-Pt Scale first)'
+                : hasExistingFootprint
+                ? 'Click corner 1 to add new roof outline (preserves existing)'
                 : 'Click first corner on canvas to draw'
-              : draftPoints.length === 1 && !draftScaleReady && !planUnderlay?.isCalibrated
+              : draftPoints.length === 1 && !draftScaleReady && !hasEstablishedScale
               ? 'Click corner 2 to set first-line scale length'
               : `${draftPoints.length} points placed · Click first point to close`}
           </span>
@@ -1915,9 +2382,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             <button
               type="button"
               onClick={() => {
+                if (attachedEdge && draftPoints.length <= 2) {
+                  setDraftPoints([]);
+                  setAttachedEdge(null);
+                  setLockedDraftBounds(null);
+                  return;
+                }
                 const next = draftPoints.slice(0, -1);
                 setDraftPoints(next);
-                if (next.length < 2 && !planUnderlay?.isCalibrated) {
+                if (next.length < 2 && !hasEstablishedScale) {
                   setDraftScaleReady(false);
                 }
                 if (next.length === 0) setLockedDraftBounds(null);
@@ -1938,13 +2411,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               <span>Close Shape</span>
             </button>
           )}
-          {draftPoints.length > 0 && (
+          {(draftPoints.length > 0 || attachedEdge) && (
             <button
               type="button"
               onClick={() => {
                 setDraftPoints([]);
+                setAttachedEdge(null);
                 setLockedDraftBounds(null);
-                setDraftScaleReady(Boolean(planUnderlay?.isCalibrated));
+                setDraftScaleReady(hasEstablishedScale);
               }}
               className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold cursor-pointer"
             >
@@ -1954,16 +2428,34 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
         </div>
       )}
 
-      {!isMobile && activeTool === 'add_line' && lineStartPt && (
+      {!isMobile && activeTool === 'add_line' && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2.5 px-3.5 py-1.5 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-purple-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
           <Crosshair className="w-3.5 h-3.5 text-purple-400 shrink-0" />
-          <span className="text-purple-200 font-medium">Click end point on roof perimeter or ridge (auto-snaps to corners)</span>
-          <button
-            onClick={() => setLineStartPt(null)}
-            className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white text-[11px] font-semibold cursor-pointer"
-          >
-            Cancel
-          </button>
+          <span className="text-purple-200 font-medium">
+            {bisectMode
+              ? bisectPts.length === 0
+                ? '3-Pt Bisector (1/3): Click first wing/edge point'
+                : bisectPts.length === 1
+                ? '3-Pt Bisector (2/3): Click corner apex vertex'
+                : '3-Pt Bisector (3/3): Click second wing/edge point'
+              : lineStartPt
+              ? chainLineMode
+                ? 'Chain ON: click next point (or Break Chain / Esc)'
+                : 'Click end point anywhere on roof or perimeter (auto-snaps)'
+              : 'Click start point → click end point to draw ridge, hip, or valley'}
+          </span>
+          {(lineStartPt || bisectPts.length > 0) && (
+            <button
+              type="button"
+              onClick={() => {
+                setLineStartPt(null);
+                setBisectPts([]);
+              }}
+              className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white text-[11px] font-semibold cursor-pointer"
+            >
+              {lineStartPt ? 'Break Chain' : 'Reset'}
+            </button>
+          )}
         </div>
       )}
 
@@ -2182,11 +2674,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 <g
                   key={`ghost-${lvl.id}`}
                   opacity={0.34}
+                  pointerEvents={isDrawingOrGeometryTool ? 'none' : undefined}
                   onClick={(ev) => {
+                    if (isDrawingOrGeometryTool) return;
                     ev.stopPropagation();
                     onSelectLevel?.(lvl.id);
                   }}
-                  className="cursor-pointer"
+                  className={isDrawingOrGeometryTool ? 'pointer-events-none' : 'cursor-pointer'}
                 >
                   {lvl.outline.edges.map((ge) => (
                     <line
@@ -2251,8 +2745,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             return (
               <g
                 key={plane.id}
+                pointerEvents={isDrawingOrGeometryTool ? 'none' : undefined}
                 onClick={(e) => {
-                  if (activeTool === 'add_feature') return;
+                  if (isDrawingOrGeometryTool) return;
                   e.stopPropagation();
                   setInspectedLine(null);
                   setEditingMeasurement(null);
@@ -2261,7 +2756,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     onInstallSelectPlane?.(plane.id);
                   }
                 }}
-                className={activeTool === 'add_feature' ? 'cursor-crosshair group' : 'cursor-pointer group'}
+                className={
+                  isCanvasTapTool
+                    ? 'cursor-crosshair group'
+                    : isDrawingOrGeometryTool
+                    ? 'pointer-events-none'
+                    : 'cursor-pointer group'
+                }
               >
                 <polygon
                   points={pointsStr}
@@ -2457,7 +2958,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             return (
               <g
                 key={pb.id}
+                pointerEvents={isCanvasTapTool || activeTool === 'adjust_shape' ? 'none' : undefined}
                 onClick={(ev) => {
+                  if (isCanvasTapTool || activeTool === 'adjust_shape') return;
                   ev.stopPropagation();
                   if (activeTool === 'delete_line') {
                     onDeletePitchBreak?.(pb.id);
@@ -2467,7 +2970,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     onSelectPitchBreak?.(pb.id);
                   }
                 }}
-                className="cursor-pointer group"
+                className={
+                  isCanvasTapTool || activeTool === 'adjust_shape'
+                    ? 'pointer-events-none'
+                    : 'cursor-pointer group'
+                }
               >
                 <line
                   x1={toSvgX(b1.x)}
@@ -2529,6 +3036,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const isSel = selectedAssetId === asset.id;
 
             const handleAssetPointerDown = (ev: React.PointerEvent) => {
+              if (isCanvasTapTool) return;
               ev.stopPropagation();
               if (activeTool === 'delete_line') {
                 onDeleteAsset?.(asset.id);
@@ -2558,9 +3066,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 return (
                   <g
                     key={asset.id}
+                    pointerEvents={isCanvasTapTool ? 'none' : undefined}
                     onPointerDown={handleAssetPointerDown}
-                    onClick={(ev) => ev.stopPropagation()}
-                    className="cursor-move group"
+                    onClick={(ev) => {
+                      if (isCanvasTapTool) return;
+                      ev.stopPropagation();
+                    }}
+                    className={isCanvasTapTool ? 'pointer-events-none' : 'cursor-move group'}
                   >
                     {/* Left & Right Dormer Roof Slopes bounded by true pitch-matched valleys */}
                     <polygon
@@ -2639,9 +3151,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               <g
                 key={asset.id}
                 transform={`translate(${svgCx}, ${svgCy}) rotate(${angleDeg})`}
+                pointerEvents={isCanvasTapTool ? 'none' : undefined}
                 onPointerDown={handleAssetPointerDown}
-                onClick={(ev) => ev.stopPropagation()}
-                className="cursor-move group"
+                onClick={(ev) => {
+                  if (isCanvasTapTool) return;
+                  ev.stopPropagation();
+                }}
+                className={isCanvasTapTool ? 'pointer-events-none' : 'cursor-move group'}
               >
                 {asset.type === 'skylight' && (
                   <>
@@ -2788,7 +3304,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           )}
 
           {/* ROOF LINES (Ridges, Hips, Valleys) WITH MINIMAL CLICKABLE CODE BADGES */}
-          {skeleton.map((s) => {
+          {displaySkeleton.map((s) => {
             const x1 = toSvgX(s.from.x);
             const y1 = toSvgY(s.from.y);
             const x2 = toSvgX(s.to.x);
@@ -2810,11 +3326,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const assignedFlashing = assignmentByLineId.get(s.id);
             const isInspected = inspectedLine?.kind === 'skeleton' && inspectedLine.id === s.id;
 
+            const isLineNonSelectable = isCanvasTapTool || activeTool === 'adjust_shape';
             const handleSkeletonLineSelect = (ev: React.MouseEvent) => {
-              if (activeTool === 'add_feature') return;
+              if (isLineNonSelectable) return;
               ev.stopPropagation();
               if (activeTool === 'delete_line' && !readOnlyGeometry) {
-                onUpdateSkeleton(skeleton.filter((sk) => sk.id !== s.id));
+                onUpdateSkeleton(displaySkeleton.filter((sk) => sk.id !== s.id));
                 return;
               }
               if (activeTool === 'assign_flashing' && onSelectLineForFlashing) {
@@ -2827,7 +3344,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             };
 
             return (
-              <g key={s.id} onClick={handleSkeletonLineSelect} className="cursor-pointer group">
+              <g
+                key={s.id}
+                pointerEvents={isLineNonSelectable ? 'none' : undefined}
+                onClick={handleSkeletonLineSelect}
+                className={isLineNonSelectable ? 'pointer-events-none' : 'cursor-pointer group'}
+              >
                 <line
                   x1={x1}
                   y1={y1}
@@ -2914,7 +3436,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             );
           })}
 
-          {/* OUTLINE EDGES (EAVES, GABLE VERGES & ABUTMENT WALLS) WITH MINIMAL CLICKABLE CODE BADGES */}
+          {/* OUTLINE EDGES (UNCLASSIFIED, EAVES, GABLE VERGES, ABUTMENT WALLS & RIDGE/HIP/VALLEY BOUNDARIES) */}
           {(() => {
             const displayEdges =
               activeLevelId === 'all' && levels && levels.length > 1
@@ -2931,14 +3453,38 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const edgeLenM = +dist(e.from, e.to).toFixed(2);
             const isGableVerge = e.type === 'verge';
             const isWall = e.type === 'wall';
+            const isUnclassified = e.type === 'unclassified';
+            const isPerimRidge = e.type === 'ridge';
+            const isPerimHip = e.type === 'hip';
+            const isPerimValley = e.type === 'valley';
             const isDefined = planes.some((p) => p.eaveEdgeId === e.id);
             const assignedFlashing = assignmentByLineId.get(e.id);
             const isInspected = inspectedLine?.kind === 'edge' && inspectedLine.id === e.id;
-            const edgeCode = isWall ? 'W' : isGableVerge ? 'B' : 'E';
+            const edgeCode = isWall
+              ? 'W'
+              : isGableVerge
+              ? 'B'
+              : isPerimRidge
+              ? 'R'
+              : isPerimHip
+              ? 'H'
+              : isPerimValley
+              ? 'V'
+              : isUnclassified
+              ? '?'
+              : 'E';
             const edgeStroke = isWall
               ? '#f59e0b'
               : isGableVerge
               ? '#818cf8'
+              : isPerimRidge
+              ? '#c084fc'
+              : isPerimHip
+              ? '#38bdf8'
+              : isPerimValley
+              ? '#fbbf24'
+              : isUnclassified
+              ? '#94a3b8'
               : isDefined
               ? '#22c55e'
               : '#ffffff';
@@ -2953,13 +3499,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             return (
               <g
                 key={e.id}
+                pointerEvents={isCanvasTapTool ? 'none' : undefined}
                 onClick={(ev) => {
-                  if (levels && e.levelId && activeLevelId === 'all') {
+                  if (isCanvasTapTool) return;
+                  if (levels && e.levelId && activeLevelId === 'all' && !isDrawingOrGeometryTool) {
                     onSelectLevel?.(e.levelId);
                   }
                   handleEdgeClick(e, ev);
                 }}
-                className="cursor-pointer group"
+                className={isCanvasTapTool ? 'pointer-events-none' : 'cursor-pointer group'}
               >
                 <line
                   x1={x1}
@@ -3006,7 +3554,17 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   y2={y2}
                   stroke={edgeStroke}
                   strokeWidth={isWall ? '4.5' : isGableVerge ? '3.8' : isDefined ? '4' : '3.2'}
-                  strokeDasharray={isWall ? '10 3' : isGableVerge ? '8 5' : undefined}
+                  strokeDasharray={
+                    isWall
+                      ? '10 3'
+                      : isGableVerge
+                      ? '8 5'
+                      : isUnclassified
+                      ? '5 4'
+                      : isPerimValley
+                      ? '6 3'
+                      : undefined
+                  }
                   strokeLinecap="round"
                   className="transition-all group-hover:stroke-sky-400"
                 />
@@ -3164,11 +3722,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 <g
                   key={node.id}
                   transform={`translate(${nx}, ${ny})`}
+                  pointerEvents={isDrawingOrGeometryTool ? 'none' : undefined}
                   onClick={(ev) => {
+                    if (isDrawingOrGeometryTool) return;
                     ev.stopPropagation();
                     onToggleJunctionGable(node.id);
                   }}
-                  className="cursor-pointer group"
+                  className={isDrawingOrGeometryTool ? 'pointer-events-none' : 'cursor-pointer group'}
                 >
                   <circle r={isTouchDevice ? 22 : 15} fill="transparent" />
                   <circle
@@ -3201,30 +3761,142 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               );
             })}
 
-          {/* OUTLINE CORNER VERTICES (Pointer drag targets with generous touch hit area) */}
-          {!readOnlyGeometry && outline.points.map((p, idx) => (
-            <g
-              key={`pt-${idx}`}
-              onPointerDown={(e) => handleVertexPointerDown(idx, e)}
-              className="cursor-grab active:cursor-grabbing group"
-            >
-              <circle
-                cx={toSvgX(p.x)}
-                cy={toSvgY(p.y)}
-                r={isTouchDevice ? 18 : 12}
-                fill="transparent"
-              />
-              <circle
-                cx={toSvgX(p.x)}
-                cy={toSvgY(p.y)}
-                r={activeTool === 'adjust_shape' ? (isTouchDevice ? 10 : 8) : 5}
-                fill={activeTool === 'adjust_shape' ? '#f59e0b' : '#ffffff'}
-                stroke="#0f172a"
-                strokeWidth="2.5"
-                className="transition-all group-hover:scale-125"
-              />
+          {/* ATTACH-TO-EDGE PICKER TARGETS WHEN DRAWING FROM WALL OR EAVE */}
+          {!readOnlyGeometry &&
+            activeTool === 'draw_roof' &&
+            drawSubMode === 'attach_edge' &&
+            !attachedEdge &&
+            allDisplayEdges.map((edgeTarget) => {
+              const x1 = toSvgX(edgeTarget.from.x);
+              const y1 = toSvgY(edgeTarget.from.y);
+              const x2 = toSvgX(edgeTarget.to.x);
+              const y2 = toSvgY(edgeTarget.to.y);
+              return (
+                <g
+                  key={`attach-target-${edgeTarget.id}`}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    handlePickAttachEdge(edgeTarget);
+                  }}
+                  className="cursor-pointer group"
+                >
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke="transparent"
+                    strokeWidth={isTouchDevice ? '34' : '24'}
+                  />
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke={edgeTarget.type === 'wall' ? '#f59e0b' : '#34d399'}
+                    strokeWidth="6"
+                    strokeOpacity="0.45"
+                    strokeLinecap="round"
+                    className="group-hover:stroke-white group-hover:stroke-opacity-90"
+                  />
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke="#ffffff"
+                    strokeWidth="2"
+                    strokeDasharray="6 4"
+                    strokeLinecap="round"
+                    pointerEvents="none"
+                  />
+                </g>
+              );
+            })}
+
+          {/* OUTLINE CORNER VERTICES (Pointer drag targets in adjust_shape, multi-level corner snaps in add_line) */}
+          {!readOnlyGeometry &&
+            (activeTool === 'add_line' ? allDisplayOutlinePoints : outline.points).map((p, idx) => {
+              const isVertexInteractive = activeTool === 'adjust_shape' || activeTool === 'add_line';
+              return (
+                <g
+                  key={`pt-${idx}`}
+                  pointerEvents={isVertexInteractive ? undefined : 'none'}
+                  onPointerDown={(e) => handleVertexPointerDown(idx, e)}
+                  onClick={(e) => handleVertexClick(idx, e)}
+                  className={
+                    activeTool === 'adjust_shape'
+                      ? 'cursor-grab active:cursor-grabbing group'
+                      : activeTool === 'add_line'
+                      ? 'cursor-crosshair group'
+                      : 'pointer-events-none'
+                  }
+                >
+                  <circle
+                    cx={toSvgX(p.x)}
+                    cy={toSvgY(p.y)}
+                    r={isTouchDevice ? 18 : 12}
+                    fill="transparent"
+                  />
+                  <circle
+                    cx={toSvgX(p.x)}
+                    cy={toSvgY(p.y)}
+                    r={
+                      activeTool === 'adjust_shape'
+                        ? isTouchDevice
+                          ? 10
+                          : 8
+                        : activeTool === 'add_line'
+                        ? isTouchDevice
+                          ? 7
+                          : 6
+                        : 5
+                    }
+                    fill={
+                      activeTool === 'adjust_shape'
+                        ? '#f59e0b'
+                        : activeTool === 'add_line'
+                        ? '#c084fc'
+                        : '#ffffff'
+                    }
+                    stroke="#0f172a"
+                    strokeWidth="2.5"
+                    className="transition-all group-hover:scale-125"
+                  />
+                </g>
+              );
+            })}
+
+          {/* 3-POINT ANGLE BISECTOR PREVIEW */}
+          {activeTool === 'add_line' && bisectMode && bisectPts.length > 0 && (
+            <g pointerEvents="none">
+              {bisectPts.map((bp, bi) => (
+                <circle
+                  key={`bi-${bi}`}
+                  cx={toSvgX(bp.x)}
+                  cy={toSvgY(bp.y)}
+                  r="6"
+                  fill={bi === 1 ? '#f59e0b' : '#c084fc'}
+                  stroke="#090d16"
+                  strokeWidth="2"
+                />
+              ))}
+              {bisectPts.length === 2 && mousePos && (() => {
+                const previewEnd = computeAngleBisectorEndPoint(bisectPts[0], bisectPts[1], mousePos);
+                return (
+                  <line
+                    x1={toSvgX(bisectPts[1].x)}
+                    y1={toSvgY(bisectPts[1].y)}
+                    x2={toSvgX(previewEnd.x)}
+                    y2={toSvgY(previewEnd.y)}
+                    stroke="#f59e0b"
+                    strokeWidth="2.5"
+                    strokeDasharray="6 3"
+                  />
+                );
+              })()}
             </g>
-          ))}
+          )}
 
           {/* FREEHAND DRAFTING REAL-TIME DISPLAY */}
           {draftPoints.length > 0 && (
@@ -3308,7 +3980,67 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             </g>
           )}
 
-          {/* FULL-VIEWPORT CAD DRAFTING CROSSHAIR & ADD-LINE RUBBERBAND TELEMETRY */}
+          {/* ADD-LINE START TARGET & LIVE RUBBERBAND (Visible on both Touch & Desktop) */}
+          {activeTool === 'add_line' && lineStartPt && (
+            <g pointerEvents="none">
+              <circle
+                cx={toSvgX(lineStartPt.x)}
+                cy={toSvgY(lineStartPt.y)}
+                r={isTouchDevice ? 15 : 11}
+                fill="#a855f7"
+                fillOpacity="0.16"
+                stroke="#c084fc"
+                strokeWidth="1.6"
+              />
+              <circle
+                cx={toSvgX(lineStartPt.x)}
+                cy={toSvgY(lineStartPt.y)}
+                r="5.5"
+                fill="#c084fc"
+                stroke="#090d16"
+                strokeWidth="2"
+              />
+              <text
+                x={toSvgX(lineStartPt.x)}
+                y={toSvgY(lineStartPt.y) - (isTouchDevice ? 19 : 14)}
+                textAnchor="middle"
+                fill="#e9d5ff"
+                stroke="#090d16"
+                strokeWidth="3"
+                style={{ paintOrder: 'stroke' }}
+                fontSize="9.5"
+                fontWeight="800"
+                fontFamily="monospace"
+              >
+                Start
+              </text>
+              {mousePos && (
+                <>
+                  <line
+                    x1={toSvgX(lineStartPt.x)}
+                    y1={toSvgY(lineStartPt.y)}
+                    x2={toSvgX(mousePos.x)}
+                    y2={toSvgY(mousePos.y)}
+                    stroke="#c084fc"
+                    strokeWidth="2.2"
+                    strokeDasharray="5 3"
+                  />
+                  {dist(lineStartPt, mousePos) >= 0.1 && (
+                    <g
+                      transform={`translate(${(toSvgX(lineStartPt.x) + toSvgX(mousePos.x)) / 2}, ${(toSvgY(lineStartPt.y) + toSvgY(mousePos.y)) / 2 - 14})`}
+                    >
+                      <rect x="-26" y="-9.5" width="52" height="19" rx="9.5" fill="#6b21a8" stroke="#e9d5ff" strokeWidth="0.9" />
+                      <text x="0" y="3.2" textAnchor="middle" fill="#ffffff" fontSize="9" fontWeight="bold" fontFamily="monospace">
+                        {dist(lineStartPt, mousePos).toFixed(2)}m
+                      </text>
+                    </g>
+                  )}
+                </>
+              )}
+            </g>
+          )}
+
+          {/* FULL-VIEWPORT CAD DRAFTING CROSSHAIR (Desktop) */}
           {!isTouchDevice &&
             mousePos &&
             (activeTool === 'draw_roof' || activeTool === 'scale_plan' || activeTool === 'add_line') && (
@@ -3334,40 +4066,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   strokeDasharray="4 4"
                 />
                 {activeTool === 'add_line' && (
-                  <>
-                    <circle
-                      cx={toSvgX(mousePos.x)}
-                      cy={toSvgY(mousePos.y)}
-                      r="5.5"
-                      fill="none"
-                      stroke="#c084fc"
-                      strokeWidth="1.6"
-                    />
-                    {lineStartPt && (
-                      <>
-                        <circle cx={toSvgX(lineStartPt.x)} cy={toSvgY(lineStartPt.y)} r="5" fill="#c084fc" />
-                        <line
-                          x1={toSvgX(lineStartPt.x)}
-                          y1={toSvgY(lineStartPt.y)}
-                          x2={toSvgX(mousePos.x)}
-                          y2={toSvgY(mousePos.y)}
-                          stroke="#c084fc"
-                          strokeWidth="2.2"
-                          strokeDasharray="5 3"
-                        />
-                        {dist(lineStartPt, mousePos) >= 0.1 && (
-                          <g
-                            transform={`translate(${(toSvgX(lineStartPt.x) + toSvgX(mousePos.x)) / 2}, ${(toSvgY(lineStartPt.y) + toSvgY(mousePos.y)) / 2 - 14})`}
-                          >
-                            <rect x="-26" y="-9.5" width="52" height="19" rx="9.5" fill="#6b21a8" stroke="#e9d5ff" strokeWidth="0.9" />
-                            <text x="0" y="3.2" textAnchor="middle" fill="#ffffff" fontSize="9" fontWeight="bold" fontFamily="monospace">
-                              {dist(lineStartPt, mousePos).toFixed(2)}m
-                            </text>
-                          </g>
-                        )}
-                      </>
-                    )}
-                  </>
+                  <circle
+                    cx={toSvgX(mousePos.x)}
+                    cy={toSvgY(mousePos.y)}
+                    r="5.5"
+                    fill="none"
+                    stroke="#c084fc"
+                    strokeWidth="1.6"
+                  />
                 )}
               </g>
             )}
@@ -3486,7 +4192,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               ? outline.edges.find((e) => e.id === inspectedLine.id) ||
                 levels?.flatMap((l) => l.outline.edges).find((e) => e.id === inspectedLine.id)
               : undefined;
-            const skelObj = !isEdge ? skeleton.find((s) => s.id === inspectedLine.id) : undefined;
+            const skelObj = !isEdge ? displaySkeleton.find((s) => s.id === inspectedLine.id) : undefined;
             if (!edgeObj && !skelObj) return null;
 
             const lineId = edgeObj ? edgeObj.id : skelObj!.id;
@@ -3504,11 +4210,20 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
             const isVerge = edgeObj?.type === 'verge';
             const isWall = edgeObj?.type === 'wall';
+            const isUnclassified = edgeObj?.type === 'unclassified';
             const badgeCode = edgeObj
               ? isWall
                 ? 'W'
                 : isVerge
                 ? 'B'
+                : edgeObj.type === 'ridge'
+                ? 'R'
+                : edgeObj.type === 'hip'
+                ? 'H'
+                : edgeObj.type === 'valley'
+                ? 'V'
+                : isUnclassified
+                ? '?'
                 : 'E'
               : skelObj!.suggestedType === 'ridge'
               ? 'R'
@@ -3522,6 +4237,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   ? 'Abutment / Riser Wall'
                   : isVerge
                   ? 'Gable / Barge'
+                  : edgeObj.type === 'ridge'
+                  ? 'Perimeter Ridge Edge'
+                  : edgeObj.type === 'hip'
+                  ? 'Perimeter Hip Edge'
+                  : edgeObj.type === 'valley'
+                  ? 'Perimeter Valley Edge'
+                  : isUnclassified
+                  ? 'Unclassified Boundary Edge'
                   : 'Eave Wall Edge'
                 : skelObj!.suggestedType === 'ridge'
                 ? 'Ridge Line'
@@ -3533,6 +4256,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 ? '#f59e0b'
                 : isVerge
                 ? '#818cf8'
+                : edgeObj.type === 'ridge'
+                ? '#c084fc'
+                : edgeObj.type === 'hip'
+                ? '#38bdf8'
+                : edgeObj.type === 'valley'
+                ? '#fbbf24'
+                : isUnclassified
+                ? '#94a3b8'
                 : '#22c55e'
               : skelObj!.suggestedType === 'ridge'
               ? '#c084fc'
@@ -3767,16 +4498,16 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     </div>
                   )}
 
-                  {edgeObj && !readOnlyGeometry && !isWall && !isVerge && (
+                  {edgeObj && !readOnlyGeometry && (
                     <button
                       type="button"
                       onClick={() => {
                         setInspectedLine(null);
                         onSelectEdgeToDefine(edgeObj);
                       }}
-                      className="min-h-[38px] px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold cursor-pointer"
+                      className="min-h-[38px] px-3 rounded-xl bg-sky-600/25 hover:bg-sky-600/40 border border-sky-500/40 text-sky-200 text-xs font-extrabold cursor-pointer"
                     >
-                      Pitch
+                      Classify / Setup Plane
                     </button>
                   )}
                 </div>

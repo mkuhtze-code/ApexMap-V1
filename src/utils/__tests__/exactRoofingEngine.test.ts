@@ -2,9 +2,13 @@ import {
   getPresetOutline,
   generateSkeletonLines,
   createPlaneFromEdge,
-  generateCuttingLayout
+  generateCuttingLayout,
+  buildAttachedOutlineFromEdge,
+  classifyOutlineEdge,
+  createRoofLevel,
+  syncMultiLevelPlanes
 } from '../exactRoofingEngine';
-import type { RoofOutline } from '../../types/exactRoofing';
+import type { RoofLevel, RoofOutline } from '../../types/exactRoofing';
 
 console.log('--- Starting Exact Roofing Engine Test Suite ---');
 
@@ -916,7 +920,6 @@ import {
   deriveRoofWallSegments,
   getAssignableRoofLinesMultiLevel,
   setEdgeMode,
-  syncMultiLevelPlanes,
   arePlanesAdjacentAtHip
 } from '../exactRoofingEngine';
 import { computeRoofingPacks, buildRoofBillOfMaterials } from '../exactRoofingBomBridge';
@@ -1427,6 +1430,268 @@ if (Math.abs(rescaledEdge0Len - 21.0) > 0.02) {
 
 console.log(
   `✓ Test 25 Passed: Freehand first-line scale (14.5m zero-jump invariant), 0.01m ortho snap, 2-pt architectural plan calibration (${calDiag.underlay.worldWidthM.toFixed(2)}m×${calDiag.underlay.worldHeightM.toFixed(2)}m) & outline rescaling verified.`
+);
+
+// 26. TEST 26: ExactRoof / CADMethods Industry Benchmark (29.67m × 6.55m @ 15° Simple 4-Hip Roof)
+const erOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 29.67, y: 0 },
+  { x: 29.67, y: 6.55 },
+  { x: 0, y: 6.55 }
+]);
+const erSkel = generateSkeletonLines(erOutline);
+const erPlanes = erOutline.edges.map((e, idx) =>
+  createPlaneFromEdge(erOutline, erSkel, e, {
+    pitchDeg: 15,
+    underlapSide: idx % 2 === 0 ? 'left' : 'right'
+  })
+);
+const erLayout = generateCuttingLayout(
+  erPlanes,
+  { coverWidth: 0.762, maxLength: 6.34, endLap: 0.15, overhang: 0.05 },
+  { startPlaneId: erPlanes[0].id }
+);
+
+if (Math.abs(erLayout.totalRoofArea - 201.2) > 0.5) {
+  throw new Error(`Expected ExactRoof benchmark area ~201.2 m², got ${erLayout.totalRoofArea} m²`);
+}
+if (erLayout.parents.length < 78 || erLayout.parents.length > 81) {
+  throw new Error(`Expected ~79-80 ordered sheets, got ${erLayout.parents.length}`);
+}
+if (erLayout.totalOrderedMetres < 268 || erLayout.totalOrderedMetres > 274) {
+  throw new Error(
+    `Expected ExactRoof benchmark ordered metres ~272 lm (268-274), got ${erLayout.totalOrderedMetres} lm`
+  );
+}
+const erMaxParentLen = Math.max(...erLayout.parents.map((p) => p.length));
+if (erMaxParentLen > 3.55) {
+  throw new Error(
+    `Must NOT manufacture inflated synthetic mother blanks (>3.55m) on a 3.44m roof; got max ${erMaxParentLen}m`
+  );
+}
+const erExactParentSum = +erLayout.parents.reduce((s, p) => s + p.length, 0).toFixed(2);
+if (Math.abs(erExactParentSum - erLayout.totalOrderedMetres) > 0.02) {
+  throw new Error(
+    `Total ordered metres (${erLayout.totalOrderedMetres}) must strictly match sum(parent.length) (${erExactParentSum})`
+  );
+}
+const erComputedReused = erLayout.parents.reduce((s, p) => s + Math.max(0, p.pieces.length - 1), 0);
+if (erComputedReused !== erLayout.totalOffcutsReused) {
+  throw new Error(
+    `totalOffcutsReused (${erLayout.totalOffcutsReused}) must equal repressed count (${erComputedReused})`
+  );
+}
+
+console.log(
+  `✓ Test 26 Passed: ExactRoof Benchmark (${erLayout.totalRoofArea} m², ${erLayout.parents.length} sheets, ${erLayout.totalOrderedMetres} lm ordered, max sheet ${Math.round(erMaxParentLen * 1000)}mm, ${erLayout.totalOffcutsReused} offcuts repressed saving ${erLayout.savedMetres}m) verified.`
+);
+
+// 27. TEST 27: Additive Multi-Body Drawing & Draw-From-Wall/Eave Edge (Zero Auto-Skeleton)
+const mbLvl1Blank = createRoofLevel(
+  1,
+  'Main House',
+  2.7,
+  [
+    { x: 0, y: 0 },
+    { x: 12, y: 0 },
+    { x: 12, y: 6 },
+    { x: 0, y: 6 }
+  ],
+  undefined,
+  { autoGenerateSkeleton: false, initialEdgeType: 'unclassified' }
+);
+if (mbLvl1Blank.skeleton.length !== 0) {
+  throw new Error(`Expected empty skeleton when autoGenerateSkeleton=false, got ${mbLvl1Blank.skeleton.length}`);
+}
+const prematurePlanes = syncMultiLevelPlanes([mbLvl1Blank], []);
+if (prematurePlanes.length !== 0) {
+  throw new Error(`Expected 0 planes for unclassified outline, got ${prematurePlanes.length}`);
+}
+
+const mbLvl1Classified: RoofLevel = {
+  ...mbLvl1Blank,
+  outline: classifyOutlineEdge(
+    classifyOutlineEdge(mbLvl1Blank.outline, mbLvl1Blank.outline.edges[0].id, 'outline'),
+    mbLvl1Blank.outline.edges[2].id,
+    'wall'
+  )
+};
+const sharedWallEdge = mbLvl1Classified.outline.edges[2]; // (12,6)->(0,6)
+const attachedOutline = buildAttachedOutlineFromEdge(
+  sharedWallEdge,
+  [
+    { x: 12, y: 6 },
+    { x: 0, y: 6 },
+    { x: 0, y: 10 },
+    { x: 12, y: 10 }
+  ],
+  'attached-verandah',
+  { levelId: 'level-2', defaultEaveHeightM: 2.7, initialEdgeType: 'unclassified' }
+);
+if (attachedOutline.points.length !== 4 || attachedOutline.edges.length !== 4) {
+  throw new Error(`Expected 4-edge attached polygon, got ${attachedOutline.edges.length} edges`);
+}
+if (
+  attachedOutline.edges[0].type !== 'wall' ||
+  attachedOutline.edges[0].hasWall !== true ||
+  !attachedOutline.edges.slice(1).every((e) => e.type === 'unclassified')
+) {
+  throw new Error('Attached polygon must preserve shared wall role while leaving outer edges unclassified');
+}
+const mbLvl2: RoofLevel = {
+  id: 'level-2',
+  code: 'L2',
+  name: 'Verandah',
+  eaveHeightM: 2.7,
+  outline: attachedOutline,
+  skeleton: []
+};
+const mbPlanes = syncMultiLevelPlanes([mbLvl1Classified, mbLvl2], []);
+if (mbPlanes.length !== 1 || mbPlanes[0].eaveEdgeId !== mbLvl1Classified.outline.edges[0].id) {
+  throw new Error(`Expected Level 1 eave plane preserved alongside Level 2 additive outline, got ${mbPlanes.length} planes`);
+}
+console.log(
+  '✓ Test 27 Passed: Additive multi-body draw, shared-edge attach, and unclassified blank setup verified.'
+);
+
+// 28. TEST 28: ExactRoof Manual Edge Classification, Eave Fall vs Sheet-Run Perpendicular Edge (Empty Skeleton)
+let manualOutline = buildOutlineFromPoints(
+  [
+    { x: 0, y: 0 },
+    { x: 10, y: 0 },
+    { x: 12, y: 6 },
+    { x: 0, y: 6 }
+  ],
+  'manual-skewed',
+  { initialEdgeType: 'unclassified' }
+);
+// Classify side 1 as Eave ('outline'), side 2 (angled east edge) as Barge ('verge'), side 3 as Ridge ('ridge')
+const eaveSide = manualOutline.edges[0];
+const angledBarge = manualOutline.edges[1];
+const northEdge = manualOutline.edges[2];
+manualOutline = classifyOutlineEdge(manualOutline, eaveSide.id, 'outline');
+manualOutline = classifyOutlineEdge(manualOutline, angledBarge.id, 'verge');
+manualOutline = classifyOutlineEdge(manualOutline, northEdge.id, 'ridge');
+
+if (
+  manualOutline.edges[0].type !== 'outline' ||
+  manualOutline.edges[1].type !== 'verge' ||
+  manualOutline.edges[2].type !== 'ridge' ||
+  manualOutline.edges[3].type !== 'unclassified'
+) {
+  throw new Error('Edge classification mutated unrelated edge types');
+}
+
+const manualPlane = createPlaneFromEdge(manualOutline, [], eaveSide, {
+  pitchDeg: 15,
+  underlapSide: 'left',
+  sheetRunEdgeId: angledBarge.id,
+  orderedSheetLengthM: 6.25,
+  name: 'Skewed Mono-Pitch'
+});
+const bargeDx = angledBarge.to.x - angledBarge.from.x;
+const bargeDy = angledBarge.to.y - angledBarge.from.y;
+const bargeLen = Math.hypot(bargeDx, bargeDy);
+if (!manualPlane.runDirection) {
+  throw new Error('Expected manualPlane.runDirection to be defined');
+}
+const dirDotBarge =
+  (manualPlane.runDirection.x * bargeDx + manualPlane.runDirection.y * bargeDy) / bargeLen;
+if (Math.abs(dirDotBarge) > 1e-4) {
+  throw new Error(`Expected sheet runDirection perpendicular to sheetRunEdgeId (${angledBarge.id}), dot=${dirDotBarge}`);
+}
+if (manualPlane.sheetRunEdgeId !== angledBarge.id) {
+  throw new Error('Expected sheetRunEdgeId preserved on created RoofPlane');
+}
+const manualLayout = generateCuttingLayout(
+  [manualPlane],
+  { coverWidth: 0.762, maxLength: 6.5, endLap: 0.15, overhang: 0.05 }
+);
+if (manualLayout.parents.length === 0 || manualLayout.totalRoofArea <= 0) {
+  throw new Error('Expected manual empty-skeleton plane to produce valid cutting layout');
+}
+if (Math.abs(manualLayout.parents[0].length - 6.25) > 0.01) {
+  throw new Error(`Expected orderedSheetLengthM override 6.25m respected, got ${manualLayout.parents[0].length}`);
+}
+console.log(
+  `✓ Test 28 Passed: ExactRoof manual setup on skeleton=[] (perpendicular sheetRunEdgeId dot=${dirDotBarge.toFixed(5)}, ordered=6250mm, area=${manualLayout.totalRoofArea}m²) verified.`
+);
+
+// 29. TEST 29: Dovetail / Bay Wing Skeleton Junctions & Overshoot Regression
+const dtCases = [
+  {
+    name: 'Bay 14x8 + 4x3 wing',
+    pts: [
+      { x: 0, y: 0 },
+      { x: 14, y: 0 },
+      { x: 14, y: 8 },
+      { x: 9, y: 8 },
+      { x: 9, y: 11 },
+      { x: 5, y: 11 },
+      { x: 5, y: 8 },
+      { x: 0, y: 8 }
+    ],
+    vergeIdx: [] as number[],
+    expectedValleyStopY: 6.0
+  },
+  {
+    name: 'Gable Dormer Bay 14x8 + 4x3 wing',
+    pts: [
+      { x: 0, y: 0 },
+      { x: 14, y: 0 },
+      { x: 14, y: 8 },
+      { x: 9, y: 8 },
+      { x: 9, y: 11 },
+      { x: 5, y: 11 },
+      { x: 5, y: 8 },
+      { x: 0, y: 8 }
+    ],
+    vergeIdx: [4],
+    expectedValleyStopY: 6.0
+  },
+  {
+    name: 'Almost-equal T-shape 16x8 + 7.8x5 wing',
+    pts: [
+      { x: 0, y: 0 },
+      { x: 16, y: 0 },
+      { x: 16, y: 8 },
+      { x: 11.9, y: 8 },
+      { x: 11.9, y: 13 },
+      { x: 4.1, y: 13 },
+      { x: 4.1, y: 8 },
+      { x: 0, y: 8 }
+    ],
+    vergeIdx: [] as number[],
+    expectedValleyStopY: 4.0
+  }
+];
+
+dtCases.forEach((tc) => {
+  let out = buildOutlineFromPoints(tc.pts);
+  tc.vergeIdx.forEach((idx) => {
+    out = classifyOutlineEdge(out, out.edges[idx].id, 'verge');
+  });
+  const skel = generateSkeletonLines(out);
+  const valleys = skel.filter((s) => s.suggestedType === 'valley');
+  if (valleys.length !== 2) {
+    throw new Error(`${tc.name}: expected 2 valleys, got ${valleys.length}`);
+  }
+  valleys.forEach((v) => {
+    const minY = Math.min(v.from.y, v.to.y);
+    if (minY < tc.expectedValleyStopY - 0.1) {
+      throw new Error(`${tc.name}: valley overshot dovetail junction (minY=${minY} < ${tc.expectedValleyStopY})`);
+    }
+  });
+  // Every skeleton line midpoint must stay strictly inside or on boundary of footprint
+  skel.forEach((s) => {
+    const mid = { x: (s.from.x + s.to.x) / 2, y: (s.from.y + s.to.y) / 2 };
+    if (!isPointInPolygon(mid, tc.pts)) {
+      throw new Error(`${tc.name}: skeleton line (${s.from.x},${s.from.y})->(${s.to.x},${s.to.y}) escaped footprint`);
+    }
+  });
+});
+console.log(
+  '✓ Test 29 Passed: Dovetail wing valleys terminate cleanly at junction and ridges stay strictly bounded.'
 );
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

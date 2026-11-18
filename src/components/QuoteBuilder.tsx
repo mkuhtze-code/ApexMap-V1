@@ -3200,7 +3200,7 @@ export const QuoteBuilder: React.FC<Props> = ({
               {activeTakeoffProject?.roofPlanModel?.bom ? (
                 <>
                   <p className="text-slate-600 text-[11px]">
-                    Import mill stock sheets ({activeTakeoffProject.roofPlanModel.bom.totalSheetsLm} lm, {activeTakeoffProject.roofPlanModel.bom.wastePercent}% waste), flashing runs ({activeTakeoffProject.roofPlanModel.bom.totalFlashingLm} lm), fixings, underlay &amp; labour straight into this quote.
+                    Import ordered sheets ({(activeTakeoffProject.roofPlanModel.bom.totalOrderedLm ?? (activeTakeoffProject.roofPlanModel.bom as { totalSheetsLm?: number }).totalSheetsLm ?? 0).toFixed(1)} lm, {activeTakeoffProject.roofPlanModel.bom.wastePercent}% waste), flashing runs ({activeTakeoffProject.roofPlanModel.bom.totalFlashingLm} lm), fixings, underlay &amp; labour straight into this quote.
                   </p>
                   <div className="flex flex-wrap justify-end gap-2 pt-1">
                     <button

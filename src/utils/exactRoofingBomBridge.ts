@@ -142,7 +142,7 @@ export function buildRoofBillOfMaterials(params: {
       lengthMm: g.lengthMm,
       lengthM: g.lengthM,
       count: g.count,
-      totalLm: g.totalLm,
+      totalLm: +(g.count * g.lengthM).toFixed(3),
       targetCodes: Array.from(g.targetCodes).sort(),
       hasOffcutHarvest: g.hasOffcutHarvest
     }))
@@ -150,10 +150,13 @@ export function buildRoofBillOfMaterials(params: {
 
   const fallbackAreaM2 = displayPlanes.reduce((s, p) => s + (p.area || 0), 0);
   const totalRoofAreaM2 = +(layout?.totalRoofArea ?? fallbackAreaM2).toFixed(2);
-  const totalSheetsCount = layout?.parents.length || 0;
-  const totalOrderedLm = +(layout?.totalOrderedMetres || 0).toFixed(2);
+  const totalSheetsCount = sheetGroups.reduce((s, g) => s + g.count, 0) || layout?.parents.length || 0;
+  const totalOrderedLm = +sheetGroups.reduce((s, g) => s + g.count * g.lengthM, 0).toFixed(2);
   const totalNetRoofLm = +(layout?.totalRoofMetres || 0).toFixed(2);
   const savedOffcutLm = +(layout?.savedMetres || 0).toFixed(2);
+  const totalOffcutsReused =
+    layout?.totalOffcutsReused ??
+    (layout?.parents.reduce((s, p) => s + Math.max(0, p.pieces.length - 1), 0) || 0);
   const wastePercent = +(layout?.wastePercent ?? 0).toFixed(1);
   const totalCutPiecesCount = layout?.pieces.length || 0;
 
@@ -189,6 +192,7 @@ export function buildRoofBillOfMaterials(params: {
     totalOrderedLm,
     totalNetRoofLm,
     savedOffcutLm,
+    totalOffcutsReused,
     wastePercent,
     sheetGroups,
     totalCutPiecesCount,
@@ -270,16 +274,16 @@ export function computeRoofingPacks(params: {
 
       layout.parents.forEach((parent) => {
         const primary = parent.pieces[0];
-        const secondary = parent.pieces[1];
+        const secondaries = parent.pieces.slice(1);
 
         if (primary && primary.targetPlaneId === planeId) {
           const { lengthMm, lengthM } = toExactMm(parent.length);
           const cur = freshBucket.get(lengthMm) || { lengthMm, lengthM, count: 0, totalLm: 0 };
           cur.count += 1;
-          cur.totalLm = +(cur.totalLm + parent.length).toFixed(3);
+          cur.totalLm = +(cur.totalLm + lengthM).toFixed(3);
           freshBucket.set(lengthMm, cur);
 
-          if (secondary) {
+          secondaries.forEach((secondary) => {
             const tgt = planeById.get(secondary.targetPlaneId);
             const key = secondary.targetPlaneId;
             const prev = producedForMap.get(key) || {
@@ -293,23 +297,26 @@ export function computeRoofingPacks(params: {
             prev.count += 1;
             prev.totalLm = +(prev.totalLm + secondary.length).toFixed(2);
             producedForMap.set(key, prev);
-          }
+          });
         }
 
-        if (secondary && secondary.targetPlaneId === planeId && primary) {
-          const src = planeById.get(primary.targetPlaneId);
-          const key = primary.targetPlaneId;
-          const prev = receivedMap.get(key) || {
-            planeId: key,
-            code: src?.code || key,
-            planeName: src?.name || key,
-            color: src?.color || '#64748b',
-            count: 0,
-            totalLm: 0
-          };
-          prev.count += 1;
-          prev.totalLm = +(prev.totalLm + secondary.length).toFixed(2);
-          receivedMap.set(key, prev);
+        if (primary) {
+          secondaries.forEach((secondary) => {
+            if (secondary.targetPlaneId !== planeId) return;
+            const src = planeById.get(primary.targetPlaneId);
+            const key = primary.targetPlaneId;
+            const prev = receivedMap.get(key) || {
+              planeId: key,
+              code: src?.code || key,
+              planeName: src?.name || key,
+              color: src?.color || '#64748b',
+              count: 0,
+              totalLm: 0
+            };
+            prev.count += 1;
+            prev.totalLm = +(prev.totalLm + secondary.length).toFixed(2);
+            receivedMap.set(key, prev);
+          });
         }
       });
     }
@@ -321,13 +328,10 @@ export function computeRoofingPacks(params: {
     const offcutsReceived = Array.from(receivedMap.values()).sort((a, b) => b.count - a.count);
     const offcutsProducedFor = Array.from(producedForMap.values()).sort((a, b) => b.count - a.count);
 
-    // Format concise pack label: e.g. "14 @ 6340mm" or "12 @ 6340mm + 5 offcuts from A"
+    // Honest complete list of ordered parent blank lengths for this pack (no length hiding/truncation)
     const freshStr =
       freshLengthGroups.length > 0
-        ? freshLengthGroups
-            .slice(0, 3)
-            .map((g) => `${g.count} @ ${g.lengthMm}mm`)
-            .join(', ') + (freshLengthGroups.length > 3 ? ` +${freshLengthGroups.length - 3} more` : '')
+        ? freshLengthGroups.map((g) => `${g.count} @ ${g.lengthMm}mm`).join(', ')
         : '0 fresh sheets';
 
     const offcutStr =

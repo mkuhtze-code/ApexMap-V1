@@ -661,14 +661,14 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <h4 className="text-xs font-extrabold uppercase tracking-wider text-white">
-                        1. Roof Sheets to Order ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} m total)
+                        1. Roof Sheets to Order ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} lm ordered)
                       </h4>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
-                        {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'}
+                      <p className="text-[11px] text-slate-400 mt-0.5 font-mono tabular-nums">
+                        {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'} · Net roof {bom.totalNetRoofLm.toFixed(1)} lm
                       </p>
                     </div>
                     <span className="text-[11px] font-mono text-emerald-400 tabular-nums">
-                      +{bom.savedOffcutLm.toFixed(1)}m reused via offcuts
+                      {bom.totalOffcutsReused ?? 0} offcuts repressed (+{bom.savedOffcutLm.toFixed(1)}m saved)
                     </span>
                   </div>
 
@@ -685,20 +685,30 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                       <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
                         {bom.sheetGroups.map((grp) => (
                           <tr key={grp.lengthMm} className="hover:bg-slate-900/50">
-                            <td className="py-2 px-3 font-black text-white">{grp.count} sheets</td>
+                            <td className="py-2 px-3 font-black text-white">{grp.count} @</td>
                             <td className="py-2 px-3 font-extrabold text-sky-400">
-                              {grp.lengthMm}mm ({grp.lengthMm % 10 !== 0 ? grp.lengthM.toFixed(3) : grp.lengthM.toFixed(2)}m)
+                              {grp.lengthMm} mm ({grp.lengthMm % 10 !== 0 ? grp.lengthM.toFixed(3) : grp.lengthM.toFixed(2)}m)
                             </td>
                             <td className="py-2 px-3 font-sans text-slate-300">
                               Faces {grp.targetCodes.join(', ') || 'Main'}
-                              {grp.hasOffcutHarvest ? ' · 180° flip offcut' : ''}
+                              {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
                             </td>
                             <td className="py-2 px-3 text-right font-bold text-slate-200">
-                              {grp.totalLm.toFixed(1)} m
+                              {(grp.count * grp.lengthM).toFixed(1)} lm
                             </td>
                           </tr>
                         ))}
                       </tbody>
+                      <tfoot className="bg-slate-900/90 border-t border-slate-700 font-mono tabular-nums">
+                        <tr>
+                          <td className="py-2 px-3 font-black text-sky-300" colSpan={3}>
+                            {bom.totalSheetsCount} sheets ordered · {bom.totalOffcutsReused ?? 0} offcuts repressed separately
+                          </td>
+                          <td className="py-2 px-3 text-right font-black text-sky-300">
+                            {bom.totalOrderedLm.toFixed(1)} lm
+                          </td>
+                        </tr>
+                      </tfoot>
                     </table>
                   </div>
                 </div>

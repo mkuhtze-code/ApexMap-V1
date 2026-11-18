@@ -255,8 +255,18 @@ export function computeSheetCourseSegments(
   const eLen = Math.hypot(edx, edy);
   if (eLen < 0.25) return [];
 
-  const uVec = { x: edx / eLen, y: edy / eLen };
-  const vInward = plane.runDirection || { x: -uVec.y, y: uVec.x };
+  const eaveU = { x: edx / eLen, y: edy / eLen };
+  let vInward = plane.runDirection;
+  let uVec = eaveU;
+  if (vInward) {
+    const vLen = Math.hypot(vInward.x, vInward.y) || 1;
+    vInward = { x: vInward.x / vLen, y: vInward.y / vLen };
+    const candA = { x: vInward.y, y: -vInward.x };
+    const candB = { x: -vInward.y, y: vInward.x };
+    uVec = candA.x * eaveU.x + candA.y * eaveU.y >= 0 ? candA : candB;
+  } else {
+    vInward = { x: -eaveU.y, y: eaveU.x };
+  }
 
   // Find u extent of polygon
   let minU = Infinity;
@@ -328,8 +338,18 @@ export function computePlaneDirectionOverlay(plane: RoofPlane): (PlaneDirectionO
   const eLen = Math.hypot(edx, edy);
   if (eLen < 0.2) return null;
 
-  const uVec = { x: edx / eLen, y: edy / eLen };
-  const vInward = plane.runDirection || { x: -uVec.y, y: uVec.x };
+  const eaveU = { x: edx / eLen, y: edy / eLen };
+  let vInward = plane.runDirection;
+  let uVec = eaveU;
+  if (vInward) {
+    const vLen = Math.hypot(vInward.x, vInward.y) || 1;
+    vInward = { x: vInward.x / vLen, y: vInward.y / vLen };
+    const candA = { x: vInward.y, y: -vInward.x };
+    const candB = { x: -vInward.y, y: vInward.x };
+    uVec = candA.x * eaveU.x + candA.y * eaveU.y >= 0 ? candA : candB;
+  } else {
+    vInward = { x: -eaveU.y, y: eaveU.x };
+  }
 
   let maxV = 0;
   for (const pt of poly) {

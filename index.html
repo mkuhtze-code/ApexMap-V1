@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+    <title>Archtech Architectural Roofing CRM | The Roofing Store Preferred Partner</title>
+    <meta name="description" content="Custom CRM, inventory tracking, client portal and site inspection platform for Archtech (www.archtech.co.nz) in partnership with The Roofing Store (www.theroofingstore.co.nz)." />
+    <meta property="og:title" content="Archtech Architectural Roofing CRM | The Roofing Store Preferred Partner" />
+    <meta property="og:description" content="Custom CRM, inventory tracking, client portal and site inspection platform for Archtech (www.archtech.co.nz) in partnership with The Roofing Store (www.theroofingstore.co.nz)." />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#070b14" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ExactRoof" />
+    <link id="app-manifest" rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      (function() {
+        var cleanPath = location.pathname.replace(/\/+$/, "");
+        var params = new URLSearchParams(location.search);
+        if (["/roof", "/exact-roofing"].includes(cleanPath) || params.get("tab") === "exact_roofing") {
+          document.getElementById("app-manifest")?.setAttribute("href", "/manifest-roofing.webmanifest");
+          document.title = "Exact Roofing Engine | ApexMap™ CAD";
+          document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute("content", "ExactRoof");
+        } else if (["/site", "/field"].includes(cleanPath)) {
+          document.getElementById("app-manifest")?.setAttribute("href", "/manifest-site.webmanifest");
+          document.title = "Archtech Site";
+          document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute("content", "Archtech Site");
+        }
+      })();
+      // Environment constraints: HMR is disabled in AI Studio preview; ignore Vite WebSocket notices
+      (function() {
+        var origConsoleError = console.error;
+        console.error = function() {
+          var str = Array.prototype.slice.call(arguments).map(function(a) {
+            return (a && a.stack) ? a.stack : String(a);
+          }).join(' ');
+          if (str.indexOf('WebSocket') !== -1 || str.indexOf('vite:ws') !== -1 || str.indexOf('[vite]') !== -1) {
+            return;
+          }
+          return origConsoleError.apply(console, arguments);
+        };
+        window.addEventListener('error', function(e) {
+          var msg = (e && e.message) ? e.message : String(e);
+          if (msg.indexOf('WebSocket') !== -1 || msg.indexOf('vite') !== -1) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+        window.addEventListener('unhandledrejection', function(e) {
+          var reason = (e && e.reason) ? (e.reason.message || String(e.reason)) : '';
+          if (reason.indexOf('WebSocket') !== -1 || reason.indexOf('vite') !== -1) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

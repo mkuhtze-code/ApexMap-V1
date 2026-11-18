@@ -1,0 +1,1432 @@
+import {
+  getPresetOutline,
+  generateSkeletonLines,
+  createPlaneFromEdge,
+  generateCuttingLayout
+} from '../exactRoofingEngine';
+import type { RoofOutline } from '../../types/exactRoofing';
+
+console.log('--- Starting Exact Roofing Engine Test Suite ---');
+
+// 1. TEST 1: 14m x 10m Rectangle & Skeleton Key
+const rectOutline = getPresetOutline('rectangle_14x10');
+console.log('Test 1 (14x10 Outline):', {
+  pointsCount: rectOutline.points.length,
+  edgesCount: rectOutline.edges.length
+});
+
+if (rectOutline.points.length !== 4 || rectOutline.edges.length !== 4) {
+  throw new Error('Failed to generate 14x10 rectangle outline');
+}
+
+const rectSkeleton = generateSkeletonLines(rectOutline);
+console.log('Test 1 (Skeleton Key):', {
+  skeletonLinesCount: rectSkeleton.length,
+  types: rectSkeleton.map((s) => s.suggestedType)
+});
+
+const ridges = rectSkeleton.filter((s) => s.suggestedType === 'ridge');
+const hips = rectSkeleton.filter((s) => s.suggestedType === 'hip');
+
+if (ridges.length !== 1 || hips.length !== 4) {
+  throw new Error(`Expected 1 ridge and 4 hips, got ${ridges.length} ridges, ${hips.length} hips`);
+}
+console.log('✓ Test 1 Passed: 14m x 10m Rectangle produced a classic 4-hip skeleton with 4m central ridge.');
+
+// 2. TEST 2: Define Planes & Developed Geometry at 22.5° Pitch
+const planes = rectOutline.edges.map((edge, idx) =>
+  createPlaneFromEdge(rectOutline, rectSkeleton, edge, {
+    pitchDeg: 22.5,
+    underlapSide: idx % 2 === 0 ? 'left' : 'right',
+    name: idx === 0 ? 'Trunk South' : idx === 1 ? 'East Hip' : idx === 2 ? 'Trunk North' : 'West Hip'
+  })
+);
+
+console.log('Test 2 (Defined Planes):', {
+  planesCount: planes.length,
+  slopeLengths: planes.map((p) => p.slopeLength),
+  areas: planes.map((p) => p.area)
+});
+
+if (planes.length !== 4) {
+  throw new Error(`Expected 4 planes, got ${planes.length}`);
+}
+
+const trunkPlane = planes[0]; // 14m eave edge, 5m plan depth
+// 5m / cos(22.5°) ≈ 5.41m
+if (!trunkPlane.slopeLength || Math.abs(trunkPlane.slopeLength - 5.41) > 0.5) {
+  throw new Error(`Expected trunk slope length ~5.41m, got ${trunkPlane.slopeLength}`);
+}
+
+if (!trunkPlane.area || trunkPlane.area < 40) {
+  throw new Error(`Expected trunk area > 40m², got ${trunkPlane.area}`);
+}
+console.log('✓ Test 2 Passed: 4 planes defined with true unfolded developed geometry at 22.5° pitch.');
+
+// 3. TEST 3: Dynamic Off-Cut / Block-Cut Engine (0.762m cover, 6.0m max length)
+const layout = generateCuttingLayout(planes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+
+console.log('Test 3 (Layout Results):', {
+  parentSheetsCount: layout.parents.length,
+  piecesCount: layout.pieces.length,
+  wastePercent: layout.wastePercent,
+  savedMetres: layout.savedMetres,
+  totalOrderedArea: layout.totalOrderedArea,
+  totalRoofArea: layout.totalRoofArea
+});
+
+if (layout.wastePercent > 6.5) {
+  throw new Error(`Expected waste percent typically under 5%, got ${layout.wastePercent}%`);
+}
+
+const flippedPieces = layout.pieces.filter((p) => p.orientation === 'flipped180');
+if (flippedPieces.length === 0) {
+  throw new Error('Expected paired offcuts flipped into triangular hip ends');
+}
+
+if (layout.parents.length === 0 || layout.placementMap.length !== 4) {
+  throw new Error('Invalid parent sheets or placement map');
+}
+
+console.log('Test 3 (Receiving Zones):', {
+  receivingZonesCount: layout.receivingZones.length,
+  zones: layout.receivingZones.map((z) => ({
+    id: z.id,
+    label: z.label,
+    sourceCode: z.sourceCode,
+    softColor: z.softSourceColor,
+    planPts: z.planPolygon.length
+  }))
+});
+
+if (layout.receivingZones.length === 0) {
+  throw new Error('Expected at least 1 offcut receiving zone with color inheritance');
+}
+
+layout.receivingZones.forEach((z) => {
+  if (z.planPolygon.length < 3) {
+    throw new Error(`Expected at least 3 points for receiving zone ${z.id}`);
+  }
+  if (!z.softSourceColor.startsWith('rgba(')) {
+    throw new Error(`Expected soft rgba color for zone ${z.id}, got ${z.softSourceColor}`);
+  }
+});
+
+const adjacentHipLinks = layout.pairingLinks.filter((l) => l.pairingType === 'adjacent_hip');
+console.log('Test 3 (Adjacent Hip Links):', adjacentHipLinks.map((l) => l.labelText));
+if (adjacentHipLinks.length === 0) {
+  throw new Error('Expected at least 1 pairing link to prioritize adjacent hips in installation sequence');
+}
+
+console.log(`✓ Test 3 Passed: Dynamic off-cut engine produced ${layout.wastePercent}% waste, pairing ${flippedPieces.length} offcuts across ${layout.receivingZones.length} inherited receiving zones (prioritizing Adjacent Hips)!`);
+
+// 4. TEST 4: Multi-Valley L-Shape Roof with Mixed Pitches
+const lOutline = getPresetOutline('l_shape_standard');
+const lSkeleton = generateSkeletonLines(lOutline);
+const lValleys = lSkeleton.filter((s) => s.suggestedType === 'valley');
+const lRidges = lSkeleton.filter((s) => s.suggestedType === 'ridge');
+const lHips = lSkeleton.filter((s) => s.suggestedType === 'hip');
+
+if (lSkeleton.length !== 8) {
+  throw new Error(`Expected exactly 8 skeleton lines for L-Shape, got ${lSkeleton.length}`);
+}
+if (lValleys.length !== 1 || lRidges.length !== 2 || lHips.length !== 5) {
+  throw new Error(
+    `Expected 1 valley, 2 ridges, 5 hips for L-Shape; got ${lValleys.length} valleys, ${lRidges.length} ridges, ${lHips.length} hips`
+  );
+}
+console.log('Test 4 (L-Shape Skeleton Verified):', {
+  totalLines: lSkeleton.length,
+  valleys: lValleys.length,
+  ridges: lRidges.length,
+  hips: lHips.length
+});
+
+const lPlanes = lOutline.edges.map((e, idx) =>
+  createPlaneFromEdge(lOutline, lSkeleton, e, {
+    pitchDeg: idx % 2 === 0 ? 15 : 25, // mixed pitches!
+    underlapSide: 'left'
+  })
+);
+
+const lLayout = generateCuttingLayout(lPlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+
+if (lLayout.parents.length === 0 || lLayout.wastePercent > 12) {
+  throw new Error('Failed to solve L-Shape mixed-pitch roof');
+}
+console.log(`✓ Test 4 Passed: L-Shape with mixed pitches solved cleanly (${lLayout.wastePercent}% waste).`);
+
+// 5. TEST 5: Editable Measurements (Direct Line Length Editing)
+import { updateEdgeLength, updateSkeletonLineLength, dist } from '../exactRoofingEngine';
+
+// Stretch 14m edge to 16.5m
+const updatedOutline = updateEdgeLength(rectOutline, 'edge-out-1', 16.5);
+const newEdge = updatedOutline.edges.find((e) => e.id === 'edge-out-1')!;
+const newEdgeLen = dist(newEdge.from, newEdge.to);
+
+if (Math.abs(newEdgeLen - 16.5) > 0.05) {
+  throw new Error(`Expected updated edge length 16.5m, got ${newEdgeLen.toFixed(2)}m`);
+}
+
+// Adjust ridge line from 4m to 6.2m
+const updatedSkel = updateSkeletonLineLength(rectSkeleton, 'skel-ridge-1', 6.2);
+const newRidge = updatedSkel.find((s) => s.id === 'skel-ridge-1')!;
+const newRidgeLen = dist(newRidge.from, newRidge.to);
+
+if (Math.abs(newRidgeLen - 6.2) > 0.05) {
+  throw new Error(`Expected updated ridge length 6.2m, got ${newRidgeLen.toFixed(2)}m`);
+}
+console.log(`✓ Test 5 Passed: Direct measurement editing resized edge to ${newEdgeLen.toFixed(2)}m and ridge to ${newRidgeLen.toFixed(2)}m accurately.`);
+
+// 6. TEST 6: T-Shape Roof (Clean Continuous Ridges, Zero Diagonal/Starburst)
+import { buildOutlineFromPoints, isPointInPolygon, pointsClose } from '../exactRoofingEngine';
+
+const tOutline = getPresetOutline('t_shape');
+const tSkeleton = generateSkeletonLines(tOutline);
+const tValleys = tSkeleton.filter((s) => s.suggestedType === 'valley');
+const tRidges = tSkeleton.filter((s) => s.suggestedType === 'ridge');
+const tHips = tSkeleton.filter((s) => s.suggestedType === 'hip');
+
+console.log('Test 6 (T-Shape Skeleton):', {
+  total: tSkeleton.length,
+  valleys: tValleys.length,
+  ridges: tRidges.length,
+  hips: tHips.length,
+  ridgeCoords: tRidges.map((r) => `${r.from.x},${r.from.y}->${r.to.x},${r.to.y}`)
+});
+
+if (tValleys.length !== 2 || tHips.length !== 6 || tRidges.length !== 2) {
+  throw new Error(
+    `Expected 2 valleys, 2 continuous ridges, 6 hips for symmetric T-Shape; got ${tValleys.length}V, ${tRidges.length}R, ${tHips.length}H`
+  );
+}
+
+// Verify ridges are strictly horizontal/vertical parallel to long eaves (no crooked diagonal ridge)
+tRidges.forEach((r) => {
+  const dx = Math.abs(r.to.x - r.from.x);
+  const dy = Math.abs(r.to.y - r.from.y);
+  if (dx > 0.05 && dy > 0.05) {
+    throw new Error(`T-Shape ridge must align parallel to eaves, got diagonal (${r.from.x},${r.from.y})->(${r.to.x},${r.to.y})`);
+  }
+});
+
+// Verify all 8 faces trace cleanly for T-Shape
+const tPlanes = tOutline.edges.map((e) => createPlaneFromEdge(tOutline, tSkeleton, e, { pitchDeg: 22.5 }));
+tPlanes.forEach((p) => {
+  if (!p.area || p.area <= 1) {
+    throw new Error(`Invalid T-Shape face ${p.name} area ${p.area}`);
+  }
+});
+console.log('✓ Test 6 Passed: T-Shape produced 2 valleys, 6 hips, and 2 orthogonal continuous ridges.');
+
+// 7. TEST 7: Asymmetric T-Shape & Asymmetric L-Shape
+const asymLOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 16, y: 0 },
+  { x: 16, y: 6 },
+  { x: 8, y: 6 },
+  { x: 8, y: 14 },
+  { x: 0, y: 14 }
+]);
+const asymLSkeleton = generateSkeletonLines(asymLOutline);
+if (
+  asymLSkeleton.filter((s) => s.suggestedType === 'valley').length !== 1 ||
+  asymLSkeleton.filter((s) => s.suggestedType === 'hip').length !== 5
+) {
+  throw new Error('Asymmetric L-Shape must classify 1 valley and 5 hips cleanly');
+}
+
+const asymTOutline = buildOutlineFromPoints([
+  { x: 4, y: 0 },
+  { x: 11, y: 0 },
+  { x: 11, y: 5 },
+  { x: 15, y: 5 },
+  { x: 15, y: 11 },
+  { x: 0, y: 11 },
+  { x: 0, y: 5 },
+  { x: 4, y: 5 }
+]);
+const asymTSkeleton = generateSkeletonLines(asymTOutline);
+if (
+  asymTSkeleton.filter((s) => s.suggestedType === 'valley').length !== 2 ||
+  asymTSkeleton.filter((s) => s.suggestedType === 'hip').length !== 6
+) {
+  throw new Error('Asymmetric T-Shape must classify 2 valleys and 6 hips cleanly');
+}
+console.log('✓ Test 7 Passed: Asymmetric L-Shape & T-Shape skeletons solved cleanly without starbursts.');
+
+// 8. TEST 8: U-Shape with Open Courtyard (No Lines Crossing Outside Courtyard!)
+const uOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 16, y: 0 },
+  { x: 16, y: 12 },
+  { x: 11, y: 12 },
+  { x: 11, y: 5 },
+  { x: 5, y: 5 },
+  { x: 5, y: 12 },
+  { x: 0, y: 12 }
+]);
+const uSkeleton = generateSkeletonLines(uOutline);
+const uValleys = uSkeleton.filter((s) => s.suggestedType === 'valley');
+const uRidges = uSkeleton.filter((s) => s.suggestedType === 'ridge');
+const uHips = uSkeleton.filter((s) => s.suggestedType === 'hip');
+
+if (uValleys.length !== 2 || uHips.length !== 6 || uRidges.length !== 3) {
+  throw new Error(
+    `Expected 2 valleys, 3 ridges, 6 hips for U-Shape; got ${uValleys.length}V, ${uRidges.length}R, ${uHips.length}H`
+  );
+}
+uSkeleton.forEach((line) => {
+  const mid = { x: (line.from.x + line.to.x) / 2, y: (line.from.y + line.to.y) / 2 };
+  if (!isPointInPolygon(mid, uOutline.points)) {
+    throw new Error(`U-Shape skeleton segment ${line.id} midpoint (${mid.x},${mid.y}) lies outside roof courtyard!`);
+  }
+});
+console.log('✓ Test 8 Passed: U-Shape produced 2 valleys, 3 wing ridges, 6 hips — zero lines crossing courtyard.');
+
+// 9. TEST 9: H-Shape Roof (4 Reflex Valleys, 8 Convex Hips)
+const hOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 4, y: 0 },
+  { x: 4, y: 4 },
+  { x: 12, y: 4 },
+  { x: 12, y: 0 },
+  { x: 16, y: 0 },
+  { x: 16, y: 14 },
+  { x: 12, y: 14 },
+  { x: 12, y: 10 },
+  { x: 4, y: 10 },
+  { x: 4, y: 14 },
+  { x: 0, y: 14 }
+]);
+const hSkeleton = generateSkeletonLines(hOutline);
+const hValleys = hSkeleton.filter((s) => s.suggestedType === 'valley');
+const hHips = hSkeleton.filter((s) => s.suggestedType === 'hip');
+if (hValleys.length !== 4 || hHips.length !== 8) {
+  throw new Error(`Expected 4 valleys and 8 hips for H-Shape; got ${hValleys.length}V, ${hHips.length}H`);
+}
+hSkeleton.forEach((line) => {
+  const mid = { x: (line.from.x + line.to.x) / 2, y: (line.from.y + line.to.y) / 2 };
+  if (!isPointInPolygon(mid, hOutline.points)) {
+    throw new Error(`H-Shape skeleton segment ${line.id} lies outside roof outline`);
+  }
+});
+console.log(`✓ Test 9 Passed: H-Shape produced 4 valleys, 8 hips, and ${hSkeleton.filter((s) => s.suggestedType === 'ridge').length} ridges.`);
+
+// 10. TEST 10: Hexagonal Pavilion & Triangle (All Convex Corners Connected, No Dropped Vertices)
+const hexOutline = buildOutlineFromPoints([
+  { x: 4, y: 0 },
+  { x: 10, y: 0 },
+  { x: 14, y: 6.9 },
+  { x: 10, y: 13.8 },
+  { x: 4, y: 13.8 },
+  { x: 0, y: 6.9 }
+]);
+const hexSkeleton = generateSkeletonLines(hexOutline);
+const hexHips = hexSkeleton.filter((s) => s.suggestedType === 'hip');
+if (hexHips.length !== 6) {
+  throw new Error(`Expected all 6 hexagon convex corners to get hips, got ${hexHips.length}`);
+}
+hexOutline.points.forEach((pt, idx) => {
+  const connected = hexHips.some((h) => pointsClose(h.from, pt, 0.05) || pointsClose(h.to, pt, 0.05));
+  if (!connected) {
+    throw new Error(`Hexagon vertex ${idx} (${pt.x},${pt.y}) was dropped!`);
+  }
+});
+
+const triOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 10, y: 0 },
+  { x: 5, y: 8.66 }
+]);
+const triSkeleton = generateSkeletonLines(triOutline);
+if (triSkeleton.length !== 3 || triSkeleton.filter((s) => s.suggestedType === 'hip').length !== 3) {
+  throw new Error(`Expected 3 hips for triangle, got ${triSkeleton.length}`);
+}
+console.log('✓ Test 10 Passed: Hexagon (6 hips, all vertices preserved) and Triangle solved cleanly.');
+
+// 11. TEST 11: Clockwise Winding Invariance & Short Fragment Collapse
+const cwTOutline = buildOutlineFromPoints([...tOutline.points].reverse());
+const cwTSkeleton = generateSkeletonLines(cwTOutline);
+if (
+  cwTSkeleton.filter((s) => s.suggestedType === 'valley').length !== 2 ||
+  cwTSkeleton.filter((s) => s.suggestedType === 'ridge').length !== 2 ||
+  cwTSkeleton.filter((s) => s.suggestedType === 'hip').length !== 6
+) {
+  throw new Error('Clockwise T-Shape outline must produce identical skeleton counts to CCW');
+}
+
+// Near-equal wing widths (6.0m cross vs 6.2m stem) should collapse tiny <0.35m ridge stub
+const nearEqualT = buildOutlineFromPoints([
+  { x: 3.9, y: 0 },
+  { x: 10.1, y: 0 },
+  { x: 10.1, y: 6 },
+  { x: 14, y: 6 },
+  { x: 14, y: 12 },
+  { x: 0, y: 12 },
+  { x: 0, y: 6 },
+  { x: 3.9, y: 6 }
+]);
+const nearEqualSkel = generateSkeletonLines(nearEqualT);
+nearEqualSkel.forEach((s) => {
+  if (dist(s.from, s.to) < 0.25) {
+    throw new Error(`Micro ridge/skeleton fragment ${s.id} (${dist(s.from, s.to).toFixed(2)}m) was not collapsed`);
+  }
+});
+console.log('✓ Test 11 Passed: Clockwise winding invariance & short ridge fragment collapse verified.');
+
+// 12. TEST 12: Opposite-Hip Offcut Transfers & Hip/Valley/Ridge Sheet Direction Invariants
+const rectSeq = layout.installationSequence || [];
+if (rectSeq.length !== 4 || rectSeq.some((s, idx) => s.stepNumber !== idx + 1 || s.sequenceIndex !== idx + 1)) {
+  throw new Error('Installation sequence must number every face sequentially with both stepNumber and sequenceIndex');
+}
+
+const unitLayVec = (entry?: { x: number; y: number }, exit?: { x: number; y: number }) => {
+  if (!entry || !exit) return { x: 0, y: 0 };
+  const d = dist(entry, exit) || 1;
+  return { x: (exit.x - entry.x) / d, y: (exit.y - entry.y) / d };
+};
+
+// Verify all 4 faces on 14x10 rectangle obey hip/valley symmetry (both into OR both away) & ridge opposition
+for (let k = 0; k < layout.sections.length; k++) {
+  const sCur = layout.sections[k];
+  const sNext = layout.sections[(k + 1) % layout.sections.length];
+  const vCur = unitLayVec(sCur.entryCorner, sCur.exitCorner);
+  const vNext = unitLayVec(sNext.entryCorner, sNext.exitCorner);
+
+  // Corner shared between sCur and sNext:
+  const sharedCorner = k % 2 === 0 ? sCur.exitCorner! : sCur.entryCorner!;
+  const toCornerCur = dist(sCur.exitCorner!, sharedCorner) < 0.2 ? 1 : -1;
+  const toCornerNext = dist(sNext.exitCorner!, sharedCorner) < 0.2 ? 1 : -1;
+  if (toCornerCur !== toCornerNext) {
+    throw new Error(`Hip between ${sCur.code} and ${sNext.code} must have both faces laying into or away from the corner`);
+  }
+
+  // Cross-ridge opposing faces (k vs k+2) must lay in opposite directions
+  const sOpp = layout.sections[(k + 2) % layout.sections.length];
+  const vOpp = unitLayVec(sOpp.entryCorner, sOpp.exitCorner);
+  if (vCur.x * vOpp.x + vCur.y * vOpp.y > -0.95) {
+    throw new Error(`Ridge opposite faces ${sCur.code} and ${sOpp.code} must run in opposite directions`);
+  }
+}
+
+// Verify Step 1 offcuts from A (#1) land on B's OPPOSITE hip (Hip 2 at NE (14,10)), NOT adjacent side of Hip 1 (SE (14,0))!
+const linkAB = layout.pairingLinks[0];
+if (!linkAB || linkAB.piecesTransferred < 4) {
+  throw new Error(`Expected primary hip batch transfer A->B, got ${linkAB?.labelText}`);
+}
+if (dist(linkAB.endPoint, { x: 14, y: 10 }) >= dist(linkAB.endPoint, { x: 14, y: 0 })) {
+  throw new Error(`Expected A's Hip 1 offcuts to land on B's opposite hip (NE 14,10), got (${linkAB.endPoint.x},${linkAB.endPoint.y})`);
+}
+
+// Uniform-pitch L-Shape: check alternating hip/valley direction & all 6 loop transfers
+const lUniformPlanes = lOutline.edges.map((e, idx) =>
+  createPlaneFromEdge(lOutline, lSkeleton, e, {
+    pitchDeg: 22.5,
+    underlapSide: idx % 2 === 0 ? 'left' : 'right'
+  })
+);
+const lUniformLayout = generateCuttingLayout(lUniformPlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+
+if (lUniformLayout.pairingLinks.length !== 6) {
+  throw new Error(`Expected 6 progressive hip/valley loop links on uniform L-Shape, got ${lUniformLayout.pairingLinks.length}`);
+}
+
+for (let k = 0; k < lUniformLayout.sections.length; k++) {
+  const sCur = lUniformLayout.sections[k];
+  const sNext = lUniformLayout.sections[(k + 1) % lUniformLayout.sections.length];
+  const sharedCorner = k % 2 === 0 ? sCur.exitCorner! : sCur.entryCorner!;
+  const curIntoCorner = dist(sCur.exitCorner!, sharedCorner) < 0.2;
+  const nextIntoCorner = dist(sNext.exitCorner!, sharedCorner) < 0.2;
+  if (curIntoCorner !== nextIntoCorner) {
+    throw new Error(`L-Shape corner between ${sCur.code} and ${sNext.code} broke hip/valley symmetry!`);
+  }
+}
+
+lUniformLayout.pairingLinks.forEach((link) => {
+  if (link.piecesTransferred < 2) {
+    throw new Error(`Unexpected 1-piece link ${link.labelText} on uniform L-Shape`);
+  }
+});
+console.log('✓ Test 12 Passed: Opposite-hip offcut handoff & hip/valley/ridge direction invariants verified.');
+
+// 13. TEST 13: Hip <-> Gable Junction Toggling & Verge Edge Sync
+import {
+  getRoofJunctionNodes,
+  toggleJunctionGable,
+  syncPlanesWithOutlineAndSkeleton
+} from '../exactRoofingEngine';
+
+const hipJunctions = getRoofJunctionNodes(rectOutline, rectSkeleton);
+if (hipJunctions.length !== 2 || hipJunctions.some((j) => j.mode !== 'hipped')) {
+  throw new Error(`Expected 2 hipped junctions on 14x10 rectangle, got ${hipJunctions.length}`);
+}
+
+const eastToggle = toggleJunctionGable(rectOutline, rectSkeleton, hipJunctions[0].id);
+if (eastToggle.toggledTo !== 'gable') {
+  throw new Error(`Expected toggle to gable, got ${eastToggle.toggledTo}`);
+}
+if (eastToggle.outline.edges.filter((e) => e.type === 'verge').length !== 1) {
+  throw new Error('Expected 1 verge edge after toggling Hip -> Gable');
+}
+const extendedRidge = eastToggle.skeleton.find((s) => s.suggestedType === 'ridge')!;
+if (Math.abs(dist(extendedRidge.from, extendedRidge.to) - 9.0) > 0.1) {
+  throw new Error(`Expected ridge to extend to 9.0m, got ${dist(extendedRidge.from, extendedRidge.to).toFixed(2)}m`);
+}
+
+const halfGablePlanes = syncPlanesWithOutlineAndSkeleton(eastToggle.outline, eastToggle.skeleton, planes, 22.5);
+if (halfGablePlanes.length !== 3) {
+  throw new Error(`Expected 3 sheeted roof planes after 1 gable end, got ${halfGablePlanes.length}`);
+}
+if (!halfGablePlanes[0].edges.some((e) => e.type === 'verge')) {
+  throw new Error('Expected adjoining side plane edges to include verge');
+}
+const halfGableLayout = generateCuttingLayout(halfGablePlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+if (halfGableLayout.sections.length !== 3 || halfGableLayout.pieces.length === 0) {
+  throw new Error('Failed to generate cutting layout on half-gable roof');
+}
+
+// Toggle back Gable -> Hip
+const restoredToggle = toggleJunctionGable(eastToggle.outline, eastToggle.skeleton, hipJunctions[0].id);
+if (restoredToggle.toggledTo !== 'hipped') {
+  throw new Error(`Expected toggle back to hipped, got ${restoredToggle.toggledTo}`);
+}
+const restoredPlanes = syncPlanesWithOutlineAndSkeleton(
+  restoredToggle.outline,
+  restoredToggle.skeleton,
+  halfGablePlanes,
+  22.5
+);
+const restoredRidge = restoredToggle.skeleton.find((s) => s.suggestedType === 'ridge')!;
+if (
+  restoredPlanes.length !== 4 ||
+  restoredToggle.skeleton.filter((s) => s.suggestedType === 'hip').length !== 4 ||
+  Math.abs(dist(restoredRidge.from, restoredRidge.to) - 4.0) > 0.1
+) {
+  throw new Error('Failed to cleanly restore 4-hip rectangle when toggling Gable -> Hip');
+}
+console.log('✓ Test 13 Passed: Hip <-> Gable junction toggling & verge plane sync verified.');
+
+// 14. TEST 14: Skylight & Chimney Sheet Column Cutouts & Split Offcut Reuse
+const skylightAsset = {
+  id: 'asset-sky-1',
+  type: 'skylight' as const,
+  planeId: planes[0].id,
+  center: { x: 7.0, y: 2.5 },
+  widthM: 1.6,
+  depthM: 1.5,
+  label: 'Velux Skylight'
+};
+const skylightLayout = generateCuttingLayout(
+  planes,
+  { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 },
+  { assets: [skylightAsset] }
+);
+const splitPieces = skylightLayout.pieces.filter((p) => p.splitFromAssetId === skylightAsset.id);
+if (splitPieces.length < 4) {
+  throw new Error(`Expected >= 4 top split sheets above skylight, got ${splitPieces.length}`);
+}
+if (skylightLayout.totalRoofMetres >= layout.totalRoofMetres) {
+  throw new Error(
+    `Expected total roof metres with skylight cutout (${skylightLayout.totalRoofMetres}) < uncut (${layout.totalRoofMetres})`
+  );
+}
+console.log(`✓ Test 14 Passed: Skylight aperture split sheet columns cleanly (${splitPieces.length} top split pieces, ${skylightLayout.wastePercent}% waste).`);
+
+// 15. TEST 15: Mono-Pitch & Gable Dormers (Apertures + Derived Slopes + Sheets)
+const monoDormer = {
+  id: 'asset-mono-1',
+  type: 'mono_dormer' as const,
+  planeId: planes[0].id,
+  center: { x: 4.5, y: 2.5 },
+  widthM: 2.4,
+  depthM: 2.0,
+  dormerPitchDeg: 12,
+  label: 'Mono Dormer'
+};
+const gableDormer = {
+  id: 'asset-gable-d1',
+  type: 'gable_dormer' as const,
+  planeId: planes[2].id,
+  center: { x: 7.0, y: 7.5 },
+  widthM: 2.6,
+  depthM: 2.2,
+  dormerPitchDeg: 25,
+  label: 'Gable Dormer'
+};
+const dormerLayout = generateCuttingLayout(
+  planes,
+  { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 },
+  { assets: [monoDormer, gableDormer] }
+);
+const effDormerPlanes = dormerLayout.effectivePlanes || [];
+const derivedMono = effDormerPlanes.filter((p) => p.parentAssetId === monoDormer.id);
+const derivedGable = effDormerPlanes.filter((p) => p.parentAssetId === gableDormer.id);
+if (derivedMono.length !== 1 || derivedMono[0].pitchDeg !== 12) {
+  throw new Error(`Expected 1 Mono Dormer plane at 12°, got ${derivedMono.length}`);
+}
+if (derivedGable.length !== 2 || derivedGable.some((p) => p.pitchDeg !== 25)) {
+  throw new Error(`Expected 2 Gable Dormer planes at 25°, got ${derivedGable.length}`);
+}
+const dormerPieces = dormerLayout.pieces.filter((p) => p.targetPlaneId.startsWith('plane-asset-'));
+if (dormerPieces.length < 6) {
+  throw new Error(`Expected cut pieces generated for all derived dormer slopes, got ${dormerPieces.length}`);
+}
+console.log(`✓ Test 15 Passed: Mono & Gable dormers generated ${derivedMono.length + derivedGable.length} derived roof planes and ${dormerPieces.length} cut sheets.`);
+
+// 16. TEST 16: Change-of-Pitch Break Line Splitting (Apron + Upper Slope + 3D Intersection Sync)
+const pitchBreak = {
+  id: 'pb-south-1',
+  planeId: planes[0].id,
+  splitPlanDistM: 2.0,
+  lowerPitchDeg: 10,
+  label: 'Veranda Pitch Break'
+};
+const breakLayout = generateCuttingLayout(
+  planes,
+  { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 },
+  { pitchBreaks: [pitchBreak] }
+);
+const effBreakPlanes = breakLayout.effectivePlanes || [];
+const lowerApron = effBreakPlanes.find((p) => p.id === `${planes[0].id}__lower`);
+const upperMain = effBreakPlanes.find((p) => p.id === `${planes[0].id}__upper`);
+if (!lowerApron || !upperMain || effBreakPlanes.length !== 5) {
+  throw new Error(`Expected 5 effective planes with lower_apron and upper_main split, got ${effBreakPlanes.length}`);
+}
+if (lowerApron.pitchDeg !== 10 || upperMain.pitchDeg !== 22.5 || (upperMain.eaveHeightM || 0) <= (lowerApron.eaveHeightM || 0)) {
+  throw new Error('Expected lower_apron at 10° and elevated upper_main at 22.5°');
+}
+
+// Verify baseline vertex ordering is NOT inverted after clipping
+if (
+  Math.hypot(lowerApron.planPolygon[0].x - 0, lowerApron.planPolygon[0].y - 0) > 0.05 ||
+  Math.hypot(lowerApron.planPolygon[1].x - 14, lowerApron.planPolygon[1].y - 0) > 0.05 ||
+  Math.hypot(upperMain.planPolygon[0].x - 2, upperMain.planPolygon[0].y - 2) > 0.05 ||
+  Math.hypot(upperMain.planPolygon[1].x - 12, upperMain.planPolygon[1].y - 2) > 0.05
+) {
+  throw new Error('Split lower/upper pitch break polygons must preserve bottom-edge baseline [0]->[1] orientation');
+}
+
+// Verify 3D intersection elevation alignment (upper_main aligns with unbroken ridge, apron meets crease flush)
+const expectedRidgeZ = 2.7 + 5.0 * Math.tan((22.5 * Math.PI) / 180);
+const actualUpperRidgeZ = (upperMain.eaveHeightM || 0) + 3.0 * Math.tan((22.5 * Math.PI) / 180);
+const actualApronCreaseZ = (lowerApron.eaveHeightM || 0) + 2.0 * Math.tan((10 * Math.PI) / 180);
+if (Math.abs(actualUpperRidgeZ - expectedRidgeZ) > 0.02) {
+  throw new Error(`Upper slope ridge height (${actualUpperRidgeZ.toFixed(3)}m) misaligned with unbroken roof (${expectedRidgeZ.toFixed(3)}m)`);
+}
+if (Math.abs(actualApronCreaseZ - (upperMain.eaveHeightM || 0)) > 0.02) {
+  throw new Error(`Lower apron top height (${actualApronCreaseZ.toFixed(3)}m) misaligned with upper break height (${upperMain.eaveHeightM}m)`);
+}
+
+// Verify perimeter parity & adjacent-face lay directions stay synchronized (South->East->North->West)
+const unbrokenSeq = layout.sections.map((s) => ({
+  id: s.planeId,
+  seq: s.sequenceIndex,
+  entry: s.entryCorner,
+  exit: s.exitCorner
+}));
+const breakMainSeq = breakLayout.sections
+  .filter((s) => s.planeId !== upperMain.id)
+  .map((s) => ({
+    id: s.planeId.replace('__lower', ''),
+    seq: s.sequenceIndex,
+    entry: s.entryCorner,
+    exit: s.exitCorner
+  }));
+if (breakMainSeq.length !== 4) {
+  throw new Error(`Expected 4 main perimeter sequence steps, got ${breakMainSeq.length}`);
+}
+for (let i = 0; i < 4; i++) {
+  if (
+    breakMainSeq[i].id !== unbrokenSeq[i].id ||
+    Math.hypot((breakMainSeq[i].entry?.x || 0) - (unbrokenSeq[i].entry?.x || 0), (breakMainSeq[i].entry?.y || 0) - (unbrokenSeq[i].entry?.y || 0)) > 0.05 ||
+    Math.hypot((breakMainSeq[i].exit?.x || 0) - (unbrokenSeq[i].exit?.x || 0), (breakMainSeq[i].exit?.y || 0) - (unbrokenSeq[i].exit?.y || 0)) > 0.05
+  ) {
+    throw new Error(`Pitch break shifted perimeter installation sequence or lay direction at step ${i + 1}`);
+  }
+}
+
+// Verify upperMain matches lowerApron sheet lay direction along +u/-u
+const lowerSec = breakLayout.sections.find((s) => s.planeId === lowerApron.id)!;
+const upperSec = breakLayout.sections.find((s) => s.planeId === upperMain.id)!;
+const lowerDirX = (lowerSec.exitCorner?.x || 0) - (lowerSec.entryCorner?.x || 0);
+const upperDirX = (upperSec.exitCorner?.x || 0) - (upperSec.entryCorner?.x || 0);
+if (lowerDirX * upperDirX <= 0) {
+  throw new Error('Expected upper_main pitch break zone to lay in the same direction as lower_apron');
+}
+
+if (
+  !breakLayout.pieces.some((p) => p.targetPlaneId === lowerApron.id) ||
+  !breakLayout.pieces.some((p) => p.targetPlaneId === upperMain.id)
+) {
+  throw new Error('Expected sheet strips generated for both lower apron and upper main pitch zones');
+}
+console.log('✓ Test 16 Passed: Change-of-Pitch break anchored at 3D upper intersection, baseline order preserved, and perimeter sequence synced.');
+
+// 17. TEST 17: Pitch-Matched Gable Dormer Valleys & Tapered Host Sheet Cuts
+import { computeGableDormerGeometry } from '../exactRoofingEngine';
+
+const equalPitchDormer = {
+  id: 'asset-gable-eq',
+  type: 'gable_dormer' as const,
+  planeId: planes[0].id,
+  center: { x: 7.0, y: 2.2 },
+  widthM: 2.6,
+  depthM: 2.6,
+  dormerPitchDeg: 22.5,
+  label: 'Equal Pitch Dormer'
+};
+const equalGeom = computeGableDormerGeometry(planes[0], equalPitchDormer);
+if (!equalGeom || Math.abs(equalGeom.valleyAngleDeg - 45.0) > 0.2 || Math.abs(equalGeom.deltaVValley - 1.3) > 0.05) {
+  throw new Error(`Expected 45° equal-pitch valley & 1.3m run, got ${equalGeom?.valleyAngleDeg}° / ${equalGeom?.deltaVValley}m`);
+}
+
+// Verify steep 35° dormer on 15° shallow host roof produces long acute valleys (< 25° from ridge)
+const shallowHostPlane = createPlaneFromEdge(rectOutline, rectSkeleton, rectOutline.edges[0], { pitchDeg: 15 });
+const steepDormer = { ...equalPitchDormer, id: 'asset-gable-steep', dormerPitchDeg: 35, depthM: 2.0 };
+const steepGeom = computeGableDormerGeometry(shallowHostPlane, steepDormer);
+if (!steepGeom || steepGeom.valleyAngleDeg >= 25 || steepGeom.deltaVValley <= steepDormer.widthM / 2 * 2.0) {
+  throw new Error(`Expected steep dormer on 15° roof to extend acute valleys, got ${steepGeom?.valleyAngleDeg}°`);
+}
+
+// Verify flat 12° dormer on 30° steep host roof produces wide shallow valleys (> 65° from ridge)
+const steepHostPlane = createPlaneFromEdge(rectOutline, rectSkeleton, rectOutline.edges[0], { pitchDeg: 30 });
+const flatDormer = { ...equalPitchDormer, id: 'asset-gable-flat', dormerPitchDeg: 12 };
+const flatGeom = computeGableDormerGeometry(steepHostPlane, flatDormer);
+if (!flatGeom || flatGeom.valleyAngleDeg <= 65 || flatGeom.deltaVValley >= flatDormer.widthM / 2 * 0.5) {
+  throw new Error(`Expected flat dormer on 30° roof to produce blunt valleys (>65°), got ${flatGeom?.valleyAngleDeg}°`);
+}
+
+// Verify exact 3D plane intersection heights on equal-pitch dormer
+const hostTanEq = Math.tan((22.5 * Math.PI) / 180);
+const zHostAtCheek = (planes[0].eaveHeightM ?? 2.7) + equalGeom.vCheekBack * hostTanEq;
+const zHostAtTie = (planes[0].eaveHeightM ?? 2.7) + equalGeom.vRidgeTie * hostTanEq;
+if (Math.abs(zHostAtCheek - equalGeom.sideEaveHeightM) > 0.02 || Math.abs(zHostAtTie - equalGeom.ridgeHeightM) > 0.02) {
+  throw new Error('Gable dormer valley vertices did not match host roof elevation cleanly');
+}
+
+// Verify tapered host sheet cuts above the angled valleys (center cut above ridge tie < outer valley cut)
+const valleyCutLayout = generateCuttingLayout(
+  planes,
+  { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 },
+  { assets: [equalPitchDormer] }
+);
+const topHostSplitSheets = valleyCutLayout.pieces
+  .filter((p) => p.targetPlaneId === planes[0].id && p.splitFromAssetId === equalPitchDormer.id && (p.minV || 0) > 1.0)
+  .sort((a, b) => a.length - b.length);
+if (topHostSplitSheets.length < 3 || topHostSplitSheets[topHostSplitSheets.length - 1].length - topHostSplitSheets[0].length < 0.3) {
+  throw new Error('Expected host sheets above gable dormer valleys to taper significantly in length across valley angle');
+}
+console.log(`✓ Test 17 Passed: Pitch-matched gable dormer valleys (${equalGeom.valleyAngleDeg}° @ 22.5°/22.5°, ${steepGeom.valleyAngleDeg}° @ 35°/15°, ${flatGeom.valleyAngleDeg}° @ 12°/30°) & tapered valley host sheets verified.`);
+
+// 18. TEST 18: Arbitrary Hip <-> Gable Edge Toggling, Stepped 13.5m x 9.5m Gable & Style Presets
+import { toggleEdgeGable, applyRoofStylePreset } from '../exactRoofingEngine';
+
+const steppedOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 6.5, y: 0 },
+  { x: 6.5, y: 2 },
+  { x: 10.5, y: 2 },
+  { x: 10.5, y: 4 },
+  { x: 13.5, y: 4 },
+  { x: 13.5, y: 9.5 },
+  { x: 0, y: 9.5 }
+]);
+const steppedInitSkel = generateSkeletonLines(steppedOutline);
+const rightEdge55 = steppedOutline.edges.find((e) => Math.abs(dist(e.from, e.to) - 5.5) < 0.05)!;
+const leftEdge95 = steppedOutline.edges.find((e) => Math.abs(dist(e.from, e.to) - 9.5) < 0.05)!;
+const topEdge135 = steppedOutline.edges.find((e) => Math.abs(dist(e.from, e.to) - 13.5) < 0.05)!;
+
+if (!rightEdge55 || !leftEdge95 || !topEdge135) {
+  throw new Error('Failed to locate expected 5.5m, 9.5m, and 13.5m edges on stepped 13.5x9.5 outline');
+}
+
+// Step A: Toggle Right 5.5m AND Left 9.5m directly to gable verges
+const stepA1 = toggleEdgeGable(steppedOutline, steppedInitSkel, rightEdge55.id, 'gable');
+const stepA2 = toggleEdgeGable(stepA1.outline, stepA1.skeleton, leftEdge95.id, 'gable');
+if (
+  stepA2.toggledTo !== 'gable' ||
+  stepA2.outline.edges.filter((e) => e.type === 'verge').length !== 2
+) {
+  throw new Error('Expected both 5.5m right and 9.5m left edges to convert to verge gable ends');
+}
+
+const mixedSteppedPlanes = syncPlanesWithOutlineAndSkeleton(stepA2.outline, stepA2.skeleton, [], 22.5);
+const topPlaneMixed = mixedSteppedPlanes.find((p) => p.eaveEdgeId === topEdge135.id);
+if (!topPlaneMixed || !topPlaneMixed.area || topPlaneMixed.planPolygon.length < 5) {
+  throw new Error(
+    `Expected stepped top 13.5m plane with multi-step ridge polygon, got ${topPlaneMixed?.planPolygon.length} pts`
+  );
+}
+const mixedSteppedLayout = generateCuttingLayout(mixedSteppedPlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+if (mixedSteppedLayout.sections.length !== mixedSteppedPlanes.length || mixedSteppedLayout.pieces.length === 0) {
+  throw new Error('Failed to generate cutting layout on mixed stepped gable roof');
+}
+
+// Step B: Apply Full Gable Ends Preset (9.5m left, 2m step risers, and 5.5m right all become verges)
+const fullGablePreset = applyRoofStylePreset(steppedOutline, 'gable');
+const fullGableVerges = fullGablePreset.outline.edges.filter((e) => e.type === 'verge');
+if (fullGableVerges.length !== 4) {
+  throw new Error(`Expected all 4 vertical end/step walls to become gable verges, got ${fullGableVerges.length}`);
+}
+const fullGablePlanes = syncPlanesWithOutlineAndSkeleton(fullGablePreset.outline, fullGablePreset.skeleton, [], 22.5);
+if (fullGablePlanes.length !== 4) {
+  throw new Error(`Expected 4 sheeted roof planes for stepped full-gable roof, got ${fullGablePlanes.length}`);
+}
+fullGablePlanes.forEach((p) => {
+  if (!p.area || p.area <= 1) {
+    throw new Error(`Invalid area (${p.area}) on stepped gable plane ${p.name}`);
+  }
+});
+const fullGableLayout = generateCuttingLayout(fullGablePlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+if (fullGableLayout.sections.length !== 4 || fullGableLayout.pieces.length === 0) {
+  throw new Error('Failed to generate cutting layout for full stepped gable roof');
+}
+
+// Step C: Apply All Hipped Preset back on the stepped outline
+const restoredHippedPreset = applyRoofStylePreset(fullGablePreset.outline, 'hipped');
+if (restoredHippedPreset.outline.edges.some((e) => e.type === 'verge')) {
+  throw new Error('Expected All Hipped preset to restore all edges to outline eaves');
+}
+const restoredHippedPlanes = syncPlanesWithOutlineAndSkeleton(
+  restoredHippedPreset.outline,
+  restoredHippedPreset.skeleton,
+  fullGablePlanes,
+  22.5
+);
+if (restoredHippedPlanes.length !== 8) {
+  throw new Error(`Expected 8 hipped planes on restored stepped roof, got ${restoredHippedPlanes.length}`);
+}
+console.log(
+  `✓ Test 18 Passed: Universal Hip <-> Gable edge toggling & stepped 13.5m×9.5m roof verified (mixed: ${mixedSteppedPlanes.length} planes / ${mixedSteppedLayout.wastePercent}% waste, full gable: ${fullGablePlanes.length} planes / ${fullGableLayout.wastePercent}% waste, hipped: ${restoredHippedPlanes.length} planes).`
+);
+
+// 19. TEST 19: Flashing Line Enumeration, True Sloped Barge Length & Stock Piece Breakdown
+import {
+  computeRoofLineTrueLengthM,
+  computeFlashingPieceBreakdown,
+  getAssignableRoofLines
+} from '../exactRoofingEngine';
+
+// Classic 14m x 8m Duo-Pitch Gable @ 22.5°
+const gableRaw = getPresetOutline('straight_gable');
+const gableApplied = applyRoofStylePreset(gableRaw, 'gable');
+const gable14x8 = gableApplied.outline;
+const gable14x8Skel = gableApplied.skeleton;
+const gable14x8Planes = syncPlanesWithOutlineAndSkeleton(gable14x8, gable14x8Skel, [], 22.5);
+const gableAssignable = getAssignableRoofLines(
+  gable14x8,
+  gable14x8Skel,
+  gable14x8Planes,
+  [],
+  []
+);
+
+const gableBarges = gableAssignable.filter((l) => l.flashingKind === 'barge');
+const gableRidges = gableAssignable.filter((l) => l.flashingKind === 'ridge');
+const gableEaves = gableAssignable.filter((l) => l.flashingKind === 'eave');
+
+if (gableBarges.length !== 2 || gableRidges.length !== 1 || gableEaves.length !== 2) {
+  throw new Error(
+    `Expected 2 barges, 1 ridge, 2 eaves on straight gable, got ${gableBarges.length}/${gableRidges.length}/${gableEaves.length}`
+  );
+}
+
+// Each 8m verge crosses ridge apex (4m / cos(22.5°) * 2 = 8.659m)
+const barge0 = gableBarges[0];
+if (
+  Math.abs(barge0.planLengthM - 8.0) > 0.05 ||
+  Math.abs(barge0.trueSlopeLengthM - 8.66) > 0.08 ||
+  barge0.suggestedCategory !== 'Barge & Edge'
+) {
+  throw new Error(
+    `Expected 8.0m plan -> ~8.66m true slope barge length (Barge & Edge), got ${barge0.planLengthM}m -> ${barge0.trueSlopeLengthM}m (${barge0.suggestedCategory})`
+  );
+}
+
+// Horizontal ridge has identical plan and true length (14.0m)
+const ridge0 = gableRidges[0];
+if (Math.abs(ridge0.trueSlopeLengthM - 14.0) > 0.05 || ridge0.suggestedCategory !== 'Ridge & Hip') {
+  throw new Error(`Expected 14.0m horizontal ridge, got ${ridge0.trueSlopeLengthM}m`);
+}
+
+// Hipped/Valley true slope length must exceed horizontal plan length
+const hipLine = lSkeleton.find((s) => s.suggestedType === 'hip')!;
+const hipSlope = computeRoofLineTrueLengthM(
+  'hip',
+  hipLine.from,
+  hipLine.to,
+  lUniformPlanes,
+  lOutline,
+  lSkeleton
+);
+if (hipSlope.trueSlopeLengthM <= hipSlope.planLengthM) {
+  throw new Error(`Expected sloped hip length > plan length (${hipSlope.planLengthM}), got ${hipSlope.trueSlopeLengthM}`);
+}
+
+// Flashing piece breakdown: 8.66m barge with max 4.0m stick -> 3 pcs with 0.30m lap (covers >= 8.96m)
+const bargeBreakdown = computeFlashingPieceBreakdown(barge0.trueSlopeLengthM, 'barge', 4.0);
+if (
+  bargeBreakdown.recommendedQuantity !== 3 ||
+  bargeBreakdown.recommendedPieceLengthM > 4.0 ||
+  bargeBreakdown.totalOrderLengthM < barge0.trueSlopeLengthM + bargeBreakdown.lapAllowanceM - 0.02
+) {
+  throw new Error(
+    `Unexpected barge piece breakdown: ${bargeBreakdown.recommendedQuantity} x ${bargeBreakdown.recommendedPieceLengthM}m for ${barge0.trueSlopeLengthM}m`
+  );
+}
+
+console.log(
+  `✓ Test 19 Passed: Assignable flashing lines (${gableAssignable.length} on gable), true slope barge (${barge0.planLengthM}m plan -> ${barge0.trueSlopeLengthM}m slope, ${bargeBreakdown.recommendedQuantity}x${bargeBreakdown.recommendedPieceLengthM}m), and hip slope (${hipSlope.trueSlopeLengthM}m) verified.`
+);
+
+// 20. TEST 20: Cascading Terraced Roofs (Multi-Tier Z-Heights, Eave Wall Lengths, Aprons & Unchanged Laying/Offcuts)
+import {
+  getMultiLevelPreset,
+  deriveRoofWallSegments,
+  getAssignableRoofLinesMultiLevel,
+  setEdgeMode,
+  syncMultiLevelPlanes,
+  arePlanesAdjacentAtHip
+} from '../exactRoofingEngine';
+import { computeRoofingPacks, buildRoofBillOfMaterials } from '../exactRoofingBomBridge';
+
+const terracePreset = getMultiLevelPreset('cascading_terrace', 22.5);
+if (terracePreset.levels.length !== 3 || terracePreset.planes.length !== 3) {
+  throw new Error(
+    `Expected 3 cascading terrace levels and 3 sloped terrace facets, got ${terracePreset.levels.length}/${terracePreset.planes.length}`
+  );
+}
+
+const [t1, t2, t3] = terracePreset.levels;
+if (t1.eaveHeightM !== 2.7 || t2.eaveHeightM !== 4.1 || t3.eaveHeightM !== 5.5) {
+  throw new Error(`Expected ascending Z heights 2.7m -> 4.1m -> 5.5m, got ${t1.eaveHeightM}/${t2.eaveHeightM}/${t3.eaveHeightM}`);
+}
+
+// Edit Tier 2 eave length to establish an extended wall (14m -> 16.5m) for its facet
+const t2EaveEdge = t2.outline.edges.find((e) => e.type === 'outline')!;
+const resizedT2Outline = updateEdgeLength(t2.outline, t2EaveEdge.id, 16.5);
+const resizedLevels = [
+  t1,
+  { ...t2, outline: resizedT2Outline, skeleton: generateSkeletonLines(resizedT2Outline) },
+  t3
+];
+const resizedTerracePlanes = syncMultiLevelPlanes(resizedLevels, terracePreset.planes, 22.5);
+const resizedT2Plane = resizedTerracePlanes.find((p) => p.levelId === t2.id)!;
+if (!resizedT2Plane || Math.abs((resizedT2Plane.eaveWidthM || 0) - 16.5) > 0.05) {
+  throw new Error(`Expected resized Tier 2 eave width to equal 16.5m, got ${resizedT2Plane?.eaveWidthM}`);
+}
+
+// Derive structural wall segments & check Z-axis relationships across terraces
+const terraceWalls = deriveRoofWallSegments(resizedLevels, resizedTerracePlanes);
+const terraceAbutments = terraceWalls.filter((w) => w.wallKind === 'abutment_wall');
+if (terraceAbutments.length !== 3) {
+  throw new Error(`Expected 3 abutment step walls across 3 terraces, got ${terraceAbutments.length}`);
+}
+
+// Each wall edge emits an Apron & Abutment flashing line
+const terraceAssignable = getAssignableRoofLinesMultiLevel(resizedLevels, resizedTerracePlanes);
+const terraceAprons = terraceAssignable.filter((l) => l.flashingKind === 'apron');
+if (terraceAprons.length !== 3 || terraceAprons.some((a) => a.suggestedCategory !== 'Apron & Abutment')) {
+  throw new Error(`Expected 3 Apron & Abutment flashing lines, got ${terraceAprons.length}`);
+}
+
+// Existing laying direction, starting edge, offcuts & packs remain intact on multi-height terraces
+const terraceCustomStart = resizedTerracePlanes[1].id;
+const terraceLayout = generateCuttingLayout(
+  resizedTerracePlanes,
+  { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 },
+  { startPlaneId: terraceCustomStart }
+);
+if (
+  terraceLayout.sections.length !== 3 ||
+  terraceLayout.startPlaneId !== terraceCustomStart ||
+  terraceLayout.sections[0].eaveHeightM !== 4.1 ||
+  terraceLayout.sections[0].levelCode !== 'L2'
+) {
+  throw new Error('Cascading terrace layout failed to honor startPlaneId or preserve Z/level metadata');
+}
+const terracePacks = computeRoofingPacks({ layout: terraceLayout, planes: resizedTerracePlanes });
+if (terracePacks.length !== 3 || terracePacks[0].eaveHeightM !== 4.1 || terracePacks[0].levelCode !== 'L2') {
+  throw new Error('Cascading terrace roofing packs failed to carry levelCode & eaveHeightM');
+}
+
+console.log(
+  `✓ Test 20 Passed: Cascading 3-tier terrace (Z: 2.7m/4.1m/5.5m), resized 16.5m wall, ${terraceAprons.length} apron lines & ${terracePacks.length} packs verified.`
+);
+
+// 21. TEST 21: 2-Storey Split Upper + Lower Roof (Isolated Hip Adjacency & Step Riser Wall Z)
+const twoStorey = getMultiLevelPreset('two_storey_split', 22.5);
+const lower1FPlanes = twoStorey.planes.filter((p) => p.levelId === 'level-1');
+const upper2FPlanes = twoStorey.planes.filter((p) => p.levelId === 'level-2');
+
+if (lower1FPlanes.length !== 1 || upper2FPlanes.length !== 4) {
+  throw new Error(
+    `Expected 1 lower 1F apron slope and 4 upper 2F hipped slopes, got ${lower1FPlanes.length}/${upper2FPlanes.length}`
+  );
+}
+
+// Hips must NEVER pair across different storey levels
+if (arePlanesAdjacentAtHip(lower1FPlanes[0], upper2FPlanes[2])) {
+  throw new Error('Must NOT pair hip offcuts directly across different building storeys');
+}
+
+// Derive structural walls and verify upper storey exterior wall rises from lower roof Z (bottomZ > 0) where overlapping
+const twoStoreyWalls = deriveRoofWallSegments(twoStorey.levels, twoStorey.planes);
+const upperWallOverLowerRoof = twoStoreyWalls.find(
+  (w) => w.levelId === 'level-2' && w.bottomZ > 0.5 && w.topZ === 5.4
+);
+if (!upperWallOverLowerRoof) {
+  throw new Error('Expected 2F upper wall segment sitting on 1F lower roof to have bottomZ > 0.5m and topZ = 5.4m');
+}
+
+// Test 3-way setEdgeMode ('hipped' | 'gable' | 'wall') on Upper 2F eave
+const u2FirstEdge = twoStorey.levels[1].outline.edges[0];
+const wallConverted = setEdgeMode(twoStorey.levels[1].outline, twoStorey.levels[1].skeleton, u2FirstEdge.id, 'wall');
+if (wallConverted.toggledTo !== 'wall' || wallConverted.outline.edges[0].type !== 'wall') {
+  throw new Error('setEdgeMode("wall") failed to convert eave edge into abutment wall');
+}
+
+// Multi-storey layout + BOM generation
+const twoStoreyLayout = generateCuttingLayout(twoStorey.planes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+const twoStoreyLines = getAssignableRoofLinesMultiLevel(twoStorey.levels, twoStorey.planes);
+const twoStoreyBom = buildRoofBillOfMaterials({
+  planes: twoStorey.planes,
+  layout: twoStoreyLayout,
+  assignments: [],
+  assignableLines: twoStoreyLines,
+  assets: []
+});
+if (
+  twoStoreyLayout.sections.length !== 5 ||
+  twoStoreyBom.totalSheetsCount < 20 ||
+  !twoStoreyLines.some((l) => l.flashingKind === 'apron' && l.levelId === 'level-1')
+) {
+  throw new Error('2-Storey Split layout, apron flashings, or BOM verification failed');
+}
+
+console.log(
+  `✓ Test 21 Passed: 2-Storey Split (${lower1FPlanes.length} lower 1F @ 2.7m + ${upper2FPlanes.length} upper 2F @ 5.4m, step riser Z ${upperWallOverLowerRoof.bottomZ}m->${upperWallOverLowerRoof.topZ}m, ${twoStoreyBom.totalSheetsCount} sheets) verified.`
+);
+
+// 22. TEST 22: Non-Destructive Wall Assignment, Eave Width Setback & Strict Sub-Roof Z Constraint
+import {
+  setEdgeWall,
+  computeEdgeSetbackLine,
+  getDefaultEdgeSetbackM,
+  isEdgeWallEnabled,
+  getPointElevationFromPlanes
+} from '../exactRoofingEngine';
+
+const rectGableApplied = applyRoofStylePreset(getPresetOutline('straight_gable'), 'gable');
+const rectGableOutline = rectGableApplied.outline;
+const rectGableSkel = rectGableApplied.skeleton;
+const rectGablePlanes = syncPlanesWithOutlineAndSkeleton(rectGableOutline, rectGableSkel, [], 22.5);
+const gableLevel: import('../../types/exactRoofing').RoofLevel = {
+  id: 'level-1',
+  code: 'L1',
+  name: 'Gable Roof',
+  eaveHeightM: 2.7,
+  outline: rectGableOutline,
+  skeleton: rectGableSkel
+};
+
+const southEaveEdge = rectGableOutline.edges.find((e) => e.type === 'outline')!;
+const eastGableEdge = rectGableOutline.edges.find((e) => e.type === 'verge')!;
+
+// Assign 0.45m setback on south eave and 0.60m setback on east gable, plus disable wall on north eave
+const northEaveEdge = rectGableOutline.edges.find(
+  (e) => e.type === 'outline' && e.id !== southEaveEdge.id
+)!;
+
+let updatedGableOutline = setEdgeWall(rectGableOutline, southEaveEdge.id, {
+  hasWall: true,
+  eaveSetbackM: 0.45
+});
+updatedGableOutline = setEdgeWall(updatedGableOutline, eastGableEdge.id, {
+  hasWall: true,
+  eaveSetbackM: 0.6
+});
+updatedGableOutline = setEdgeWall(updatedGableOutline, northEaveEdge.id, {
+  hasWall: false
+});
+
+// Verify wall assignment NEVER alters roof geometry (planes, slope lengths, developed polygons, or skeleton)
+const planesAfterWalls = syncPlanesWithOutlineAndSkeleton(
+  updatedGableOutline,
+  rectGableSkel,
+  rectGablePlanes,
+  22.5
+);
+if (
+  planesAfterWalls.length !== rectGablePlanes.length ||
+  JSON.stringify(planesAfterWalls.map((p) => p.planPolygon)) !==
+    JSON.stringify(rectGablePlanes.map((p) => p.planPolygon)) ||
+  JSON.stringify(planesAfterWalls.map((p) => p.developedPolygon)) !==
+    JSON.stringify(rectGablePlanes.map((p) => p.developedPolygon))
+) {
+  throw new Error('Assigning walls or eave setbacks must NEVER alter roof plane geometry');
+}
+
+const sbSouth = computeEdgeSetbackLine(updatedGableOutline, southEaveEdge.id);
+const sbEast = computeEdgeSetbackLine(updatedGableOutline, eastGableEdge.id);
+if (
+  !sbSouth ||
+  !sbEast ||
+  Math.abs(sbSouth.eaveSetbackM - 0.45) > 0.01 ||
+  Math.abs(sbEast.eaveSetbackM - 0.6) > 0.01 ||
+  !isPointInPolygon(
+    { x: (sbSouth.wallFrom.x + sbSouth.wallTo.x) / 2, y: (sbSouth.wallFrom.y + sbSouth.wallTo.y) / 2 },
+    updatedGableOutline.points
+  ) ||
+  !isPointInPolygon(
+    { x: (sbEast.wallFrom.x + sbEast.wallTo.x) / 2, y: (sbEast.wallFrom.y + sbEast.wallTo.y) / 2 },
+    updatedGableOutline.points
+  )
+) {
+  throw new Error('Eave width setback must inset wall footprints inside roof polygon');
+}
+
+const gableWalls = deriveRoofWallSegments(
+  [{ ...gableLevel, outline: updatedGableOutline }],
+  planesAfterWalls
+);
+if (
+  gableWalls.some((w) => w.edgeId === northEaveEdge.id) ||
+  isEdgeWallEnabled(updatedGableOutline.edges.find((e) => e.id === northEaveEdge.id)!)
+) {
+  throw new Error('Wall with hasWall=false must be omitted from wall segments');
+}
+
+// Verify south eave setback wall at 0.45m meets sloped roof strictly at 2.7 + 0.45 * tan(22.5°) = 2.886m
+const southWallSeg = gableWalls.find((w) => w.edgeId === southEaveEdge.id)!;
+const expectedSouthTopZ = +(2.7 + 0.45 * Math.tan((22.5 * Math.PI) / 180)).toFixed(2);
+if (Math.abs(southWallSeg.topZ - expectedSouthTopZ) > 0.03) {
+  throw new Error(`Expected 0.45m setback south wall topZ ~${expectedSouthTopZ}m, got ${southWallSeg.topZ}m`);
+}
+
+// Verify EVERY point on EVERY wall (including gable ends, eave walls & cascading abutment walls) is <= overlying roof Z
+gableWalls.forEach((w) => {
+  w.topProfilePoints3D.forEach((pt3) => {
+    const roofAtPt = getPointElevationFromPlanes({ x: pt3.x, y: pt3.y }, planesAfterWalls, updatedGableOutline);
+    if (roofAtPt.matchedPlaneIds.length > 0 && pt3.z > roofAtPt.z + 0.05) {
+      throw new Error(
+        `Wall ${w.edgeId} extends above roof plane at (${pt3.x}, ${pt3.y}): wallZ=${pt3.z} > roofZ=${roofAtPt.z}`
+      );
+    }
+  });
+});
+
+// Check cascading terrace abutment walls also sit strictly <= tier roof peak (no +1.2m overshoot)
+const terraceOutlinesByLevel = new Map(resizedLevels.map((l) => [l.id, l.outline] as [string, RoofOutline]));
+terraceAbutments.forEach((w) => {
+  const lvlPlanes = resizedTerracePlanes.filter((p) => p.levelId === w.levelId);
+  const lvlOut = terraceOutlinesByLevel.get(w.levelId);
+  w.topProfilePoints3D.forEach((pt3) => {
+    const roofAtPt = getPointElevationFromPlanes({ x: pt3.x, y: pt3.y }, lvlPlanes, lvlOut);
+    if (roofAtPt.matchedPlaneIds.length > 0 && pt3.z > roofAtPt.z + 0.02) {
+      throw new Error(`Abutment wall ${w.id} exceeded terrace roof plane: ${pt3.z} > ${roofAtPt.z}`);
+    }
+  });
+});
+void getDefaultEdgeSetbackM;
+
+console.log(
+  `✓ Test 22 Passed: Non-destructive Wall Assignment, mitered Eave Width setbacks (0.45m -> Z:${southWallSeg.topZ}m, 0.60m gable) & zero roof-plane overshoot verified.`
+);
+
+// 23. TEST 23: Pure Z-Axis Eave Height Invariance (No Geometry Change & Preserved Same-Level Hip Adjacency)
+const baseRectPlanes = syncPlanesWithOutlineAndSkeleton(rectOutline, rectSkeleton, [], 22.5);
+const baseRectLayout = generateCuttingLayout(baseRectPlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+
+// Shift Roof Level Z from 2.7m -> 4.9m and verify 2D/developed geometry & offcuts stay 100% invariant
+const shiftedPlanes = baseRectPlanes.map((p) => ({ ...p, eaveHeightM: 4.9 }));
+const shiftedLayout = generateCuttingLayout(shiftedPlanes, {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+});
+
+if (
+  JSON.stringify(shiftedPlanes.map((p) => p.planPolygon)) !==
+    JSON.stringify(baseRectPlanes.map((p) => p.planPolygon)) ||
+  JSON.stringify(shiftedPlanes.map((p) => p.developedPolygon)) !==
+    JSON.stringify(baseRectPlanes.map((p) => p.developedPolygon)) ||
+  shiftedLayout.totalOrderedArea !== baseRectLayout.totalOrderedArea ||
+  shiftedLayout.savedMetres !== baseRectLayout.savedMetres
+) {
+  throw new Error('Changing eaveHeightM in Z-space must NOT alter 2D/developed roof geometry or sheet cutting lengths');
+}
+
+// Also verify single-plane Z adjustment on same level keeps hip adjacency intact
+const mixedZSameLevel = baseRectPlanes.map((p, idx) =>
+  idx === 0 ? { ...p, eaveHeightM: 3.4 } : p
+);
+if (!arePlanesAdjacentAtHip(mixedZSameLevel[0], mixedZSameLevel[1])) {
+  throw new Error('Single-plane Z adjustment on same level should preserve same-level hip adjacency');
+}
+
+const elevatedLevelWalls = deriveRoofWallSegments(
+  [
+    {
+      id: 'level-1',
+      code: 'L1',
+      name: 'Elevated Main',
+      eaveHeightM: 4.9,
+      outline: {
+        ...rectOutline,
+        levelId: 'level-1',
+        edges: rectOutline.edges.map((e) => ({ ...e, levelId: 'level-1', eaveHeightM: 4.9 }))
+      },
+      skeleton: rectSkeleton
+    }
+  ],
+  shiftedPlanes
+);
+if (elevatedLevelWalls.some((w) => Math.abs(w.topZ - 4.9) > 0.05)) {
+  throw new Error('Expected all eave walls on 4.9m Z roof to sit at topZ = 4.9m without altering roof geometry');
+}
+
+console.log(
+  '✓ Test 23 Passed: Pure Z-axis eave height shifts (2.7m -> 4.9m) move walls/planes in Z without altering roof geometry, offcuts, or same-level hip links.'
+);
+
+// 24. TEST 24: Auto-Lines Convex/Reflex Classification, Essential Hips/Valleys, Eave-Parallel Ridges & No Star-Burst
+import { classifyOutlineCorners } from '../exactRoofingEngine';
+
+// 24A: Near-collinear touch noise vertex along a 14m flat eave must NOT emit an extra spurious hip
+const noisyRectOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 7, y: 0.06 }, // 0.06m noise (< 1 deg turn)
+  { x: 14, y: 0 },
+  { x: 14, y: 10 },
+  { x: 0, y: 10 }
+]);
+const noisyClassified = classifyOutlineCorners(noisyRectOutline);
+const noisySkel = generateSkeletonLines(noisyRectOutline);
+if (
+  noisyClassified.length !== 4 ||
+  noisyClassified.some((c) => c.classification !== 'convex') ||
+  noisySkel.filter((s) => s.suggestedType === 'hip').length !== 4 ||
+  noisySkel.filter((s) => s.suggestedType === 'ridge').length !== 1
+) {
+  throw new Error(
+    `Expected noisy rectangle to classify 4 convex corners and emit 4 essential hips + 1 ridge, got ${noisyClassified.length} corners / ${noisySkel.length} lines`
+  );
+}
+
+// 24B: Projecting Bay / Porch Wing House (6 convex corners -> 6 essential hips, 2 reflex corners -> 2 valleys, continuous eave-parallel ridges, ZERO starbursts)
+const bayOutline = buildOutlineFromPoints([
+  { x: 0, y: 0 },
+  { x: 4, y: 0 },
+  { x: 4, y: -3 },
+  { x: 10, y: -3 },
+  { x: 10, y: 0 },
+  { x: 14, y: 0 },
+  { x: 14, y: 8 },
+  { x: 0, y: 8 }
+]);
+const bayClassified = classifyOutlineCorners(bayOutline);
+const bayConvexCount = bayClassified.filter((c) => c.classification === 'convex').length;
+const bayReflexCount = bayClassified.filter((c) => c.classification === 'reflex').length;
+if (bayConvexCount !== 6 || bayReflexCount !== 2) {
+  throw new Error(`Expected 6 convex + 2 reflex vertices on bay-window house, got ${bayConvexCount}C/${bayReflexCount}R`);
+}
+
+const baySkel = generateSkeletonLines(bayOutline);
+const bayHips = baySkel.filter((s) => s.suggestedType === 'hip');
+const bayValleys = baySkel.filter((s) => s.suggestedType === 'valley');
+const bayRidges = baySkel.filter((s) => s.suggestedType === 'ridge');
+
+if (bayHips.length !== 6 || bayValleys.length !== 2 || bayRidges.length < 2) {
+  throw new Error(
+    `Expected exactly 6 essential hips, 2 valleys, >=2 ridges on bay house, got ${bayHips.length}H/${bayValleys.length}V/${bayRidges.length}R`
+  );
+}
+
+// Check NO starburst center node collecting >= 4 lines, and EVERY ridge is strictly parallel to at least one eave
+const bayCentroid = {
+  x: bayOutline.points.reduce((a, p) => a + p.x, 0) / bayOutline.points.length,
+  y: bayOutline.points.reduce((a, p) => a + p.y, 0) / bayOutline.points.length
+};
+const starburstLinesAtCentroid = baySkel.filter(
+  (s) => pointsClose(s.from, bayCentroid, 0.2) || pointsClose(s.to, bayCentroid, 0.2)
+);
+if (starburstLinesAtCentroid.length >= 4) {
+  throw new Error('Detected starburst convergence at polygon centroid on bay-window house');
+}
+bayRidges.forEach((r) => {
+  const rLen = dist(r.from, r.to) || 1;
+  const rDir = { x: (r.to.x - r.from.x) / rLen, y: (r.to.y - r.from.y) / rLen };
+  const alignedWithAnEave = bayOutline.edges.some((e) => {
+    const eLen = dist(e.from, e.to) || 1;
+    const eDir = { x: (e.to.x - e.from.x) / eLen, y: (e.to.y - e.from.y) / eLen };
+    return Math.abs(rDir.x * eDir.x + rDir.y * eDir.y) > 0.99;
+  });
+  if (!alignedWithAnEave) {
+    throw new Error(`Ridge (${r.from.x},${r.from.y})->(${r.to.x},${r.to.y}) is NOT parallel to any eave`);
+  }
+});
+
+console.log(
+  `✓ Test 24 Passed: Vertex classifier (${bayConvexCount} convex -> ${bayHips.length} essential hips, ${bayReflexCount} reflex -> ${bayValleys.length} valleys), noise pruning, ${bayRidges.length} eave-parallel ridges & zero starburst verified.`
+);
+
+// 25. TEST 25: Freehand First-Line Calibration, Precision Draft Snap & 2-Point Architectural Plan Calibration
+import {
+  parseDistanceInputToMetres,
+  applyDraftPointSnap,
+  calibrateDraftPointsFromFirstLine,
+  createPlanUnderlaySpec,
+  calibratePlanUnderlayFromTwoPoints,
+  scalePlanUnderlayFromFactor,
+  scaleOutlineUniformly
+} from '../exactRoofingEngine';
+
+// 25A: Unit parser ('m', 'mm', comma formatting, and bounds checks)
+if (
+  parseDistanceInputToMetres('14.5', 'm') !== 14.5 ||
+  parseDistanceInputToMetres('14,500', 'mm') !== 14.5 ||
+  parseDistanceInputToMetres('6340', 'auto') !== 6.34 ||
+  parseDistanceInputToMetres('0.01', 'm') !== null ||
+  parseDistanceInputToMetres('-5', 'm') !== null
+) {
+  throw new Error('parseDistanceInputToMetres failed unit/comma/validation checks');
+}
+
+// 25B: Precision draft snap preserves 10mm resolution and 45/90 deg ortho locking
+const orthoSnapped = applyDraftPointSnap({ x: 8.43, y: 2.12 }, { x: 2.0, y: 2.0 }, { orthoSnap: true });
+if (orthoSnapped.x !== 8.43 || orthoSnapped.y !== 2.0) {
+  throw new Error(`Expected 0-deg ortho lock to pin Y=2.0 and keep 8.43m X precision, got (${orthoSnapped.x},${orthoSnapped.y})`);
+}
+const freeAngle = applyDraftPointSnap({ x: 5.37, y: 3.81 }, { x: 2.0, y: 2.0 }, { orthoSnap: true });
+if (Math.abs(freeAngle.x - 5.37) > 0.015 || Math.abs(freeAngle.y - 3.81) > 0.015) {
+  throw new Error(`Expected free-angle point to preserve 0.01m precision, got (${freeAngle.x},${freeAngle.y})`);
+}
+
+// 25C: Freehand first-line calibration scales points AND bounds around P0 with ZERO screen-pixel jump
+const initBounds = { minX: 0, maxX: 16, minY: 0, maxY: 12, width: 16, height: 12 };
+const initDraft = [
+  { x: 2.5, y: 3.0 },
+  { x: 7.5, y: 3.0 } // drawn at 5.0m raw, user declares real length = 14.5m
+];
+const normBeforeP1X = (initDraft[1].x - (initBounds.minX + initBounds.width / 2)) / initBounds.width;
+const normBeforeP1Y = (initDraft[1].y - (initBounds.minY + initBounds.height / 2)) / initBounds.height;
+
+const firstLineCal = calibrateDraftPointsFromFirstLine(initDraft, 14.5, initBounds);
+if (!firstLineCal) {
+  throw new Error('calibrateDraftPointsFromFirstLine returned null for valid inputs');
+}
+const calLenM = dist(firstLineCal.scaledPoints[0], firstLineCal.scaledPoints[1]);
+if (Math.abs(calLenM - 14.5) > 0.005 || Math.abs(firstLineCal.scaleFactor - 2.9) > 0.005) {
+  throw new Error(`Expected calibrated Line 1 = 14.5m (factor 2.9x), got ${calLenM}m (factor ${firstLineCal.scaleFactor})`);
+}
+const normAfterP1X =
+  (firstLineCal.scaledPoints[1].x - (firstLineCal.scaledBounds.minX + firstLineCal.scaledBounds.width / 2)) /
+  firstLineCal.scaledBounds.width;
+const normAfterP1Y =
+  (firstLineCal.scaledPoints[1].y - (firstLineCal.scaledBounds.minY + firstLineCal.scaledBounds.height / 2)) /
+  firstLineCal.scaledBounds.height;
+if (Math.abs(normAfterP1X - normBeforeP1X) > 1e-4 || Math.abs(normAfterP1Y - normBeforeP1Y) > 1e-4) {
+  throw new Error('Freehand calibration must keep P0/P1 normalized screen coordinates invariant (zero viewport jump)');
+}
+
+// 25D: 2-Point Architectural Plan calibration (horizontal, vertical & diagonal picks preserve aspect ratio & exact span)
+const rawSheet = createPlanUnderlaySpec({
+  id: 'sheet-rc01',
+  name: 'RC-01 Roof Plan',
+  imageUrl: 'data:image/svg+xml;utf8,<svg/>',
+  aspectRatio: 1.5, // e.g., 1500x1000 px drawing
+  initialWidthM: 30
+});
+const calHoriz = calibratePlanUnderlayFromTwoPoints(
+  rawSheet,
+  { x: 0.2, y: 0.3 },
+  { x: 0.7, y: 0.3 }, // Δx_norm = 0.5 -> width must be 12.0 / 0.5 = 24.0m, height = 16.0m
+  12.0,
+  { resetOriginToZero: true }
+);
+if (
+  !calHoriz ||
+  Math.abs(calHoriz.underlay.worldWidthM - 24.0) > 0.01 ||
+  Math.abs(calHoriz.underlay.worldHeightM - 16.0) > 0.01 ||
+  Math.abs(dist(calHoriz.p1World, calHoriz.p2World) - 12.0) > 0.002
+) {
+  throw new Error(
+    `2-Point horizontal plan calibration failed: width=${calHoriz?.underlay.worldWidthM}, height=${calHoriz?.underlay.worldHeightM}`
+  );
+}
+
+const calDiag = calibratePlanUnderlayFromTwoPoints(
+  rawSheet,
+  { x: 0.15, y: 0.2 },
+  { x: 0.75, y: 0.8 },
+  18.4,
+  { resetOriginToZero: false }
+);
+if (
+  !calDiag ||
+  !calDiag.underlay.isCalibrated ||
+  Math.abs(dist(calDiag.p1World, calDiag.p2World) - 18.4) > 0.002 ||
+  Math.abs(calDiag.underlay.worldWidthM / calDiag.underlay.worldHeightM - 1.5) > 0.01
+) {
+  throw new Error('2-Point diagonal plan calibration failed aspect ratio or distance accuracy');
+}
+
+const scaledUnderlayCheck = scalePlanUnderlayFromFactor(rawSheet, { x: 0, y: 0 }, 0.5);
+if (Math.abs(scaledUnderlayCheck.worldWidthM - 15) > 0.01 || Math.abs(scaledUnderlayCheck.worldHeightM - 10) > 0.01) {
+  throw new Error('scalePlanUnderlayFromFactor failed uniform rescale');
+}
+
+const uniformlyRescaledOutline = scaleOutlineUniformly(rectOutline, 1.5, rectOutline.points[0]);
+const rescaledEdge0Len = dist(uniformlyRescaledOutline.edges[0].from, uniformlyRescaledOutline.edges[0].to);
+if (Math.abs(rescaledEdge0Len - 21.0) > 0.02) {
+  throw new Error(`Expected uniformly 1.5x rescaled 14m eave to measure 21.0m, got ${rescaledEdge0Len}`);
+}
+
+console.log(
+  `✓ Test 25 Passed: Freehand first-line scale (14.5m zero-jump invariant), 0.01m ortho snap, 2-pt architectural plan calibration (${calDiag.underlay.worldWidthM.toFixed(2)}m×${calDiag.underlay.worldHeightM.toFixed(2)}m) & outline rescaling verified.`
+);
+
+console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

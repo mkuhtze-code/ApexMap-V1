@@ -1,0 +1,129 @@
+import assert from 'node:assert/strict';
+import {
+  buildAutoFlashingAssignments,
+  computeIdealUnderlapSideForPlane,
+  getMinimumPitchForProfile,
+  normalizeAndVerifyAiRoofOutline,
+  runDeterministicRoofAudit
+} from '../exactRoofingAiBridge';
+import {
+  generateCuttingLayout,
+  generateSkeletonLines,
+  getAssignableRoofLinesMultiLevel,
+  getPresetOutline,
+  syncMultiLevelPlanes
+} from '../exactRoofingEngine';
+import { RoofLevel, SheetSpec } from '../../types/exactRoofing';
+import { DEFAULT_ARCHITECTURAL_PROFILES } from '../sheetMetalGeometry';
+
+const sheetSpec: SheetSpec = {
+  coverWidth: 0.762,
+  maxLength: 6.0,
+  endLap: 0.15,
+  overhang: 0.05
+};
+
+// 1. Test AI Polygon Closed-Loop Orthogonalization & Micro-Vertex Cleanup
+{
+  // Slightly skewed near-rectangular L-shape from Vision scan + tiny 0.2m noise vertex
+  const noisyRaw = [
+    { x: 0.1, y: 0.1 },
+    { x: 14.0, y: 0.32 }, // ~0.9 deg skew -> snaps horizontal
+    { x: 14.08, y: 8.0 }, // ~0.6 deg skew -> snaps vertical
+    { x: 8.0, y: 8.15 },
+    { x: 7.9, y: 12.0 },
+    { x: 4.0, y: 12.0 }, // Collinear along bottom edge -> simplified cleanly
+    { x: 0.05, y: 12.05 }
+  ];
+  const verified = normalizeAndVerifyAiRoofOutline(noisyRaw, 22.5);
+  assert.ok(verified.points.length >= 5, 'Preserves L-shape outer corners');
+  assert.ok(verified.skeleton.length >= 3, 'Generates valid roof skeleton lines');
+  assert.ok(verified.repairsApplied.length > 0, 'Logs geometric snap & cleanup repairs');
+  assert.equal(verified.pitchDeg, 22.5);
+}
+
+// 2. Test Profile Minimum Pitch Rules (NZMRM Code of Practice)
+{
+  assert.equal(getMinimumPitchForProfile('TRS Corrugate 0.55mm'), 8);
+  assert.equal(getMinimumPitchForProfile('TRS Plumbdeck Trapezoidal 0.55mm'), 3);
+  assert.equal(getMinimumPitchForProfile('Archtech Super Seam 38mm'), 1.5);
+}
+
+// 3. Test Deterministic Self-Audit Catching Low Pitch + Wind Side-Lap + Unassigned Flashings
+{
+  const outline = getPresetOutline('rectangle_14x10');
+  const skeleton = generateSkeletonLines(outline);
+  const levels: RoofLevel[] = [
+    {
+      id: 'level-1',
+      code: 'L1',
+      name: 'Main Roof',
+      eaveHeightM: 2.7,
+      outline,
+      skeleton
+    }
+  ];
+  // Force shallow 4° pitch (fails Corrugate 8° minimum) & uniform 'left' underlaps
+  const planes = syncMultiLevelPlanes(levels, [], 4).map((p) => ({
+    ...p,
+    underlapSide: 'left' as const
+  }));
+  const layout = generateCuttingLayout(planes, sheetSpec);
+  const assignableLines = getAssignableRoofLinesMultiLevel(levels, planes, [], []);
+
+  const report = runDeterministicRoofAudit({
+    planes,
+    levels,
+    layout,
+    sheetSpec,
+    assignableLines,
+    flashingAssignments: [],
+    profileName: 'TRS Corrugate 0.55mm',
+    windZone: 'Very High',
+    prevailingWind: 'SW'
+  });
+
+  assert.equal(report.status, 'Action Required');
+  assert.ok(
+    report.recommendedPatches.some((p) => p.op === 'set_plane_pitch' && p.valueNumber === 8),
+    'Detects Corrugate sub-8 degree pitch and proposes exact 8° fix patch'
+  );
+  assert.ok(
+    report.recommendedPatches.some((p) => p.op === 'set_plane_direction'),
+    'Detects exposed wind side-lap and proposes flip patch'
+  );
+  assert.ok(
+    report.recommendedPatches.some((p) => p.op === 'auto_assign_flashings'),
+    'Detects unassigned ridge/hip flashings and proposes auto-assign patch'
+  );
+
+  // Check auto-assignment matches NZ profiles across all critical roof lines
+  const autoFlashings = buildAutoFlashingAssignments({
+    assignableLines,
+    existingAssignments: [],
+    libraryProfiles: DEFAULT_ARCHITECTURAL_PROFILES,
+    material: '0.55mm ColorCote Vitor+',
+    colorName: 'FlaxPod'
+  });
+  const criticalLinesCount = assignableLines.filter((l) => l.flashingKind !== 'eave').length;
+  assert.equal(autoFlashings.length, criticalLinesCount, 'Auto-assigns every critical roof flashing line');
+}
+
+// 4. Test Ideal Wind Underlap Symmetry on Opposing Roof Slopes
+{
+  const outline = getPresetOutline('rectangle_14x10');
+  const skeleton = generateSkeletonLines(outline);
+  const levels: RoofLevel[] = [
+    { id: 'level-1', code: 'L1', name: 'Main Roof', eaveHeightM: 2.7, outline, skeleton }
+  ];
+  const planes = syncMultiLevelPlanes(levels, [], 22.5);
+  const southSlope = planes[0];
+  const northSlope = planes[2];
+  assert.notEqual(
+    computeIdealUnderlapSideForPlane(southSlope, 'W'),
+    computeIdealUnderlapSideForPlane(northSlope, 'W'),
+    'Opposing North vs South slopes mirror their leeward side-lap direction against West wind'
+  );
+}
+
+console.log('✓ All exactRoofingAiBridge deterministic + AI verification tests passed!');

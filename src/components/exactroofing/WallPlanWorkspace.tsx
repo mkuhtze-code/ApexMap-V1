@@ -74,6 +74,7 @@ interface Props {
   onUpdateWallFacet: (updatedFacet: WallFacet) => void;
   wallFilterMode?: WallFilterMode;
   onChangeWallFilterMode?: (mode: WallFilterMode) => void;
+  onBuildRoofFromWalls?: (plan: WallPlan) => void;
   initialSubView?: 'plan' | 'elevation';
   readOnly?: boolean;
 }
@@ -92,6 +93,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   onUpdateWallFacet,
   wallFilterMode: propWallFilterMode,
   onChangeWallFilterMode,
+  onBuildRoofFromWalls,
   initialSubView = 'plan',
   readOnly = false
 }) => {
@@ -779,6 +781,18 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                   <span>Sync Roof Tops</span>
                 </button>
               )}
+
+              {wallPlan && wallPlan.points.length >= 3 && onBuildRoofFromWalls && (
+                <button
+                  type="button"
+                  onClick={() => onBuildRoofFromWalls(wallPlan)}
+                  className="px-2.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer shadow-sm"
+                  title="Copy wall outline to active roof level as RoofOutline (no auto skeleton)"
+                >
+                  <Compass className="w-3.5 h-3.5" />
+                  <span>Build Roof</span>
+                </button>
+              )}
             </>
           )}
         </div>
@@ -914,6 +928,30 @@ export const WallPlanWorkspace: React.FC<Props> = ({
           </div>
         </div>
       )}
+
+      {/* Seed Roof Banner when a wall outline exists before roof */}
+      {!readOnly &&
+        !isDrawing &&
+        wallPlan &&
+        wallPlan.facets.length >= 3 &&
+        levels.every((l) => l.outline.points.length < 3) &&
+        onBuildRoofFromWalls && (
+          <div className="bg-indigo-950/45 border border-indigo-500/40 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 text-indigo-200">
+              <Compass className="w-4 h-4 text-indigo-400 shrink-0" />
+              <span className="font-bold">
+                Wall plan closed ({wallPlan.facets.length} faces) — ready to seed the roof footprint in site metres.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => onBuildRoofFromWalls(wallPlan)}
+              className="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-extrabold cursor-pointer"
+            >
+              Build roof from wall plan
+            </button>
+          </div>
+        )}
 
       {/* Undetailed Faces Prompt Strip */}
       {takeoffSummary.undetailedCount > 0 && nextUndetailedFacet && !isDrawing && (

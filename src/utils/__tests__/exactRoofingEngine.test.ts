@@ -1976,4 +1976,157 @@ console.log(
   '✓ Test 33 Passed: Abutment roof draw parity (infinite host snap + shorter/equal/longer colinear wall tagging) verified.'
 );
 
+// 34. TEST 34: Explicit Penetration Placement Relationships (From Eave, From Apex, From Side, Cut Aperture & Plane Reassign)
+import {
+  computeAssetPlacementMetrics,
+  updateAssetFromPlacement,
+  repositionAssetToPlane,
+  resolveEffectivePlanesWithAssets
+} from '../exactRoofingEngine';
+import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
+import { deriveWallPlanFromRoofLevels } from '../wallCladdingEngine';
+
+const gablePreset34 = getMultiLevelPreset('straight_gable', 22.5);
+const hostFaceA = gablePreset34.planes[0];
+const hostFaceB = gablePreset34.planes[1];
+
+const rawSkylight: import('../../types/exactRoofing').RoofAsset = {
+  id: 'asset-skylight-34',
+  type: 'skylight',
+  planeId: hostFaceA.id,
+  center: {
+    x: (hostFaceA.planPolygon[0].x + hostFaceA.planPolygon[1].x) / 2,
+    y: hostFaceA.planPolygon[0].y + 2.0 * (hostFaceA.runDirection?.y ?? 1)
+  },
+  widthM: 1.2,
+  depthM: 1.5,
+  label: 'Skylight 1'
+};
+
+// Move skylight explicitly to 1.40m from eave along slope
+const placedFromEave = updateAssetFromPlacement(hostFaceA, rawSkylight, {
+  distFromEaveM: 1.4,
+  offsetFromLeftM: 4.5
+});
+const mEave = computeAssetPlacementMetrics(hostFaceA, placedFromEave);
+if (
+  Math.abs((placedFromEave.distFromEaveM ?? -1) - 1.4) > 0.03 ||
+  Math.abs(mEave.distFromEaveM - 1.4) > 0.03 ||
+  Math.abs((placedFromEave.offsetFromLeftM ?? -1) - 4.5) > 0.03 ||
+  Math.abs(
+    mEave.distFromEaveM + mEave.depthSlopeM + mEave.distFromApexM - mEave.runSlopeM
+  ) > 0.06
+) {
+  throw new Error(
+    `Expected skylight distFromEave=1.40m & sum(eave+depthSlope+apex)=runSlope (${mEave.distFromEaveM}+${mEave.depthSlopeM}+${mEave.distFromApexM} vs ${mEave.runSlopeM})`
+  );
+}
+
+// Now anchor from apex (0.85m clearance from ridge) & confirm eave distance shifts accordingly
+const placedFromApex = updateAssetFromPlacement(hostFaceA, placedFromEave, {
+  distFromApexM: 0.85
+});
+const mApex = computeAssetPlacementMetrics(hostFaceA, placedFromApex);
+if (
+  Math.abs((placedFromApex.distFromApexM ?? -1) - 0.85) > 0.03 ||
+  Math.abs(mApex.distFromApexM - 0.85) > 0.03 ||
+  mApex.distFromEaveM <= mEave.distFromEaveM
+) {
+  throw new Error(
+    `Expected distFromApex=0.85m to shift skylight upslope cleanly (got apex=${mApex.distFromApexM}, eave=${mApex.distFromEaveM})`
+  );
+}
+
+// Confirm cut-layout apertures reflect the updated placement & reassigning plane works cleanly
+const resolved34 = resolveEffectivePlanesWithAssets([hostFaceA, hostFaceB], [placedFromApex], []);
+const effectiveHostA = resolved34.find((p) => p.id === hostFaceA.id)!;
+if (!effectiveHostA.apertures || effectiveHostA.apertures.length !== 1) {
+  throw new Error('Expected hostFaceA to emit 1 aperture synced with placed skylight');
+}
+const movedToB = repositionAssetToPlane(hostFaceB, placedFromApex);
+if (movedToB.planeId !== hostFaceB.id || movedToB.distFromEaveM === undefined) {
+  throw new Error('repositionAssetToPlane failed to reassign host plane and placement metrics');
+}
+console.log(
+  `✓ Test 34 Passed: Skylight/penetration Eave (${mEave.distFromEaveM}m) <-> Apex (${mApex.distFromApexM}m) relationships & aperture sync verified.`
+);
+
+// 35. TEST 35: Takeoff Completeness Evaluator (Undetailed Walls, Return Faces, Flashings, Planes & Penetrations)
+const uWallSeed35 = deriveWallPlanFromRoofLevels(
+  [
+    createRoofLevel(1, 'U-Courtyard', 2.7, [
+      { x: 0, y: 0 },
+      { x: 14, y: 0 },
+      { x: 14, y: 8 },
+      { x: 10, y: 8 },
+      { x: 10, y: 4 },
+      { x: 4, y: 4 },
+      { x: 4, y: 8 },
+      { x: 0, y: 8 }
+    ])
+  ],
+  2.7
+)!;
+const lines35 = getAssignableRoofLinesMultiLevel(gablePreset34.levels, gablePreset34.planes);
+const criticalLines35 = lines35.filter((l) => l.flashingKind !== 'eave');
+
+const incompleteReport = evaluateTakeoffCompleteness({
+  levels: gablePreset34.levels,
+  planes: gablePreset34.planes,
+  assignableLines: lines35,
+  flashingAssignments: [],
+  wallPlan: uWallSeed35,
+  assets: [{ ...placedFromApex, planeId: 'missing-plane-id' }]
+});
+
+if (
+  incompleteReport.isComplete ||
+  incompleteReport.undetailedWallsCount !== 8 ||
+  incompleteReport.undetailedReturnsCount !== 3 ||
+  incompleteReport.unassignedFlashingsCount !== criticalLines35.length ||
+  incompleteReport.incompletePenetrationsCount !== 1
+) {
+  throw new Error(
+    `Takeoff completeness counts mismatch: ${JSON.stringify({
+      undetailedWalls: incompleteReport.undetailedWallsCount,
+      undetailedReturns: incompleteReport.undetailedReturnsCount,
+      unassignedFlashings: incompleteReport.unassignedFlashingsCount,
+      incompletePenetrations: incompleteReport.incompletePenetrationsCount
+    })}`
+  );
+}
+
+// Resolve all issues: assign cladding to all 8 walls, assign all critical flashings, fix asset host plane
+const completeReport = evaluateTakeoffCompleteness({
+  levels: gablePreset34.levels,
+  planes: gablePreset34.planes,
+  assignableLines: lines35,
+  flashingAssignments: criticalLines35.map((l) => ({
+    id: `fa-${l.lineId}`,
+    lineId: l.lineId,
+    lineLabel: l.label,
+    flashingKind: l.flashingKind,
+    profileId: 'prof-1',
+    profileName: 'Standard Flashing',
+    planLengthM: l.planLengthM,
+    trueSlopeLengthM: l.trueSlopeLengthM,
+    pieceLengthLm: 4,
+    quantity: l.recommendedQuantity,
+    totalLinearMetres: l.totalOrderLengthM,
+    assignedAt: new Date().toISOString()
+  })),
+  wallPlan: {
+    ...uWallSeed35,
+    facets: uWallSeed35.facets.map((f) => ({ ...f, claddingType: 'weatherboard' }))
+  },
+  assets: [placedFromApex]
+});
+
+if (!completeReport.isComplete || completeReport.totalIssuesCount !== 0) {
+  throw new Error(`Expected completeReport.isComplete=true after resolving issues, got ${completeReport.totalIssuesCount}`);
+}
+console.log(
+  '✓ Test 35 Passed: Takeoff completeness gate catches undetailed walls/returns, missing flashings & orphan penetrations and clears when resolved.'
+);
+
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

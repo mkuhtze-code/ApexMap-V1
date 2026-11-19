@@ -32,6 +32,8 @@ import {
   updateSkeletonLineLength,
   getRoofJunctionNodes,
   computeGableDormerGeometry,
+  computeAssetPlacementMetrics,
+  syncAssetRelationshipFields,
   computeEdgeSetbackLine,
   getDefaultEdgeSetbackM,
   isEdgeWallEnabled,
@@ -1036,7 +1038,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       depthM = +Math.max(0.6, Math.min(6.0, snap(spanV, 0.25))).toFixed(2);
     }
 
-    const newAsset: RoofAsset = {
+    const newAsset: RoofAsset = syncAssetRelationshipFields(hostPlane, {
       id: `asset-${featureType}-${Date.now().toString().slice(-5)}`,
       type: featureType,
       planeId: hostPlane.id,
@@ -1046,7 +1048,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       dormerPitchDeg: def.pitch,
       heightAboveRoofM: featureType === 'chimney' ? 1.1 : 0.85,
       label: def.label
-    };
+    });
     onAddAsset?.(newAsset);
     onSelectAsset?.(newAsset.id);
   };
@@ -1584,7 +1586,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       } else if (draggedAssetId) {
         const target = assets.find((a) => a.id === draggedAssetId);
         if (target) {
-          onUpdateAsset?.({ ...target, center: pt });
+          const hoveredHost =
+            planes.find((p) => isPointInPolygon(pt, p.planPolygon)) ||
+            planes.find((p) => p.id === target.planeId);
+          onUpdateAsset?.(
+            syncAssetRelationshipFields(hoveredHost, { ...target, center: pt })
+          );
         }
       } else if (activeTool === 'add_feature' && dragBoxStart) {
         setDragBoxCurrent(pt);
@@ -3576,6 +3583,45 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         GD
                       </text>
                     </g>
+                    {isSel && (() => {
+                      const m = computeAssetPlacementMetrics(hostPlane, asset);
+                      const eavePt = {
+                        x: m.pA.x + m.uC * m.uVec.x + m.minVPlan * m.vInward.x,
+                        y: m.pA.y + m.uC * m.uVec.y + m.minVPlan * m.vInward.y
+                      };
+                      const apexPt = {
+                        x: m.pA.x + m.uC * m.uVec.x + m.maxVPlan * m.vInward.x,
+                        y: m.pA.y + m.uC * m.uVec.y + m.maxVPlan * m.vInward.y
+                      };
+                      return (
+                        <g pointerEvents="none">
+                          <line
+                            x1={toSvgX(eavePt.x)}
+                            y1={toSvgY(eavePt.y)}
+                            x2={toSvgX(geom.pFMid.x)}
+                            y2={toSvgY(geom.pFMid.y)}
+                            stroke="#38bdf8"
+                            strokeWidth="1.5"
+                            strokeDasharray="3 2"
+                          />
+                          <line
+                            x1={toSvgX(geom.pRidgeTie.x)}
+                            y1={toSvgY(geom.pRidgeTie.y)}
+                            x2={toSvgX(apexPt.x)}
+                            y2={toSvgY(apexPt.y)}
+                            stroke="#c084fc"
+                            strokeWidth="1.5"
+                            strokeDasharray="3 2"
+                          />
+                          <g transform={`translate(${svgCx}, ${svgCy - dPx / 2 - 14})`}>
+                            <rect x="-54" y="-9" width="108" height="16" rx="4" fill="#090d16" fillOpacity="0.92" stroke="#38bdf8" strokeWidth="1" />
+                            <text x="0" y="2" textAnchor="middle" fill="#bae6fd" fontSize="8" fontWeight="800" fontFamily="monospace">
+                              {`E:${m.distFromEaveM.toFixed(2)}m · A:${m.distFromApexM.toFixed(2)}m`}
+                            </text>
+                          </g>
+                        </g>
+                      );
+                    })()}
                   </g>
                 );
               }
@@ -3717,6 +3763,56 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     ? 'MD'
                     : 'GD'}
                 </text>
+
+                {isSel && hostPlane && (() => {
+                  const m = computeAssetPlacementMetrics(hostPlane, asset);
+                  const eavePt = {
+                    x: m.pA.x + m.uC * m.uVec.x + m.minVPlan * m.vInward.x,
+                    y: m.pA.y + m.uC * m.uVec.y + m.minVPlan * m.vInward.y
+                  };
+                  const apexPt = {
+                    x: m.pA.x + m.uC * m.uVec.x + m.maxVPlan * m.vInward.x,
+                    y: m.pA.y + m.uC * m.uVec.y + m.maxVPlan * m.vInward.y
+                  };
+                  const relEaveLocalY =
+                    ((eavePt.x - asset.center.x) * -Math.sin((angleDeg * Math.PI) / 180) +
+                      (eavePt.y - asset.center.y) * Math.cos((angleDeg * Math.PI) / 180)) *
+                    scale;
+                  const relApexLocalY =
+                    ((apexPt.x - asset.center.x) * -Math.sin((angleDeg * Math.PI) / 180) +
+                      (apexPt.y - asset.center.y) * Math.cos((angleDeg * Math.PI) / 180)) *
+                    scale;
+                  const frontEdgeY = relEaveLocalY < 0 ? -dPx / 2 : dPx / 2;
+                  const backEdgeY = -frontEdgeY;
+                  return (
+                    <g pointerEvents="none">
+                      <line
+                        x1="0"
+                        y1={relEaveLocalY}
+                        x2="0"
+                        y2={frontEdgeY}
+                        stroke="#38bdf8"
+                        strokeWidth="1.5"
+                        strokeDasharray="3 2"
+                      />
+                      <line
+                        x1="0"
+                        y1={backEdgeY}
+                        x2="0"
+                        y2={relApexLocalY}
+                        stroke="#c084fc"
+                        strokeWidth="1.5"
+                        strokeDasharray="3 2"
+                      />
+                      <g transform={`translate(0, ${-dPx / 2 - 14}) rotate(${-angleDeg})`}>
+                        <rect x="-54" y="-9" width="108" height="16" rx="4" fill="#090d16" fillOpacity="0.92" stroke="#38bdf8" strokeWidth="1" />
+                        <text x="0" y="2" textAnchor="middle" fill="#bae6fd" fontSize="8" fontWeight="800" fontFamily="monospace">
+                          {`E:${m.distFromEaveM.toFixed(2)}m · A:${m.distFromApexM.toFixed(2)}m`}
+                        </text>
+                      </g>
+                    </g>
+                  );
+                })()}
               </g>
             );
           })}

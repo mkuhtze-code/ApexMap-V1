@@ -32,6 +32,8 @@ export interface PlanEdge {
   eaveSetbackM?: number;
   /** Optional explicit bottom Z elevation for stepped walls */
   wallBottomZ?: number;
+  /** Optional bidirectional link to matching WallFacet id */
+  wallFacetId?: string;
 }
 
 export interface RoofOutline {
@@ -91,6 +93,12 @@ export interface RoofAsset {
   dormerPitchDeg?: number;
   heightAboveRoofM?: number;
   label?: string;
+  /** Distance along host plane slope from eave edge to lower/front edge of penetration (m) */
+  distFromEaveM?: number;
+  /** Distance along host plane slope from top apex/ridge edge down to upper/back edge of penetration (m) */
+  distFromApexM?: number;
+  /** Horizontal offset from host plane left eave corner to penetration center along eave (m) */
+  offsetFromLeftM?: number;
 }
 
 export interface PitchBreakLine {
@@ -606,4 +614,33 @@ export interface ExactRoofModelSnapshot {
   lastUpdatedAt: string;
   updatedBy?: string;
 }
+
+export type TakeoffCompletenessCategory =
+  | 'undetailed_wall'
+  | 'undetailed_return'
+  | 'missing_flashing'
+  | 'incomplete_plane'
+  | 'incomplete_penetration';
+
+export interface TakeoffCompletenessIssue {
+  id: string;
+  category: TakeoffCompletenessCategory;
+  severity: 'warning' | 'blocker';
+  title: string;
+  detail: string;
+  targetId?: string;
+  targetCode?: string;
+}
+
+export interface TakeoffCompletenessReport {
+  isComplete: boolean;
+  totalIssuesCount: number;
+  undetailedWallsCount: number;
+  undetailedReturnsCount: number;
+  unassignedFlashingsCount: number;
+  incompletePlanesCount: number;
+  incompletePenetrationsCount: number;
+  issues: TakeoffCompletenessIssue[];
+}
+
 

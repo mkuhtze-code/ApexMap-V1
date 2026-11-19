@@ -9,6 +9,8 @@ import {
   AssignableRoofLine,
   RoofFlashingAssignment,
   RoofLifecycleStage,
+  TakeoffCompletenessIssue,
+  TakeoffCompletenessReport,
   WallCladdingType,
   WallFacet,
   WallFilterMode,
@@ -27,13 +29,17 @@ import {
   Layers,
   Link2,
   Plus,
-  Building2
+  Building2,
+  AlertTriangle
 } from 'lucide-react';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
+  computeAssetPlacementMetrics,
   computeGableDormerGeometry,
   getDefaultEdgeSetbackM,
   isEdgeWallEnabled,
+  repositionAssetToPlane,
+  updateAssetFromPlacement,
   dist
 } from '../../utils/exactRoofingEngine';
 import {
@@ -100,6 +106,8 @@ interface Props {
   onBuildWallFaces?: () => void;
   wallFilterMode?: WallFilterMode;
   onChangeWallFilterMode?: (mode: WallFilterMode) => void;
+  completenessReport?: TakeoffCompletenessReport;
+  onJumpToCompletenessIssue?: (issue: TakeoffCompletenessIssue) => void;
 }
 
 export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
@@ -152,7 +160,9 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   onUpdateWallFacet,
   onBuildWallFaces,
   wallFilterMode: propWallFilterMode,
-  onChangeWallFilterMode
+  onChangeWallFilterMode,
+  completenessReport,
+  onJumpToCompletenessIssue
 }) => {
   const { isMobile } = useDeviceDetection();
   const isInstalling = lifecycleStage === 'installing';
@@ -248,7 +258,14 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
 
   const inspectorBody = (
     <div className="flex-1 overflow-y-auto p-4 space-y-3.5 text-xs font-sans">
-      {selectedAsset ? (
+      {selectedAsset ? (() => {
+        const hostPlane = planes.find((p) => p.id === selectedAsset.planeId) || null;
+        const metrics = hostPlane
+          ? computeAssetPlacementMetrics(hostPlane, selectedAsset)
+          : null;
+        const isDormer =
+          selectedAsset.type === 'mono_dormer' || selectedAsset.type === 'gable_dormer';
+        return (
         <>
           <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2">
             <div className="flex items-center justify-between">
@@ -263,9 +280,124 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               </button>
             </div>
             <p className="text-[11px] text-slate-400">
-              Drag on Plan View to reposition. Sheet runs split &amp; re-pair automatically.
+              Edit exact distances from the host eave or apex/ridge, or drag on Plan View.
             </p>
+            {planes.length > 0 && (
+              <div className="pt-1">
+                <label className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
+                  Host Roof Face
+                </label>
+                <select
+                  disabled={isLockedView}
+                  value={hostPlane?.id || ''}
+                  onChange={(e) => {
+                    const nextPlane = planes.find((p) => p.id === e.target.value);
+                    if (nextPlane && onUpdateAsset) {
+                      onUpdateAsset(repositionAssetToPlane(nextPlane, selectedAsset));
+                    }
+                  }}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs font-bold text-white focus:outline-hidden focus:border-cyan-400 disabled:opacity-60"
+                >
+                  {!hostPlane && <option value="">Unassigned — pick host face</option>}
+                  {planes.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.code}: {p.name} ({p.pitchDeg}°)
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
+
+          {hostPlane && metrics && (
+            <div className="bg-slate-900/90 border border-cyan-500/30 p-3.5 rounded-2xl space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-cyan-300 text-[11px] uppercase tracking-wider">
+                  Slope Placement (Plan &amp; 3D Synced)
+                </span>
+                <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                  Run {metrics.runSlopeM.toFixed(2)}m
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-slate-950 p-2 rounded-xl border border-slate-800 space-y-1">
+                  <label className="text-[10px] text-sky-300 font-bold block">
+                    {isDormer ? 'Front from Eave (m)' : 'From Eave (slope m)'}
+                  </label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0.05"
+                    max={Math.max(0.5, +(metrics.runSlopeM - metrics.depthSlopeM).toFixed(2))}
+                    disabled={isLockedView}
+                    value={metrics.distFromEaveM}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (Number.isFinite(val) && val >= 0 && onUpdateAsset) {
+                        onUpdateAsset(
+                          updateAssetFromPlacement(hostPlane, selectedAsset, {
+                            distFromEaveM: val
+                          })
+                        );
+                      }
+                    }}
+                    className="w-full bg-slate-900 border border-sky-500/40 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-sky-400 disabled:opacity-60"
+                  />
+                </div>
+
+                <div className="bg-slate-950 p-2 rounded-xl border border-slate-800 space-y-1">
+                  <label className="text-[10px] text-purple-300 font-bold block">
+                    {isDormer ? 'Tie Clear to Apex (m)' : 'From Apex / Ridge (m)'}
+                  </label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max={Math.max(0.5, +(metrics.runSlopeM - metrics.depthSlopeM).toFixed(2))}
+                    disabled={isLockedView}
+                    value={metrics.distFromApexM}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (Number.isFinite(val) && val >= 0 && onUpdateAsset) {
+                        onUpdateAsset(
+                          updateAssetFromPlacement(hostPlane, selectedAsset, {
+                            distFromApexM: val
+                          })
+                        );
+                      }
+                    }}
+                    className="w-full bg-slate-900 border border-purple-500/40 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-purple-400 disabled:opacity-60"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-slate-950 p-2 rounded-xl border border-slate-800 flex items-center justify-between gap-2">
+                <label className="text-[10px] text-slate-300 font-bold">
+                  Offset from Left Edge (m)
+                </label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0.2"
+                  max={Math.max(1, +(metrics.eaveWidthM - 0.2).toFixed(2))}
+                  disabled={isLockedView}
+                  value={metrics.offsetFromLeftM}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (Number.isFinite(val) && val >= 0 && onUpdateAsset) {
+                      onUpdateAsset(
+                        updateAssetFromPlacement(hostPlane, selectedAsset, {
+                          offsetFromLeftM: val
+                        })
+                      );
+                    }
+                  }}
+                  className="w-24 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums text-right focus:outline-hidden focus:border-cyan-400 disabled:opacity-60"
+                />
+              </div>
+            </div>
+          )}
 
           <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-3">
             <div className="flex items-center justify-between">
@@ -281,15 +413,23 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 max={6.0}
                 step={0.1}
                 value={selectedAsset.widthM}
-                onChange={(e) =>
-                  onUpdateAsset?.({ ...selectedAsset, widthM: parseFloat(e.target.value) })
-                }
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  if (!onUpdateAsset) return;
+                  if (hostPlane) {
+                    onUpdateAsset(
+                      updateAssetFromPlacement(hostPlane, selectedAsset, { widthM: val })
+                    );
+                  } else {
+                    onUpdateAsset({ ...selectedAsset, widthM: val });
+                  }
+                }}
                 className="w-full accent-cyan-500 cursor-pointer h-2"
               />
             )}
 
             <div className="flex items-center justify-between pt-1">
-              <label className="font-bold text-slate-300 text-[11px]">Depth (up slope)</label>
+              <label className="font-bold text-slate-300 text-[11px]">Depth (plan run)</label>
               <span className="font-mono font-black text-sm text-white tabular-nums">
                 {selectedAsset.depthM.toFixed(2)}m
               </span>
@@ -301,9 +441,17 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 max={5.0}
                 step={0.1}
                 value={selectedAsset.depthM}
-                onChange={(e) =>
-                  onUpdateAsset?.({ ...selectedAsset, depthM: parseFloat(e.target.value) })
-                }
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  if (!onUpdateAsset) return;
+                  if (hostPlane) {
+                    onUpdateAsset(
+                      updateAssetFromPlacement(hostPlane, selectedAsset, { depthM: val })
+                    );
+                  } else {
+                    onUpdateAsset({ ...selectedAsset, depthM: val });
+                  }
+                }}
                 className="w-full accent-cyan-500 cursor-pointer h-2"
               />
             )}
@@ -369,7 +517,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
             </button>
           )}
         </>
-      ) : selectedPitchBreak ? (
+        );
+      })() : selectedPitchBreak ? (
         <>
           <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2">
             <div className="flex items-center justify-between">
@@ -1056,6 +1205,75 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 : 'Tap any roof area on the plan or below to edit pitch, direction, and offcut routing.'}
             </p>
           </div>
+
+          {/* Takeoff Completeness Gate & Action Prompts */}
+          {completenessReport && (
+            <div
+              className={`border p-3.5 rounded-2xl space-y-2 ${
+                completenessReport.isComplete
+                  ? 'bg-emerald-950/30 border-emerald-500/40'
+                  : 'bg-amber-950/35 border-amber-500/45'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider">
+                  {completenessReport.isComplete ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="text-emerald-300">Takeoff Complete</span>
+                    </>
+                  ) : (
+                    <>
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                      <span className="text-amber-300">
+                        Needs Review ({completenessReport.totalIssuesCount})
+                      </span>
+                    </>
+                  )}
+                </div>
+                {completenessReport.undetailedReturnsCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded bg-rose-500/20 border border-rose-500/40 text-rose-300 text-[10px] font-bold">
+                    {completenessReport.undetailedReturnsCount} ret
+                  </span>
+                )}
+              </div>
+
+              {!completenessReport.isComplete && (
+                <>
+                  <div className="flex flex-wrap gap-1.5 text-[10px] font-bold">
+                    {completenessReport.undetailedWallsCount > 0 && (
+                      <span className="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-200 border border-amber-500/30">
+                        {completenessReport.undetailedWallsCount} Undetailed Walls
+                      </span>
+                    )}
+                    {completenessReport.unassignedFlashingsCount > 0 && (
+                      <span className="px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-200 border border-sky-500/30">
+                        {completenessReport.unassignedFlashingsCount} Flashings
+                      </span>
+                    )}
+                    {completenessReport.incompletePlanesCount > 0 && (
+                      <span className="px-2 py-0.5 rounded-md bg-rose-500/15 text-rose-200 border border-rose-500/30">
+                        {completenessReport.incompletePlanesCount} Planes
+                      </span>
+                    )}
+                  </div>
+                  <div className="space-y-1 max-h-36 overflow-y-auto pr-0.5">
+                    {completenessReport.issues.slice(0, 6).map((issue) => (
+                      <button
+                        key={issue.id}
+                        type="button"
+                        onClick={() => onJumpToCompletenessIssue?.(issue)}
+                        className="w-full text-left px-2.5 py-1.5 rounded-xl bg-slate-950/75 hover:bg-slate-900 border border-slate-800/80 flex items-center justify-between gap-2 text-[11px] cursor-pointer transition-colors"
+                      >
+                        <span className="text-slate-200 truncate font-medium">{issue.title}</span>
+                        <span className="text-sky-400 font-bold text-[10px] shrink-0">Fix →</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           {layout && (
             <div className="grid grid-cols-2 gap-2 text-xs tabular-nums">

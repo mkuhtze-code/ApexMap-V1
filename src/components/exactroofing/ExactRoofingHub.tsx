@@ -20,6 +20,7 @@ import {
   ExactRoofModelSnapshot,
   RoofBomSummary,
   RoofPlanUnderlay,
+  TakeoffCompletenessIssue,
   WallFacet,
   WallFilterMode,
   WallPlan
@@ -48,9 +49,11 @@ import {
   dist
 } from '../../utils/exactRoofingEngine';
 import {
+  deriveRoofOutlineFromWallPlan,
   deriveWallPlanFromRoofLevels,
   syncWallPlanWithRoof
 } from '../../utils/wallCladdingEngine';
+import { evaluateTakeoffCompleteness } from '../../utils/takeoffCompleteness';
 import {
   getDefaultMitreNotes,
   getFlashingKindDisplayLabel,
@@ -393,6 +396,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [activeFlashingLineId, setActiveFlashingLineId] = useState<string | null>(null);
   const [isOrderModalOpen, setIsOrderModalOpen] = useState<boolean>(false);
   const [orderModalTab, setOrderModalTab] = useState<'orders' | 'quote' | undefined>(undefined);
+  const [pendingWallPlanForRoof, setPendingWallPlanForRoof] = useState<WallPlan | null>(null);
+  const [isMeasureLockGateOpen, setIsMeasureLockGateOpen] = useState<boolean>(false);
   const [libraryVersion, setLibraryVersion] = useState<number>(0);
   const [drawingSuiteSession, setDrawingSuiteSession] = useState<{
     line: AssignableRoofLine;
@@ -1279,6 +1284,57 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setActiveTab('wall_plan');
   };
 
+  const applyRoofFromWallPlan = (sourcePlan: WallPlan) => {
+    const targetLvl = focusedLevel;
+    const idPrefix =
+      targetLvl.id !== 'level-1'
+        ? `${targetLvl.code.toLowerCase()}__`
+        : '';
+    const seeded = deriveRoofOutlineFromWallPlan(sourcePlan, {
+      levelId: targetLvl.id,
+      idPrefix,
+      edgeType: 'unclassified'
+    });
+    if (!seeded) return;
+
+    const nextLevels = levels.map((lvl) =>
+      lvl.id === targetLvl.id
+        ? {
+            ...lvl,
+            outline: seeded.outline,
+            skeleton: []
+          }
+        : lvl
+    );
+    const cleanedPrevPlanes = planes.filter(
+      (p) => (p.levelId || 'level-1') !== targetLvl.id
+    );
+    const nextPlanes = syncMultiLevelPlanes(nextLevels, cleanedPrevPlanes);
+
+    setLevels(nextLevels);
+    setOutline(seeded.outline);
+    setSkeleton([]);
+    setPlanes(nextPlanes);
+    setWallPlan(seeded.linkedWallPlan);
+    setSelectedPlaneId(null);
+    setPendingWallPlanForRoof(null);
+    setActiveTab('canvas_plan');
+    triggerNotice(
+      `✓ Seeded ${targetLvl.code} roof outline from wall plan (${seeded.outline.edges.length} edges) — classify eaves to create roof faces`
+    );
+  };
+
+  const handleBuildRoofFromWallPlan = (sourcePlan?: WallPlan | null) => {
+    const targetPlan = sourcePlan || wallPlan;
+    if (!targetPlan || targetPlan.points.length < 3) return;
+    const hasExistingFootprint = focusedLevel.outline.points.length >= 3;
+    if (hasExistingFootprint) {
+      setPendingWallPlanForRoof(targetPlan);
+      return;
+    }
+    applyRoofFromWallPlan(targetPlan);
+  };
+
   const handleSelectAsset = (assetId: string | null) => {
     setSelectedAssetId(assetId);
     setSelectedPitchBreakId(null);
@@ -1597,6 +1653,19 @@ export const ExactRoofingHub: React.FC<Props> = ({
     [assignableLines, flashingAssignments]
   );
 
+  const completenessReport = useMemo(
+    () =>
+      evaluateTakeoffCompleteness({
+        levels,
+        planes,
+        assignableLines,
+        flashingAssignments,
+        wallPlan,
+        assets
+      }),
+    [levels, planes, assignableLines, flashingAssignments, wallPlan, assets]
+  );
+
   // Computed BOM & Site Roofing Packs
   const roofBom = useMemo(
     () =>
@@ -1707,11 +1776,68 @@ export const ExactRoofingHub: React.FC<Props> = ({
       measureConfirmedAt: confirmedAt,
       measureConfirmedBy: confirmedBy
     });
+    setIsMeasureLockGateOpen(false);
     setMeasureLocked(true);
     setLifecycleStage('installing');
     setActiveTab('layout_results');
     persistSnapshotToProject(nextSnap);
     triggerNotice('Measure confirmed & locked · Ready for site Installation');
+  };
+
+  const handleRequestLockMeasure = () => {
+    if (!completenessReport.isComplete) {
+      setIsMeasureLockGateOpen(true);
+      return;
+    }
+    handleConfirmLockMeasure();
+  };
+
+  const handleJumpToCompletenessIssue = (issue: TakeoffCompletenessIssue) => {
+    setIsMeasureLockGateOpen(false);
+    if (issue.category === 'undetailed_return') {
+      setWallFilterMode('returns');
+      if (issue.targetId) {
+        handleOpenWallElevation(issue.targetId);
+      } else {
+        setActiveTab('wall_plan');
+      }
+      return;
+    }
+    if (issue.category === 'undetailed_wall') {
+      setWallFilterMode('undetailed');
+      if (issue.targetId) {
+        handleOpenWallElevation(issue.targetId);
+      } else {
+        setActiveTab('wall_plan');
+      }
+      return;
+    }
+    if (issue.category === 'missing_flashing') {
+      if (issue.targetId) {
+        setActiveFlashingLineId(issue.targetId);
+      }
+      return;
+    }
+    if (issue.category === 'incomplete_plane') {
+      setActiveTab('canvas_plan');
+      if (issue.targetId) {
+        const matchedPlane = planes.find((p) => p.id === issue.targetId);
+        if (matchedPlane) {
+          handleSelectPlane(matchedPlane.id);
+        } else {
+          handleSelectLevel(issue.targetId);
+        }
+      }
+      setIsInspectorOpen(true);
+      return;
+    }
+    if (issue.category === 'incomplete_penetration') {
+      setActiveTab('canvas_plan');
+      if (issue.targetId) {
+        handleSelectAsset(issue.targetId);
+      }
+      setIsInspectorOpen(true);
+    }
   };
 
   const handleUnlockMeasure = () => {
@@ -2046,7 +2172,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                         <button
                           type="button"
                           onClick={() => {
-                            handleConfirmLockMeasure();
+                            handleRequestLockMeasure();
                             setIsMobileHubMenuOpen(false);
                           }}
                           className="min-h-[38px] px-2 rounded-xl bg-amber-600/25 border border-amber-500/50 text-amber-300 text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer"
@@ -2252,7 +2378,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
                   {lifecycleStage === 'measuring' && !measureLocked ? (
                     <button
-                      onClick={handleConfirmLockMeasure}
+                      onClick={handleRequestLockMeasure}
                       className="h-10 px-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer"
                       aria-label="Lock Measure"
                     >
@@ -2374,6 +2500,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 onUpdateWallFacet={handleUpdateWallFacet}
                 wallFilterMode={wallFilterMode}
                 onChangeWallFilterMode={setWallFilterMode}
+                onBuildRoofFromWalls={handleBuildRoofFromWallPlan}
                 initialSubView={wallSubView}
                 readOnly={isReadOnlyGeometry}
               />
@@ -2440,6 +2567,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 assignableLines={assignableLines}
                 flashingAssignments={flashingAssignments}
                 assets={assets}
+                wallPlan={wallPlan}
+                completenessReport={completenessReport}
                 measureLocked={measureLocked}
                 onSelectPlane={(planeId) => {
                   handleSelectPlane(planeId);
@@ -2454,12 +2583,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   if (edge) setSelectedEdgeForPlane(edge);
                 }}
                 onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
+                onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
                 onOpenOrderModal={() => {
                   setOrderModalTab('orders');
                   setIsOrderModalOpen(true);
                 }}
                 onRecalculateLayout={handleGenerateLayoutClick}
-                onConfirmLockMeasure={handleConfirmLockMeasure}
+                onConfirmLockMeasure={handleRequestLockMeasure}
               />
             </div>
           )}
@@ -2734,6 +2864,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onBuildWallFaces={handleBuildWallFaces}
           wallFilterMode={wallFilterMode}
           onChangeWallFilterMode={setWallFilterMode}
+          completenessReport={completenessReport}
+          onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
         />
 
         {/* Modals */}
@@ -3177,7 +3309,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
                 {!measureLocked ? (
                   <button
-                    onClick={handleConfirmLockMeasure}
+                    onClick={handleRequestLockMeasure}
                     className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5"
                     title="Lock Roof Dimensions & Offcuts for Site Installation"
                   >
@@ -3358,6 +3490,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onUpdateWallFacet={handleUpdateWallFacet}
               wallFilterMode={wallFilterMode}
               onChangeWallFilterMode={setWallFilterMode}
+              onBuildRoofFromWalls={handleBuildRoofFromWallPlan}
               initialSubView={wallSubView}
               readOnly={isReadOnlyGeometry}
             />
@@ -3433,6 +3566,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
               assignableLines={assignableLines}
               flashingAssignments={flashingAssignments}
               assets={assets}
+              wallPlan={wallPlan}
+              completenessReport={completenessReport}
               measureLocked={measureLocked}
               onSelectPlane={(planeId) => {
                 handleSelectPlane(planeId);
@@ -3447,12 +3582,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 if (edge) setSelectedEdgeForPlane(edge);
               }}
               onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
+              onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
               onOpenOrderModal={() => {
                 setOrderModalTab('orders');
                 setIsOrderModalOpen(true);
               }}
               onRecalculateLayout={handleGenerateLayoutClick}
-              onConfirmLockMeasure={handleConfirmLockMeasure}
+              onConfirmLockMeasure={handleRequestLockMeasure}
             />
           )}
 
@@ -3546,6 +3682,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onBuildWallFaces={handleBuildWallFaces}
           wallFilterMode={wallFilterMode}
           onChangeWallFilterMode={setWallFilterMode}
+          completenessReport={completenessReport}
+          onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
         />
       </div>
 
@@ -3718,6 +3856,133 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onAssignProfile={handleAssignFromDrawingSuite}
           onClose={() => setDrawingSuiteSession(null)}
         />
+      )}
+
+      {/* Confirm Overwriting Existing Roof Footprint from Wall Plan */}
+      {pendingWallPlanForRoof && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setPendingWallPlanForRoof(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md bg-[#0b101d] border border-slate-700 rounded-2xl p-5 space-y-4 shadow-2xl text-white"
+          >
+            <div className="space-y-1">
+              <div className="text-xs font-extrabold uppercase tracking-wider text-indigo-400">
+                Update Footprint from Wall Plan
+              </div>
+              <h3 className="text-base font-black text-white">
+                Replace {focusedLevel.code} roof outline?
+              </h3>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                {focusedLevel.code} already has a roof footprint ({focusedLevel.outline.points.length} vertices). Continuing replaces {focusedLevel.code}&apos;s outline with the wall plan boundary ({pendingWallPlanForRoof.facets.length} faces) in site metres and clears stale skeleton lines so you can classify eaves cleanly.
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingWallPlanForRoof(null)}
+                className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => applyRoofFromWallPlan(pendingWallPlanForRoof)}
+                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-extrabold cursor-pointer"
+              >
+                Replace Roof Footprint
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pre-Lock Takeoff Completeness Review Gate */}
+      {isMeasureLockGateOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setIsMeasureLockGateOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg bg-[#0b101d] border border-amber-500/50 rounded-2xl p-5 space-y-4 shadow-2xl text-white"
+          >
+            <div className="space-y-1">
+              <div className="text-xs font-extrabold uppercase tracking-wider text-amber-400">
+                Takeoff Completeness Check
+              </div>
+              <h3 className="text-base font-black text-white">
+                {completenessReport.totalIssuesCount} items still need attention before locking
+              </h3>
+              <p className="text-xs text-slate-300">
+                Review undetailed walls, internal return faces, missing flashings, or roof planes so nothing is missed from quantities.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-1.5 text-[11px] font-bold">
+              {completenessReport.undetailedReturnsCount > 0 && (
+                <span className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-200">
+                  {completenessReport.undetailedReturnsCount} Undetailed Returns
+                </span>
+              )}
+              {completenessReport.undetailedWallsCount > 0 && (
+                <span className="px-2.5 py-1 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-200">
+                  {completenessReport.undetailedWallsCount} Undetailed Walls
+                </span>
+              )}
+              {completenessReport.unassignedFlashingsCount > 0 && (
+                <span className="px-2.5 py-1 rounded-lg bg-sky-950/60 border border-sky-500/40 text-sky-200">
+                  {completenessReport.unassignedFlashingsCount} Unassigned Flashings
+                </span>
+              )}
+              {completenessReport.incompletePlanesCount > 0 && (
+                <span className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-200">
+                  {completenessReport.incompletePlanesCount} Incomplete Roof Faces
+                </span>
+              )}
+            </div>
+
+            <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+              {completenessReport.issues.map((issue) => (
+                <div
+                  key={issue.id}
+                  className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-bold text-slate-100 truncate">{issue.title}</div>
+                    <div className="text-[11px] text-slate-400 truncate">{issue.detail}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleJumpToCompletenessIssue(issue)}
+                    className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold cursor-pointer shrink-0"
+                  >
+                    Fix
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-1 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setIsMeasureLockGateOpen(false)}
+                className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold cursor-pointer"
+              >
+                Keep Reviewing
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmLockMeasure}
+                className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold cursor-pointer"
+              >
+                Lock Measure Anyway
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

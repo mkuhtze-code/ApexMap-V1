@@ -6165,6 +6165,282 @@ export function scaleSkeletonUniformly(
   }));
 }
 
+export interface HostPlaneRunSpan {
+  pA: Point2D;
+  uVec: Point2D;
+  vInward: Point2D;
+  cosPitch: number;
+  minU: number;
+  maxU: number;
+  minVPlan: number;
+  maxVPlan: number;
+  minVSlope: number;
+  maxVSlope: number;
+  runPlanM: number;
+  runSlopeM: number;
+}
+
+export interface AssetPlacementMetrics extends HostPlaneRunSpan {
+  uC: number;
+  vPlanC: number;
+  vSlopeC: number;
+  depthSlopeM: number;
+  distFromEaveM: number;
+  distFromApexM: number;
+  offsetFromLeftM: number;
+  eaveWidthM: number;
+}
+
+function getPlaneBasisVectors(hostPlane: RoofPlane): {
+  pA: Point2D;
+  uVec: Point2D;
+  vInward: Point2D;
+  cosPitch: number;
+} {
+  const pA = hostPlane.planPolygon[0] || { x: 0, y: 0 };
+  const pB = hostPlane.planPolygon[1] || { x: pA.x + 1, y: pA.y };
+  const dx = pB.x - pA.x;
+  const dy = pB.y - pA.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const uVec = { x: dx / len, y: dy / len };
+  const vInward = hostPlane.runDirection || { x: -uVec.y, y: uVec.x };
+  const cosPitch = Math.max(0.15, Math.cos(((hostPlane.pitchDeg || 22.5) * Math.PI) / 180));
+  return { pA, uVec, vInward, cosPitch };
+}
+
+/**
+ * Computes exact plan & slope run span [minV .. maxV] of a host RoofPlane at horizontal coordinate uM
+ * along its eave axis, supporting rectangular, trapezoidal (hip), and tapered facets.
+ */
+export function computeHostPlaneRunSpanAtU(
+  hostPlane: RoofPlane,
+  uM: number
+): HostPlaneRunSpan {
+  const { pA, uVec, vInward, cosPitch } = getPlaneBasisVectors(hostPlane);
+  const poly = hostPlane.planPolygon;
+  const localPts = poly.map((pt) => {
+    const rx = pt.x - pA.x;
+    const ry = pt.y - pA.y;
+    return {
+      u: rx * uVec.x + ry * uVec.y,
+      v: rx * vInward.x + ry * vInward.y
+    };
+  });
+
+  const us = localPts.map((p) => p.u);
+  const vs = localPts.map((p) => p.v);
+  const minU = us.length > 0 ? Math.min(...us) : 0;
+  const maxU = us.length > 0 ? Math.max(...us) : hostPlane.eaveWidthM || 4;
+  const uQuery = Math.max(minU + 1e-4, Math.min(maxU - 1e-4, uM));
+
+  const crossings: number[] = [];
+  for (let i = 0; i < localPts.length; i++) {
+    const a = localPts[i];
+    const b = localPts[(i + 1) % localPts.length];
+    if ((a.u <= uQuery && b.u >= uQuery) || (b.u <= uQuery && a.u >= uQuery)) {
+      const du = b.u - a.u;
+      if (Math.abs(du) > 1e-6) {
+        const t = (uQuery - a.u) / du;
+        if (t >= -1e-4 && t <= 1 + 1e-4) {
+          crossings.push(a.v + t * (b.v - a.v));
+        }
+      } else if (Math.abs(uQuery - a.u) < 1e-3) {
+        crossings.push(a.v, b.v);
+      }
+    }
+  }
+
+  const fallbackMaxVPlan =
+    vs.length > 0 ? Math.max(...vs) : (hostPlane.slopeLength || 4) * cosPitch;
+  const minVPlan =
+    crossings.length >= 2 ? Math.min(...crossings) : vs.length > 0 ? Math.min(...vs) : 0;
+  const maxVPlan =
+    crossings.length >= 2
+      ? Math.max(...crossings)
+      : fallbackMaxVPlan;
+
+  const safeMinVPlan = Math.min(minVPlan, maxVPlan);
+  const safeMaxVPlan = Math.max(safeMinVPlan + 0.25, maxVPlan);
+  const minVSlope = safeMinVPlan / cosPitch;
+  const maxVSlope = safeMaxVPlan / cosPitch;
+
+  return {
+    pA,
+    uVec,
+    vInward,
+    cosPitch,
+    minU,
+    maxU,
+    minVPlan: +safeMinVPlan.toFixed(3),
+    maxVPlan: +safeMaxVPlan.toFixed(3),
+    minVSlope: +minVSlope.toFixed(3),
+    maxVSlope: +maxVSlope.toFixed(3),
+    runPlanM: +(safeMaxVPlan - safeMinVPlan).toFixed(3),
+    runSlopeM: +(maxVSlope - minVSlope).toFixed(3)
+  };
+}
+
+/**
+ * Computes dimensional placement of a RoofAsset relative to its host RoofPlane's eave, apex/ridge, and left edge.
+ * All distance outputs are in slope metres along the sheet run (matching roof measurement tape practice).
+ */
+export function computeAssetPlacementMetrics(
+  hostPlane: RoofPlane,
+  asset: RoofAsset
+): AssetPlacementMetrics {
+  const { pA, uVec, vInward, cosPitch } = getPlaneBasisVectors(hostPlane);
+  const rx = asset.center.x - pA.x;
+  const ry = asset.center.y - pA.y;
+  const uC = rx * uVec.x + ry * uVec.y;
+  const vPlanC = rx * vInward.x + ry * vInward.y;
+
+  const span = computeHostPlaneRunSpanAtU(hostPlane, uC);
+  const vSlopeC = vPlanC / cosPitch;
+  const depthSlopeM = Math.max(0.2, asset.depthM) / cosPitch;
+  const halfDSlope = depthSlopeM / 2;
+
+  const frontSlope = vSlopeC - halfDSlope;
+  const backSlope = vSlopeC + halfDSlope;
+
+  const distFromEaveM = +Math.max(0, frontSlope - span.minVSlope).toFixed(2);
+  const distFromApexM = +Math.max(0, span.maxVSlope - backSlope).toFixed(2);
+  const offsetFromLeftM = +Math.max(0, uC - span.minU).toFixed(2);
+  const eaveWidthM = +Math.max(0.5, span.maxU - span.minU).toFixed(2);
+
+  return {
+    ...span,
+    uC: +uC.toFixed(3),
+    vPlanC: +vPlanC.toFixed(3),
+    vSlopeC: +vSlopeC.toFixed(3),
+    depthSlopeM: +depthSlopeM.toFixed(3),
+    distFromEaveM,
+    distFromApexM,
+    offsetFromLeftM,
+    eaveWidthM
+  };
+}
+
+/**
+ * Syncs `distFromEaveM`, `distFromApexM`, and `offsetFromLeftM` onto a RoofAsset from its world center.
+ */
+export function syncAssetRelationshipFields(
+  hostPlane: RoofPlane | undefined,
+  asset: RoofAsset
+): RoofAsset {
+  if (!hostPlane || hostPlane.planPolygon.length < 3) return asset;
+  const m = computeAssetPlacementMetrics(hostPlane, asset);
+  return {
+    ...asset,
+    planeId: hostPlane.id,
+    distFromEaveM: m.distFromEaveM,
+    distFromApexM: m.distFromApexM,
+    offsetFromLeftM: m.offsetFromLeftM
+  };
+}
+
+/**
+ * Updates a RoofAsset's world `center` and synced metrics from explicit eave distance, apex distance,
+ * side offset, width, or depth edits while keeping plan 2D, cut-layout apertures, and 3D synced.
+ */
+export function updateAssetFromPlacement(
+  hostPlane: RoofPlane,
+  asset: RoofAsset,
+  updates: {
+    distFromEaveM?: number;
+    distFromApexM?: number;
+    offsetFromLeftM?: number;
+    widthM?: number;
+    depthM?: number;
+    anchorEdge?: 'eave' | 'apex';
+  }
+): RoofAsset {
+  const nextWidthM =
+    updates.widthM !== undefined && Number.isFinite(updates.widthM)
+      ? +Math.max(0.3, Math.min(10, updates.widthM)).toFixed(2)
+      : asset.widthM;
+  const nextDepthM =
+    updates.depthM !== undefined && Number.isFinite(updates.depthM)
+      ? +Math.max(0.3, Math.min(8, updates.depthM)).toFixed(2)
+      : asset.depthM;
+
+  const currMetrics = computeAssetPlacementMetrics(hostPlane, asset);
+  const maxOffset = Math.max(0.2, currMetrics.maxU - currMetrics.minU - 0.15);
+  const nextU =
+    updates.offsetFromLeftM !== undefined && Number.isFinite(updates.offsetFromLeftM)
+      ? currMetrics.minU + Math.max(0.15, Math.min(maxOffset, updates.offsetFromLeftM))
+      : currMetrics.uC;
+
+  const span = computeHostPlaneRunSpanAtU(hostPlane, nextU);
+  const halfDSlope = nextDepthM / (2 * span.cosPitch);
+
+  let nextVSlopeC = currMetrics.vSlopeC;
+  if (updates.distFromEaveM !== undefined && Number.isFinite(updates.distFromEaveM)) {
+    const maxFromEave = Math.max(0.05, span.runSlopeM - halfDSlope * 2);
+    const clampedFront = Math.max(0.05, Math.min(maxFromEave, updates.distFromEaveM));
+    nextVSlopeC = span.minVSlope + clampedFront + halfDSlope;
+  } else if (updates.distFromApexM !== undefined && Number.isFinite(updates.distFromApexM)) {
+    const maxFromApex = Math.max(0.05, span.runSlopeM - halfDSlope * 2);
+    const clampedApex = Math.max(0, Math.min(maxFromApex, updates.distFromApexM));
+    nextVSlopeC = span.maxVSlope - clampedApex - halfDSlope;
+  } else if (updates.depthM !== undefined) {
+    if (updates.anchorEdge === 'apex') {
+      const keepApex = Math.max(0, currMetrics.distFromApexM);
+      nextVSlopeC = Math.max(span.minVSlope + halfDSlope, span.maxVSlope - keepApex - halfDSlope);
+    } else {
+      const keepEave = Math.max(0.05, currMetrics.distFromEaveM);
+      nextVSlopeC = Math.min(span.maxVSlope - halfDSlope, span.minVSlope + keepEave + halfDSlope);
+    }
+  }
+
+  const minCenterSlope = span.minVSlope + Math.min(halfDSlope, span.runSlopeM * 0.45);
+  const maxCenterSlope = span.maxVSlope - Math.min(halfDSlope, span.runSlopeM * 0.45);
+  const clampedCenterSlope = Math.max(minCenterSlope, Math.min(maxCenterSlope, nextVSlopeC));
+  const vPlanC = clampedCenterSlope * span.cosPitch;
+
+  const nextCenter: Point2D = {
+    x: +(span.pA.x + nextU * span.uVec.x + vPlanC * span.vInward.x).toFixed(3),
+    y: +(span.pA.y + nextU * span.uVec.y + vPlanC * span.vInward.y).toFixed(3)
+  };
+
+  return syncAssetRelationshipFields(hostPlane, {
+    ...asset,
+    widthM: nextWidthM,
+    depthM: nextDepthM,
+    center: nextCenter
+  });
+}
+
+/**
+ * Re-assigns an asset cleanly onto a different host RoofPlane using its current eave offset
+ * or centered cleanly on the new host face.
+ */
+export function repositionAssetToPlane(targetPlane: RoofPlane, asset: RoofAsset): RoofAsset {
+  const { pA, uVec, vInward } = getPlaneBasisVectors(targetPlane);
+  const span = computeHostPlaneRunSpanAtU(
+    targetPlane,
+    (targetPlane.eaveWidthM ?? 4) / 2
+  );
+  const midU = (span.minU + span.maxU) / 2;
+  const centeredSpan = computeHostPlaneRunSpanAtU(targetPlane, midU);
+  const desiredDistEave = asset.distFromEaveM ?? Math.max(0.4, centeredSpan.runSlopeM * 0.35);
+  const halfDSlope = asset.depthM / (2 * centeredSpan.cosPitch);
+  const clampedFront = Math.max(
+    0.1,
+    Math.min(Math.max(0.1, centeredSpan.runSlopeM - halfDSlope * 2), desiredDistEave)
+  );
+  const vPlanC = (centeredSpan.minVSlope + clampedFront + halfDSlope) * centeredSpan.cosPitch;
+  const center: Point2D = {
+    x: +(pA.x + midU * uVec.x + vPlanC * vInward.x).toFixed(3),
+    y: +(pA.y + midU * uVec.y + vPlanC * vInward.y).toFixed(3)
+  };
+  return syncAssetRelationshipFields(targetPlane, {
+    ...asset,
+    planeId: targetPlane.id,
+    center
+  });
+}
+
+
 
 
 

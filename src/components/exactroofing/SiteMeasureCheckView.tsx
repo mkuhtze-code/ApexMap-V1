@@ -6,12 +6,17 @@ import {
   RoofAsset,
   RoofBomSummary,
   RoofFlashingAssignment,
-  RoofPlane
+  RoofPlane,
+  TakeoffCompletenessIssue,
+  TakeoffCompletenessReport,
+  WallPlan
 } from '../../types/exactRoofing';
 import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBridge';
-import { dist } from '../../utils/exactRoofingEngine';
+import { computeAssetPlacementMetrics, dist } from '../../utils/exactRoofingEngine';
+import { computeWallTakeoffSummary } from '../../utils/wallCladdingEngine';
 import {
   AlertTriangle,
+  Building2,
   Check,
   CheckCircle2,
   Compass,
@@ -31,12 +36,15 @@ interface Props {
   assignableLines: AssignableRoofLine[];
   flashingAssignments: RoofFlashingAssignment[];
   assets: RoofAsset[];
+  wallPlan?: WallPlan | null;
+  completenessReport?: TakeoffCompletenessReport;
   measureLocked: boolean;
   onSelectPlane: (planeId: string) => void;
   onUpdatePlaneOrderedSheetLength?: (planeId: string, lengthM: number | undefined) => void;
   onOpenPlanTab: () => void;
   onOpenPlaneEditor: (plane: RoofPlane) => void;
   onSelectLineForFlashing: (lineId: string) => void;
+  onJumpToCompletenessIssue?: (issue: TakeoffCompletenessIssue) => void;
   onOpenOrderModal: () => void;
   onRecalculateLayout: () => void;
   onConfirmLockMeasure: () => void;
@@ -50,12 +58,15 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   assignableLines,
   flashingAssignments,
   assets,
+  wallPlan = null,
+  completenessReport,
   measureLocked,
   onSelectPlane,
   onUpdatePlaneOrderedSheetLength,
   onOpenPlanTab,
   onOpenPlaneEditor,
   onSelectLineForFlashing,
+  onJumpToCompletenessIssue,
   onOpenOrderModal,
   onRecalculateLayout,
   onConfirmLockMeasure
@@ -88,6 +99,11 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   const missingStructuralFlashings = useMemo(
     () => structuralLines.filter((l) => !assignmentByLineId.has(l.lineId)),
     [structuralLines, assignmentByLineId]
+  );
+
+  const wallSummary = useMemo(
+    () => (wallPlan && wallPlan.facets.length > 0 ? computeWallTakeoffSummary(wallPlan.facets) : null),
+    [wallPlan]
   );
 
   const stepsDoneCount =
@@ -629,16 +645,119 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
         )}
 
         {assets.length > 0 && (
-          <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs">
-            <span className="font-bold text-slate-300">
-              Roof Penetrations / Features Modeled: {assets.length}
-            </span>
-            <span className="font-mono text-sky-300 tabular-nums">
-              {assets.map((a) => `${a.label || a.type} (${a.widthM.toFixed(1)}×${a.depthM.toFixed(1)}m)`).join(' · ')}
-            </span>
+          <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800 space-y-2 text-xs">
+            <div className="font-bold text-slate-300">
+              Roof Penetrations / Features Modeled ({assets.length})
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {assets.map((a) => {
+                const hp = displayPlanes.find((p) => p.id === a.planeId) || planes.find((p) => p.id === a.planeId);
+                const m = hp ? computeAssetPlacementMetrics(hp, a) : null;
+                return (
+                  <div
+                    key={a.id}
+                    className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-bold text-cyan-300 truncate">
+                        {a.label || a.type.replace('_', ' ')} ({a.widthM.toFixed(2)}×{a.depthM.toFixed(2)}m)
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+                        {hp ? `Face ${hp.code}` : 'No host face'}
+                        {m ? ` · Eave ${m.distFromEaveM.toFixed(2)}m · Apex ${m.distFromApexM.toFixed(2)}m` : ''}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
       </div>
+
+      {/* 6. WALLS, RETURNS & TAKEOFF COMPLETENESS GATE */}
+      {(wallSummary || (completenessReport && !completenessReport.isComplete)) && (
+        <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-black text-white flex items-center gap-2">
+                <Building2 className="w-4 h-4 text-amber-400" />
+                <span>Section 4: Walls, Returns &amp; Completeness Check</span>
+              </h3>
+              <p className="text-xs text-slate-400">
+                Verify all wall elevations, internal return faces, and missing flashings before locking measure.
+              </p>
+            </div>
+            {completenessReport && (
+              <span
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold border ${
+                  completenessReport.isComplete
+                    ? 'bg-emerald-950/50 text-emerald-300 border-emerald-500/40'
+                    : 'bg-amber-950/50 text-amber-300 border-amber-500/40'
+                }`}
+              >
+                {completenessReport.isComplete
+                  ? 'All Checks Ready'
+                  : `${completenessReport.totalIssuesCount} Open Items`}
+              </span>
+            )}
+          </div>
+
+          {wallSummary && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs tabular-nums">
+              <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-400 font-bold uppercase">Wall Faces</div>
+                <div className="font-mono font-black text-white mt-0.5">
+                  {wallSummary.detailedFacesCount}/{wallSummary.totalFaces} detailed
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-400 font-bold uppercase">Return Faces</div>
+                <div className="font-mono font-black text-amber-300 mt-0.5">
+                  {wallSummary.returnFacesCount} returns ({wallSummary.internalCornersCount} notch)
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-400 font-bold uppercase">Net Wall Area</div>
+                <div className="font-mono font-black text-emerald-400 mt-0.5">
+                  {wallSummary.totalNetAreaM2.toFixed(1)} m²
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-400 font-bold uppercase">Openings</div>
+                <div className="font-mono font-black text-sky-300 mt-0.5">
+                  {wallSummary.totalOpeningsCount} ({wallSummary.totalOpeningsAreaM2.toFixed(1)} m²)
+                </div>
+              </div>
+            </div>
+          )}
+
+          {completenessReport && completenessReport.issues.length > 0 && (
+            <div className="space-y-1.5">
+              {completenessReport.issues.map((issue) => (
+                <div
+                  key={issue.id}
+                  className="p-2.5 rounded-xl bg-amber-950/30 border border-amber-500/35 flex flex-wrap items-center justify-between gap-2 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-bold text-amber-200">{issue.title}</div>
+                    <div className="text-[11px] text-slate-400">{issue.detail}</div>
+                  </div>
+                  {!measureLocked && onJumpToCompletenessIssue && (
+                    <button
+                      type="button"
+                      onClick={() => onJumpToCompletenessIssue(issue)}
+                      className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold cursor-pointer shrink-0"
+                    >
+                      Jump to Fix
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

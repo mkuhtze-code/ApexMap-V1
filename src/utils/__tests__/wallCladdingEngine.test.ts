@@ -12,9 +12,11 @@ import {
   createDefaultWallOpening,
   createHorizontalDadoSplit,
   createVerticalBaySplit,
+  deriveRoofOutlineFromWallPlan,
   deriveWallPlanFromRoofLevels,
   fitWallFacetTopToRoof,
   isWallFacetUndetailed,
+  linkWallFacetsToRoofLevels,
   syncWallPlanWithRoof,
   updateWallPlanEdgeLength
 } from '../wallCladdingEngine';
@@ -345,4 +347,56 @@ assert.ok(exportData.csvText.includes('OPENINGS SCHEDULE'));
 assert.ok(exportData.csvText.includes('W1'));
 console.log('✓ Test 9 Passed: Mixed cladding dado/bay splitting, straddling openings, linealM dedup, & CSV schedule');
 
-console.log('--- All Wall Cladding Phase 1 & Phase 2 Engine Tests Passed ---');
+// 10. Bidirectional Walls -> Roof Seeding (U-notch preservation, zero auto skeleton, edge links, optional overhang)
+const uWallPlan = {
+  points: uShapePoints,
+  edges: initialPlanEdges,
+  defaultHeightM: 2.7,
+  facets: uFacets
+};
+const seededFromWalls = deriveRoofOutlineFromWallPlan(uWallPlan, {
+  levelId: 'level-1',
+  eaveOverhangM: 0.45
+});
+assert.ok(seededFromWalls, 'Expected seeded roof outline from closed U-notch wall plan');
+assert.equal(seededFromWalls.outline.points.length, 8, 'All 8 U-notch vertices including return corners must transfer');
+assert.equal(seededFromWalls.outline.edges.length, 8, 'All 8 edges must transfer');
+assert.equal(
+  seededFromWalls.outline.edges.every((e) => e.type === 'unclassified' && e.hasWall === true && !!e.wallFacetId),
+  true,
+  'Seeded roof edges start unclassified with wallFacetId links and hasWall enabled'
+);
+assert.equal(
+  seededFromWalls.linkedWallPlan.facets.every(
+    (f, idx) => f.roofEdgeId === seededFromWalls.outline.edges[idx].id
+  ),
+  true,
+  'Every wall facet gets bidirectional roofEdgeId link'
+);
+// Outward 0.45m eave overhang must expand perimeter bounds beyond wall bounds [0..14] -> [-0.45..14.45]
+const minRoofX = Math.min(...seededFromWalls.outline.points.map((p) => p.x));
+const maxRoofX = Math.max(...seededFromWalls.outline.points.map((p) => p.x));
+assert.ok(minRoofX < -0.4 && maxRoofX > 14.4, `Expected 0.45m outward overhang on roof points (got ${minRoofX}..${maxRoofX})`);
+
+// Refresh link helper preserves existing cladding/openings while verifying roofEdgeId links
+const relinked = linkWallFacetsToRoofLevels(
+  { ...uWallPlan, facets: uFacets.map((f) => ({ ...f, roofEdgeId: undefined })) },
+  [
+    {
+      id: 'level-1',
+      code: 'L1',
+      name: 'Main',
+      eaveHeightM: 2.7,
+      outline: seededFromWalls.outline,
+      skeleton: []
+    }
+  ]
+);
+assert.equal(
+  relinked.facets.filter((f) => !!f.roofEdgeId).length,
+  8,
+  'linkWallFacetsToRoofLevels relinks all 8 exterior/return facets to roof edges'
+);
+console.log('✓ Test 10 Passed: Bidirectional Walls -> Roof seeding preserves 8 U-notch faces, overhang & edge links');
+
+console.log('--- All Wall Cladding Phase 1 & Phase 2 + Bidirectional Tests Passed ---');

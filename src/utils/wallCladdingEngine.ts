@@ -1,4 +1,6 @@
 import {
+  EdgeType,
+  PlanEdge,
   Point2D,
   RoofLevel,
   RoofOutline,
@@ -1428,4 +1430,148 @@ export function buildWallTakeoffExportData(wallPlan: WallPlan | null): WallTakeo
     csvText: csvLines.join('\n')
   };
 }
+
+/**
+ * Computes signed shoestring area (>0 for CCW in Y-down, <0 for CW) to determine outward normals
+ * cleanly for arbitrary concave / L-shape / U-notch wall outlines.
+ */
+function wallSignedArea2(points: Point2D[]): number {
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return sum * 0.5;
+}
+
+/**
+ * Bidirectional Walls -> Roof seeding:
+ * Copies a closed WallPlan exterior footprint (including internal notch / return faces)
+ * into a site-scale RoofOutline for the active roof level, without auto-generating any skeleton.
+ * Preserves bidirectional links (`PlanEdge.wallFacetId` <-> `WallFacet.roofEdgeId`).
+ */
+export function deriveRoofOutlineFromWallPlan(
+  wallPlan: WallPlan | null | undefined,
+  options?: {
+    levelId?: string;
+    idPrefix?: string;
+    eaveOverhangM?: number;
+    edgeType?: EdgeType;
+  }
+): { outline: RoofOutline; linkedWallPlan: WallPlan } | null {
+  if (!wallPlan) return null;
+
+  const baseFacets: WallFacet[] =
+    wallPlan.facets.length >= 3
+      ? wallPlan.facets
+      : wallPlan.points.length >= 3
+      ? buildWallFacetsFromPlan(
+          { points: wallPlan.points, edges: wallPlan.edges },
+          { defaultHeightM: wallPlan.defaultHeightM, mergeCollinear: false }
+        )
+      : [];
+
+  if (baseFacets.length < 3) return null;
+
+  const wallPts = baseFacets.map((f) => ({
+    x: +f.from.x.toFixed(3),
+    y: +f.from.y.toFixed(3)
+  }));
+  const signedA = wallSignedArea2(wallPts);
+  const overhang = Math.max(0, +(options?.eaveOverhangM ?? 0).toFixed(3));
+
+  let roofPts: Point2D[] = wallPts.map((p) => ({ ...p }));
+  if (overhang > 0.005) {
+    // Outward normal in screen coords: if signedA > 0 (CW in Y-up / CCW in Y-down), outward is (+dy, -dx)/len; else (-dy, +dx)/len
+    const sign = signedA >= 0 ? 1 : -1;
+    const offsetSegs = baseFacets.map((f) => {
+      const dx = f.to.x - f.from.x;
+      const dy = f.to.y - f.from.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const nx = (sign * dy) / len;
+      const ny = (-sign * dx) / len;
+      return {
+        from: { x: f.from.x + nx * overhang, y: f.from.y + ny * overhang },
+        to: { x: f.to.x + nx * overhang, y: f.to.y + ny * overhang }
+      };
+    });
+
+    roofPts = offsetSegs.map((curr, idx) => {
+      const prev = offsetSegs[(idx - 1 + offsetSegs.length) % offsetSegs.length];
+      const inter = lineIntersection2D(prev.from, prev.to, curr.from, curr.to);
+      if (inter && dist(inter, wallPts[idx]) <= overhang * 3 + 0.5) {
+        return { x: +inter.x.toFixed(3), y: +inter.y.toFixed(3) };
+      }
+      return { x: +curr.from.x.toFixed(3), y: +curr.from.y.toFixed(3) };
+    });
+  }
+
+  const levelId = options?.levelId || 'level-1';
+  const idPrefix = options?.idPrefix ?? '';
+  const initialEdgeType: EdgeType = options?.edgeType ?? 'unclassified';
+
+  const edges: PlanEdge[] = baseFacets.map((facet, idx) => {
+    const nextIdx = (idx + 1) % roofPts.length;
+    const edgeId = `${idPrefix}edge-wall-${idx + 1}`;
+    return {
+      id: edgeId,
+      from: roofPts[idx],
+      to: roofPts[nextIdx],
+      type: initialEdgeType,
+      eaveHeightM: +(facet.topZ || wallPlan.defaultHeightM || 2.7).toFixed(3),
+      levelId,
+      hasWall: true,
+      eaveSetbackM: overhang,
+      wallBottomZ: +(facet.bottomZ || 0).toFixed(3),
+      wallFacetId: facet.id
+    };
+  });
+
+  const outline: RoofOutline = {
+    id: `outline-from-walls-${Date.now().toString().slice(-5)}`,
+    points: roofPts,
+    edges,
+    levelId
+  };
+
+  const linkedFacets = baseFacets.map((facet, idx) => ({
+    ...facet,
+    roofEdgeId: edges[idx].id
+  }));
+
+  const linkedWallPlan: WallPlan = {
+    ...wallPlan,
+    facets: linkedFacets,
+    builtAt: new Date().toISOString()
+  };
+
+  return { outline, linkedWallPlan };
+}
+
+/**
+ * Refreshes bidirectional edge links between WallPlan facets and existing RoofLevels
+ * without modifying user-authored cladding, openings, or roof geometry.
+ */
+export function linkWallFacetsToRoofLevels(
+  wallPlan: WallPlan,
+  roofLevels: RoofLevel[]
+): WallPlan {
+  if (!wallPlan || wallPlan.facets.length === 0 || roofLevels.length === 0) return wallPlan;
+  const linkedFacets = wallPlan.facets.map((facet) => {
+    const matched =
+      facet.roofEdgeId &&
+      roofLevels.some((lvl) => lvl.outline.edges.some((e) => e.id === facet.roofEdgeId))
+        ? facet.roofEdgeId
+        : findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
+    return matched && matched !== facet.roofEdgeId
+      ? { ...facet, roofEdgeId: matched }
+      : facet;
+  });
+  return {
+    ...wallPlan,
+    facets: linkedFacets
+  };
+}
+
 

@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Building2,
@@ -7,12 +7,16 @@ import {
   Download,
   Layers,
   Link2,
+  Maximize2,
   PenTool,
   Plus,
   Ruler,
   Sparkles,
+  Square,
   Trash2,
-  Undo2
+  Undo2,
+  ZoomIn,
+  ZoomOut
 } from 'lucide-react';
 import { ArchitecturalPlan } from '../../types/crm';
 import {
@@ -27,8 +31,13 @@ import {
 } from '../../types/exactRoofing';
 import {
   applyDraftPointSnap,
+  buildCompleteSquarePoints,
+  computeCornerAngleDeg,
+  computePointAtLengthInDirection,
   dist,
-  pointsClose
+  parseDistanceInputToMetres,
+  pointsClose,
+  squarePolygonCorner
 } from '../../utils/exactRoofingEngine';
 import {
   analyzeWallPlanTopology,
@@ -87,17 +96,41 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   readOnly = false
 }) => {
   const svgRef = useRef<SVGSVGElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const [subView, setSubView] = useState<'plan' | 'elevation'>(initialSubView);
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
   const [draftPoints, setDraftPoints] = useState<Point2D[]>([]);
   const [hoverPt, setHoverPt] = useState<Point2D | null>(null);
+  const [typedLengthBuffer, setTypedLengthBuffer] = useState<string>('');
+  const lastAimPtRef = useRef<Point2D | null>(null);
   const [draggingVertexIdx, setDraggingVertexIdx] = useState<number | null>(null);
+  const [selectedVertexIdx, setSelectedVertexIdx] = useState<number | null>(null);
   const [defaultHeightM, setDefaultHeightM] = useState<number>(
     wallPlan?.defaultHeightM || levels[0]?.eaveHeightM || 2.7
   );
   const [editLengthVal, setEditLengthVal] = useState<string>('');
   const [localFilterMode, setLocalFilterMode] = useState<WallFilterMode>('all');
   const [scheduleTab, setScheduleTab] = useState<ScheduleTab>('summary');
+
+  // Zoom & Pan state for the wall floor plan CAD viewport
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isPanDragging, setIsPanDragging] = useState<boolean>(false);
+  const zoomRef = useRef<number>(1);
+  const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  zoomRef.current = zoom;
+  panRef.current = pan;
+  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const lastPinchDistRef = useRef<number | null>(null);
+  const panDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    originPanX: number;
+    originPanY: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressNextClickRef = useRef<boolean>(false);
 
   const filterMode = propWallFilterMode ?? localFilterMode;
   const setFilterMode = (mode: WallFilterMode) => {
@@ -187,33 +220,100 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   const svgH = 520;
   const worldW = Math.max(4, viewBounds.maxX - viewBounds.minX);
   const worldH = Math.max(4, viewBounds.maxY - viewBounds.minY);
-  const pxPerM = Math.min((svgW - 48) / worldW, (svgH - 48) / worldH);
-  const offsetX = (svgW - worldW * pxPerM) / 2 - viewBounds.minX * pxPerM;
-  const offsetY = (svgH - worldH * pxPerM) / 2 - viewBounds.minY * pxPerM;
+  const basePxPerM = Math.min((svgW - 48) / worldW, (svgH - 48) / worldH);
+  const pxPerM = basePxPerM * zoom;
+  const centerX = svgW / 2;
+  const centerY = svgH / 2;
+  const worldCenterX = viewBounds.minX + worldW / 2;
+  const worldCenterY = viewBounds.minY + worldH / 2;
 
-  const toSvgX = (wx: number) => wx * pxPerM + offsetX;
-  const toSvgY = (wy: number) => wy * pxPerM + offsetY;
-  const fromSvgX = (sx: number) => (sx - offsetX) / pxPerM;
-  const fromSvgY = (sy: number) => (sy - offsetY) / pxPerM;
+  const toSvgX = (wx: number) => centerX + (wx - worldCenterX) * pxPerM + pan.x;
+  const toSvgY = (wy: number) => centerY + (wy - worldCenterY) * pxPerM + pan.y;
+  const fromSvgX = (sx: number) => worldCenterX + (sx - centerX - pan.x) / pxPerM;
+  const fromSvgY = (sy: number) => worldCenterY + (sy - centerY - pan.y) / pxPerM;
 
   const gridData = useMemo(
     () => computeMetricGridLines(svgW, svgH, pxPerM, fromSvgX, fromSvgY, toSvgX, toSvgY),
-    [pxPerM, offsetX, offsetY]
+    [pxPerM, worldCenterX, worldCenterY, pan.x, pan.y]
   );
   const scaleBar = useMemo(() => computeDynamicScaleBar(pxPerM), [pxPerM]);
+
+  const squareClosedPoints = useMemo(
+    () => (isDrawing ? buildCompleteSquarePoints(draftPoints, true) : null),
+    [isDrawing, draftPoints]
+  );
+
+  const selectedCornerAngleDeg = useMemo(() => {
+    if (isDrawing || !wallPlan || selectedVertexIdx === null) return null;
+    return computeCornerAngleDeg(wallPlan.points, selectedVertexIdx);
+  }, [isDrawing, wallPlan, selectedVertexIdx]);
+
+  const typedPreviewPt = useMemo(() => {
+    if (!isDrawing || draftPoints.length === 0 || !typedLengthBuffer.trim()) return null;
+    const distM = parseDistanceInputToMetres(typedLengthBuffer, 'auto');
+    if (distM === null) return null;
+    const lastPt = draftPoints[draftPoints.length - 1];
+    return computePointAtLengthInDirection(lastPt, hoverPt || lastAimPtRef.current, distM, {
+      orthoSnap: true,
+      fallbackDir: { x: 1, y: 0 }
+    });
+  }, [isDrawing, draftPoints, typedLengthBuffer, hoverPt]);
+
+  useEffect(() => {
+    if (!wallPlan || selectedVertexIdx === null || selectedVertexIdx >= wallPlan.points.length) {
+      if (selectedVertexIdx !== null) setSelectedVertexIdx(null);
+    }
+  }, [wallPlan, selectedVertexIdx]);
+
+  // Cursor-anchored wheel zoom
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      const svg = svgRef.current;
+      if (!svg) return;
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const fitScale = Math.min(rect.width / svgW, rect.height / svgH) || 1;
+      const renderedW = svgW * fitScale;
+      const renderedH = svgH * fitScale;
+      const padLeft = rect.left + (rect.width - renderedW) / 2;
+      const padTop = rect.top + (rect.height - renderedH) / 2;
+      const cursorSvgX = (e.clientX - padLeft) / fitScale;
+      const cursorSvgY = (e.clientY - padTop) / fitScale;
+
+      const delta = -e.deltaY * (e.deltaMode === 1 ? 18 : 1);
+      const factor = Math.exp(delta * 0.0014);
+      const oldZoom = zoomRef.current;
+      const nextZoom = Math.max(0.5, Math.min(6.0, +(oldZoom * factor).toFixed(3)));
+      if (Math.abs(nextZoom - oldZoom) < 1e-4) return;
+
+      const ratio = nextZoom / oldZoom;
+      const oldPan = panRef.current;
+      const nextPanX = cursorSvgX - centerX - (cursorSvgX - centerX - oldPan.x) * ratio;
+      const nextPanY = cursorSvgY - centerY - (cursorSvgY - centerY - oldPan.y) * ratio;
+      setZoom(nextZoom);
+      setPan({ x: nextPanX, y: nextPanY });
+    };
+
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+    return () => viewport.removeEventListener('wheel', handleWheel);
+  }, []);
 
   const getWorldFromClient = (clientX: number, clientY: number): Point2D | null => {
     const svg = svgRef.current;
     if (!svg) return null;
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
-    const scale = Math.min(rect.width / svgW, rect.height / svgH);
-    const renderedW = svgW * scale;
-    const renderedH = svgH * scale;
+    const fitScale = Math.min(rect.width / svgW, rect.height / svgH);
+    const renderedW = svgW * fitScale;
+    const renderedH = svgH * fitScale;
     const padLeft = (rect.width - renderedW) / 2;
     const padTop = (rect.height - renderedH) / 2;
-    const sx = (clientX - rect.left - padLeft) / scale;
-    const sy = (clientY - rect.top - padTop) / scale;
+    const sx = (clientX - rect.left - padLeft) / fitScale;
+    const sy = (clientY - rect.top - padTop) / fitScale;
     return { x: fromSvgX(sx), y: fromSvgY(sy) };
   };
 
@@ -251,10 +351,95 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     setIsDrawing(false);
     setDraftPoints([]);
     setHoverPt(null);
+    setTypedLengthBuffer('');
+    lastAimPtRef.current = null;
+    setSelectedVertexIdx(null);
     if (builtFacets[0]) {
       onSelectWallFacet(builtFacets[0].id);
     }
   };
+
+  const commitTypedWallLength = (rawInput: string) => {
+    if (!isDrawing || draftPoints.length === 0) return false;
+    const distM = parseDistanceInputToMetres(rawInput, 'auto');
+    if (distM === null) return false;
+    const lastPt = draftPoints[draftPoints.length - 1];
+    const nextPt = computePointAtLengthInDirection(
+      lastPt,
+      hoverPt || lastAimPtRef.current,
+      distM,
+      { orthoSnap: true, fallbackDir: { x: 1, y: 0 } }
+    );
+    if (!nextPt || dist(lastPt, nextPt) < 0.05) return false;
+    setTypedLengthBuffer('');
+    if (draftPoints.length >= 3 && pointsClose(nextPt, draftPoints[0], 0.25)) {
+      commitDraftLoop(draftPoints);
+      return true;
+    }
+    setDraftPoints((curr) => [...curr, nextPt]);
+    lastAimPtRef.current = null;
+    return true;
+  };
+
+  // SketchUp-style type-to-length & Close Square shortcuts while drawing floor plan
+  useEffect(() => {
+    if (!isDrawing || readOnly) return;
+    const isTypingTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el) return false;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (isTypingTarget(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 'Escape') {
+        if (typedLengthBuffer.length > 0) {
+          setTypedLengthBuffer('');
+          return;
+        }
+        if (draftPoints.length > 0) {
+          setDraftPoints((p) => p.slice(0, -1));
+        } else {
+          setIsDrawing(false);
+        }
+        return;
+      }
+      if (draftPoints.length === 0) return;
+
+      if (/^[0-9]$/.test(e.key)) {
+        e.preventDefault();
+        setTypedLengthBuffer((prev) => (prev.length < 8 ? prev + e.key : prev));
+        return;
+      }
+      if (e.key === '.' && !typedLengthBuffer.includes('.')) {
+        e.preventDefault();
+        setTypedLengthBuffer((prev) => (prev === '' ? '0.' : prev + '.'));
+        return;
+      }
+      if (e.key === 'Backspace' && typedLengthBuffer.length > 0) {
+        e.preventDefault();
+        setTypedLengthBuffer((prev) => prev.slice(0, -1));
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (typedLengthBuffer.trim().length > 0) {
+          commitTypedWallLength(typedLengthBuffer);
+        } else if (draftPoints.length >= 3) {
+          commitDraftLoop(draftPoints);
+        }
+        return;
+      }
+      if (e.key.toLowerCase() === 'r' && squareClosedPoints) {
+        e.preventDefault();
+        commitDraftLoop(squareClosedPoints);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isDrawing, readOnly, draftPoints, typedLengthBuffer, hoverPt, squareClosedPoints]);
 
   const handleBuildFacesFromPlan = () => {
     if (readOnly) return;
@@ -324,7 +509,15 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   };
 
   const handleSvgClick = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!isDrawing || readOnly) return;
+    if (suppressNextClickRef.current) {
+      suppressNextClickRef.current = false;
+      return;
+    }
+    if (!isDrawing) {
+      setSelectedVertexIdx(null);
+      return;
+    }
+    if (readOnly) return;
     const raw = getWorldFromClient(e.clientX, e.clientY);
     if (!raw) return;
 
@@ -337,9 +530,72 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     const snapped = snapToSitePoints(raw, prev);
     if (prev && dist(prev, snapped) < 0.1) return;
     setDraftPoints((curr) => [...curr, snapped]);
+    setTypedLengthBuffer('');
+    lastAimPtRef.current = null;
+  };
+
+  const handleSvgPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activePointersRef.current.size === 2) {
+      const pts = Array.from(activePointersRef.current.values());
+      lastPinchDistRef.current = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      panDragRef.current = null;
+      setIsPanDragging(false);
+      return;
+    }
+    if (draggingVertexIdx !== null) return;
+    if ((e.button === 1 || (e.button === 0 && (!isDrawing || e.altKey))) && activePointersRef.current.size === 1) {
+      panDragRef.current = {
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        originPanX: panRef.current.x,
+        originPanY: panRef.current.y,
+        moved: false
+      };
+    }
   };
 
   const handleSvgPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    const rect = svg?.getBoundingClientRect();
+    const fitScale = rect ? Math.min(rect.width / svgW, rect.height / svgH) || 1 : 1;
+
+    if (activePointersRef.current.has(e.pointerId)) {
+      const prev = activePointersRef.current.get(e.pointerId)!;
+      activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activePointersRef.current.size === 2) {
+        const pts = Array.from(activePointersRef.current.values());
+        const d = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        if (lastPinchDistRef.current !== null && lastPinchDistRef.current > 0) {
+          const ratio = d / lastPinchDistRef.current;
+          setZoom((z) => Math.max(0.5, Math.min(6.0, +(z * ratio).toFixed(3))));
+        }
+        lastPinchDistRef.current = d;
+        setPan((p) => ({
+          x: p.x + (e.clientX - prev.x) * 0.6,
+          y: p.y + (e.clientY - prev.y) * 0.6
+        }));
+        return;
+      }
+    }
+
+    if (panDragRef.current && panDragRef.current.pointerId === e.pointerId) {
+      const dxScreen = e.clientX - panDragRef.current.startClientX;
+      const dyScreen = e.clientY - panDragRef.current.startClientY;
+      if (Math.hypot(dxScreen, dyScreen) > 4) {
+        panDragRef.current.moved = true;
+        setIsPanDragging(true);
+      }
+      if (panDragRef.current.moved) {
+        setPan({
+          x: panDragRef.current.originPanX + dxScreen / fitScale,
+          y: panDragRef.current.originPanY + dyScreen / fitScale
+        });
+      }
+      return;
+    }
+
     const raw = getWorldFromClient(e.clientX, e.clientY);
     if (!raw) return;
 
@@ -354,14 +610,40 @@ export const WallPlanWorkspace: React.FC<Props> = ({
 
     if (isDrawing) {
       const prev = draftPoints[draftPoints.length - 1] || null;
-      setHoverPt(snapToSitePoints(raw, prev));
+      const snappedHover = snapToSitePoints(raw, prev);
+      setHoverPt(snappedHover);
+      lastAimPtRef.current = snappedHover;
     }
   };
 
-  const handleSvgPointerUp = () => {
+  const handleSvgPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (panDragRef.current && panDragRef.current.pointerId === e.pointerId) {
+      if (panDragRef.current.moved) {
+        suppressNextClickRef.current = true;
+      }
+      panDragRef.current = null;
+      setIsPanDragging(false);
+    }
+    activePointersRef.current.delete(e.pointerId);
+    if (activePointersRef.current.size < 2) {
+      lastPinchDistRef.current = null;
+    }
     if (draggingVertexIdx !== null) {
       setDraggingVertexIdx(null);
     }
+  };
+
+  const handleSquareSelectedCorner = () => {
+    if (readOnly || !wallPlan || selectedVertexIdx === null) return;
+    if (selectedVertexIdx < 0 || selectedVertexIdx >= wallPlan.points.length) return;
+    const squaredPts = squarePolygonCorner(wallPlan.points, selectedVertexIdx);
+    const updated = moveWallPlanVertex(
+      wallPlan,
+      selectedVertexIdx,
+      squaredPts[selectedVertexIdx],
+      levels
+    );
+    onUpdateWallPlan(updated);
   };
 
   const handleApplyEdgeLength = () => {
@@ -452,6 +734,9 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                   setIsDrawing((v) => !v);
                   setDraftPoints([]);
                   setHoverPt(null);
+                  setTypedLengthBuffer('');
+                  lastAimPtRef.current = null;
+                  setSelectedVertexIdx(null);
                 }}
                 className={`px-2.5 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer ${
                   isDrawing
@@ -560,22 +845,63 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* Interactive Drawing Banner */}
+      {/* Interactive Drawing Banner (with SketchUp Type-to-Length & Close Square) */}
       {isDrawing && (
         <div className="bg-amber-950/60 border border-amber-500/40 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
           <span className="font-bold text-amber-200">
-            Click corners clockwise/counter-clockwise around single-storey floor plan ({draftPoints.length} pts). Snaps to roof points &amp; 45°/90° axes.
+            Tap corners ({draftPoints.length} pts) · aim &amp; type length (m or mm) + Enter
           </span>
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {draftPoints.length >= 1 && (
+              <form
+                onSubmit={(ev) => {
+                  ev.preventDefault();
+                  commitTypedWallLength(typedLengthBuffer);
+                }}
+                className="flex items-center gap-1 bg-slate-950/90 border border-amber-500/40 rounded-lg px-1.5 py-0.5"
+              >
+                <Ruler className="w-3 h-3 text-amber-400" />
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={typedLengthBuffer}
+                  onChange={(ev) => setTypedLengthBuffer(ev.target.value)}
+                  placeholder="Len m/mm"
+                  aria-label="Typed wall segment length"
+                  className="w-20 bg-transparent text-white font-mono font-bold text-xs placeholder:text-slate-500 focus:outline-hidden tabular-nums"
+                />
+                <button
+                  type="submit"
+                  disabled={parseDistanceInputToMetres(typedLengthBuffer, 'auto') === null}
+                  className="px-2 py-0.5 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-[11px] cursor-pointer disabled:opacity-35"
+                >
+                  Set
+                </button>
+              </form>
+            )}
             <button
               type="button"
               disabled={draftPoints.length === 0}
-              onClick={() => setDraftPoints((p) => p.slice(0, -1))}
+              onClick={() => {
+                setDraftPoints((p) => p.slice(0, -1));
+                setTypedLengthBuffer('');
+              }}
               className="px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 font-bold flex items-center gap-1 cursor-pointer disabled:opacity-40"
             >
               <Undo2 className="w-3.5 h-3.5" />
               <span>Undo</span>
             </button>
+            {squareClosedPoints && (
+              <button
+                type="button"
+                onClick={() => commitDraftLoop(squareClosedPoints)}
+                className="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-extrabold flex items-center gap-1 cursor-pointer"
+                title="Complete right-angle rectangle back to start (R)"
+              >
+                <Square className="w-3.5 h-3.5" />
+                <span>Close Square</span>
+              </button>
+            )}
             <button
               type="button"
               disabled={draftPoints.length < 3}
@@ -583,7 +909,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold flex items-center gap-1 cursor-pointer disabled:opacity-40"
             >
               <Check className="w-3.5 h-3.5" />
-              <span>Close &amp; Build Faces</span>
+              <span>Close &amp; Build</span>
             </button>
           </div>
         </div>
@@ -616,16 +942,67 @@ export const WallPlanWorkspace: React.FC<Props> = ({
 
       {/* True-Scale 2D Floor Plan Canvas + Selected Wall Bar */}
       <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2.5 flex-1 min-h-[300px]">
-        <div className="relative flex-1 bg-[#070b14] border border-slate-800/90 rounded-xl overflow-hidden min-h-[260px]">
+        <div
+          ref={viewportRef}
+          className="relative flex-1 bg-[#070b14] border border-slate-800/90 rounded-xl overflow-hidden min-h-[260px] touch-none"
+        >
+          {/* Floating Plan Zoom / Fit Controls */}
+          <div className="absolute top-2 right-2 z-15 flex items-center gap-0.5 p-0.5 rounded-xl bg-[#090d16]/90 backdrop-blur-md border border-slate-800 shadow-lg">
+            <button
+              type="button"
+              onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))}
+              className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 cursor-pointer"
+              title="Zoom Out"
+              aria-label="Zoom Out Wall Plan"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setZoom(1);
+                setPan({ x: 0, y: 0 });
+              }}
+              className="px-2 py-1 rounded-lg text-[10px] font-mono font-bold text-slate-300 hover:text-white hover:bg-slate-800 tabular-nums cursor-pointer"
+              title="Fit Plan"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoom((z) => Math.min(6.0, +(z + 0.25).toFixed(2)))}
+              className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 cursor-pointer"
+              title="Zoom In"
+              aria-label="Zoom In Wall Plan"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            {(zoom !== 1 || pan.x !== 0 || pan.y !== 0) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setZoom(1);
+                  setPan({ x: 0, y: 0 });
+                }}
+                className="p-1.5 rounded-lg text-sky-400 hover:text-white hover:bg-slate-800 cursor-pointer"
+                title="Reset Fit"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
           <svg
             ref={svgRef}
             viewBox={`0 0 ${svgW} ${svgH}`}
             className={`w-full h-full select-none ${
-              isDrawing ? 'cursor-crosshair' : 'cursor-default'
+              isPanDragging ? 'cursor-grabbing' : isDrawing ? 'cursor-crosshair' : 'cursor-grab'
             }`}
             onClick={handleSvgClick}
+            onPointerDown={handleSvgPointerDown}
             onPointerMove={handleSvgPointerMove}
             onPointerUp={handleSvgPointerUp}
+            onPointerCancel={handleSvgPointerUp}
             preserveAspectRatio="xMidYMid meet"
           >
             {/* Metric Blueprint Grid */}
@@ -823,26 +1200,90 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 );
               })}
 
-            {/* Draggable Corner Vertices */}
+            {/* Draggable & Selectable Corner Vertices (tap to select & square 90°) */}
             {!isDrawing &&
               !readOnly &&
               wallPlan &&
-              wallPlan.points.map((pt, idx) => (
-                <circle
-                  key={`wv-${idx}`}
-                  cx={toSvgX(pt.x)}
-                  cy={toSvgY(pt.y)}
-                  r="5.5"
-                  fill="#0f172a"
-                  stroke="#38bdf8"
-                  strokeWidth="2"
-                  className="cursor-move"
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    setDraggingVertexIdx(idx);
-                  }}
-                />
-              ))}
+              wallPlan.points.map((pt, idx) => {
+                const isSelCorner = selectedVertexIdx === idx;
+                return (
+                  <g
+                    key={`wv-${idx}`}
+                    className="cursor-move"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedVertexIdx(idx);
+                    }}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      setSelectedVertexIdx(idx);
+                      setDraggingVertexIdx(idx);
+                    }}
+                  >
+                    <circle
+                      cx={toSvgX(pt.x)}
+                      cy={toSvgY(pt.y)}
+                      r="11"
+                      fill="transparent"
+                    />
+                    {isSelCorner && (
+                      <circle
+                        cx={toSvgX(pt.x)}
+                        cy={toSvgY(pt.y)}
+                        r="10"
+                        fill="none"
+                        stroke="#fbbf24"
+                        strokeWidth="1.8"
+                        strokeDasharray="3 2"
+                      />
+                    )}
+                    <circle
+                      cx={toSvgX(pt.x)}
+                      cy={toSvgY(pt.y)}
+                      r={isSelCorner ? 6.5 : 5.5}
+                      fill={isSelCorner ? '#f59e0b' : '#0f172a'}
+                      stroke={isSelCorner ? '#ffffff' : '#38bdf8'}
+                      strokeWidth="2"
+                    />
+                  </g>
+                );
+              })}
+
+            {/* Selected Corner Angle Badge */}
+            {!isDrawing &&
+              wallPlan &&
+              selectedVertexIdx !== null &&
+              selectedCornerAngleDeg !== null &&
+              wallPlan.points[selectedVertexIdx] && (
+                <g
+                  transform={`translate(${toSvgX(wallPlan.points[selectedVertexIdx].x)}, ${
+                    toSvgY(wallPlan.points[selectedVertexIdx].y) - 18
+                  })`}
+                  pointerEvents="none"
+                >
+                  <rect
+                    x="-28"
+                    y="-10"
+                    width="56"
+                    height="18"
+                    rx="6"
+                    fill="#0b101d"
+                    stroke="#f59e0b"
+                    strokeWidth="1.2"
+                  />
+                  <text
+                    x="0"
+                    y="3"
+                    textAnchor="middle"
+                    fill="#fde68a"
+                    fontSize="10"
+                    fontWeight="bold"
+                    fontFamily="monospace"
+                  >
+                    {selectedCornerAngleDeg.toFixed(1)}°
+                  </text>
+                </g>
+              )}
 
             {/* Draft Polyline Preview */}
             {isDrawing && draftPoints.length > 0 && (
@@ -853,30 +1294,44 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                   stroke="#f59e0b"
                   strokeWidth="2.5"
                 />
-                {hoverPt && (
-                  <>
-                    <line
-                      x1={toSvgX(draftPoints[draftPoints.length - 1].x)}
-                      y1={toSvgY(draftPoints[draftPoints.length - 1].y)}
-                      x2={toSvgX(hoverPt.x)}
-                      y2={toSvgY(hoverPt.y)}
-                      stroke="#fbbf24"
-                      strokeWidth="2"
-                      strokeDasharray="5 4"
-                    />
-                    <text
-                      x={(toSvgX(draftPoints[draftPoints.length - 1].x) + toSvgX(hoverPt.x)) / 2}
-                      y={(toSvgY(draftPoints[draftPoints.length - 1].y) + toSvgY(hoverPt.y)) / 2 - 8}
-                      textAnchor="middle"
-                      fill="#fde68a"
-                      fontSize="12"
-                      fontWeight="bold"
-                      fontFamily="monospace"
-                    >
-                      {dist(draftPoints[draftPoints.length - 1], hoverPt).toFixed(2)}m
-                    </text>
-                  </>
-                )}
+                {(typedPreviewPt || hoverPt) && (() => {
+                  const last = draftPoints[draftPoints.length - 1];
+                  const target = typedPreviewPt || hoverPt!;
+                  return (
+                    <>
+                      <line
+                        x1={toSvgX(last.x)}
+                        y1={toSvgY(last.y)}
+                        x2={toSvgX(target.x)}
+                        y2={toSvgY(target.y)}
+                        stroke={typedPreviewPt ? '#38bdf8' : '#fbbf24'}
+                        strokeWidth={typedPreviewPt ? '2.8' : '2'}
+                        strokeDasharray="5 4"
+                      />
+                      <text
+                        x={(toSvgX(last.x) + toSvgX(target.x)) / 2}
+                        y={(toSvgY(last.y) + toSvgY(target.y)) / 2 - 8}
+                        textAnchor="middle"
+                        fill={typedPreviewPt ? '#7dd3fc' : '#fde68a'}
+                        fontSize="12"
+                        fontWeight="bold"
+                        fontFamily="monospace"
+                      >
+                        {dist(last, target).toFixed(2)}m
+                      </text>
+                      {typedPreviewPt && (
+                        <circle
+                          cx={toSvgX(typedPreviewPt.x)}
+                          cy={toSvgY(typedPreviewPt.y)}
+                          r="5"
+                          fill="#38bdf8"
+                          stroke="#070b14"
+                          strokeWidth="1.5"
+                        />
+                      )}
+                    </>
+                  );
+                })()}
                 {draftPoints.map((p, i) => (
                   <circle
                     key={`dp-${i}`}
@@ -951,6 +1406,28 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               </div>
             </div>
           )}
+
+          {/* Selected Corner Square 90° Action Overlay */}
+          {!isDrawing &&
+            !readOnly &&
+            wallPlan &&
+            selectedVertexIdx !== null &&
+            selectedCornerAngleDeg !== null && (
+              <div className="absolute bottom-2.5 right-2.5 z-15 bg-[#0b101d]/95 border border-amber-500/45 rounded-xl px-2.5 py-1.5 flex items-center gap-2 text-xs shadow-xl">
+                <span className="font-mono text-amber-200 font-bold tabular-nums">
+                  Corner #{selectedVertexIdx + 1} · {selectedCornerAngleDeg.toFixed(1)}°
+                </span>
+                <button
+                  type="button"
+                  onClick={handleSquareSelectedCorner}
+                  className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold flex items-center gap-1 cursor-pointer"
+                  title="Force this corner to 90 degrees without shifting neighbors"
+                >
+                  <Square className="w-3 h-3" />
+                  <span>Square 90°</span>
+                </button>
+              </div>
+            )}
         </div>
 
         {/* Selected Wall Face Quick Action Bar */}

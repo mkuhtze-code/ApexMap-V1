@@ -4,11 +4,19 @@ import {
   createPlaneFromEdge,
   generateCuttingLayout,
   buildAttachedOutlineFromEdge,
+  buildCompleteSquarePoints,
+  canCloseDraftSquare,
   classifyOutlineEdge,
+  computeCornerAngleDeg,
+  computePointAtLengthInDirection,
   createRoofLevel,
+  squareOutlineCorner,
+  squarePolygonCorner,
+  snapPointToSupportingLine,
+  isEdgeColinearWithSegment,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
-import type { RoofLevel, RoofOutline } from '../../types/exactRoofing';
+import type { PlanEdge, RoofLevel, RoofOutline } from '../../types/exactRoofing';
 
 console.log('--- Starting Exact Roofing Engine Test Suite ---');
 
@@ -1692,6 +1700,280 @@ dtCases.forEach((tc) => {
 });
 console.log(
   '✓ Test 29 Passed: Dovetail wing valleys terminate cleanly at junction and ridges stay strictly bounded.'
+);
+
+// 30. TEST 30: Close Square / Close at Right Angles (3-corner rect, rotated rect & L-shape)
+const threePtBox = [
+  { x: 0, y: 0 },
+  { x: 10, y: 0 },
+  { x: 10, y: 6 }
+];
+const sqRect = buildCompleteSquarePoints(threePtBox, true);
+if (!sqRect || sqRect.length !== 4) {
+  throw new Error('Expected Close Square to complete 3-point box into 4 corners');
+}
+if (Math.abs(sqRect[3].x - 0) > 0.01 || Math.abs(sqRect[3].y - 6) > 0.01) {
+  throw new Error(`Expected 4th corner (0,6), got (${sqRect[3].x},${sqRect[3].y})`);
+}
+for (let ci = 0; ci < 4; ci++) {
+  const ang = computeCornerAngleDeg(sqRect, ci);
+  if (ang === null || Math.abs(ang - 90) > 0.2) {
+    throw new Error(`Expected 90 deg at corner ${ci}, got ${ang}`);
+  }
+}
+
+// Rotated 3-point box (36.87 deg baseline: (0,0) -> (4,3) -> (1,7))
+const rotThreePt = [
+  { x: 0, y: 0 },
+  { x: 4, y: 3 },
+  { x: 1, y: 7 }
+];
+const rotSq = buildCompleteSquarePoints(rotThreePt, false);
+if (!rotSq || rotSq.length !== 4) {
+  throw new Error('Expected rotated 3-pt rectangle to complete cleanly');
+}
+if (Math.abs(rotSq[3].x - -3) > 0.05 || Math.abs(rotSq[3].y - 4) > 0.05) {
+  throw new Error(`Expected rotated 4th corner (-3,4), got (${rotSq[3].x},${rotSq[3].y})`);
+}
+
+// L-shape missing final closing 90 deg corner
+const openLShape = [
+  { x: 0, y: 0 },
+  { x: 10, y: 0 },
+  { x: 10, y: 4 },
+  { x: 5, y: 4 },
+  { x: 5, y: 8 }
+];
+const closedL = buildCompleteSquarePoints(openLShape, true);
+if (!closedL || closedL.length !== 6) {
+  throw new Error(`Expected L-shape Close Square to add corner (0,8), got ${closedL?.length}`);
+}
+if (Math.abs(closedL[5].x - 0) > 0.01 || Math.abs(closedL[5].y - 8) > 0.01) {
+  throw new Error(`Expected L-shape closing corner (0,8), got (${closedL[5].x},${closedL[5].y})`);
+}
+
+// Collinear / non-perpendicular 3-pt should NOT offer Close Square
+if (
+  canCloseDraftSquare(
+    [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 10, y: 0.2 }
+    ],
+    true
+  )
+) {
+  throw new Error('Collinear draft chain should not offer Close Square');
+}
+console.log('✓ Test 30 Passed: Close Square completes axis-aligned, rotated, and L-shape outlines accurately.');
+
+// 31. TEST 31: SketchUp Type-to-Length Parsing & Directional Endpoint Placement
+const lenM = parseDistanceInputToMetres('5.45', 'auto');
+const lenMm = parseDistanceInputToMetres('5450', 'auto');
+if (lenM !== 5.45 || lenMm !== 5.45) {
+  throw new Error(`Expected 5.45m from both '5.45' and '5450', got ${lenM} and ${lenMm}`);
+}
+const orthoAimPt = computePointAtLengthInDirection(
+  { x: 2, y: 3 },
+  { x: 8.5, y: 3.15 }, // slight vertical wobble within ortho snap
+  lenMm!,
+  { orthoSnap: true }
+);
+if (!orthoAimPt || Math.abs(orthoAimPt.x - 7.45) > 0.01 || Math.abs(orthoAimPt.y - 3) > 0.01) {
+  throw new Error(`Expected ortho-locked typed endpoint (7.45, 3), got ${JSON.stringify(orthoAimPt)}`);
+}
+const freeDiagPt = computePointAtLengthInDirection(
+  { x: 0, y: 0 },
+  { x: 3, y: 4 },
+  10,
+  { orthoSnap: false }
+);
+if (!freeDiagPt || Math.abs(freeDiagPt.x - 6) > 0.01 || Math.abs(freeDiagPt.y - 8) > 0.01) {
+  throw new Error(`Expected 3-4-5 diagonal at 10m -> (6,8), got ${JSON.stringify(freeDiagPt)}`);
+}
+console.log('✓ Test 31 Passed: SketchUp type-to-length (m/mm) directional & ortho placement verified.');
+
+// 32. TEST 32: Corner Squaring (Thales 90 deg Projection) + Edge Metadata Preservation
+const skewedPts = [
+  { x: 0, y: 0 },
+  { x: 10, y: 0 },
+  { x: 10.8, y: 6.4 }, // skewed top-right corner
+  { x: 0, y: 6 }
+];
+const beforeAngle = computeCornerAngleDeg(skewedPts, 2);
+if (beforeAngle === null || Math.abs(beforeAngle - 90) < 1) {
+  throw new Error(`Expected skewed corner #2 away from 90 deg, got ${beforeAngle}`);
+}
+let skewedOutline = classifyOutlineEdge(
+  {
+    id: 'skew-test',
+    points: skewedPts,
+    edges: [
+      { id: 'e0', from: skewedPts[0], to: skewedPts[1], type: 'outline', hasWall: true, eaveSetbackM: 0.45 },
+      { id: 'e1', from: skewedPts[1], to: skewedPts[2], type: 'verge' },
+      { id: 'e2', from: skewedPts[2], to: skewedPts[3], type: 'ridge' },
+      { id: 'e3', from: skewedPts[3], to: skewedPts[0], type: 'wall', hasWall: true }
+    ]
+  },
+  'e0',
+  'outline'
+);
+const squaredOutline = squareOutlineCorner(skewedOutline, 2);
+const afterAngle = computeCornerAngleDeg(squaredOutline.points, 2);
+if (afterAngle === null || Math.abs(afterAngle - 90) > 0.2) {
+  throw new Error(`Expected corner #2 squared to 90.0 deg, got ${afterAngle}`);
+}
+// Neighboring corners 1 and 3 must stay stationary
+if (
+  squaredOutline.points[1].x !== 10 ||
+  squaredOutline.points[1].y !== 0 ||
+  squaredOutline.points[3].x !== 0 ||
+  squaredOutline.points[3].y !== 6
+) {
+  throw new Error('Squaring corner #2 must not move neighbor corners 1 or 3');
+}
+// Preserved edge metadata
+if (
+  squaredOutline.edges[0].hasWall !== true ||
+  squaredOutline.edges[0].eaveSetbackM !== 0.45 ||
+  squaredOutline.edges[1].type !== 'verge' ||
+  squaredOutline.edges[2].type !== 'ridge' ||
+  squaredOutline.edges[3].type !== 'wall'
+) {
+  throw new Error('squareOutlineCorner must preserve all edge classifications and wall/setback metadata');
+}
+// True 90 deg corner remains invariant under squarePolygonCorner
+const trueRect = squarePolygonCorner(
+  [
+    { x: 0, y: 0 },
+    { x: 10, y: 0 },
+    { x: 10, y: 6 },
+    { x: 0, y: 6 }
+  ],
+  2
+);
+if (Math.abs(trueRect[2].x - 10) > 1e-3 || Math.abs(trueRect[2].y - 6) > 1e-3) {
+  throw new Error('Existing 90 deg corner must remain invariant');
+}
+console.log(
+  `✓ Test 32 Passed: Corner squaring (${beforeAngle}° -> ${afterAngle}°) preserves neighbor coordinates & edge metadata.`
+);
+
+// 33. TEST 33: Abutment Roof Draw Parity — Infinite Host Line Snap & Shorter/Equal/Longer Colinear Tagging
+const hostWallEdge: PlanEdge = {
+  id: 'host-wall-south',
+  from: { x: 0, y: 6 },
+  to: { x: 12, y: 6 },
+  type: 'wall',
+  hasWall: true,
+  eaveHeightM: 2.7,
+  eaveSetbackM: 0.45
+};
+
+// 33a. Supporting line snap works mid-segment, past both ends, and releases cleanly outboard
+const snapMid = snapPointToSupportingLine({ x: 5.5, y: 6.18 }, hostWallEdge.from, hostWallEdge.to, 0.35);
+const snapBeforeFrom = snapPointToSupportingLine({ x: -2.4, y: 5.82 }, hostWallEdge.from, hostWallEdge.to, 0.35);
+const snapPastTo = snapPointToSupportingLine({ x: 14.8, y: 6.2 }, hostWallEdge.from, hostWallEdge.to, 0.35);
+const noSnapOutboard = snapPointToSupportingLine({ x: 5.5, y: 8.5 }, hostWallEdge.from, hostWallEdge.to, 0.35);
+if (
+  !snapMid.snapped ||
+  snapMid.pt.y !== 6 ||
+  !snapBeforeFrom.snapped ||
+  snapBeforeFrom.pt.x !== -2.4 ||
+  snapBeforeFrom.pt.y !== 6 ||
+  !snapPastTo.snapped ||
+  snapPastTo.pt.x !== 14.8 ||
+  snapPastTo.pt.y !== 6 ||
+  noSnapOutboard.snapped
+) {
+  throw new Error('snapPointToSupportingLine failed infinite supporting line snap behavior');
+}
+
+// 33b. Shorter mid-wall lean-to abutment [3..9] against [0..12] host
+const shorterAbutment = buildAttachedOutlineFromEdge(
+  hostWallEdge,
+  [
+    { x: 3, y: 6 },
+    { x: 9, y: 6 },
+    { x: 9, y: 9.5 },
+    { x: 3, y: 9.5 }
+  ],
+  'abutment-shorter'
+);
+if (
+  shorterAbutment.edges[0].type !== 'wall' ||
+  shorterAbutment.edges[0].hasWall !== true ||
+  shorterAbutment.edges[0].eaveHeightM !== 2.7 ||
+  shorterAbutment.edges[0].eaveSetbackM !== 0.45 ||
+  !shorterAbutment.edges.slice(1).every((e) => e.type === 'unclassified')
+) {
+  throw new Error('Shorter mid-wall abutment must tag only the colinear shared chord as wall and inherit host defaults');
+}
+
+// 33c. Longer abutment [-2..15] extending past BOTH host endpoints [0..12]
+const longerAbutment = buildAttachedOutlineFromEdge(
+  hostWallEdge,
+  [
+    { x: -2, y: 6 },
+    { x: 15, y: 6 },
+    { x: 15, y: 10 },
+    { x: -2, y: 10 }
+  ],
+  'abutment-longer'
+);
+if (
+  longerAbutment.edges[0].type !== 'wall' ||
+  longerAbutment.edges[0].hasWall !== true ||
+  longerAbutment.edges[0].eaveHeightM !== 2.7 ||
+  longerAbutment.edges[0].eaveSetbackM !== 0.45 ||
+  !longerAbutment.edges.slice(1).every((e) => e.type === 'unclassified')
+) {
+  throw new Error('Longer abutment extending past host endpoints must tag colinear shared chord as wall');
+}
+
+// 33d. Equal full-face abutment against an eave ('outline') host edge + Square close parity
+const hostEaveEdge: PlanEdge = {
+  id: 'host-eave-north',
+  from: { x: 0, y: 0 },
+  to: { x: 10, y: 0 },
+  type: 'outline',
+  eaveHeightM: 2.4,
+  eaveSetbackM: 0.6
+};
+const equalFromEave = buildAttachedOutlineFromEdge(
+  hostEaveEdge,
+  buildCompleteSquarePoints(
+    [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: -3.5 }
+    ],
+    true
+  )!,
+  'abutment-equal-eave'
+);
+if (
+  equalFromEave.edges[0].type !== 'wall' ||
+  equalFromEave.edges[0].eaveHeightM !== 2.4 ||
+  equalFromEave.edges[0].eaveSetbackM !== 0.6 ||
+  !equalFromEave.edges.slice(1).every((e) => e.type === 'unclassified')
+) {
+  throw new Error('Equal abutment attached to eave with Close Square must tag shared edge as wall');
+}
+
+// 33e. Distant colinear edge without overlap must NOT be misclassified
+if (
+  isEdgeColinearWithSegment(
+    { from: { x: 20, y: 6 }, to: { x: 25, y: 6 } },
+    hostWallEdge.from,
+    hostWallEdge.to
+  )
+) {
+  throw new Error('Non-overlapping distant segment on same line must not match host edge');
+}
+
+console.log(
+  '✓ Test 33 Passed: Abutment roof draw parity (infinite host snap + shorter/equal/longer colinear wall tagging) verified.'
 );
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

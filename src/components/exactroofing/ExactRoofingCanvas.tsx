@@ -18,9 +18,16 @@ import {
 import { ArchitecturalPlan } from '../../types/crm';
 import {
   moveVertex,
+  deleteVertex,
   insertVertexOnEdge,
   buildOutlineFromPoints,
   buildAttachedOutlineFromEdge,
+  buildCompleteSquarePoints,
+  snapPointToSupportingLine,
+  computeCornerAngleDeg,
+  computePointAtLengthInDirection,
+  parseDistanceInputToMetres,
+  squareOutlineCorner,
   updateEdgeLength,
   updateSkeletonLineLength,
   getRoofJunctionNodes,
@@ -69,7 +76,8 @@ import {
   Undo2,
   Crosshair,
   Link2,
-  GitBranch
+  GitBranch,
+  Square
 } from 'lucide-react';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
@@ -222,6 +230,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const [isTwoPointScaleModalOpen, setIsTwoPointScaleModalOpen] = useState<boolean>(false);
   const [isPlanModalOpen, setIsPlanModalOpen] = useState<boolean>(false);
   const [mousePos, setMousePos] = useState<Point2D | null>(null);
+  const [typedLengthBuffer, setTypedLengthBuffer] = useState<string>('');
+  const lastAimPosRef = useRef<Point2D | null>(null);
+  const [selectedVertexIdx, setSelectedVertexIdx] = useState<number | null>(null);
 
   const hasExistingFootprint = useMemo(
     () =>
@@ -313,6 +324,16 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   // Dragging vertex state
   const [draggedVertexIdx, setDraggedVertexIdx] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (
+      activeTool !== 'adjust_shape' ||
+      selectedVertexIdx === null ||
+      selectedVertexIdx >= outline.points.length
+    ) {
+      if (selectedVertexIdx !== null) setSelectedVertexIdx(null);
+    }
+  }, [activeTool, outline.points.length, selectedVertexIdx]);
 
   // Shared tool guards: geometry/drawing tools must not trigger plane/junction/ghost selection
   const isDrawingOrGeometryTool =
@@ -602,6 +623,34 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     return best ? { x: +best.x.toFixed(3), y: +best.y.toFixed(3) } : pt;
   };
 
+  // Resolve draw_roof cursor point: prioritizes existing corners, then host supporting line (infinite extension), then ortho/precision snap
+  const resolveDrawRoofPointerPoint = (
+    clientX: number,
+    clientY: number,
+    prevPt: Point2D | null
+  ): Point2D => {
+    const rawPt = getPlanPointFromPointer(clientX, clientY, 'raw');
+    const cornerFromRaw = snapDraftPointToExisting(rawPt);
+    if (cornerFromRaw.x !== rawPt.x || cornerFromRaw.y !== rawPt.y) {
+      return cornerFromRaw;
+    }
+    if (attachedEdge) {
+      const snapPx = isTouchDevice ? 22 : 14;
+      const lineSnapRadiusM = Math.max(0.25, Math.min(0.85, snapPx / Math.max(scale, 10)));
+      const lineRes = snapPointToSupportingLine(
+        rawPt,
+        attachedEdge.from,
+        attachedEdge.to,
+        lineSnapRadiusM
+      );
+      if (lineRes.snapped) {
+        return lineRes.pt;
+      }
+    }
+    const drafted = getPlanPointFromPointer(clientX, clientY, 'draft', prevPt);
+    return snapDraftPointToExisting(drafted);
+  };
+
   // Convert pointer event to world coordinates accurately under object-contain
   const getPlanPointFromPointer = (
     clientX: number,
@@ -676,6 +725,97 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     return () => viewport.removeEventListener('wheel', handleWheel);
   }, [svgWidth, svgHeight, centerX, centerY, isFirstLineModalOpen, isTwoPointScaleModalOpen, isPlanModalOpen]);
 
+  const hasActiveTypedSegment =
+    (activeTool === 'draw_roof' && draftPoints.length >= 1) ||
+    (activeTool === 'add_line' && Boolean(lineStartPt) && !bisectMode);
+
+  const squareClosedPoints = useMemo(
+    () => (activeTool === 'draw_roof' ? buildCompleteSquarePoints(draftPoints, orthoSnap) : null),
+    [activeTool, draftPoints, orthoSnap]
+  );
+
+  const selectedCornerAngleDeg = useMemo(() => {
+    if (activeTool !== 'adjust_shape' || selectedVertexIdx === null) return null;
+    return computeCornerAngleDeg(outline.points, selectedVertexIdx);
+  }, [activeTool, outline.points, selectedVertexIdx]);
+
+  const typedSegmentPreview = useMemo(() => {
+    if (!hasActiveTypedSegment || !typedLengthBuffer.trim()) return null;
+    const distM = parseDistanceInputToMetres(typedLengthBuffer, 'auto');
+    if (distM === null) return null;
+    const fromPt =
+      activeTool === 'draw_roof' ? draftPoints[draftPoints.length - 1] : lineStartPt;
+    if (!fromPt) return null;
+    const aimPt = mousePos || lastAimPosRef.current;
+    const keepHostAxis = Boolean(
+      activeTool === 'draw_roof' &&
+        attachedEdge &&
+        aimPt &&
+        snapPointToSupportingLine(aimPt, attachedEdge.from, attachedEdge.to, 0.02).snapped
+    );
+    const toPt = computePointAtLengthInDirection(fromPt, aimPt, distM, {
+      orthoSnap: keepHostAxis ? false : orthoSnap,
+      fallbackDir: { x: 1, y: 0 }
+    });
+    if (!toPt) return null;
+    return { fromPt, toPt, lengthM: distM };
+  }, [hasActiveTypedSegment, typedLengthBuffer, activeTool, draftPoints, lineStartPt, mousePos, orthoSnap, attachedEdge]);
+
+  const commitTypedSegmentLength = (rawInput: string): boolean => {
+    if (readOnlyGeometry || !hasActiveTypedSegment) return false;
+    const distM = parseDistanceInputToMetres(rawInput, 'auto');
+    if (distM === null) return false;
+
+    if (activeTool === 'draw_roof' && draftPoints.length >= 1) {
+      const fromPt = draftPoints[draftPoints.length - 1];
+      const aimPt = mousePos || lastAimPosRef.current;
+      const keepHostAxis = Boolean(
+        attachedEdge &&
+          aimPt &&
+          snapPointToSupportingLine(aimPt, attachedEdge.from, attachedEdge.to, 0.02).snapped
+      );
+      const nextPt = computePointAtLengthInDirection(fromPt, aimPt, distM, {
+        orthoSnap: keepHostAxis ? false : orthoSnap,
+        fallbackDir: { x: 1, y: 0 }
+      });
+      if (!nextPt || dist(fromPt, nextPt) < 0.05) return false;
+
+      if (!lockedDraftBounds) {
+        setLockedDraftBounds({ ...bounds });
+      }
+      setTypedLengthBuffer('');
+      lastAimPosRef.current = null;
+
+      if (draftPoints.length >= 3 && dist(nextPt, draftPoints[0]) < 0.25) {
+        finishCustomOutline();
+        return true;
+      }
+
+      const nextDraft = [...draftPoints, nextPt];
+      setDraftPoints(nextDraft);
+      if (nextDraft.length === 2 && !draftScaleReady && !hasEstablishedScale) {
+        setDraftScaleReady(true);
+      }
+      return true;
+    }
+
+    if (activeTool === 'add_line' && lineStartPt && !bisectMode) {
+      const nextPt = computePointAtLengthInDirection(
+        lineStartPt,
+        mousePos || lastAimPosRef.current,
+        distM,
+        { orthoSnap, fallbackDir: { x: 1, y: 0 } }
+      );
+      if (!nextPt || dist(lineStartPt, nextPt) < 0.08) return false;
+      setTypedLengthBuffer('');
+      lastAimPosRef.current = null;
+      commitAddLinePoint(nextPt);
+      return true;
+    }
+
+    return false;
+  };
+
   useEffect(() => {
     const isTypingTarget = (target: EventTarget | null) => {
       const el = target as HTMLElement | null;
@@ -693,6 +833,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
         return;
       }
       if (e.key === 'Escape') {
+        if (typedLengthBuffer.length > 0) {
+          setTypedLengthBuffer('');
+          return;
+        }
         if (editingMeasurement) {
           setEditingMeasurement(null);
           return;
@@ -721,23 +865,56 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           return;
         }
         if (activeTool === 'draw_roof' && draftPoints.length > 0) {
-          if (attachedEdge && draftPoints.length <= 2) {
-            setDraftPoints([]);
-            setAttachedEdge(null);
-            setLockedDraftBounds(null);
-            return;
-          }
           const next = draftPoints.slice(0, -1);
           setDraftPoints(next);
           if (next.length < 2 && !hasEstablishedScale) setDraftScaleReady(false);
           if (next.length === 0) setLockedDraftBounds(null);
           return;
         }
+        if (activeTool === 'draw_roof' && attachedEdge) {
+          setAttachedEdge(null);
+          setLockedDraftBounds(null);
+          return;
+        }
         setActiveTool('set_pitch');
         return;
       }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      // SketchUp-style type-to-length entry while drawing a segment
+      if (hasActiveTypedSegment && !readOnlyGeometry) {
+        if (/^[0-9]$/.test(e.key)) {
+          e.preventDefault();
+          setTypedLengthBuffer((prev) => (prev.length < 8 ? prev + e.key : prev));
+          return;
+        }
+        if (e.key === '.' && !typedLengthBuffer.includes('.')) {
+          e.preventDefault();
+          setTypedLengthBuffer((prev) => (prev === '' ? '0.' : prev + '.'));
+          return;
+        }
+        if (e.key === 'Backspace' && typedLengthBuffer.length > 0) {
+          e.preventDefault();
+          setTypedLengthBuffer((prev) => prev.slice(0, -1));
+          return;
+        }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (typedLengthBuffer.trim().length > 0) {
+            commitTypedSegmentLength(typedLengthBuffer);
+          } else if (activeTool === 'draw_roof' && draftPoints.length >= 3) {
+            finishCustomOutline();
+          }
+          return;
+        }
+      }
+
       const key = e.key.toLowerCase();
+      if (key === 'r' && !readOnlyGeometry && activeTool === 'draw_roof' && squareClosedPoints) {
+        e.preventDefault();
+        finishCustomOutline(squareClosedPoints);
+        return;
+      }
       if (key === 'v') {
         setActiveTool('set_pitch');
       } else if (key === 'm') {
@@ -750,10 +927,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           setActiveTool('draw_roof');
           setAttachedEdge(null);
           setDrawSubMode('free');
+          setTypedLengthBuffer('');
           setDraftScaleReady(hasEstablishedScale);
         } else if (key === 'l') {
           setActiveTool('add_line');
           setBisectPts([]);
+          setTypedLengthBuffer('');
         } else if (key === 'f') {
           setActiveTool('add_feature');
         } else if (key === 'e') {
@@ -790,7 +969,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     attachedEdge,
     outline.points.length,
     hasEstablishedScale,
-    readOnlyGeometry
+    readOnlyGeometry,
+    hasActiveTypedSegment,
+    typedLengthBuffer,
+    squareClosedPoints,
+    mousePos,
+    orthoSnap
   ]);
 
   // Helper: place feature (skylight, chimney, dormers, pitch break) at point or drag box on host plane
@@ -954,8 +1138,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       if (drawSubMode === 'attach_edge' && !attachedEdge) return;
 
       const prevPt = draftPoints.length > 0 ? draftPoints[draftPoints.length - 1] : null;
-      const snappedDraft = getPlanPointFromPointer(e.clientX, e.clientY, 'draft', prevPt);
-      const pt = snapDraftPointToExisting(snappedDraft);
+      const pt = resolveDrawRoofPointerPoint(e.clientX, e.clientY, prevPt);
 
       if (draftPoints.length === 0 && !lockedDraftBounds) {
         setLockedDraftBounds({ ...bounds });
@@ -983,6 +1166,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
       const nextDraft = [...draftPoints, pt];
       setDraftPoints(nextDraft);
+      setTypedLengthBuffer('');
+      lastAimPosRef.current = null;
 
       // Require first-line scale length popup ONLY when scale has not already been established
       if (nextDraft.length === 2 && !draftScaleReady && !hasEstablishedScale) {
@@ -1023,6 +1208,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
     if (!lineStartPt) {
       setLineStartPt(pt);
+      setTypedLengthBuffer('');
+      lastAimPosRef.current = null;
     } else {
       if (dist(lineStartPt, pt) < 0.08) return;
       const newLine: SkeletonLine = {
@@ -1034,6 +1221,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       };
       onUpdateSkeleton([...displaySkeleton, newLine]);
       setLineStartPt(chainLineMode ? pt : null);
+      setTypedLengthBuffer('');
+      lastAimPosRef.current = null;
     }
   };
 
@@ -1110,19 +1299,22 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   const handlePickAttachEdge = (edge: PlanEdge) => {
     setAttachedEdge(edge);
-    setDraftPoints([{ ...edge.from }, { ...edge.to }]);
+    setDraftPoints([]);
     setLockedDraftBounds({ ...bounds });
     setDraftScaleReady(true);
+    setTypedLengthBuffer('');
+    lastAimPosRef.current = null;
   };
 
-  const finishCustomOutline = () => {
-    if (draftPoints.length >= 3) {
+  const finishCustomOutline = (overridePoints?: Point2D[]) => {
+    const pts = overridePoints || draftPoints;
+    if (pts.length >= 3) {
       const customId = `roof-custom-${Date.now()}`;
       const newOutline = attachedEdge
-        ? buildAttachedOutlineFromEdge(attachedEdge, draftPoints, customId, {
+        ? buildAttachedOutlineFromEdge(attachedEdge, pts, customId, {
             initialEdgeType: 'unclassified'
           })
-        : buildOutlineFromPoints(draftPoints, customId, {
+        : buildOutlineFromPoints(pts, customId, {
             initialEdgeType: 'unclassified'
           });
 
@@ -1135,6 +1327,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       setAttachedEdge(null);
       setDrawSubMode('free');
       setLockedDraftBounds(null);
+      setTypedLengthBuffer('');
+      lastAimPosRef.current = null;
       setDraftScaleReady(true);
       setZoom(1);
       setPan({ x: 0, y: 0 });
@@ -1257,6 +1451,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     if (readOnlyGeometry || activeTool !== 'adjust_shape') return;
     e.stopPropagation();
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    setSelectedVertexIdx(idx);
     setDraggedVertexIdx(idx);
   };
 
@@ -1264,11 +1459,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     if (readOnlyGeometry) return;
     if (activeTool === 'adjust_shape') {
       e.stopPropagation();
+      setSelectedVertexIdx(idx);
       return;
     }
     if (activeTool === 'add_line') {
       e.stopPropagation();
-      commitAddLinePoint(outline.points[idx]);
+      commitAddLinePoint(allDisplayOutlinePoints[idx] || outline.points[idx]);
     }
   };
 
@@ -1315,7 +1511,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       setDragBoxCurrent(pt);
     } else if (activeTool === 'add_line' && activePointersRef.current.size === 1) {
       const rawPt = getPlanPointFromPointer(e.clientX, e.clientY, 'raw');
-      setMousePos(getSnappedLinePoint(rawPt).pt);
+      const snappedLine = getSnappedLinePoint(rawPt).pt;
+      setMousePos(snappedLine);
+      lastAimPosRef.current = snappedLine;
     }
   };
 
@@ -1363,18 +1561,26 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
         : null;
     if (activeTool === 'add_line') {
       const rawPt = getPlanPointFromPointer(e.clientX, e.clientY, 'raw');
-      setMousePos(getSnappedLinePoint(rawPt).pt);
+      const snappedLine = getSnappedLinePoint(rawPt).pt;
+      setMousePos(snappedLine);
+      lastAimPosRef.current = snappedLine;
     } else {
-      const pt = getPlanPointFromPointer(
-        e.clientX,
-        e.clientY,
-        activeTool === 'scale_plan' ? 'raw' : activeTool === 'draw_roof' ? 'draft' : 'edit',
-        prevDraftPt
-      );
+      const pt =
+        activeTool === 'draw_roof'
+          ? resolveDrawRoofPointerPoint(e.clientX, e.clientY, prevDraftPt)
+          : getPlanPointFromPointer(
+              e.clientX,
+              e.clientY,
+              activeTool === 'scale_plan' ? 'raw' : 'edit',
+              prevDraftPt
+            );
       setMousePos(pt);
+      if (activeTool === 'draw_roof') {
+        lastAimPosRef.current = pt;
+      }
 
       if (draggedVertexIdx !== null && activeTool === 'adjust_shape') {
-        onUpdateOutline(moveVertex(outline, draggedVertexIdx, pt));
+        onUpdateOutline(moveVertex(outline, draggedVertexIdx, pt), { autoGenerateSkeleton: false });
       } else if (draggedAssetId) {
         const target = assets.find((a) => a.id === draggedAssetId);
         if (target) {
@@ -1620,12 +1826,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       {isMobile ? (
         <>
 
-          {/* Contextual Bottom-Center Active Tool Pills Only When Actively Drawing / Scaling */}
+          {/* Contextual Bottom-Center Active Tool Pills Only When Actively Drawing / Scaling / Editing Corner */}
           {!readOnlyGeometry &&
             (activeTool === 'add_line' ||
               activeTool === 'scale_plan' ||
               activeTool === 'draw_roof' ||
-              activeTool === 'add_feature') && (
+              activeTool === 'add_feature' ||
+              activeTool === 'adjust_shape') && (
               <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1.5 w-[calc(100%-16px)] max-w-sm pointer-events-none">
                 {activeTool === 'add_line' && (
                   <div className="pointer-events-auto bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex flex-wrap justify-center items-center gap-1 animate-in fade-in slide-in-from-bottom-2">
@@ -1671,6 +1878,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         setBisectMode((v) => !v);
                         setLineStartPt(null);
                         setBisectPts([]);
+                        setTypedLengthBuffer('');
                       }}
                       className={`min-h-[34px] px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer flex items-center gap-1 ${
                         bisectMode ? 'bg-amber-600 text-white' : 'text-slate-300 hover:bg-slate-800'
@@ -1683,7 +1891,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 )}
 
                 {activeTool === 'add_line' && (
-                  <div className="pointer-events-auto flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-purple-500/45 shadow-xl text-[11px]">
+                  <div className="pointer-events-auto flex flex-wrap justify-center items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-purple-500/45 shadow-xl text-[11px]">
                     <Crosshair className="w-3.5 h-3.5 text-purple-400 shrink-0" />
                     <span className="text-purple-100 font-semibold">
                       {bisectMode
@@ -1693,17 +1901,42 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           ? 'Bisect (2/3): Tap corner vertex'
                           : 'Bisect (3/3): Tap side pt 2'
                         : lineStartPt
-                        ? chainLineMode
-                          ? 'Pinned · Tap next point (Chain ON)'
-                          : 'Start pinned · Tap end point'
+                        ? 'Pinned · aim & type length or tap end'
                         : 'Tap start point → tap end point'}
                     </span>
+                    {!bisectMode && lineStartPt && (
+                      <form
+                        onSubmit={(ev) => {
+                          ev.preventDefault();
+                          commitTypedSegmentLength(typedLengthBuffer);
+                        }}
+                        className="flex items-center gap-1 bg-slate-950 border border-purple-500/40 rounded-lg px-1.5 py-0.5"
+                      >
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={typedLengthBuffer}
+                          onChange={(ev) => setTypedLengthBuffer(ev.target.value)}
+                          placeholder="m / mm"
+                          aria-label="Line length in metres or millimetres"
+                          className="w-16 bg-transparent text-white font-mono font-bold text-[11px] placeholder:text-slate-500 focus:outline-hidden tabular-nums"
+                        />
+                        <button
+                          type="submit"
+                          disabled={parseDistanceInputToMetres(typedLengthBuffer, 'auto') === null}
+                          className="px-1.5 py-0.5 rounded bg-purple-600 text-white font-bold text-[10px] cursor-pointer disabled:opacity-35"
+                        >
+                          Set
+                        </button>
+                      </form>
+                    )}
                     {lineStartPt || bisectPts.length > 0 ? (
                       <button
                         type="button"
                         onClick={() => {
                           setLineStartPt(null);
                           setBisectPts([]);
+                          setTypedLengthBuffer('');
                         }}
                         className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-semibold cursor-pointer"
                       >
@@ -1790,6 +2023,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     <span className="text-emerald-200 font-bold truncate">
                       {drawSubMode === 'attach_edge' && !attachedEdge
                         ? 'Tap an existing wall or eave edge'
+                        : draftPoints.length === 0 && attachedEdge
+                        ? 'Host wall set — tap start (snaps to line)'
                         : draftPoints.length === 0
                         ? planUnderlay && !planUnderlay.isCalibrated && !hasEstablishedScale
                           ? 'Draw line 1 or use 2-Pt Scale'
@@ -1800,6 +2035,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         ? 'Tap corner 2 (scale prompt next)'
                         : `${draftPoints.length} pts · Tap green start`}
                     </span>
+                    {attachedEdge && draftPoints.length === 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setAttachedEdge(null)}
+                        className="px-2 py-0.5 rounded-lg bg-amber-600/25 border border-amber-500/45 text-amber-200 font-bold shrink-0 cursor-pointer"
+                      >
+                        Repick Wall
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => setOrthoSnap((v) => !v)}
@@ -1811,16 +2055,37 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     >
                       Ortho {orthoSnap ? 'ON' : 'OFF'}
                     </button>
+                    {draftPoints.length >= 1 && (
+                      <form
+                        onSubmit={(ev) => {
+                          ev.preventDefault();
+                          commitTypedSegmentLength(typedLengthBuffer);
+                        }}
+                        className="flex items-center gap-1 bg-slate-950 border border-emerald-500/40 rounded-lg px-1.5 py-0.5"
+                      >
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={typedLengthBuffer}
+                          onChange={(ev) => setTypedLengthBuffer(ev.target.value)}
+                          placeholder="m / mm"
+                          aria-label="Typed segment length"
+                          className="w-16 bg-transparent text-white font-mono font-bold text-[11px] placeholder:text-slate-500 focus:outline-hidden tabular-nums"
+                        />
+                        <button
+                          type="submit"
+                          disabled={parseDistanceInputToMetres(typedLengthBuffer, 'auto') === null}
+                          className="px-1.5 py-0.5 rounded bg-emerald-600 text-white font-bold text-[10px] cursor-pointer disabled:opacity-35"
+                        >
+                          Set
+                        </button>
+                      </form>
+                    )}
                     {draftPoints.length > 0 && (
                       <button
                         type="button"
                         onClick={() => {
-                          if (attachedEdge && draftPoints.length <= 2) {
-                            setDraftPoints([]);
-                            setAttachedEdge(null);
-                            setLockedDraftBounds(null);
-                            return;
-                          }
+                          setTypedLengthBuffer('');
                           const next = draftPoints.slice(0, -1);
                           setDraftPoints(next);
                           if (next.length < 2 && !hasEstablishedScale) {
@@ -1834,10 +2099,20 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         <span>Undo</span>
                       </button>
                     )}
+                    {squareClosedPoints && (
+                      <button
+                        type="button"
+                        onClick={() => finishCustomOutline(squareClosedPoints)}
+                        className="px-2.5 py-0.5 rounded-lg bg-sky-600 text-white font-extrabold flex items-center gap-1 shrink-0 cursor-pointer"
+                      >
+                        <Square className="w-3 h-3" />
+                        <span>Close 90°</span>
+                      </button>
+                    )}
                     {draftPoints.length >= 3 && (
                       <button
                         type="button"
-                        onClick={finishCustomOutline}
+                        onClick={() => finishCustomOutline()}
                         className="px-2.5 py-0.5 rounded-lg bg-emerald-600 text-white font-extrabold flex items-center gap-1 shrink-0 cursor-pointer"
                       >
                         <Check className="w-3 h-3" />
@@ -1851,12 +2126,56 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           setDraftPoints([]);
                           setAttachedEdge(null);
                           setLockedDraftBounds(null);
+                          setTypedLengthBuffer('');
+                          lastAimPosRef.current = null;
                           setDraftScaleReady(hasEstablishedScale);
                         }}
                         className="px-2 py-0.5 rounded-lg bg-slate-900 text-slate-400 font-semibold shrink-0 cursor-pointer"
                       >
                         Reset
                       </button>
+                    )}
+                  </div>
+                )}
+
+                {activeTool === 'adjust_shape' && (
+                  <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-amber-500/45 shadow-xl text-[11px] max-w-full">
+                    {selectedVertexIdx !== null && selectedCornerAngleDeg !== null ? (
+                      <>
+                        <span className="font-mono font-bold text-amber-200 tabular-nums">
+                          C{selectedVertexIdx + 1} · {selectedCornerAngleDeg.toFixed(1)}°
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateOutline(squareOutlineCorner(outline, selectedVertexIdx), {
+                              autoGenerateSkeleton: false
+                            })
+                          }
+                          className="px-2.5 py-1 rounded-lg bg-amber-500 text-slate-950 font-extrabold flex items-center gap-1 cursor-pointer"
+                        >
+                          <Square className="w-3 h-3" />
+                          <span>Square 90°</span>
+                        </button>
+                        {outline.points.length > 3 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onUpdateOutline(deleteVertex(outline, selectedVertexIdx), {
+                                autoGenerateSkeleton: false
+                              });
+                              setSelectedVertexIdx(null);
+                            }}
+                            className="px-2 py-1 rounded-lg bg-rose-600/30 border border-rose-500/50 text-rose-200 font-bold cursor-pointer"
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-amber-200 font-semibold">
+                        Drag corner or tap corner to Square 90°
+                      </span>
                     )}
                   </div>
                 )}
@@ -2356,7 +2675,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           <Crosshair className="w-4 h-4 text-emerald-400 shrink-0" />
           <span className="text-emerald-200 font-bold">
             {drawSubMode === 'attach_edge' && !attachedEdge
-              ? 'Click an existing wall or eave edge to attach new roof'
+              ? 'Click an existing wall or eave edge to set host reference line'
+              : draftPoints.length === 0 && attachedEdge
+              ? 'Host wall reference set — click start anywhere (snaps to wall line)'
               : draftPoints.length === 0
               ? planUnderlay && !planUnderlay.isCalibrated && !hasEstablishedScale
                 ? 'Click first corner (or use 2-Pt Scale first)'
@@ -2365,8 +2686,44 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 : 'Click first corner on canvas to draw'
               : draftPoints.length === 1 && !draftScaleReady && !hasEstablishedScale
               ? 'Click corner 2 to set first-line scale length'
-              : `${draftPoints.length} points placed · Click first point to close`}
+              : `${draftPoints.length} pts · Type length + Enter or click start`}
           </span>
+          {attachedEdge && draftPoints.length === 0 && (
+            <button
+              type="button"
+              onClick={() => setAttachedEdge(null)}
+              className="px-2.5 py-1 rounded-xl bg-amber-600/25 hover:bg-amber-600/40 border border-amber-500/45 text-amber-200 text-xs font-bold cursor-pointer"
+            >
+              Repick Wall
+            </button>
+          )}
+          {draftPoints.length >= 1 && (
+            <form
+              onSubmit={(ev) => {
+                ev.preventDefault();
+                commitTypedSegmentLength(typedLengthBuffer);
+              }}
+              className="flex items-center gap-1 bg-slate-950 border border-emerald-500/40 rounded-xl px-2 py-0.5"
+            >
+              <Ruler className="w-3.5 h-3.5 text-emerald-400" />
+              <input
+                type="text"
+                inputMode="decimal"
+                value={typedLengthBuffer}
+                onChange={(ev) => setTypedLengthBuffer(ev.target.value)}
+                placeholder="Len m/mm"
+                aria-label="Typed segment length"
+                className="w-20 bg-transparent text-white font-mono font-bold text-xs placeholder:text-slate-500 focus:outline-hidden tabular-nums"
+              />
+              <button
+                type="submit"
+                disabled={parseDistanceInputToMetres(typedLengthBuffer, 'auto') === null}
+                className="px-2 py-0.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-35"
+              >
+                Set
+              </button>
+            </form>
+          )}
           <button
             type="button"
             onClick={() => setOrthoSnap((v) => !v)}
@@ -2382,12 +2739,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             <button
               type="button"
               onClick={() => {
-                if (attachedEdge && draftPoints.length <= 2) {
-                  setDraftPoints([]);
-                  setAttachedEdge(null);
-                  setLockedDraftBounds(null);
-                  return;
-                }
+                setTypedLengthBuffer('');
                 const next = draftPoints.slice(0, -1);
                 setDraftPoints(next);
                 if (next.length < 2 && !hasEstablishedScale) {
@@ -2401,10 +2753,21 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               <span>Undo</span>
             </button>
           )}
+          {squareClosedPoints && (
+            <button
+              type="button"
+              onClick={() => finishCustomOutline(squareClosedPoints)}
+              className="px-3 py-1 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1"
+              title="Complete right-angle rectangle back to start (R)"
+            >
+              <Square className="w-3.5 h-3.5" />
+              <span>Close Square</span>
+            </button>
+          )}
           {draftPoints.length >= 3 && (
             <button
               type="button"
-              onClick={finishCustomOutline}
+              onClick={() => finishCustomOutline()}
               className="px-3 py-1 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1"
             >
               <Check className="w-3.5 h-3.5" />
@@ -2418,6 +2781,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 setDraftPoints([]);
                 setAttachedEdge(null);
                 setLockedDraftBounds(null);
+                setTypedLengthBuffer('');
+                lastAimPosRef.current = null;
                 setDraftScaleReady(hasEstablishedScale);
               }}
               className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold cursor-pointer"
@@ -2429,7 +2794,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       )}
 
       {!isMobile && activeTool === 'add_line' && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2.5 px-3.5 py-1.5 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-purple-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-2.5 px-3.5 py-1.5 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-purple-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
           <Crosshair className="w-3.5 h-3.5 text-purple-400 shrink-0" />
           <span className="text-purple-200 font-medium">
             {bisectMode
@@ -2439,22 +2804,91 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 ? '3-Pt Bisector (2/3): Click corner apex vertex'
                 : '3-Pt Bisector (3/3): Click second wing/edge point'
               : lineStartPt
-              ? chainLineMode
-                ? 'Chain ON: click next point (or Break Chain / Esc)'
-                : 'Click end point anywhere on roof or perimeter (auto-snaps)'
+              ? 'Aim & type length + Enter, or click next point (Esc to break)'
               : 'Click start point → click end point to draw ridge, hip, or valley'}
           </span>
+          {!bisectMode && lineStartPt && (
+            <form
+              onSubmit={(ev) => {
+                ev.preventDefault();
+                commitTypedSegmentLength(typedLengthBuffer);
+              }}
+              className="flex items-center gap-1 bg-slate-950 border border-purple-500/40 rounded-xl px-2 py-0.5"
+            >
+              <Ruler className="w-3.5 h-3.5 text-purple-400" />
+              <input
+                type="text"
+                inputMode="decimal"
+                value={typedLengthBuffer}
+                onChange={(ev) => setTypedLengthBuffer(ev.target.value)}
+                placeholder="Len m/mm"
+                aria-label="Typed line length"
+                className="w-20 bg-transparent text-white font-mono font-bold text-xs placeholder:text-slate-500 focus:outline-hidden tabular-nums"
+              />
+              <button
+                type="submit"
+                disabled={parseDistanceInputToMetres(typedLengthBuffer, 'auto') === null}
+                className="px-2 py-0.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-35"
+              >
+                Set
+              </button>
+            </form>
+          )}
           {(lineStartPt || bisectPts.length > 0) && (
             <button
               type="button"
               onClick={() => {
                 setLineStartPt(null);
                 setBisectPts([]);
+                setTypedLengthBuffer('');
               }}
               className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white text-[11px] font-semibold cursor-pointer"
             >
               {lineStartPt ? 'Break Chain' : 'Reset'}
             </button>
+          )}
+        </div>
+      )}
+
+      {!isMobile && !readOnlyGeometry && activeTool === 'adjust_shape' && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-2.5 px-3.5 py-2 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-amber-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
+          {selectedVertexIdx !== null && selectedCornerAngleDeg !== null ? (
+            <>
+              <span className="font-mono font-bold text-amber-200 tabular-nums">
+                Corner #{selectedVertexIdx + 1} · {selectedCornerAngleDeg.toFixed(1)}°
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateOutline(squareOutlineCorner(outline, selectedVertexIdx), {
+                    autoGenerateSkeleton: false
+                  })
+                }
+                className="px-3 py-1 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs flex items-center gap-1.5 cursor-pointer"
+                title="Force selected corner to 90 degrees without moving neighbors"
+              >
+                <Square className="w-3.5 h-3.5" />
+                <span>Square Corner (90°)</span>
+              </button>
+              {outline.points.length > 3 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onUpdateOutline(deleteVertex(outline, selectedVertexIdx), {
+                      autoGenerateSkeleton: false
+                    });
+                    setSelectedVertexIdx(null);
+                  }}
+                  className="px-2.5 py-1 rounded-xl bg-rose-600/25 hover:bg-rose-600/40 border border-rose-500/45 text-rose-200 font-bold text-xs cursor-pointer"
+                >
+                  Delete Corner
+                </button>
+              )}
+            </>
+          ) : (
+            <span className="text-amber-200 font-semibold">
+              Drag corner points · Click a corner to Square 90° · Click an edge to insert corner
+            </span>
           )}
         </div>
       )}
@@ -3814,10 +4248,64 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               );
             })}
 
+          {/* ACTIVE HOST WALL REFERENCE LINE & INFINITE SUPPORTING SNAP GUIDE */}
+          {!readOnlyGeometry &&
+            activeTool === 'draw_roof' &&
+            attachedEdge &&
+            (() => {
+              const dx = attachedEdge.to.x - attachedEdge.from.x;
+              const dy = attachedEdge.to.y - attachedEdge.from.y;
+              const len = Math.hypot(dx, dy) || 1;
+              const ux = dx / len;
+              const uy = dy / len;
+              const ext = 60;
+              const extA = { x: attachedEdge.from.x - ux * ext, y: attachedEdge.from.y - uy * ext };
+              const extB = { x: attachedEdge.to.x + ux * ext, y: attachedEdge.to.y + uy * ext };
+              const cursorOnHostLine =
+                mousePos &&
+                snapPointToSupportingLine(mousePos, attachedEdge.from, attachedEdge.to, 0.025).snapped;
+              return (
+                <g pointerEvents="none">
+                  <line
+                    x1={toSvgX(extA.x)}
+                    y1={toSvgY(extA.y)}
+                    x2={toSvgX(extB.x)}
+                    y2={toSvgY(extB.y)}
+                    stroke="#f59e0b"
+                    strokeOpacity="0.42"
+                    strokeWidth="1.5"
+                    strokeDasharray="6 5"
+                  />
+                  <line
+                    x1={toSvgX(attachedEdge.from.x)}
+                    y1={toSvgY(attachedEdge.from.y)}
+                    x2={toSvgX(attachedEdge.to.x)}
+                    y2={toSvgY(attachedEdge.to.y)}
+                    stroke="#f59e0b"
+                    strokeOpacity="0.88"
+                    strokeWidth="4"
+                    strokeLinecap="round"
+                  />
+                  {cursorOnHostLine && mousePos && (
+                    <circle
+                      cx={toSvgX(mousePos.x)}
+                      cy={toSvgY(mousePos.y)}
+                      r="7"
+                      fill="#f59e0b"
+                      fillOpacity="0.3"
+                      stroke="#fde68a"
+                      strokeWidth="1.8"
+                    />
+                  )}
+                </g>
+              );
+            })()}
+
           {/* OUTLINE CORNER VERTICES (Pointer drag targets in adjust_shape, multi-level corner snaps in add_line) */}
           {!readOnlyGeometry &&
             (activeTool === 'add_line' ? allDisplayOutlinePoints : outline.points).map((p, idx) => {
               const isVertexInteractive = activeTool === 'adjust_shape' || activeTool === 'add_line';
+              const isSelCorner = activeTool === 'adjust_shape' && selectedVertexIdx === idx;
               return (
                 <g
                   key={`pt-${idx}`}
@@ -3838,6 +4326,17 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     r={isTouchDevice ? 18 : 12}
                     fill="transparent"
                   />
+                  {isSelCorner && (
+                    <circle
+                      cx={toSvgX(p.x)}
+                      cy={toSvgY(p.y)}
+                      r={isTouchDevice ? 15 : 12.5}
+                      fill="none"
+                      stroke="#fbbf24"
+                      strokeWidth="2"
+                      strokeDasharray="3 2"
+                    />
+                  )}
                   <circle
                     cx={toSvgX(p.x)}
                     cy={toSvgY(p.y)}
@@ -3853,16 +4352,43 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         : 5
                     }
                     fill={
-                      activeTool === 'adjust_shape'
+                      isSelCorner
+                        ? '#fbbf24'
+                        : activeTool === 'adjust_shape'
                         ? '#f59e0b'
                         : activeTool === 'add_line'
                         ? '#c084fc'
                         : '#ffffff'
                     }
-                    stroke="#0f172a"
+                    stroke={isSelCorner ? '#ffffff' : '#0f172a'}
                     strokeWidth="2.5"
                     className="transition-all group-hover:scale-125"
                   />
+                  {isSelCorner && selectedCornerAngleDeg !== null && (
+                    <g transform={`translate(${toSvgX(p.x)}, ${toSvgY(p.y) - 20})`} pointerEvents="none">
+                      <rect
+                        x="-26"
+                        y="-9.5"
+                        width="52"
+                        height="19"
+                        rx="6"
+                        fill="#090d16"
+                        stroke="#fbbf24"
+                        strokeWidth="1.2"
+                      />
+                      <text
+                        x="0"
+                        y="3.2"
+                        textAnchor="middle"
+                        fill="#fde68a"
+                        fontSize="9.5"
+                        fontWeight="bold"
+                        fontFamily="monospace"
+                      >
+                        {selectedCornerAngleDeg.toFixed(1)}°
+                      </text>
+                    </g>
+                  )}
                 </g>
               );
             })}
@@ -4014,29 +4540,90 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               >
                 Start
               </text>
-              {mousePos && (
+              {typedSegmentPreview && activeTool === 'add_line' ? (
                 <>
                   <line
-                    x1={toSvgX(lineStartPt.x)}
-                    y1={toSvgY(lineStartPt.y)}
-                    x2={toSvgX(mousePos.x)}
-                    y2={toSvgY(mousePos.y)}
-                    stroke="#c084fc"
-                    strokeWidth="2.2"
+                    x1={toSvgX(typedSegmentPreview.fromPt.x)}
+                    y1={toSvgY(typedSegmentPreview.fromPt.y)}
+                    x2={toSvgX(typedSegmentPreview.toPt.x)}
+                    y2={toSvgY(typedSegmentPreview.toPt.y)}
+                    stroke="#38bdf8"
+                    strokeWidth="2.8"
                     strokeDasharray="5 3"
                   />
-                  {dist(lineStartPt, mousePos) >= 0.1 && (
-                    <g
-                      transform={`translate(${(toSvgX(lineStartPt.x) + toSvgX(mousePos.x)) / 2}, ${(toSvgY(lineStartPt.y) + toSvgY(mousePos.y)) / 2 - 14})`}
-                    >
-                      <rect x="-26" y="-9.5" width="52" height="19" rx="9.5" fill="#6b21a8" stroke="#e9d5ff" strokeWidth="0.9" />
-                      <text x="0" y="3.2" textAnchor="middle" fill="#ffffff" fontSize="9" fontWeight="bold" fontFamily="monospace">
-                        {dist(lineStartPt, mousePos).toFixed(2)}m
-                      </text>
-                    </g>
-                  )}
+                  <circle
+                    cx={toSvgX(typedSegmentPreview.toPt.x)}
+                    cy={toSvgY(typedSegmentPreview.toPt.y)}
+                    r="5"
+                    fill="#38bdf8"
+                    stroke="#090d16"
+                    strokeWidth="1.8"
+                  />
+                  <g
+                    transform={`translate(${(toSvgX(typedSegmentPreview.fromPt.x) + toSvgX(typedSegmentPreview.toPt.x)) / 2}, ${(toSvgY(typedSegmentPreview.fromPt.y) + toSvgY(typedSegmentPreview.toPt.y)) / 2 - 14})`}
+                  >
+                    <rect x="-32" y="-9.5" width="64" height="19" rx="9.5" fill="#0369a1" stroke="#bae6fd" strokeWidth="1" />
+                    <text x="0" y="3.2" textAnchor="middle" fill="#ffffff" fontSize="9" fontWeight="bold" fontFamily="monospace">
+                      {typedSegmentPreview.lengthM.toFixed(2)}m ↵
+                    </text>
+                  </g>
                 </>
+              ) : (
+                mousePos && (
+                  <>
+                    <line
+                      x1={toSvgX(lineStartPt.x)}
+                      y1={toSvgY(lineStartPt.y)}
+                      x2={toSvgX(mousePos.x)}
+                      y2={toSvgY(mousePos.y)}
+                      stroke="#c084fc"
+                      strokeWidth="2.2"
+                      strokeDasharray="5 3"
+                    />
+                    {dist(lineStartPt, mousePos) >= 0.1 && (
+                      <g
+                        transform={`translate(${(toSvgX(lineStartPt.x) + toSvgX(mousePos.x)) / 2}, ${(toSvgY(lineStartPt.y) + toSvgY(mousePos.y)) / 2 - 14})`}
+                      >
+                        <rect x="-26" y="-9.5" width="52" height="19" rx="9.5" fill="#6b21a8" stroke="#e9d5ff" strokeWidth="0.9" />
+                        <text x="0" y="3.2" textAnchor="middle" fill="#ffffff" fontSize="9" fontWeight="bold" fontFamily="monospace">
+                          {dist(lineStartPt, mousePos).toFixed(2)}m
+                        </text>
+                      </g>
+                    )}
+                  </>
+                )
               )}
+            </g>
+          )}
+
+          {/* TYPED LENGTH LIVE TARGET PREVIEW FOR DRAW ROOF */}
+          {activeTool === 'draw_roof' && typedSegmentPreview && (
+            <g pointerEvents="none">
+              <line
+                x1={toSvgX(typedSegmentPreview.fromPt.x)}
+                y1={toSvgY(typedSegmentPreview.fromPt.y)}
+                x2={toSvgX(typedSegmentPreview.toPt.x)}
+                y2={toSvgY(typedSegmentPreview.toPt.y)}
+                stroke="#38bdf8"
+                strokeWidth="3"
+                strokeDasharray="5 3"
+              />
+              <circle
+                cx={toSvgX(typedSegmentPreview.toPt.x)}
+                cy={toSvgY(typedSegmentPreview.toPt.y)}
+                r="5.5"
+                fill="#38bdf8"
+                stroke="#090d16"
+                strokeWidth="2"
+              />
+              <g
+                transform={`translate(${(toSvgX(typedSegmentPreview.fromPt.x) + toSvgX(typedSegmentPreview.toPt.x)) / 2}, ${(toSvgY(typedSegmentPreview.fromPt.y) + toSvgY(typedSegmentPreview.toPt.y)) / 2 - 15})`}
+              >
+                <rect x="-34" y="-9.5" width="68" height="19" rx="9.5" fill="#0369a1" stroke="#bae6fd" strokeWidth="1" />
+                <text x="0" y="3.2" textAnchor="middle" fill="#ffffff" fontSize="9" fontWeight="bold" fontFamily="monospace">
+                  {typedSegmentPreview.lengthM.toFixed(2)}m ↵
+                </text>
+              </g>
             </g>
           )}
 

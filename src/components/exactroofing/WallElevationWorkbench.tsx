@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ChevronLeft,
@@ -11,11 +11,14 @@ import {
   Layers,
   Link2,
   Maximize,
+  Maximize2,
   Plus,
   Ruler,
   Square,
   Trash2,
-  Upload
+  Upload,
+  ZoomIn,
+  ZoomOut
 } from 'lucide-react';
 import { ArchitecturalPlan } from '../../types/crm';
 import {
@@ -79,6 +82,7 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   readOnly = false
 }) => {
   const svgRef = useRef<SVGSVGElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [selectedOpeningId, setSelectedOpeningId] = useState<string | null>(
     facet.openings[0]?.id || null
@@ -89,6 +93,34 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   const [calPtsNorm, setCalPtsNorm] = useState<Point2D[]>([]);
   const [calDistM, setCalDistM] = useState<string>('2.10');
   const [imageAspect, setImageAspect] = useState<number>(1.45);
+
+  // Zoom & Pan state for inspecting underlay scans & parametric openings
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isPanDragging, setIsPanDragging] = useState<boolean>(false);
+  const zoomRef = useRef<number>(1);
+  const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  zoomRef.current = zoom;
+  panRef.current = pan;
+  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const lastPinchDistRef = useRef<number | null>(null);
+  const panDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    originPanX: number;
+    originPanY: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressNextClickRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+    setSelectedOpeningId(facet.openings[0]?.id || null);
+    setCalibratingTwoPt(false);
+    setCalPtsNorm([]);
+  }, [facet.id]);
 
   const metrics = useMemo(() => computeWallFacetMetrics(facet), [facet]);
   const primaryCladding = useMemo(() => getFacetPrimaryDisplayCladding(facet), [facet]);
@@ -321,6 +353,10 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   const wallH = Math.max(20, maxProfileHeight * pxPerM);
   const svgW = padL + wallW + padR;
   const svgH = padT + wallH + padB;
+  const vbW = +(svgW / zoom).toFixed(2);
+  const vbH = +(svgH / zoom).toFixed(2);
+  const vbX = +((svgW - vbW) / 2 + pan.x).toFixed(2);
+  const vbY = +((svgH - vbH) / 2 + pan.y).toFixed(2);
 
   const toSvgX = (uM: number) => padL + uM * pxPerM;
   const toSvgY = (vM: number) => padT + (maxProfileHeight - vM) * pxPerM;
@@ -335,16 +371,147 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     return { x: ux, y: uy, width: uw, height: uh };
   }, [facet.underlay, maxProfileHeight]);
 
+  // Cursor-anchored wheel zoom on the elevation canvas
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      const svg = svgRef.current;
+      if (!svg) return;
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      const oldZoom = zoomRef.current;
+      const oldPan = panRef.current;
+      const oldVbW = svgW / oldZoom;
+      const oldVbH = svgH / oldZoom;
+      const oldVbX = (svgW - oldVbW) / 2 + oldPan.x;
+      const oldVbY = (svgH - oldVbH) / 2 + oldPan.y;
+
+      const fitScale = Math.min(rect.width / oldVbW, rect.height / oldVbH) || 1;
+      const renderedW = oldVbW * fitScale;
+      const renderedH = oldVbH * fitScale;
+      const padLeftPx = (rect.width - renderedW) / 2;
+      const padTopPx = (rect.height - renderedH) / 2;
+
+      const fx = (e.clientX - rect.left - padLeftPx) / Math.max(1, renderedW);
+      const fy = (e.clientY - rect.top - padTopPx) / Math.max(1, renderedH);
+      const cursorSvgX = oldVbX + fx * oldVbW;
+      const cursorSvgY = oldVbY + fy * oldVbH;
+
+      const delta = -e.deltaY * (e.deltaMode === 1 ? 18 : 1);
+      const factor = Math.exp(delta * 0.0014);
+      const nextZoom = Math.max(0.5, Math.min(8.0, +(oldZoom * factor).toFixed(3)));
+      if (Math.abs(nextZoom - oldZoom) < 1e-4) return;
+
+      const nextVbW = svgW / nextZoom;
+      const nextVbH = svgH / nextZoom;
+      const nextVbX = cursorSvgX - fx * nextVbW;
+      const nextVbY = cursorSvgY - fy * nextVbH;
+      const nextPanX = nextVbX - (svgW - nextVbW) / 2;
+      const nextPanY = nextVbY - (svgH - nextVbH) / 2;
+
+      setZoom(nextZoom);
+      setPan({ x: +nextPanX.toFixed(2), y: +nextPanY.toFixed(2) });
+    };
+
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+    return () => viewport.removeEventListener('wheel', handleWheel);
+  }, [svgW, svgH]);
+
+  const handleSvgPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activePointersRef.current.size === 2) {
+      const pts = Array.from(activePointersRef.current.values());
+      lastPinchDistRef.current = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      panDragRef.current = null;
+      setIsPanDragging(false);
+      return;
+    }
+    if ((e.button === 0 || e.button === 1) && activePointersRef.current.size === 1) {
+      panDragRef.current = {
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        originPanX: panRef.current.x,
+        originPanY: panRef.current.y,
+        moved: false
+      };
+      setIsPanDragging(false);
+    }
+  };
+
+  const handleSvgPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const fitScale = Math.min(rect.width / vbW, rect.height / vbH) || 1;
+
+    if (activePointersRef.current.has(e.pointerId)) {
+      const prev = activePointersRef.current.get(e.pointerId)!;
+      activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activePointersRef.current.size === 2) {
+        const pts = Array.from(activePointersRef.current.values());
+        const d = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        if (lastPinchDistRef.current !== null && lastPinchDistRef.current > 0) {
+          const ratio = d / lastPinchDistRef.current;
+          setZoom((z) => Math.max(0.5, Math.min(8.0, +(z * ratio).toFixed(3))));
+        }
+        lastPinchDistRef.current = d;
+        setPan((p) => ({
+          x: +(p.x - ((e.clientX - prev.x) * 0.6) / fitScale).toFixed(2),
+          y: +(p.y - ((e.clientY - prev.y) * 0.6) / fitScale).toFixed(2)
+        }));
+        return;
+      }
+    }
+
+    if (panDragRef.current && panDragRef.current.pointerId === e.pointerId) {
+      const dxScreen = e.clientX - panDragRef.current.startClientX;
+      const dyScreen = e.clientY - panDragRef.current.startClientY;
+      if (Math.hypot(dxScreen, dyScreen) > 4) {
+        panDragRef.current.moved = true;
+        setIsPanDragging(true);
+      }
+      if (panDragRef.current.moved) {
+        setPan({
+          x: +(panDragRef.current.originPanX - dxScreen / fitScale).toFixed(2),
+          y: +(panDragRef.current.originPanY - dyScreen / fitScale).toFixed(2)
+        });
+      }
+    }
+  };
+
+  const handleSvgPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (panDragRef.current && panDragRef.current.pointerId === e.pointerId) {
+      if (panDragRef.current.moved) {
+        suppressNextClickRef.current = true;
+      }
+      panDragRef.current = null;
+      setIsPanDragging(false);
+    }
+    activePointersRef.current.delete(e.pointerId);
+    if (activePointersRef.current.size < 2) {
+      lastPinchDistRef.current = null;
+    }
+  };
+
   const handleSvgClick = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (suppressNextClickRef.current) {
+      suppressNextClickRef.current = false;
+      return;
+    }
     if (readOnly || !svgRef.current) return;
     const rect = svgRef.current.getBoundingClientRect();
-    const scale = Math.min(rect.width / svgW, rect.height / svgH);
-    const renderedW = svgW * scale;
-    const renderedH = svgH * scale;
+    const fitScale = Math.min(rect.width / vbW, rect.height / vbH) || 1;
+    const renderedW = vbW * fitScale;
+    const renderedH = vbH * fitScale;
     const padLeftPx = (rect.width - renderedW) / 2;
     const padTopPx = (rect.height - renderedH) / 2;
-    const svgX = (e.clientX - rect.left - padLeftPx) / Math.max(0.01, scale);
-    const svgY = (e.clientY - rect.top - padTopPx) / Math.max(0.01, scale);
+    const svgX = vbX + (e.clientX - rect.left - padLeftPx) / Math.max(0.01, fitScale);
+    const svgY = vbY + (e.clientY - rect.top - padTopPx) / Math.max(0.01, fitScale);
 
     if (calibratingTwoPt && underlayBox) {
       const nx = Math.max(0, Math.min(1, (svgX - underlayBox.x) / underlayBox.width));
@@ -762,21 +929,79 @@ export const WallElevationWorkbench: React.FC<Props> = ({
               })}
             </div>
 
-            {clickPlaceType && (
-              <span className="text-[11px] font-bold text-sky-300">
-                Click anywhere along Wall {facet.code} to place {clickPlaceType}
-              </span>
-            )}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {clickPlaceType && (
+                <span className="text-[11px] font-bold text-sky-300">
+                  Tap Wall {facet.code} to place {clickPlaceType}
+                </span>
+              )}
+              <div className="flex items-center gap-0.5 p-0.5 rounded-xl bg-slate-950 border border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.35).toFixed(2)))}
+                  className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 cursor-pointer"
+                  title="Zoom Out"
+                  aria-label="Zoom Out Elevation"
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setZoom(1);
+                    setPan({ x: 0, y: 0 });
+                  }}
+                  className="px-2 py-1 rounded-lg text-[10px] font-mono font-bold text-slate-300 hover:text-white hover:bg-slate-800 tabular-nums cursor-pointer"
+                  title="Reset Fit Face"
+                >
+                  {Math.round(zoom * 100)}%
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setZoom((z) => Math.min(8.0, +(z + 0.35).toFixed(2)))}
+                  className="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 cursor-pointer"
+                  title="Zoom In"
+                  aria-label="Zoom In Elevation"
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </button>
+                {(zoom !== 1 || pan.x !== 0 || pan.y !== 0) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setZoom(1);
+                      setPan({ x: 0, y: 0 });
+                    }}
+                    className="px-2 py-1 rounded-lg text-sky-400 hover:text-white hover:bg-slate-800 text-[10px] font-bold flex items-center gap-1 cursor-pointer"
+                    title="Fit Face"
+                  >
+                    <Maximize2 className="w-3 h-3" />
+                    <span>Fit</span>
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
 
           {/* True-Scale Elevation SVG */}
-          <div className="flex-1 bg-[#070b14] border border-slate-800/90 rounded-xl p-2 flex items-center justify-center overflow-hidden min-h-[240px]">
+          <div
+            ref={viewportRef}
+            className="flex-1 bg-[#070b14] border border-slate-800/90 rounded-xl p-2 flex items-center justify-center overflow-hidden min-h-[260px] touch-none"
+          >
             <svg
               ref={svgRef}
-              viewBox={`0 0 ${svgW} ${svgH}`}
-              className={`w-full h-full max-h-[380px] select-none ${
-                clickPlaceType || calibratingTwoPt ? 'cursor-crosshair' : 'cursor-default'
+              viewBox={`${vbX} ${vbY} ${vbW} ${vbH}`}
+              className={`w-full h-full max-h-[400px] select-none ${
+                isPanDragging
+                  ? 'cursor-grabbing'
+                  : clickPlaceType || calibratingTwoPt
+                  ? 'cursor-crosshair'
+                  : 'cursor-grab'
               }`}
+              onPointerDown={handleSvgPointerDown}
+              onPointerMove={handleSvgPointerMove}
+              onPointerUp={handleSvgPointerUp}
+              onPointerCancel={handleSvgPointerUp}
               onClick={handleSvgClick}
               preserveAspectRatio="xMidYMid meet"
             >
@@ -1016,7 +1241,7 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                     key={c.id}
                     className={calibratingTwoPt ? 'pointer-events-none' : 'cursor-pointer'}
                     onClick={(ev) => {
-                      if (calibratingTwoPt) return;
+                      if (calibratingTwoPt || suppressNextClickRef.current) return;
                       ev.stopPropagation();
                       setSelectedOpeningId(c.id);
                     }}

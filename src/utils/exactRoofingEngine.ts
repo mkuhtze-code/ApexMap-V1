@@ -169,8 +169,81 @@ export function buildOutlineFromPoints(
 }
 
 /**
- * Builds a closed roof outline attached to an existing wall/gutter edge.
- * Preserves the attachment edge's role when it was a wall (or marks it unclassified),
+ * Projects a 2D point onto the infinite supporting line defined by [lineFrom, lineTo]
+ * if within snapRadiusM (supports snapping mid-segment AND extending beyond either endpoint).
+ */
+export function snapPointToSupportingLine(
+  pt: Point2D,
+  lineFrom: Point2D,
+  lineTo: Point2D,
+  snapRadiusM = 0.45
+): { pt: Point2D; snapped: boolean; perpDist: number } {
+  const dx = lineTo.x - lineFrom.x;
+  const dy = lineTo.y - lineFrom.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-5) {
+    return { pt: { ...pt }, snapped: false, perpDist: Infinity };
+  }
+  const ux = dx / len;
+  const uy = dy / len;
+  const s = (pt.x - lineFrom.x) * ux + (pt.y - lineFrom.y) * uy;
+  const projX = lineFrom.x + ux * s;
+  const projY = lineFrom.y + uy * s;
+  const perpDist = Math.hypot(pt.x - projX, pt.y - projY);
+  if (perpDist <= snapRadiusM) {
+    return {
+      pt: { x: +projX.toFixed(3), y: +projY.toFixed(3) },
+      snapped: true,
+      perpDist
+    };
+  }
+  return { pt: { ...pt }, snapped: false, perpDist };
+}
+
+/**
+ * Checks whether a drawn boundary edge is colinear with a host edge's infinite supporting line
+ * and overlaps the host run (supporting shorter mid-wall, equal full-face, or longer past-corner abutments).
+ */
+export function isEdgeColinearWithSegment(
+  edge: { from: Point2D; to: Point2D },
+  hostFrom: Point2D,
+  hostTo: Point2D,
+  options?: { perpTolM?: number; angleTolDeg?: number }
+): boolean {
+  const perpTolM = options?.perpTolM ?? 0.15;
+  const angleTolDeg = options?.angleTolDeg ?? 6;
+  const hostDx = hostTo.x - hostFrom.x;
+  const hostDy = hostTo.y - hostFrom.y;
+  const hostLen = Math.hypot(hostDx, hostDy);
+  const edgeDx = edge.to.x - edge.from.x;
+  const edgeDy = edge.to.y - edge.from.y;
+  const edgeLen = Math.hypot(edgeDx, edgeDy);
+  if (hostLen < 0.08 || edgeLen < 0.08) return false;
+
+  const ux = hostDx / hostLen;
+  const uy = hostDy / hostLen;
+  const ex = edgeDx / edgeLen;
+  const ey = edgeDy / edgeLen;
+
+  const minDot = Math.cos((angleTolDeg * Math.PI) / 180);
+  if (Math.abs(ex * ux + ey * uy) < minDot) return false;
+
+  const perpA = Math.abs((edge.from.x - hostFrom.x) * -uy + (edge.from.y - hostFrom.y) * ux);
+  const perpB = Math.abs((edge.to.x - hostFrom.x) * -uy + (edge.to.y - hostFrom.y) * ux);
+  if (perpA > perpTolM || perpB > perpTolM) return false;
+
+  const tA = (edge.from.x - hostFrom.x) * ux + (edge.from.y - hostFrom.y) * uy;
+  const tB = (edge.to.x - hostFrom.x) * ux + (edge.to.y - hostFrom.y) * uy;
+  const eMin = Math.min(tA, tB);
+  const eMax = Math.max(tA, tB);
+  const overlap = Math.min(eMax, hostLen) - Math.max(eMin, 0);
+  return overlap > 0.05;
+}
+
+/**
+ * Builds a closed roof outline attached to an existing wall/gutter host edge.
+ * Detects any boundary edge(s) colinear with the host supporting line (shorter, equal, or longer),
+ * tags them as abutment walls inheriting host height/setback defaults,
  * and leaves all newly drawn outer edges unclassified for ExactRoof setup.
  */
 export function buildAttachedOutlineFromEdge(
@@ -193,16 +266,19 @@ export function buildAttachedOutlineFromEdge(
   return {
     ...base,
     edges: base.edges.map((e) => {
-      const matchesAttached =
-        (pointsClose(e.from, attachedEdge.from, 0.12) &&
-          pointsClose(e.to, attachedEdge.to, 0.12)) ||
-        (pointsClose(e.from, attachedEdge.to, 0.12) &&
-          pointsClose(e.to, attachedEdge.from, 0.12));
-      if (!matchesAttached) return e;
+      const colinearToHost = isEdgeColinearWithSegment(e, attachedEdge.from, attachedEdge.to);
+      if (!colinearToHost) return e;
       return {
         ...e,
-        type: attachedEdge.type === 'wall' ? 'wall' : options?.initialEdgeType ?? 'unclassified',
-        hasWall: attachedEdge.type === 'wall' ? true : e.hasWall
+        type: 'wall',
+        ...(attachedEdge.type === 'wall' || attachedEdge.hasWall === true
+          ? { hasWall: true }
+          : attachedEdge.hasWall === false
+          ? { hasWall: false }
+          : {}),
+        ...(attachedEdge.eaveSetbackM !== undefined
+          ? { eaveSetbackM: attachedEdge.eaveSetbackM }
+          : {})
       };
     })
   };
@@ -290,9 +366,99 @@ function preserveOutlineEdgeMetadata(next: RoofOutline, prev: RoofOutline): Roof
       id: prev.edges[i]?.id || e.id,
       type: prev.edges[i]?.type || e.type,
       ...(prev.edges[i]?.eaveHeightM !== undefined ? { eaveHeightM: prev.edges[i].eaveHeightM } : {}),
+      ...(prev.edges[i]?.hasWall !== undefined ? { hasWall: prev.edges[i].hasWall } : {}),
+      ...(prev.edges[i]?.eaveSetbackM !== undefined ? { eaveSetbackM: prev.edges[i].eaveSetbackM } : {}),
+      ...(prev.edges[i]?.wallBottomZ !== undefined ? { wallBottomZ: prev.edges[i].wallBottomZ } : {}),
       ...(prev.edges[i]?.levelId ? { levelId: prev.edges[i].levelId } : prev.levelId ? { levelId: prev.levelId } : {})
     }))
   };
+}
+
+/**
+ * Interior corner angle in degrees [0..180] at vertexIdx of a closed polygon.
+ */
+export function computeCornerAngleDeg(points: Point2D[], vertexIdx: number): number | null {
+  const n = points.length;
+  if (n < 3 || vertexIdx < 0 || vertexIdx >= n) return null;
+  const prev = points[(vertexIdx - 1 + n) % n];
+  const curr = points[vertexIdx];
+  const next = points[(vertexIdx + 1) % n];
+  const ax = prev.x - curr.x;
+  const ay = prev.y - curr.y;
+  const bx = next.x - curr.x;
+  const by = next.y - curr.y;
+  const la = Math.hypot(ax, ay);
+  const lb = Math.hypot(bx, by);
+  if (la < 1e-4 || lb < 1e-4) return null;
+  const dot = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb)));
+  return +((Math.acos(dot) * 180) / Math.PI).toFixed(1);
+}
+
+/**
+ * Squares a single corner vertex V of a closed polygon so adjacent edges (P_prev->V and V->P_next)
+ * meet at 90 degrees without moving P_prev or P_next or breaking the closed outline.
+ *
+ * Rule (Thales Closest-Right-Angle Projection):
+ * Projects V radially onto the Thales circle with diameter [P_prev, P_next]
+ * (center M = midpoint(P_prev, P_next), radius R = dist(P_prev, P_next) / 2).
+ * This is the minimum-distance move on V that enforces angle(P_prev, V', P_next) = 90 deg,
+ * preserves orientation on the same side of the chord, and leaves an exact 90 deg corner unchanged.
+ */
+export function squarePolygonCorner(points: Point2D[], vertexIdx: number): Point2D[] {
+  const n = points.length;
+  if (n < 3 || vertexIdx < 0 || vertexIdx >= n) return points;
+  const prev = points[(vertexIdx - 1 + n) % n];
+  const curr = points[vertexIdx];
+  const next = points[(vertexIdx + 1) % n];
+
+  const chordDx = next.x - prev.x;
+  const chordDy = next.y - prev.y;
+  const chordLen = Math.hypot(chordDx, chordDy);
+  if (chordLen < 0.08) return points;
+
+  const midX = (prev.x + next.x) / 2;
+  const midY = (prev.y + next.y) / 2;
+  const radius = chordLen / 2;
+
+  const rx = curr.x - midX;
+  const ry = curr.y - midY;
+  const rLen = Math.hypot(rx, ry);
+
+  let nextX: number;
+  let nextY: number;
+  if (rLen < 1e-4) {
+    // 180-deg collinear vertex: offset perpendicularly to the chord
+    const ux = -chordDy / chordLen;
+    const uy = chordDx / chordLen;
+    nextX = midX + ux * radius;
+    nextY = midY + uy * radius;
+  } else {
+    nextX = midX + (rx / rLen) * radius;
+    nextY = midY + (ry / rLen) * radius;
+  }
+
+  return points.map((p, idx) =>
+    idx === vertexIdx
+      ? { x: +nextX.toFixed(3), y: +nextY.toFixed(3) }
+      : { ...p }
+  );
+}
+
+/**
+ * Squares the corner vertex of a RoofOutline while preserving all edge metadata.
+ */
+export function squareOutlineCorner(outline: RoofOutline, vertexIdx: number): RoofOutline {
+  if (vertexIdx < 0 || vertexIdx >= outline.points.length || outline.points.length < 3) {
+    return outline;
+  }
+  const squaredPoints = squarePolygonCorner(outline.points, vertexIdx);
+  return preserveOutlineEdgeMetadata(
+    buildOutlineFromPoints(squaredPoints, outline.id, {
+      levelId: outline.levelId,
+      idPrefix: getLevelIdPrefixFromOutline(outline)
+    }),
+    outline
+  );
 }
 
 export function updateEdgeLength(outline: RoofOutline, edgeId: string, newLengthM: number): RoofOutline {
@@ -5625,6 +5791,128 @@ export function applyDraftPointSnap(
     x: +(Math.round(x / step) * step).toFixed(3),
     y: +(Math.round(y / step) * step).toFixed(3)
   };
+}
+
+/**
+ * Computes an endpoint placed at exact `lengthM` from `fromPt` in the direction of `dirTargetPt`
+ * (or `fallbackDir` if cursor has not moved yet). Honors 45/90-deg axis snap when `orthoSnap` is enabled.
+ */
+export function computePointAtLengthInDirection(
+  fromPt: Point2D,
+  dirTargetPt: Point2D | null | undefined,
+  lengthM: number,
+  options?: { orthoSnap?: boolean; fallbackDir?: Point2D }
+): Point2D | null {
+  if (!Number.isFinite(lengthM) || lengthM < 0.05 || lengthM > 2000) return null;
+  const orthoSnap = options?.orthoSnap ?? true;
+
+  let dx = dirTargetPt ? dirTargetPt.x - fromPt.x : 0;
+  let dy = dirTargetPt ? dirTargetPt.y - fromPt.y : 0;
+  const rawLen = Math.hypot(dx, dy);
+
+  if (rawLen < 1e-4) {
+    const fb = options?.fallbackDir ?? { x: 1, y: 0 };
+    const fbLen = Math.hypot(fb.x, fb.y) || 1;
+    dx = fb.x / fbLen;
+    dy = fb.y / fbLen;
+  } else {
+    dx /= rawLen;
+    dy /= rawLen;
+    if (orthoSnap) {
+      const angle = Math.atan2(dy, dx);
+      const octant = Math.PI / 4; // 0, 45, 90, 135, 180...
+      const nearestAxis = Math.round(angle / octant) * octant;
+      if (Math.abs(angle - nearestAxis) <= (12 * Math.PI) / 180) {
+        dx = Math.cos(nearestAxis);
+        dy = Math.sin(nearestAxis);
+      }
+    }
+  }
+
+  return {
+    x: +(fromPt.x + dx * lengthM).toFixed(3),
+    y: +(fromPt.y + dy * lengthM).toFixed(3)
+  };
+}
+
+/**
+ * Completes an open draft polyline back to P0 at right angles relative to the first edge
+ * (or world axes when `orthoSnap` is true and edge 0 is axis-aligned):
+ * - For 3 placed points (2 sides of a box), completes the 4th rectangle corner.
+ * - For 4+ placed points whose closing gap is diagonal to the base frame, inserts the missing 90-deg corner.
+ * Returns null if the geometry cannot form a valid orthogonal closure.
+ */
+export function buildCompleteSquarePoints(
+  points: Point2D[],
+  orthoSnap = true
+): Point2D[] | null {
+  if (!points || points.length < 3) return null;
+  const p0 = points[0];
+  const p1 = points[1];
+  const len0 = dist(p0, p1);
+  if (len0 < 0.15) return null;
+
+  let u = { x: (p1.x - p0.x) / len0, y: (p1.y - p0.y) / len0 };
+  if (orthoSnap) {
+    if (Math.abs(u.x) >= 0.996) u = { x: Math.sign(u.x), y: 0 };
+    else if (Math.abs(u.y) >= 0.996) u = { x: 0, y: Math.sign(u.y) };
+  }
+  const n = { x: -u.y, y: u.x };
+
+  if (points.length === 3) {
+    const p2 = points[2];
+    const vx = p2.x - p1.x;
+    const vy = p2.y - p1.y;
+    const len2 = Math.hypot(vx, vy);
+    if (len2 < 0.15) return null;
+
+    const uComp = vx * u.x + vy * u.y;
+    const nComp = vx * n.x + vy * n.y;
+    // Second segment must make a clear perpendicular turn (within ~25 deg of 90 deg)
+    if (Math.abs(nComp) < 0.15 || Math.abs(uComp / len2) > 0.45) {
+      return null;
+    }
+
+    const snapP2 = Math.abs(uComp) <= 0.005 || Math.abs(uComp / len2) <= 0.22;
+    const finalP2: Point2D = snapP2
+      ? { x: +(p1.x + n.x * nComp).toFixed(3), y: +(p1.y + n.y * nComp).toFixed(3) }
+      : { ...p2 };
+    const p3: Point2D = {
+      x: +(p0.x + n.x * nComp).toFixed(3),
+      y: +(p0.y + n.y * nComp).toFixed(3)
+    };
+    if (dist(finalP2, p3) < 0.15 || dist(p3, p0) < 0.15) return null;
+    return [{ ...p0 }, { ...p1 }, finalP2, p3];
+  }
+
+  const pLast = points[points.length - 1];
+  const pPrev = points[points.length - 2];
+  const gapX = p0.x - pLast.x;
+  const gapY = p0.y - pLast.y;
+  const du = gapX * u.x + gapY * u.y;
+  const dn = gapX * n.x + gapY * n.y;
+
+  // Already aligned on either axis -> normal Close closes cleanly without adding a corner
+  if (Math.abs(du) < 0.15 || Math.abs(dn) < 0.15) {
+    return null;
+  }
+
+  const lastVx = pLast.x - pPrev.x;
+  const lastVy = pLast.y - pPrev.y;
+  const lastDotU = Math.abs(lastVx * u.x + lastVy * u.y);
+  const lastDotN = Math.abs(lastVx * n.x + lastVy * n.y);
+
+  const corner: Point2D =
+    lastDotU >= lastDotN
+      ? { x: +(pLast.x + n.x * dn).toFixed(3), y: +(pLast.y + n.y * dn).toFixed(3) }
+      : { x: +(pLast.x + u.x * du).toFixed(3), y: +(pLast.y + u.y * du).toFixed(3) };
+
+  if (dist(pLast, corner) < 0.15 || dist(corner, p0) < 0.15) return null;
+  return [...points.map((p) => ({ ...p })), corner];
+}
+
+export function canCloseDraftSquare(points: Point2D[], orthoSnap = true): boolean {
+  return buildCompleteSquarePoints(points, orthoSnap) !== null;
 }
 
 /**

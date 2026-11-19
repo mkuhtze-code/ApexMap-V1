@@ -2,15 +2,20 @@ import {
   Point2D,
   RoofLevel,
   RoofOutline,
+  RoofPlane,
+  WallCladdingRegion,
   WallCladdingType,
+  WallElevationUnderlay,
   WallFacet,
   WallOpening,
   WallOpeningType,
   WallPlan,
-  WallPlanEdge
+  WallPlanEdge,
+  WallRoofProfilePoint
 } from '../types/exactRoofing';
 import {
   computeEdgeSetbackLine,
+  deriveRoofWallSegments,
   dist,
   getDefaultEdgeSetbackM,
   isEdgeWallEnabled,
@@ -385,6 +390,9 @@ export function buildWallFacetsFromPlan(
       heightM
     };
     const openings = (prev?.openings || []).map((op) => clampWallOpeningToFacet(facetBase, op));
+    const regions = prev?.regions
+      ? prev.regions.map((r) => clampWallRegionToFacet(facetBase, r))
+      : undefined;
 
     return {
       id: prev?.id || `wall-facet-${idx + 1}`,
@@ -396,8 +404,12 @@ export function buildWallFacetsFromPlan(
       heightM,
       bottomZ,
       topZ,
+      heightSource: prev?.heightSource ?? 'manual',
+      roofProfile: prev?.roofProfile,
       claddingType: prev?.claddingType ?? defaultCladding,
       openings,
+      regions,
+      underlay: prev?.underlay ?? null,
       roofEdgeId: prev?.roofEdgeId ?? findMatchingRoofEdgeId(seg.from, seg.to, options?.roofLevels)
     };
   });
@@ -405,12 +417,13 @@ export function buildWallFacetsFromPlan(
 
 /**
  * Derives a single-storey WallPlan directly from the primary roof footprint
- * using each roof edge's eave setback when defined.
+ * using each roof edge's eave setback when defined, and links tops to roof eaves.
  */
 export function deriveWallPlanFromRoofLevels(
   levels: RoofLevel[],
   defaultHeightM = 2.7,
-  existingFacets?: WallFacet[]
+  existingFacets?: WallFacet[],
+  roofPlanes?: RoofPlane[]
 ): WallPlan | null {
   const baseLevel = levels.find((l) => l.outline.points.length >= 3);
   if (!baseLevel) return null;
@@ -455,22 +468,30 @@ export function deriveWallPlanFromRoofLevels(
   }
 
   const wallEdges = buildWallEdgesFromPoints(wallPoints, 'wall-edge');
-  const facets = buildWallFacetsFromPlan(
+  const rawFacets = buildWallFacetsFromPlan(
     { points: wallPoints, edges: wallEdges },
     {
       defaultHeightM: hM,
       existingFacets,
       roofLevels: levels
     }
-  );
+  ).map((f) => {
+    const prev = matchExistingFacet(f.from, f.to, existingFacets);
+    return {
+      ...f,
+      heightSource: prev?.heightSource ?? ('roof' as const)
+    };
+  });
 
-  return {
+  const plan: WallPlan = {
     points: wallPoints,
     edges: wallEdges,
     defaultHeightM: hM,
-    facets,
+    facets: rawFacets,
     builtAt: new Date().toISOString()
   };
+
+  return syncWallPlanWithRoof(plan, levels, roofPlanes);
 }
 
 /**
@@ -597,26 +618,158 @@ export function createDefaultWallOpening(
   });
 }
 
+export function clampWallRegionToFacet(
+  facet: Pick<WallFacet, 'lengthM' | 'heightM'>,
+  region: WallCladdingRegion
+): WallCladdingRegion {
+  const L = Math.max(0.2, facet.lengthM);
+  const H = Math.max(0.2, facet.heightM);
+  const uStartM = +Math.max(0, Math.min(L - 0.1, region.uStartM || 0)).toFixed(3);
+  const uEndM = +Math.max(uStartM + 0.1, Math.min(L, region.uEndM || L)).toFixed(3);
+  const vStartM = +Math.max(0, Math.min(H - 0.1, region.vStartM || 0)).toFixed(3);
+  const vEndM = +Math.max(vStartM + 0.1, Math.min(H, region.vEndM || H)).toFixed(3);
+  return {
+    ...region,
+    uStartM,
+    uEndM,
+    vStartM,
+    vEndM
+  };
+}
+
+export function createHorizontalDadoSplit(
+  facet: WallFacet,
+  splitHeightM = 1.2,
+  lowerCladding?: WallCladdingType,
+  upperCladding?: WallCladdingType
+): WallCladdingRegion[] {
+  const H = Math.max(0.6, facet.heightM);
+  const splitV = +Math.max(0.3, Math.min(H - 0.3, splitHeightM)).toFixed(3);
+  const baseCladding = facet.claddingType !== 'none' ? facet.claddingType : 'brick';
+  const lowType = lowerCladding ?? baseCladding;
+  const upType = upperCladding ?? (lowType === 'weatherboard' ? 'profiled_metal' : 'weatherboard');
+  return [
+    {
+      id: `reg-low-${Date.now().toString(36)}`,
+      label: 'Lower Dado',
+      claddingType: lowType,
+      uStartM: 0,
+      uEndM: +facet.lengthM.toFixed(3),
+      vStartM: 0,
+      vEndM: splitV
+    },
+    {
+      id: `reg-up-${Date.now().toString(36)}`,
+      label: 'Upper Wall',
+      claddingType: upType,
+      uStartM: 0,
+      uEndM: +facet.lengthM.toFixed(3),
+      vStartM: splitV,
+      vEndM: +H.toFixed(3)
+    }
+  ];
+}
+
+export function createVerticalBaySplit(
+  facet: WallFacet,
+  splitUM?: number,
+  leftCladding?: WallCladdingType,
+  rightCladding?: WallCladdingType
+): WallCladdingRegion[] {
+  const L = Math.max(0.6, facet.lengthM);
+  const splitU = +Math.max(0.3, Math.min(L - 0.3, splitUM ?? L * 0.5)).toFixed(3);
+  const baseCladding = facet.claddingType !== 'none' ? facet.claddingType : 'weatherboard';
+  const leftType = leftCladding ?? baseCladding;
+  const rightType = rightCladding ?? (leftType === 'profiled_metal' ? 'weatherboard' : 'profiled_metal');
+  return [
+    {
+      id: `reg-left-${Date.now().toString(36)}`,
+      label: 'Bay 1',
+      claddingType: leftType,
+      uStartM: 0,
+      uEndM: splitU,
+      vStartM: 0,
+      vEndM: +facet.heightM.toFixed(3)
+    },
+    {
+      id: `reg-right-${Date.now().toString(36)}`,
+      label: 'Bay 2',
+      claddingType: rightType,
+      uStartM: splitU,
+      uEndM: +L.toFixed(3),
+      vStartM: 0,
+      vEndM: +facet.heightM.toFixed(3)
+    }
+  ];
+}
+
+export function isWallFacetUndetailed(facet: WallFacet): boolean {
+  if (facet.regions && facet.regions.length > 0) {
+    return facet.regions.every((r) => r.claddingType === 'none');
+  }
+  return facet.claddingType === 'none';
+}
+
+export function getFacetPrimaryDisplayCladding(facet: WallFacet): WallCladdingType {
+  if (facet.regions && facet.regions.length > 0) {
+    const firstAssigned = facet.regions.find((r) => r.claddingType !== 'none');
+    if (firstAssigned) return firstAssigned.claddingType;
+  }
+  return facet.claddingType;
+}
+
+export interface WallFacetRegionMetric {
+  regionId?: string;
+  label?: string;
+  claddingType: WallCladdingType;
+  uStartM: number;
+  uEndM: number;
+  vStartM: number;
+  vEndM: number;
+  grossAreaM2: number;
+  openingsAreaM2: number;
+  netAreaM2: number;
+}
+
 export interface WallFacetMetrics {
   grossAreaM2: number;
   openingsAreaM2: number;
   netCladdingAreaM2: number;
   openingsCount: number;
+  regionBreakdown: WallFacetRegionMetric[];
 }
 
 /**
- * Exact vertical-strip sweep union area for openings so overlapping edits never over-deduct area.
+ * Exact vertical-strip sweep union area for openings clipped inside any rectangle [u0..u1] x [v0..v1]
+ * so overlapping edits and mixed-cladding regions never over-deduct or double-count area.
  */
-function computeOpeningsUnionArea(facet: WallFacet): number {
+function computeOpeningsUnionAreaInRect(
+  facet: WallFacet,
+  u0: number,
+  u1: number,
+  v0: number,
+  v1: number
+): number {
+  const rectW = u1 - u0;
+  const rectH = v1 - v0;
+  if (rectW <= 1e-4 || rectH <= 1e-4) return 0;
+
   const clamped = facet.openings
     .map((o) => clampWallOpeningToFacet(facet, o))
-    .filter((o) => o.widthM > 0.01 && o.heightM > 0.01);
+    .map((o) => ({
+      x0: Math.max(u0, o.distFromStartM),
+      x1: Math.min(u1, o.distFromStartM + o.widthM),
+      y0: Math.max(v0, o.sillHeightM),
+      y1: Math.min(v1, o.sillHeightM + o.heightM)
+    }))
+    .filter((r) => r.x1 - r.x0 > 0.001 && r.y1 - r.y0 > 0.001);
+
   if (clamped.length === 0) return 0;
 
   const xs = new Set<number>();
-  clamped.forEach((o) => {
-    xs.add(o.distFromStartM);
-    xs.add(o.distFromStartM + o.widthM);
+  clamped.forEach((r) => {
+    xs.add(r.x0);
+    xs.add(r.x1);
   });
   const sortedX = Array.from(xs).sort((a, b) => a - b);
 
@@ -629,39 +782,437 @@ function computeOpeningsUnionArea(facet: WallFacet): number {
     const midX = (x0 + x1) / 2;
 
     const yIntervals = clamped
-      .filter((o) => o.distFromStartM <= midX && o.distFromStartM + o.widthM >= midX)
-      .map((o) => [o.sillHeightM, o.sillHeightM + o.heightM] as [number, number])
+      .filter((r) => r.x0 <= midX && r.x1 >= midX)
+      .map((r) => [r.y0, r.y1] as [number, number])
       .sort((a, b) => a[0] - b[0]);
 
     let coveredY = 0;
     let curStart = -1;
     let curEnd = -1;
-    for (const [y0, y1] of yIntervals) {
-      if (y0 > curEnd) {
+    for (const [ya, yb] of yIntervals) {
+      if (ya > curEnd) {
         if (curEnd > curStart) coveredY += curEnd - curStart;
-        curStart = y0;
-        curEnd = y1;
-      } else if (y1 > curEnd) {
-        curEnd = y1;
+        curStart = ya;
+        curEnd = yb;
+      } else if (yb > curEnd) {
+        curEnd = yb;
       }
     }
     if (curEnd > curStart) coveredY += curEnd - curStart;
     area += dx * coveredY;
   }
 
-  return +area.toFixed(3);
+  return +area.toFixed(4);
 }
 
 export function computeWallFacetMetrics(facet: WallFacet): WallFacetMetrics {
-  const grossAreaM2 = +(Math.max(0, facet.lengthM) * Math.max(0, facet.heightM)).toFixed(2);
-  const rawOpeningsArea = computeOpeningsUnionArea(facet);
+  const L = Math.max(0, facet.lengthM);
+  const H = Math.max(0, facet.heightM);
+  const grossAreaM2 = +(L * H).toFixed(2);
+  const rawOpeningsArea = computeOpeningsUnionAreaInRect(facet, 0, L, 0, H);
   const openingsAreaM2 = +Math.min(grossAreaM2, rawOpeningsArea).toFixed(2);
   const netCladdingAreaM2 = +Math.max(0, grossAreaM2 - openingsAreaM2).toFixed(2);
+
+  let regionBreakdown: WallFacetRegionMetric[];
+  if (facet.regions && facet.regions.length > 0 && L > 0.01 && H > 0.01) {
+    const clampedRegions = facet.regions.slice(0, 3).map((r) => clampWallRegionToFacet(facet, r));
+    regionBreakdown = clampedRegions.map((r) => {
+      const rGross = +(Math.max(0, r.uEndM - r.uStartM) * Math.max(0, r.vEndM - r.vStartM)).toFixed(3);
+      const rOp = +Math.min(
+        rGross,
+        computeOpeningsUnionAreaInRect(facet, r.uStartM, r.uEndM, r.vStartM, r.vEndM)
+      ).toFixed(3);
+      const rNet = +Math.max(0, rGross - rOp).toFixed(3);
+      return {
+        regionId: r.id,
+        label: r.label,
+        claddingType: r.claddingType,
+        uStartM: r.uStartM,
+        uEndM: r.uEndM,
+        vStartM: r.vStartM,
+        vEndM: r.vEndM,
+        grossAreaM2: +rGross.toFixed(2),
+        openingsAreaM2: +rOp.toFixed(2),
+        netAreaM2: +rNet.toFixed(2)
+      };
+    });
+
+    // Account for any uncovered wall margin under facet.claddingType if custom regions leave a gap
+    const coveredGross = regionBreakdown.reduce((s, r) => s + r.grossAreaM2, 0);
+    const uncoveredGross = +(grossAreaM2 - coveredGross).toFixed(2);
+    if (uncoveredGross > 0.05) {
+      const coveredOp = regionBreakdown.reduce((s, r) => s + r.openingsAreaM2, 0);
+      const remOp = +Math.max(0, openingsAreaM2 - coveredOp).toFixed(2);
+      regionBreakdown.push({
+        label: 'Remainder',
+        claddingType: facet.claddingType,
+        uStartM: 0,
+        uEndM: L,
+        vStartM: 0,
+        vEndM: H,
+        grossAreaM2: uncoveredGross,
+        openingsAreaM2: Math.min(uncoveredGross, remOp),
+        netAreaM2: +Math.max(0, uncoveredGross - Math.min(uncoveredGross, remOp)).toFixed(2)
+      });
+    }
+  } else {
+    regionBreakdown = [
+      {
+        claddingType: facet.claddingType,
+        uStartM: 0,
+        uEndM: L,
+        vStartM: 0,
+        vEndM: H,
+        grossAreaM2,
+        openingsAreaM2,
+        netAreaM2: netCladdingAreaM2
+      }
+    ];
+  }
+
   return {
     grossAreaM2,
     openingsAreaM2,
     netCladdingAreaM2,
-    openingsCount: facet.openings.length
+    openingsCount: facet.openings.length,
+    regionBreakdown
+  };
+}
+
+/**
+ * Resolves vertical eave height & optional raked gable profile from matching roof edge / planes.
+ */
+export function resolveRoofTopForWallFacet(
+  facet: WallFacet,
+  roofLevels: RoofLevel[],
+  roofPlanes: RoofPlane[] = []
+): {
+  roofEdgeId?: string;
+  topZ: number;
+  heightM: number;
+  roofProfile?: WallRoofProfilePoint[];
+} | null {
+  if (!roofLevels || roofLevels.length === 0) return null;
+
+  const matchedEdgeId =
+    facet.roofEdgeId ?? findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
+  if (!matchedEdgeId) return null;
+
+  const wallSegments = deriveRoofWallSegments(roofLevels, roofPlanes);
+  const segMatch = wallSegments.find((w) => w.edgeId === matchedEdgeId);
+
+  let rawTopZ: number | null = null;
+  let profile: WallRoofProfilePoint[] | undefined;
+
+  if (segMatch) {
+    rawTopZ = segMatch.topZ;
+    if (segMatch.topProfilePoints3D && segMatch.topProfilePoints3D.length >= 2) {
+      const segDx = segMatch.wallTo.x - segMatch.wallFrom.x;
+      const segDy = segMatch.wallTo.y - segMatch.wallFrom.y;
+      const segLen = Math.hypot(segDx, segDy) || 1;
+      const wDx = facet.to.x - facet.from.x;
+      const wDy = facet.to.y - facet.from.y;
+      const wLen = Math.hypot(wDx, wDy) || 1;
+      const dirDot = (segDx / segLen) * (wDx / wLen) + (segDy / segLen) * (wDy / wLen);
+
+      const pts = segMatch.topProfilePoints3D
+        .map((tp) => {
+          const dFromStart =
+            dirDot >= 0
+              ? Math.hypot(tp.x - segMatch.wallFrom.x, tp.y - segMatch.wallFrom.y)
+              : segLen - Math.hypot(tp.x - segMatch.wallFrom.x, tp.y - segMatch.wallFrom.y);
+          const distM = +Math.max(
+            0,
+            Math.min(facet.lengthM, (dFromStart / segLen) * facet.lengthM)
+          ).toFixed(3);
+          const tuckedTopZ = +Math.max(facet.bottomZ + 0.4, tp.z - 0.025).toFixed(3);
+          return { distM, topZ: tuckedTopZ };
+        })
+        .sort((a, b) => a.distM - b.distM);
+
+      const minZ = Math.min(...pts.map((p) => p.topZ));
+      const maxZ = Math.max(...pts.map((p) => p.topZ));
+      if (maxZ - minZ > 0.04) {
+        profile = pts;
+      }
+      rawTopZ = minZ;
+    }
+  } else {
+    for (const lvl of roofLevels) {
+      const edge = lvl.outline.edges.find((e) => e.id === matchedEdgeId);
+      if (edge) {
+        const planeMatch = roofPlanes.find((p) => p.eaveEdgeId === edge.id);
+        rawTopZ = edge.eaveHeightM ?? planeMatch?.eaveHeightM ?? lvl.eaveHeightM ?? 2.7;
+        break;
+      }
+    }
+  }
+
+  if (rawTopZ === null || !Number.isFinite(rawTopZ)) return null;
+
+  const tuckedTopZ = profile
+    ? +Math.max(...profile.map((p) => p.topZ)).toFixed(3)
+    : +Math.max(facet.bottomZ + 0.4, rawTopZ - 0.025).toFixed(3);
+  const heightM = +Math.max(0.4, tuckedTopZ - facet.bottomZ).toFixed(3);
+
+  return {
+    roofEdgeId: matchedEdgeId,
+    topZ: +(facet.bottomZ + heightM).toFixed(3),
+    heightM,
+    roofProfile: profile
+  };
+}
+
+export function fitWallFacetTopToRoof(
+  facet: WallFacet,
+  roofLevels: RoofLevel[],
+  roofPlanes: RoofPlane[] = []
+): WallFacet {
+  const resolved = resolveRoofTopForWallFacet(facet, roofLevels, roofPlanes);
+  if (!resolved) return facet;
+  const nextBase = { lengthM: facet.lengthM, heightM: resolved.heightM };
+  return {
+    ...facet,
+    roofEdgeId: resolved.roofEdgeId ?? facet.roofEdgeId,
+    heightSource: 'roof',
+    heightM: resolved.heightM,
+    topZ: resolved.topZ,
+    roofProfile: resolved.roofProfile,
+    openings: facet.openings.map((op) => clampWallOpeningToFacet(nextBase, op)),
+    regions: facet.regions
+      ? facet.regions.map((r) => clampWallRegionToFacet(nextBase, r))
+      : undefined
+  };
+}
+
+export function syncWallPlanWithRoof(
+  wallPlan: WallPlan,
+  roofLevels: RoofLevel[],
+  roofPlanes: RoofPlane[] = [],
+  options?: { forceAllLinked?: boolean }
+): WallPlan {
+  if (!wallPlan || !roofLevels || roofLevels.length === 0) return wallPlan;
+  let changed = false;
+  const nextFacets = wallPlan.facets.map((facet) => {
+    const matchedId =
+      facet.roofEdgeId ?? findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
+    const shouldSync =
+      options?.forceAllLinked
+        ? Boolean(matchedId)
+        : facet.heightSource === 'roof' && Boolean(matchedId);
+    if (!shouldSync) {
+      if (matchedId && matchedId !== facet.roofEdgeId) {
+        changed = true;
+        return { ...facet, roofEdgeId: matchedId };
+      }
+      return facet;
+    }
+    const fitted = fitWallFacetTopToRoof(
+      { ...facet, roofEdgeId: matchedId },
+      roofLevels,
+      roofPlanes
+    );
+    if (
+      fitted.heightM !== facet.heightM ||
+      fitted.topZ !== facet.topZ ||
+      fitted.roofEdgeId !== facet.roofEdgeId ||
+      JSON.stringify(fitted.roofProfile || null) !== JSON.stringify(facet.roofProfile || null)
+    ) {
+      changed = true;
+    }
+    return fitted;
+  });
+
+  if (!changed) return wallPlan;
+  return {
+    ...wallPlan,
+    facets: nextFacets,
+    builtAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Computes real-world image dimensions (m) on a wall elevation from two normalized [0..1] clicks.
+ */
+export function calibrateUnderlayFromTwoPoints(params: {
+  imageAspect: number;
+  p1Norm: Point2D;
+  p2Norm: Point2D;
+  knownDistanceM: number;
+  facetLengthM: number;
+  facetHeightM: number;
+}): {
+  worldWidthM: number;
+  worldHeightM: number;
+  offsetXM: number;
+  offsetYM: number;
+} {
+  const aspect = Math.max(0.1, Math.min(10, params.imageAspect || 1.4));
+  const dx = params.p2Norm.x - params.p1Norm.x;
+  const dy = (params.p2Norm.y - params.p1Norm.y) / aspect;
+  const spanWidthUnits = Math.max(0.01, Math.hypot(dx, dy));
+  const worldWidthM = +Math.max(
+    0.5,
+    Math.min(80, params.knownDistanceM / spanWidthUnits)
+  ).toFixed(3);
+  const worldHeightM = +Math.max(0.5, worldWidthM / aspect).toFixed(3);
+  // Anchor so p1 aligns neatly inside the elevation frame if image is larger than wall
+  const p1WorldX = params.p1Norm.x * worldWidthM;
+  const p1WorldFromBottomY = (1 - params.p1Norm.y) * worldHeightM;
+  const offsetXM = +(Math.max(-worldWidthM * 0.85, Math.min(params.facetLengthM * 0.5, (params.facetLengthM - worldWidthM) / 2 || -p1WorldX * 0))).toFixed(3);
+  const offsetYM = +Math.max(-worldHeightM * 0.85, Math.min(params.facetHeightM * 0.5, params.facetHeightM - worldHeightM - (p1WorldFromBottomY * 0))).toFixed(3);
+  return {
+    worldWidthM,
+    worldHeightM,
+    offsetXM,
+    offsetYM
+  };
+}
+
+export interface WallCornerTopologyItem {
+  vertexIndex: number;
+  point: Point2D;
+  kind: 'external' | 'internal';
+  interiorAngleDeg: number;
+}
+
+export interface WallPlanTopology {
+  externalCornersCount: number;
+  internalCornersCount: number;
+  returnFacesCount: number;
+  cornerDetails: WallCornerTopologyItem[];
+  returnFacetIds: string[];
+}
+
+export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
+  if (!facets || facets.length < 3) {
+    return {
+      externalCornersCount: 0,
+      internalCornersCount: 0,
+      returnFacesCount: 0,
+      cornerDetails: [],
+      returnFacetIds: []
+    };
+  }
+
+  // Signed area in screen-down 2D coordinates (x right, y down)
+  let signedArea2 = 0;
+  for (let i = 0; i < facets.length; i++) {
+    const f = facets[i];
+    signedArea2 += f.from.x * f.to.y - f.to.x * f.from.y;
+  }
+  const orientationSign = signedArea2 >= 0 ? 1 : -1;
+
+  const cornerDetails: WallCornerTopologyItem[] = [];
+  let externalCornersCount = 0;
+  let internalCornersCount = 0;
+
+  for (let i = 0; i < facets.length; i++) {
+    const prev = facets[(i - 1 + facets.length) % facets.length];
+    const curr = facets[i];
+    const lenA = dist(prev.from, prev.to) || 1;
+    const lenB = dist(curr.from, curr.to) || 1;
+    const ax = (prev.to.x - prev.from.x) / lenA;
+    const ay = (prev.to.y - prev.from.y) / lenA;
+    const bx = (curr.to.x - curr.from.x) / lenB;
+    const by = (curr.to.y - curr.from.y) / lenB;
+
+    const cross = (ax * by - ay * bx) * orientationSign;
+    const dot = Math.max(-1, Math.min(1, ax * bx + ay * by));
+    const turnAngleDeg = (Math.acos(dot) * 180) / Math.PI;
+    // In screen-down CW (orientationSign > 0), right-hand exterior turn has cross > 0 -> interior angle < 180
+    // Left-hand reflex/notch turn has cross < 0 -> interior angle = 180 + turnAngleDeg > 180
+    const isInternal = cross < -0.04;
+    const interiorAngleDeg = +(isInternal ? 180 + turnAngleDeg : 180 - turnAngleDeg).toFixed(1);
+    const kind = isInternal ? 'internal' : 'external';
+
+    if (isInternal) internalCornersCount++;
+    else externalCornersCount++;
+
+    cornerDetails.push({
+      vertexIndex: i,
+      point: curr.from,
+      kind,
+      interiorAngleDeg
+    });
+  }
+
+  const returnFacetIdSet = new Set<string>();
+  for (let i = 0; i < facets.length; i++) {
+    const startCorner = cornerDetails[i];
+    const endCorner = cornerDetails[(i + 1) % facets.length];
+    const isShortNib = facets[i].lengthM <= 2.2 && facets.length >= 6;
+    if (startCorner?.kind === 'internal' || endCorner?.kind === 'internal' || isShortNib) {
+      returnFacetIdSet.add(facets[i].id);
+    }
+  }
+
+  return {
+    externalCornersCount,
+    internalCornersCount,
+    returnFacesCount: returnFacetIdSet.size,
+    cornerDetails,
+    returnFacetIds: Array.from(returnFacetIdSet)
+  };
+}
+
+export interface WallOpeningScheduleRow {
+  id: string;
+  facetId: string;
+  facetCode: string;
+  type: WallOpeningType;
+  label: string;
+  widthM: number;
+  heightM: number;
+  sillHeightM: number;
+  distFromStartM: number;
+  areaM2: number;
+}
+
+export interface WallOpeningsScheduleSummary {
+  rows: WallOpeningScheduleRow[];
+  totalCount: number;
+  totalAreaM2: number;
+  countsByType: Record<WallOpeningType, number>;
+}
+
+export function buildWallOpeningsSchedule(facets: WallFacet[]): WallOpeningsScheduleSummary {
+  const rows: WallOpeningScheduleRow[] = [];
+  const countsByType: Record<WallOpeningType, number> = {
+    window: 0,
+    door: 0,
+    garage: 0,
+    void: 0
+  };
+  let totalAreaM2 = 0;
+
+  facets.forEach((f) => {
+    const sortedOps = [...f.openings].sort((a, b) => a.distFromStartM - b.distFromStartM);
+    sortedOps.forEach((op) => {
+      const c = clampWallOpeningToFacet(f, op);
+      const areaM2 = +(c.widthM * c.heightM).toFixed(2);
+      countsByType[c.type] = (countsByType[c.type] || 0) + 1;
+      totalAreaM2 += areaM2;
+      rows.push({
+        id: c.id,
+        facetId: f.id,
+        facetCode: f.code,
+        type: c.type,
+        label: c.label || c.type,
+        widthM: c.widthM,
+        heightM: c.heightM,
+        sillHeightM: c.sillHeightM,
+        distFromStartM: c.distFromStartM,
+        areaM2
+      });
+    });
+  });
+
+  return {
+    rows,
+    totalCount: rows.length,
+    totalAreaM2: +totalAreaM2.toFixed(2),
+    countsByType
   };
 }
 
@@ -683,22 +1234,30 @@ export interface WallTakeoffSummary {
   totalFaces: number;
   detailedFacesCount: number;
   undetailedCount: number;
+  undetailedFacetIds: string[];
   totalLinealM: number;
   totalGrossAreaM2: number;
   totalOpeningsAreaM2: number;
   totalNetAreaM2: number;
   totalOpeningsCount: number;
+  externalCornersCount: number;
+  internalCornersCount: number;
+  returnFacesCount: number;
+  returnFacetIds: string[];
   byCladding: WallCladdingGroupSummary[];
 }
 
 export function computeWallTakeoffSummary(facets: WallFacet[]): WallTakeoffSummary {
-  const groupMap = new Map<WallCladdingType, WallCladdingGroupSummary>();
+  const groupMap = new Map<
+    WallCladdingType,
+    WallCladdingGroupSummary & { facetIdSet: Set<string>; spanByFacet: Map<string, number> }
+  >();
   let totalLinealM = 0;
   let totalGrossAreaM2 = 0;
   let totalOpeningsAreaM2 = 0;
   let totalNetAreaM2 = 0;
   let totalOpeningsCount = 0;
-  let undetailedCount = 0;
+  const undetailedFacetIds: string[] = [];
 
   facets.forEach((f) => {
     const m = computeWallFacetMetrics(f);
@@ -707,51 +1266,166 @@ export function computeWallTakeoffSummary(facets: WallFacet[]): WallTakeoffSumma
     totalOpeningsAreaM2 += m.openingsAreaM2;
     totalNetAreaM2 += m.netCladdingAreaM2;
     totalOpeningsCount += m.openingsCount;
-    if (f.claddingType === 'none') {
-      undetailedCount++;
+    if (isWallFacetUndetailed(f)) {
+      undetailedFacetIds.push(f.id);
     }
 
-    const meta = getWallCladdingMeta(f.claddingType);
-    const existing = groupMap.get(f.claddingType);
-    if (existing) {
-      existing.faceCount += 1;
-      existing.faceCodes.push(f.code);
-      existing.linealM = +(existing.linealM + f.lengthM).toFixed(2);
-      existing.grossAreaM2 = +(existing.grossAreaM2 + m.grossAreaM2).toFixed(2);
-      existing.openingsAreaM2 = +(existing.openingsAreaM2 + m.openingsAreaM2).toFixed(2);
-      existing.netAreaM2 = +(existing.netAreaM2 + m.netCladdingAreaM2).toFixed(2);
-      existing.openingsCount += m.openingsCount;
-    } else {
-      groupMap.set(f.claddingType, {
-        claddingType: f.claddingType,
-        label: meta.label,
-        shortLabel: meta.shortLabel,
-        hex: meta.hex,
-        faceCount: 1,
-        faceCodes: [f.code],
-        linealM: +f.lengthM.toFixed(2),
-        grossAreaM2: m.grossAreaM2,
-        openingsAreaM2: m.openingsAreaM2,
-        netAreaM2: m.netCladdingAreaM2,
-        openingsCount: m.openingsCount
-      });
-    }
+    m.regionBreakdown.forEach((reg) => {
+      const meta = getWallCladdingMeta(reg.claddingType);
+      const regSpan = Math.min(f.lengthM, Math.max(0, reg.uEndM - reg.uStartM));
+      let existing = groupMap.get(reg.claddingType);
+      if (!existing) {
+        existing = {
+          claddingType: reg.claddingType,
+          label: meta.label,
+          shortLabel: meta.shortLabel,
+          hex: meta.hex,
+          faceCount: 0,
+          faceCodes: [],
+          linealM: 0,
+          grossAreaM2: 0,
+          openingsAreaM2: 0,
+          netAreaM2: 0,
+          openingsCount: 0,
+          facetIdSet: new Set<string>(),
+          spanByFacet: new Map<string, number>()
+        };
+        groupMap.set(reg.claddingType, existing);
+      }
+
+      if (!existing.facetIdSet.has(f.id)) {
+        existing.facetIdSet.add(f.id);
+        existing.faceCount += 1;
+        existing.faceCodes.push(f.code);
+        existing.openingsCount += m.openingsCount;
+      }
+
+      // Accumulate unique horizontal coverage per face (avoid double-counting linealM on horizontal dado splits)
+      const prevSpan = existing.spanByFacet.get(f.id) || 0;
+      const nextSpan = Math.min(f.lengthM, Math.max(prevSpan, regSpan));
+      existing.spanByFacet.set(f.id, nextSpan);
+      existing.linealM = +Array.from(existing.spanByFacet.values())
+        .reduce((a, b) => a + b, 0)
+        .toFixed(2);
+
+      existing.grossAreaM2 = +(existing.grossAreaM2 + reg.grossAreaM2).toFixed(2);
+      existing.openingsAreaM2 = +(existing.openingsAreaM2 + reg.openingsAreaM2).toFixed(2);
+      existing.netAreaM2 = +(existing.netAreaM2 + reg.netAreaM2).toFixed(2);
+    });
   });
 
   const orderMap = new Map(WALL_CLADDING_OPTIONS.map((o, idx) => [o.type, idx]));
-  const byCladding = Array.from(groupMap.values()).sort(
-    (a, b) => (orderMap.get(a.claddingType) ?? 99) - (orderMap.get(b.claddingType) ?? 99)
-  );
+  const byCladding: WallCladdingGroupSummary[] = Array.from(groupMap.values())
+    .map(({ facetIdSet: _f, spanByFacet: _s, ...rest }) => rest)
+    .sort((a, b) => (orderMap.get(a.claddingType) ?? 99) - (orderMap.get(b.claddingType) ?? 99));
+
+  const topology = analyzeWallPlanTopology(facets);
 
   return {
     totalFaces: facets.length,
-    detailedFacesCount: facets.length - undetailedCount,
-    undetailedCount,
+    detailedFacesCount: facets.length - undetailedFacetIds.length,
+    undetailedCount: undetailedFacetIds.length,
+    undetailedFacetIds,
     totalLinealM: +totalLinealM.toFixed(2),
     totalGrossAreaM2: +totalGrossAreaM2.toFixed(2),
     totalOpeningsAreaM2: +totalOpeningsAreaM2.toFixed(2),
     totalNetAreaM2: +totalNetAreaM2.toFixed(2),
     totalOpeningsCount,
+    externalCornersCount: topology.externalCornersCount,
+    internalCornersCount: topology.internalCornersCount,
+    returnFacesCount: topology.returnFacesCount,
+    returnFacetIds: topology.returnFacetIds,
     byCladding
   };
 }
+
+export interface WallTakeoffExportPayload {
+  generatedAt: string;
+  summary: WallTakeoffSummary;
+  faces: {
+    code: string;
+    name: string;
+    lengthM: number;
+    heightM: number;
+    bottomZ: number;
+    topZ: number;
+    heightSource: string;
+    isReturnFace: boolean;
+    claddingSummary: string;
+    openingsCount: number;
+    grossAreaM2: number;
+    openingsAreaM2: number;
+    netAreaM2: number;
+    needsDetail: boolean;
+  }[];
+  openingsSchedule: WallOpeningsScheduleSummary;
+  csvText: string;
+}
+
+export function buildWallTakeoffExportData(wallPlan: WallPlan | null): WallTakeoffExportPayload {
+  const facets = wallPlan?.facets || [];
+  const summary = computeWallTakeoffSummary(facets);
+  const openingsSchedule = buildWallOpeningsSchedule(facets);
+  const returnSet = new Set(summary.returnFacetIds);
+
+  const faces = facets.map((f) => {
+    const m = computeWallFacetMetrics(f);
+    const claddingSummary =
+      f.regions && f.regions.length > 0
+        ? f.regions.map((r) => `${r.label || 'Region'}: ${getWallCladdingMeta(r.claddingType).shortLabel}`).join(' / ')
+        : getWallCladdingMeta(f.claddingType).label;
+    return {
+      code: f.code,
+      name: f.name || `Wall ${f.code}`,
+      lengthM: f.lengthM,
+      heightM: f.heightM,
+      bottomZ: f.bottomZ,
+      topZ: f.topZ,
+      heightSource: f.heightSource || 'manual',
+      isReturnFace: returnSet.has(f.id),
+      claddingSummary,
+      openingsCount: f.openings.length,
+      grossAreaM2: m.grossAreaM2,
+      openingsAreaM2: m.openingsAreaM2,
+      netAreaM2: m.netCladdingAreaM2,
+      needsDetail: isWallFacetUndetailed(f)
+    };
+  });
+
+  const csvLines: string[] = [
+    'WALL CLADDING SUMMARY',
+    'Cladding Type,Faces,Lineal (m),Gross (m2),Openings (m2),Net Cladding (m2)',
+    ...summary.byCladding.map(
+      (g) =>
+        `"${g.label}","${g.faceCodes.join(' ')}",${g.linealM.toFixed(2)},${g.grossAreaM2.toFixed(2)},${g.openingsAreaM2.toFixed(2)},${g.netAreaM2.toFixed(2)}`
+    ),
+    '',
+    'PER-FACE WALL SCHEDULE',
+    'Code,Length (m),Height (m),Height Source,Return Face,Cladding,Openings,Gross (m2),Openings (m2),Net (m2),Status',
+    ...faces.map(
+      (r) =>
+        `${r.code},${r.lengthM.toFixed(2)},${r.heightM.toFixed(2)},${r.heightSource},${r.isReturnFace ? 'Yes' : 'No'},"${r.claddingSummary}",${r.openingsCount},${r.grossAreaM2.toFixed(2)},${r.openingsAreaM2.toFixed(2)},${r.netAreaM2.toFixed(2)},${r.needsDetail ? 'Needs Detail' : 'Detailed'}`
+    ),
+    '',
+    'CORNERS & RETURNS',
+    `External Corners,${summary.externalCornersCount}`,
+    `Internal (Notch) Corners,${summary.internalCornersCount}`,
+    `Return / Short Faces,${summary.returnFacesCount}`,
+    '',
+    'OPENINGS SCHEDULE',
+    'Wall Code,Type,Label,Width (m),Height (m),Sill (m),Offset X (m),Area (m2)',
+    ...openingsSchedule.rows.map(
+      (o) =>
+        `${o.facetCode},${o.type},"${o.label}",${o.widthM.toFixed(2)},${o.heightM.toFixed(2)},${o.sillHeightM.toFixed(2)},${o.distFromStartM.toFixed(2)},${o.areaM2.toFixed(2)}`
+    )
+  ];
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary,
+    faces,
+    openingsSchedule,
+    csvText: csvLines.join('\n')
+  };
+}
+

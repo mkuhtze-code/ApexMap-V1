@@ -1,9 +1,12 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Building2,
   Check,
   Compass,
+  Download,
   Layers,
+  Link2,
   PenTool,
   Plus,
   Ruler,
@@ -11,12 +14,15 @@ import {
   Trash2,
   Undo2
 } from 'lucide-react';
+import { ArchitecturalPlan } from '../../types/crm';
 import {
   Point2D,
   RoofLevel,
   RoofOutline,
+  RoofPlane,
   RoofPlanUnderlay,
   WallFacet,
+  WallFilterMode,
   WallPlan
 } from '../../types/exactRoofing';
 import {
@@ -25,13 +31,19 @@ import {
   pointsClose
 } from '../../utils/exactRoofingEngine';
 import {
+  analyzeWallPlanTopology,
   buildWallEdgesFromPoints,
   buildWallFacetsFromPlan,
+  buildWallOpeningsSchedule,
+  buildWallTakeoffExportData,
   computeWallFacetMetrics,
   computeWallTakeoffSummary,
   deriveWallPlanFromRoofLevels,
+  getFacetPrimaryDisplayCladding,
   getWallCladdingMeta,
+  isWallFacetUndetailed,
   moveWallPlanVertex,
+  syncWallPlanWithRoof,
   updateWallPlanEdgeLength
 } from '../../utils/wallCladdingEngine';
 import {
@@ -44,23 +56,33 @@ import { WallElevationWorkbench } from './WallElevationWorkbench';
 interface Props {
   wallPlan: WallPlan | null;
   levels: RoofLevel[];
+  roofPlanes?: RoofPlane[];
+  projectPlans?: ArchitecturalPlan[];
   planUnderlay?: RoofPlanUnderlay | null;
   selectedWallFacetId: string | null;
   onSelectWallFacet: (facetId: string | null) => void;
   onUpdateWallPlan: (nextPlan: WallPlan | null) => void;
   onUpdateWallFacet: (updatedFacet: WallFacet) => void;
+  wallFilterMode?: WallFilterMode;
+  onChangeWallFilterMode?: (mode: WallFilterMode) => void;
   initialSubView?: 'plan' | 'elevation';
   readOnly?: boolean;
 }
 
+type ScheduleTab = 'summary' | 'faces' | 'openings';
+
 export const WallPlanWorkspace: React.FC<Props> = ({
   wallPlan,
   levels,
+  roofPlanes = [],
+  projectPlans = [],
   planUnderlay,
   selectedWallFacetId,
   onSelectWallFacet,
   onUpdateWallPlan,
   onUpdateWallFacet,
+  wallFilterMode: propWallFilterMode,
+  onChangeWallFilterMode,
   initialSubView = 'plan',
   readOnly = false
 }) => {
@@ -74,6 +96,14 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     wallPlan?.defaultHeightM || levels[0]?.eaveHeightM || 2.7
   );
   const [editLengthVal, setEditLengthVal] = useState<string>('');
+  const [localFilterMode, setLocalFilterMode] = useState<WallFilterMode>('all');
+  const [scheduleTab, setScheduleTab] = useState<ScheduleTab>('summary');
+
+  const filterMode = propWallFilterMode ?? localFilterMode;
+  const setFilterMode = (mode: WallFilterMode) => {
+    setLocalFilterMode(mode);
+    onChangeWallFilterMode?.(mode);
+  };
 
   const facets = wallPlan?.facets || [];
   const selectedFacet = useMemo(
@@ -81,7 +111,6 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     [facets, selectedWallFacetId]
   );
 
-  // Keep length draft synchronized when facet changes
   React.useEffect(() => {
     const target = facets.find((f) => f.id === selectedWallFacetId);
     setEditLengthVal(target ? target.lengthM.toFixed(2) : '');
@@ -91,8 +120,36 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     () => computeWallTakeoffSummary(facets),
     [facets]
   );
+  const topology = useMemo(
+    () => analyzeWallPlanTopology(facets),
+    [facets]
+  );
+  const openingsSchedule = useMemo(
+    () => buildWallOpeningsSchedule(facets),
+    [facets]
+  );
 
-  // Compute unified world viewport framing roof + wall plan + draft points
+  const returnFacetIdSet = useMemo(
+    () => new Set(topology.returnFacetIds),
+    [topology.returnFacetIds]
+  );
+
+  const filteredFacets = useMemo(() => {
+    if (filterMode === 'undetailed') {
+      return facets.filter((f) => isWallFacetUndetailed(f));
+    }
+    if (filterMode === 'returns') {
+      return facets.filter((f) => returnFacetIdSet.has(f.id));
+    }
+    return facets;
+  }, [facets, filterMode, returnFacetIdSet]);
+
+  const nextUndetailedFacet = useMemo(
+    () => facets.find((f) => isWallFacetUndetailed(f)) || null,
+    [facets]
+  );
+
+  // Unified world viewport framing roof + wall plan + draft points
   const viewBounds = useMemo(() => {
     const pts: Point2D[] = [
       ...levels.flatMap((l) => l.outline.points),
@@ -234,7 +291,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     const derived = deriveWallPlanFromRoofLevels(
       levels,
       defaultHeightM,
-      wallPlan?.facets
+      wallPlan?.facets,
+      roofPlanes
     );
     if (!derived) return;
     onUpdateWallPlan(derived);
@@ -245,12 +303,31 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     }
   };
 
+  const handleSyncRoofTops = () => {
+    if (readOnly || !wallPlan) return;
+    const synced = syncWallPlanWithRoof(wallPlan, levels, roofPlanes, {
+      forceAllLinked: true
+    });
+    onUpdateWallPlan(synced);
+  };
+
+  const handleExportCsv = () => {
+    if (!wallPlan) return;
+    const payload = buildWallTakeoffExportData(wallPlan);
+    const blob = new Blob([payload.csvText], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `wall-cladding-takeoff-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handleSvgClick = (e: React.MouseEvent<SVGSVGElement>) => {
     if (!isDrawing || readOnly) return;
     const raw = getWorldFromClient(e.clientX, e.clientY);
     if (!raw) return;
 
-    // Close loop if clicking close to first draft point
     if (draftPoints.length >= 3 && pointsClose(raw, draftPoints[0], 0.45)) {
       commitDraftLoop(draftPoints);
       return;
@@ -302,7 +379,6 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     onUpdateWallPlan(updated);
   };
 
-  // Wrapper outline so we can reuse exact outward CAD dimension placement
   const wallAsOutline: RoofOutline | null = useMemo(() => {
     if (!wallPlan || wallPlan.points.length < 3) return null;
     return {
@@ -322,6 +398,9 @@ export const WallPlanWorkspace: React.FC<Props> = ({
       <WallElevationWorkbench
         facet={selectedFacet}
         facets={facets}
+        projectPlans={projectPlans}
+        roofLevels={levels}
+        roofPlanes={roofPlanes}
         onSelectFacet={(id) => onSelectWallFacet(id)}
         onUpdateFacet={onUpdateWallFacet}
         onBackToPlan={() => setSubView('plan')}
@@ -335,7 +414,6 @@ export const WallPlanWorkspace: React.FC<Props> = ({
       {/* Top Action & Sub-View Toolbar */}
       <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0">
         <div className="flex flex-wrap items-center gap-1.5">
-          {/* Sub-mode switcher */}
           <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
             <button
               type="button"
@@ -404,11 +482,48 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 <Layers className="w-3.5 h-3.5" />
                 <span>Build Faces</span>
               </button>
+
+              {wallPlan && wallPlan.facets.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleSyncRoofTops}
+                  className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-bold text-sky-300 flex items-center gap-1.5 cursor-pointer"
+                  title="Snap linked wall tops cleanly to overlying roof eaves"
+                >
+                  <Link2 className="w-3.5 h-3.5" />
+                  <span>Sync Roof Tops</span>
+                </button>
+              )}
             </>
           )}
         </div>
 
-        <div className="flex items-center gap-2 text-xs">
+        <div className="flex items-center gap-2 text-xs flex-wrap">
+          {facets.length > 0 && (
+            <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
+              {(
+                [
+                  { id: 'all', label: `All (${facets.length})` },
+                  { id: 'undetailed', label: `Needs Detail (${takeoffSummary.undetailedCount})` },
+                  { id: 'returns', label: `Returns (${topology.returnFacesCount})` }
+                ] as const
+              ).map((flt) => (
+                <button
+                  key={flt.id}
+                  type="button"
+                  onClick={() => setFilterMode(flt.id)}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                    filterMode === flt.id
+                      ? 'bg-amber-500 text-slate-950'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {flt.label}
+                </button>
+              ))}
+            </div>
+          )}
+
           <label className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1">
             <span className="text-[10px] font-bold text-slate-400">Default H</span>
             <input
@@ -474,6 +589,31 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         </div>
       )}
 
+      {/* Undetailed Faces Prompt Strip */}
+      {takeoffSummary.undetailedCount > 0 && nextUndetailedFacet && !isDrawing && (
+        <div className="bg-amber-950/35 border border-amber-500/35 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 text-amber-200">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="font-bold">
+              {takeoffSummary.undetailedCount} wall {takeoffSummary.undetailedCount === 1 ? 'face still needs' : 'faces still need'} cladding assignment
+              {topology.internalCornersCount > 0
+                ? ` · ${topology.internalCornersCount} internal notch corners detected`
+                : ''}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              onSelectWallFacet(nextUndetailedFacet.id);
+              setSubView('elevation');
+            }}
+            className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-extrabold cursor-pointer"
+          >
+            Detail Wall {nextUndetailedFacet.code}
+          </button>
+        </div>
+      )}
+
       {/* True-Scale 2D Floor Plan Canvas + Selected Wall Bar */}
       <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2.5 flex-1 min-h-[300px]">
         <div className="relative flex-1 bg-[#070b14] border border-slate-800/90 rounded-xl overflow-hidden min-h-[260px]">
@@ -514,7 +654,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               ))}
             </g>
 
-            {/* Calibrated Site Plan Underlay (Shared Site Coordinates) */}
+            {/* Calibrated Site Plan Underlay */}
             {planUnderlay && planUnderlay.visible !== false && planUnderlay.isCalibrated && (
               <image
                 href={planUnderlay.imageUrl}
@@ -557,7 +697,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               />
             )}
 
-            {/* Labelled Wall Facets (Edges + Dimension Callouts + Face Codes) */}
+            {/* Labelled Wall Facets */}
             {wallAsOutline &&
               facets.map((facet) => {
                 const x1 = toSvgX(facet.from.x);
@@ -565,7 +705,15 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 const x2 = toSvgX(facet.to.x);
                 const y2 = toSvgY(facet.to.y);
                 const isSel = facet.id === selectedWallFacetId;
-                const meta = getWallCladdingMeta(facet.claddingType);
+                const isUndetailed = isWallFacetUndetailed(facet);
+                const isReturn = returnFacetIdSet.has(facet.id);
+                const matchesFilter =
+                  filterMode === 'all' ||
+                  (filterMode === 'undetailed' && isUndetailed) ||
+                  (filterMode === 'returns' && isReturn);
+
+                const primary = getFacetPrimaryDisplayCladding(facet);
+                const meta = getWallCladdingMeta(primary);
                 const dimPlace = computeEdgeDimensionPlacement(
                   {
                     id: facet.id,
@@ -584,6 +732,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 return (
                   <g
                     key={facet.id}
+                    opacity={matchesFilter ? 1 : 0.24}
                     className={isDrawing ? 'pointer-events-none' : 'cursor-pointer'}
                     onClick={(e) => {
                       if (isDrawing) return;
@@ -597,7 +746,6 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       setSubView('elevation');
                     }}
                   >
-                    {/* Wide invisible hit zone for easy mobile & desktop clicking */}
                     <line
                       x1={x1}
                       y1={y1}
@@ -611,17 +759,17 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       y1={y1}
                       x2={x2}
                       y2={y2}
-                      stroke={isSel ? '#38bdf8' : facet.claddingType === 'none' ? '#f59e0b' : meta.hex}
-                      strokeWidth={isSel ? 5.5 : 3.5}
+                      stroke={isSel ? '#38bdf8' : isUndetailed ? '#f59e0b' : meta.hex}
+                      strokeWidth={isSel ? 5.5 : isReturn ? 4.2 : 3.5}
                       strokeLinecap="round"
                     />
 
-                    {/* Wall Code Badge right on wall midpoint */}
+                    {/* Wall Code Node */}
                     <g transform={`translate(${midX}, ${midY})`}>
                       <circle
                         r="11"
                         fill={isSel ? '#0284c7' : '#0b101d'}
-                        stroke={isSel ? '#ffffff' : facet.claddingType === 'none' ? '#f59e0b' : meta.hex}
+                        stroke={isSel ? '#ffffff' : isUndetailed ? '#f59e0b' : meta.hex}
                         strokeWidth="2"
                       />
                       <text
@@ -650,6 +798,27 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       {facet.lengthM.toFixed(2)}m
                       {facet.openings.length > 0 ? ` (${facet.openings.length})` : ''}
                     </text>
+                  </g>
+                );
+              })}
+
+            {/* Corner Markers (Internal Concave Notches Highlighted in Amber) */}
+            {!isDrawing &&
+              topology.cornerDetails.map((c, idx) => {
+                if (c.kind !== 'internal') return null;
+                return (
+                  <g
+                    key={`ic-${idx}`}
+                    transform={`translate(${toSvgX(c.point.x)}, ${toSvgY(c.point.y)})`}
+                    pointerEvents="none"
+                  >
+                    <circle
+                      r="9"
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth="1.6"
+                      strokeDasharray="3 2"
+                    />
                   </g>
                 );
               })}
@@ -790,13 +959,21 @@ export const WallPlanWorkspace: React.FC<Props> = ({
             <div className="flex items-center gap-2 min-w-0">
               <span
                 className="w-6 h-6 rounded-lg flex items-center justify-center font-mono font-black text-xs text-white border border-white/20 shrink-0"
-                style={{ backgroundColor: getWallCladdingMeta(selectedFacet.claddingType).hex }}
+                style={{
+                  backgroundColor: getWallCladdingMeta(
+                    getFacetPrimaryDisplayCladding(selectedFacet)
+                  ).hex
+                }}
               >
                 {selectedFacet.code}
               </span>
               <div className="min-w-0">
                 <div className="font-bold text-white truncate">
-                  Wall {selectedFacet.code} · {getWallCladdingMeta(selectedFacet.claddingType).label}
+                  Wall {selectedFacet.code} ·{' '}
+                  {selectedFacet.regions && selectedFacet.regions.length > 1
+                    ? `${selectedFacet.regions.length} Mixed Regions`
+                    : getWallCladdingMeta(selectedFacet.claddingType).label}
+                  {selectedFacet.heightSource === 'roof' ? ' · From Roof' : ''}
                 </div>
                 <div className="text-[11px] font-mono text-slate-400 tabular-nums">
                   {selectedFacet.lengthM.toFixed(2)}m × {selectedFacet.heightM.toFixed(2)}m ·{' '}
@@ -839,24 +1016,41 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         )}
       </div>
 
-      {/* Area-by-Cladding Takeoff Summary */}
+      {/* Takeoff Schedules & Corner Topology Card */}
       {facets.length > 0 && (
         <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-3 space-y-2.5 shrink-0">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-300">
-                Wall Cladding Summary
-              </span>
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
+                {(
+                  [
+                    { id: 'summary', label: 'Cladding Summary' },
+                    { id: 'faces', label: `Per Face (${filteredFacets.length})` },
+                    { id: 'openings', label: `Openings (${openingsSchedule.totalCount})` }
+                  ] as const
+                ).map((st) => (
+                  <button
+                    key={st.id}
+                    type="button"
+                    onClick={() => setScheduleTab(st.id)}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                      scheduleTab === st.id
+                        ? 'bg-sky-600 text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {st.label}
+                  </button>
+                ))}
+              </div>
+
               <span className="text-[11px] font-mono text-slate-400 tabular-nums">
-                {takeoffSummary.totalFaces} faces · {takeoffSummary.totalLinealM.toFixed(2)} lm
+                {topology.externalCornersCount} ext · {topology.internalCornersCount} int notch ·{' '}
+                {topology.returnFacesCount} returns
               </span>
             </div>
+
             <div className="flex items-center gap-3 text-xs tabular-nums font-mono">
-              {takeoffSummary.undetailedCount > 0 && (
-                <span className="text-amber-400 font-bold">
-                  {takeoffSummary.undetailedCount} unassigned
-                </span>
-              )}
               <span className="text-slate-400">
                 Gross {takeoffSummary.totalGrossAreaM2.toFixed(1)} m²
               </span>
@@ -866,49 +1060,182 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               <span className="text-emerald-400 font-extrabold">
                 Net {takeoffSummary.totalNetAreaM2.toFixed(1)} m²
               </span>
+              <button
+                type="button"
+                onClick={handleExportCsv}
+                className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-sans text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                title="Download Wall Cladding & Openings CSV"
+              >
+                <Download className="w-3 h-3 text-sky-400" />
+                <span>CSV</span>
+              </button>
             </div>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs tabular-nums">
-              <thead>
-                <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-500">
-                  <th className="py-1.5 pr-3 font-bold">Cladding Type</th>
-                  <th className="py-1.5 px-2 font-bold">Faces</th>
-                  <th className="py-1.5 px-2 font-bold text-right">Lineal (m)</th>
-                  <th className="py-1.5 px-2 font-bold text-right">Gross (m²)</th>
-                  <th className="py-1.5 px-2 font-bold text-right">Openings (m²)</th>
-                  <th className="py-1.5 pl-2 font-bold text-right">Net Cladding (m²)</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70">
-                {takeoffSummary.byCladding.map((grp) => (
-                  <tr key={grp.claddingType} className="text-slate-200">
-                    <td className="py-1.5 pr-3">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/20"
-                          style={{ backgroundColor: grp.hex }}
-                        />
-                        <span className="font-bold">{grp.label}</span>
-                      </div>
-                    </td>
-                    <td className="py-1.5 px-2 font-mono text-slate-400">
-                      {grp.faceCodes.join(', ')}
-                    </td>
-                    <td className="py-1.5 px-2 font-mono text-right">{grp.linealM.toFixed(2)}</td>
-                    <td className="py-1.5 px-2 font-mono text-right">{grp.grossAreaM2.toFixed(2)}</td>
-                    <td className="py-1.5 px-2 font-mono text-right text-amber-400">
-                      {grp.openingsAreaM2 > 0 ? `−${grp.openingsAreaM2.toFixed(2)}` : '0.00'}
-                    </td>
-                    <td className="py-1.5 pl-2 font-mono text-right font-extrabold text-emerald-400">
-                      {grp.netAreaM2.toFixed(2)}
-                    </td>
+          {scheduleTab === 'summary' && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs tabular-nums">
+                <thead>
+                  <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-500">
+                    <th className="py-1.5 pr-3 font-bold">Cladding Type</th>
+                    <th className="py-1.5 px-2 font-bold">Faces</th>
+                    <th className="py-1.5 px-2 font-bold text-right">Lineal (m)</th>
+                    <th className="py-1.5 px-2 font-bold text-right">Gross (m²)</th>
+                    <th className="py-1.5 px-2 font-bold text-right">Openings (m²)</th>
+                    <th className="py-1.5 pl-2 font-bold text-right">Net Cladding (m²)</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70">
+                  {takeoffSummary.byCladding.map((grp) => (
+                    <tr key={grp.claddingType} className="text-slate-200">
+                      <td className="py-1.5 pr-3">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/20"
+                            style={{ backgroundColor: grp.hex }}
+                          />
+                          <span className="font-bold">{grp.label}</span>
+                        </div>
+                      </td>
+                      <td className="py-1.5 px-2 font-mono text-slate-400">
+                        {grp.faceCodes.join(', ')}
+                      </td>
+                      <td className="py-1.5 px-2 font-mono text-right">{grp.linealM.toFixed(2)}</td>
+                      <td className="py-1.5 px-2 font-mono text-right">{grp.grossAreaM2.toFixed(2)}</td>
+                      <td className="py-1.5 px-2 font-mono text-right text-amber-400">
+                        {grp.openingsAreaM2 > 0 ? `−${grp.openingsAreaM2.toFixed(2)}` : '0.00'}
+                      </td>
+                      <td className="py-1.5 pl-2 font-mono text-right font-extrabold text-emerald-400">
+                        {grp.netAreaM2.toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {scheduleTab === 'faces' && (
+            <div className="overflow-x-auto max-h-56 overflow-y-auto">
+              <table className="w-full text-left text-xs tabular-nums">
+                <thead>
+                  <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-500">
+                    <th className="py-1.5 pr-2 font-bold">Face</th>
+                    <th className="py-1.5 px-2 font-bold">Cladding</th>
+                    <th className="py-1.5 px-2 font-bold text-right">L × H</th>
+                    <th className="py-1.5 px-2 font-bold">Height Source</th>
+                    <th className="py-1.5 px-2 font-bold text-right">Openings</th>
+                    <th className="py-1.5 px-2 font-bold text-right">Net (m²)</th>
+                    <th className="py-1.5 pl-2 font-bold text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70">
+                  {filteredFacets.map((f) => {
+                    const m = computeWallFacetMetrics(f);
+                    const undetailed = isWallFacetUndetailed(f);
+                    const isRet = returnFacetIdSet.has(f.id);
+                    const prim = getFacetPrimaryDisplayCladding(f);
+                    return (
+                      <tr
+                        key={f.id}
+                        onClick={() => onSelectWallFacet(f.id)}
+                        className="text-slate-200 hover:bg-slate-900/60 cursor-pointer"
+                      >
+                        <td className="py-1.5 pr-2 font-mono font-bold">
+                          {f.code}
+                          {isRet ? ' (Return)' : ''}
+                        </td>
+                        <td className="py-1.5 px-2">
+                          {f.regions && f.regions.length > 1
+                            ? f.regions
+                                .map((r) => getWallCladdingMeta(r.claddingType).shortLabel)
+                                .join(' + ')
+                            : getWallCladdingMeta(prim).shortLabel}
+                        </td>
+                        <td className="py-1.5 px-2 font-mono text-right">
+                          {f.lengthM.toFixed(2)} × {f.heightM.toFixed(2)}m
+                        </td>
+                        <td className="py-1.5 px-2 text-slate-400">
+                          {f.heightSource === 'roof' ? 'Roof Eave' : 'Manual'}
+                        </td>
+                        <td className="py-1.5 px-2 font-mono text-right">{f.openings.length}</td>
+                        <td
+                          className={`py-1.5 px-2 font-mono text-right font-bold ${
+                            undetailed ? 'text-amber-400' : 'text-emerald-400'
+                          }`}
+                        >
+                          {m.netCladdingAreaM2.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 pl-2 text-right">
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              onSelectWallFacet(f.id);
+                              setSubView('elevation');
+                            }}
+                            className="text-sky-400 hover:text-sky-300 font-bold cursor-pointer"
+                          >
+                            {undetailed ? 'Detail' : 'Edit'}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {scheduleTab === 'openings' && (
+            <div className="overflow-x-auto max-h-56 overflow-y-auto">
+              {openingsSchedule.rows.length === 0 ? (
+                <div className="text-xs text-slate-400 py-2">
+                  No windows, doors, or garage openings added yet. Open any wall elevation to add openings.
+                </div>
+              ) : (
+                <table className="w-full text-left text-xs tabular-nums">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-500">
+                      <th className="py-1.5 pr-2 font-bold">Wall</th>
+                      <th className="py-1.5 px-2 font-bold">Label</th>
+                      <th className="py-1.5 px-2 font-bold">Type</th>
+                      <th className="py-1.5 px-2 font-bold text-right">W × H (m)</th>
+                      <th className="py-1.5 px-2 font-bold text-right">Sill Z (m)</th>
+                      <th className="py-1.5 pl-2 font-bold text-right">Area (m²)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/70">
+                    {openingsSchedule.rows.map((row) => (
+                      <tr
+                        key={row.id}
+                        onClick={() => {
+                          onSelectWallFacet(row.facetId);
+                          setSubView('elevation');
+                        }}
+                        className="text-slate-200 hover:bg-slate-900/60 cursor-pointer"
+                      >
+                        <td className="py-1.5 pr-2 font-mono font-bold text-sky-300">
+                          {row.facetCode}
+                        </td>
+                        <td className="py-1.5 px-2 font-bold">{row.label}</td>
+                        <td className="py-1.5 px-2 capitalize text-slate-400">{row.type}</td>
+                        <td className="py-1.5 px-2 font-mono text-right">
+                          {row.widthM.toFixed(2)} × {row.heightM.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 px-2 font-mono text-right">
+                          {row.sillHeightM.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 pl-2 font-mono text-right font-bold text-amber-400">
+                          {row.areaM2.toFixed(2)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

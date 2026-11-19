@@ -1,17 +1,32 @@
 import assert from 'node:assert/strict';
 import {
+  analyzeWallPlanTopology,
   buildWallEdgesFromPoints,
   buildWallFacetsFromPlan,
+  buildWallOpeningsSchedule,
+  buildWallTakeoffExportData,
+  calibrateUnderlayFromTwoPoints,
   clampWallOpeningToFacet,
   computeWallFacetMetrics,
   computeWallTakeoffSummary,
   createDefaultWallOpening,
+  createHorizontalDadoSplit,
+  createVerticalBaySplit,
   deriveWallPlanFromRoofLevels,
+  fitWallFacetTopToRoof,
+  isWallFacetUndetailed,
+  syncWallPlanWithRoof,
   updateWallPlanEdgeLength
 } from '../wallCladdingEngine';
-import { createRoofLevel, getPresetOutline, generateSkeletonLines } from '../exactRoofingEngine';
+import {
+  applyRoofStylePreset,
+  createRoofLevel,
+  generateSkeletonLines,
+  getPresetOutline,
+  syncMultiLevelPlanes
+} from '../exactRoofingEngine';
 
-console.log('--- Starting Wall Cladding Phase 1 Engine Tests ---');
+console.log('--- Starting Wall Cladding Phase 1 & Phase 2 Engine Tests ---');
 
 // 1. U-shape courtyard with deep re-entrant notch (8 edges, including 2 notch returns + recess)
 const uShapePoints = [
@@ -54,13 +69,28 @@ assert.equal(mergedFacets[0].lengthM, 12);
 assert.equal(mergedFacets[3].lengthM, 0.45);
 console.log('✓ Test 2 Passed: Safe collinear merging preserves 0.45m return nib');
 
-// 3. Preserving per-face cladding & openings when rebuilding faces or editing edge length
+// 3. Preserving per-face cladding, openings, underlays, & mixed regions on rebuild
 const initialPlanEdges = buildWallEdgesFromPoints(uShapePoints, 'wall-edge');
+const sampleUnderlay = {
+  id: 'ul-1',
+  name: 'North Elevation Scan',
+  imageUrl: 'data:image/png;base64,iVBORw0KGgo=',
+  imageAspect: 2.0,
+  worldWidthM: 14.0,
+  worldHeightM: 7.0,
+  offsetXM: 0,
+  offsetYM: 0,
+  opacity: 0.45,
+  visible: true,
+  calibrationMode: 'two_point' as const
+};
 const detailedFacets = uFacets.map((f, idx) => {
   if (idx === 0) {
     return {
       ...f,
       claddingType: 'weatherboard' as const,
+      underlay: sampleUnderlay,
+      regions: createHorizontalDadoSplit(f, 1.2, 'brick', 'weatherboard'),
       openings: [
         createDefaultWallOpening(f, 'door', 1.2),
         createDefaultWallOpening(f, 'window', 4.5)
@@ -84,10 +114,12 @@ const rebuiltFacets = buildWallFacetsFromPlan(
 );
 assert.equal(rebuiltFacets[0].claddingType, 'weatherboard');
 assert.equal(rebuiltFacets[0].openings.length, 2);
+assert.equal(rebuiltFacets[0].underlay?.name, 'North Elevation Scan');
+assert.equal(rebuiltFacets[0].regions?.length, 2);
 assert.equal(rebuiltFacets[4].claddingType, 'brick');
 assert.equal(rebuiltFacets[4].openings.length, 1);
 assert.equal(rebuiltFacets[1].claddingType, 'none');
-console.log('✓ Test 3 Passed: Facet cladding & openings survive rebuild');
+console.log('✓ Test 3 Passed: Facet cladding, openings, underlay, & regions survive rebuild');
 
 // 4. Parametric opening clamping & Area-by-cladding summary math
 const smallFacet = { ...rebuiltFacets[3], lengthM: 2.0, heightM: 2.4 };
@@ -114,7 +146,7 @@ assert.equal(summary.undetailedCount, 6);
 assert.equal(summary.totalOpeningsCount, 3);
 const brickGroup = summary.byCladding.find((g) => g.claddingType === 'brick');
 assert.ok(brickGroup);
-assert.equal(brickGroup.netAreaM2, 9.0);
+assert.ok(brickGroup.netAreaM2 > 9.0, 'Brick total should include both notch wall E and Dado lower region of A');
 console.log('✓ Test 4 Passed: Opening bounds & cladding area summary reconcile accurately');
 
 // 5. Roof footprint derivation with eave setback + roofEdgeId linking + edge length edit
@@ -131,6 +163,7 @@ assert.equal(derivedPlan.facets.length, 4);
 assert.equal(derivedPlan.facets[0].lengthM, 13.1);
 assert.equal(derivedPlan.facets[1].lengthM, 9.1);
 assert.ok(derivedPlan.facets.every((f) => Boolean(f.roofEdgeId)), 'All 4 walls link back to roof edges');
+assert.ok(derivedPlan.facets.every((f) => f.heightSource === 'roof'), 'Derived walls default to roof-linked heightSource');
 
 // Add an opening to facet A and update edge length to 15.0m -> opening & cladding preserved
 const withOp = {
@@ -151,4 +184,165 @@ assert.equal(resizedPlan.facets[0].claddingType, 'profiled_metal');
 assert.equal(resizedPlan.facets[0].openings.length, 1);
 console.log('✓ Test 5 Passed: Roof setback derivation (0.45m eave) & edge resizing preserve wall details');
 
-console.log('--- All Wall Cladding Phase 1 Engine Tests Passed ---');
+// --- Phase 2 Tests ---
+
+// 6. Phase 2: Elevation Underlay 2-Point Calibration Math
+const cal = calibrateUnderlayFromTwoPoints({
+  imageAspect: 2.0,
+  p1Norm: { x: 0.1, y: 0.5 },
+  p2Norm: { x: 0.6, y: 0.5 }, // 50% of image width spans 5.0m -> full image width = 10.0m, height = 5.0m
+  knownDistanceM: 5.0,
+  facetLengthM: 10.0,
+  facetHeightM: 2.7
+});
+assert.equal(cal.worldWidthM, 10.0);
+assert.equal(cal.worldHeightM, 5.0);
+console.log('✓ Test 6 Passed: Elevation 2-point underlay calibration solves real-world scale accurately');
+
+// 7. Phase 2: Roof-Wall Vertical Link + Gable Rake Profile + Manual Override Preservation
+const rawGableOutline = getPresetOutline('straight_gable');
+rawGableOutline.edges = rawGableOutline.edges.map((e) => ({ ...e, hasWall: true, eaveSetbackM: 0.45 }));
+const gablePreset = applyRoofStylePreset(rawGableOutline, 'gable');
+const gableLvl = createRoofLevel(1, 'Gable House', 3.0, gablePreset.outline.points);
+gableLvl.outline = {
+  ...gablePreset.outline,
+  edges: gablePreset.outline.edges.map((e) => ({ ...e, eaveHeightM: 3.0 }))
+};
+gableLvl.skeleton = gablePreset.skeleton;
+const gablePlanes = syncMultiLevelPlanes([gableLvl], [], 22.5);
+
+const gableWalls = deriveWallPlanFromRoofLevels([gableLvl], 2.7, undefined, gablePlanes);
+assert.ok(gableWalls, 'Gable roof should derive wall plan');
+const vergeEdgeIds = new Set(
+  gableLvl.outline.edges.filter((e) => e.type === 'verge').map((e) => e.id)
+);
+const gableWall = gableWalls.facets.find((f) => f.roofEdgeId && vergeEdgeIds.has(f.roofEdgeId));
+assert.ok(gableWall, 'Should match a gable end wall facet');
+assert.ok(
+  gableWall.roofProfile && gableWall.roofProfile.length >= 3,
+  'Gable end wall synced to roof must carry a raked roofProfile contour'
+);
+assert.ok(gableWall.topZ > 3.1, 'Gable apex topZ rises above 3.0m eave');
+
+// Raise roof eave height from 3.0m -> 3.6m; keep Facet A as 'roof' and Facet B as 'manual'
+const editedWalls = {
+  ...gableWalls,
+  facets: gableWalls.facets.map((f, idx) =>
+    idx === 1
+      ? {
+          ...f,
+          heightSource: 'manual' as const,
+          heightM: 2.55,
+          topZ: 2.55,
+          claddingType: 'weatherboard' as const
+        }
+      : { ...f, claddingType: 'profiled_metal' as const }
+  )
+};
+const raisedLvl = {
+  ...gableLvl,
+  eaveHeightM: 3.6,
+  outline: {
+    ...gableLvl.outline,
+    edges: gableLvl.outline.edges.map((e) => ({ ...e, eaveHeightM: 3.6 }))
+  }
+};
+const raisedPlanes = syncMultiLevelPlanes([raisedLvl], gablePlanes, 22.5);
+const syncedWalls = syncWallPlanWithRoof(editedWalls, [raisedLvl], raisedPlanes);
+
+const expectedSetbackTopZ = 3.6 + 0.45 * Math.tan((22.5 * Math.PI) / 180) - 0.025;
+assert.ok(
+  Math.abs(syncedWalls.facets[0].topZ - expectedSetbackTopZ) < 0.04,
+  `Roof-linked wall at 0.45m setback should update to ~${expectedSetbackTopZ.toFixed(3)}m (got ${syncedWalls.facets[0].topZ})`
+);
+assert.equal(syncedWalls.facets[1].heightM, 2.55, 'Manual height override must NOT be overwritten');
+assert.equal(syncedWalls.facets[1].heightSource, 'manual');
+
+// Explicit per-face "Fit Top to Roof Eave" overrides manual back to roof
+const refitted = fitWallFacetTopToRoof(syncedWalls.facets[1], [raisedLvl], raisedPlanes);
+assert.equal(refitted.heightSource, 'roof');
+assert.ok(refitted.topZ > 3.5);
+console.log('✓ Test 7 Passed: Roof-wall vertical sync updates roof-linked walls & gable rakes while protecting manual overrides');
+
+// 8. Phase 2: Corners & Returns Topology Analysis (U-Notch)
+const topology = analyzeWallPlanTopology(uFacets);
+assert.equal(topology.externalCornersCount, 6, 'U-shape has 6 external corners');
+assert.equal(topology.internalCornersCount, 2, 'U-shape has 2 concave internal notch corners');
+assert.equal(topology.returnFacesCount, 3, 'U-shape notch identifies D, E, F return faces');
+assert.deepEqual(
+  uFacets.filter((f) => topology.returnFacetIds.includes(f.id)).map((f) => f.code),
+  ['D', 'E', 'F']
+);
+console.log('✓ Test 8 Passed: Corner & notch-return topology identifies 6 ext / 2 int / 3 returns');
+
+// 9. Phase 2: Mixed Cladding Regions (Horizontal Dado & Vertical Bay) + Opening Deduction + Schedule
+const testWall = {
+  ...uFacets[0],
+  lengthM: 10.0,
+  heightM: 2.7,
+  topZ: 2.7,
+  claddingType: 'weatherboard' as const,
+  openings: [
+    {
+      id: 'op-win-straddle',
+      type: 'window' as const,
+      distFromStartM: 2.0,
+      sillHeightM: 0.9, // straddles dado seam at 1.2m (0.3m inside lower dado, 0.9m inside upper wall)
+      widthM: 2.0,
+      heightM: 1.2,
+      label: 'W1'
+    }
+  ]
+};
+const dadoRegions = createHorizontalDadoSplit(testWall, 1.2, 'brick', 'weatherboard');
+const dadoWall = { ...testWall, regions: dadoRegions };
+const dadoMetrics = computeWallFacetMetrics(dadoWall);
+
+assert.equal(dadoMetrics.grossAreaM2, 27.0);
+assert.equal(dadoMetrics.openingsAreaM2, 2.4); // 2.0 * 1.2
+assert.equal(dadoMetrics.netCladdingAreaM2, 24.6);
+assert.equal(dadoMetrics.regionBreakdown.length, 2);
+// Lower dado: 10*1.2 = 12.0m2 gross, opening clip [0.9..1.2] x 2.0 = 0.6m2 -> 11.4m2 net
+assert.equal(dadoMetrics.regionBreakdown[0].grossAreaM2, 12.0);
+assert.equal(dadoMetrics.regionBreakdown[0].openingsAreaM2, 0.6);
+assert.equal(dadoMetrics.regionBreakdown[0].netAreaM2, 11.4);
+// Upper wall: 10*1.5 = 15.0m2 gross, opening clip [1.2..2.1] x 2.0 = 1.8m2 -> 13.2m2 net
+assert.equal(dadoMetrics.regionBreakdown[1].grossAreaM2, 15.0);
+assert.equal(dadoMetrics.regionBreakdown[1].openingsAreaM2, 1.8);
+assert.equal(dadoMetrics.regionBreakdown[1].netAreaM2, 13.2);
+
+// Verify computeWallTakeoffSummary does not double count horizontal linealM when summarizing mixed dado regions
+const bayWall = {
+  ...uFacets[1],
+  lengthM: 8.0,
+  heightM: 2.7,
+  topZ: 2.7,
+  regions: createVerticalBaySplit(uFacets[1], 3.5, 'brick', 'profiled_metal'),
+  openings: []
+};
+const mixedSummary = computeWallTakeoffSummary([dadoWall, bayWall]);
+const brickSum = mixedSummary.byCladding.find((g) => g.claddingType === 'brick');
+const wbSum = mixedSummary.byCladding.find((g) => g.claddingType === 'weatherboard');
+assert.ok(brickSum && wbSum);
+assert.equal(wbSum.linealM, 10.0, 'Weatherboard spans 10.0m horizontally');
+assert.equal(brickSum.netAreaM2, +(11.4 + 3.5 * 2.7).toFixed(2));
+assert.equal(isWallFacetUndetailed(dadoWall), false);
+
+// Openings schedule & CSV export
+const schedule = buildWallOpeningsSchedule([dadoWall, bayWall]);
+assert.equal(schedule.totalCount, 1);
+assert.equal(schedule.totalAreaM2, 2.4);
+assert.equal(schedule.countsByType.window, 1);
+
+const exportData = buildWallTakeoffExportData({
+  points: uShapePoints,
+  edges: initialPlanEdges,
+  defaultHeightM: 2.7,
+  facets: [dadoWall, bayWall]
+});
+assert.ok(exportData.csvText.includes('WALL CLADDING SUMMARY'));
+assert.ok(exportData.csvText.includes('OPENINGS SCHEDULE'));
+assert.ok(exportData.csvText.includes('W1'));
+console.log('✓ Test 9 Passed: Mixed cladding dado/bay splitting, straddling openings, linealM dedup, & CSV schedule');
+
+console.log('--- All Wall Cladding Phase 1 & Phase 2 Engine Tests Passed ---');

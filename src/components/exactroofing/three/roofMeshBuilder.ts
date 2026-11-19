@@ -7,6 +7,7 @@ import {
   RoofOutline,
   RoofPlane,
   SkeletonLine,
+  WallFilterMode,
   WallPlan
 } from '../../../types/exactRoofing';
 import {
@@ -345,6 +346,7 @@ export function buildRoofSceneGroup(params: {
   wallPlan?: WallPlan | null;
   selectedPlaneId?: string | null;
   selectedWallFacetId?: string | null;
+  wallFilterMode?: WallFilterMode;
   shadingMode: Roof3DShadingMode;
   swatch: ColorsteelSwatch;
   textures: ProceduralRoofTextureSet;
@@ -363,6 +365,7 @@ export function buildRoofSceneGroup(params: {
     wallPlan,
     selectedPlaneId,
     selectedWallFacetId,
+    wallFilterMode = 'all',
     shadingMode,
     swatch,
     textures,
@@ -803,6 +806,7 @@ export function buildRoofSceneGroup(params: {
         wallPlan,
         bounds,
         selectedWallFacetId,
+        wallFilterMode,
         shadingMode,
         wallNormalMap,
         rootGroup,
@@ -821,8 +825,18 @@ export function buildRoofSceneGroup(params: {
     const wallSegments = deriveRoofWallSegments(allLevels, structuralPlanes).filter((wall) => {
       if (!hasWallPlanFacets) return true;
       // When detailed WallPlan facets exist, skip exterior single-storey strips & matched roofEdgeId
-      // to avoid Z-fighting, while keeping gable triangle infills / multi-storey step risers.
+      // to avoid Z-fighting, while keeping gable triangle infills unless facet itself is roof-raked.
       if (wall.wallKind === 'exterior_eave') return false;
+      if (wall.wallKind === 'gable_end') {
+        const linkedRaked = (wallPlan?.facets || []).find(
+          (f) =>
+            f.roofEdgeId === wall.edgeId &&
+            f.heightSource === 'roof' &&
+            f.roofProfile &&
+            f.roofProfile.length >= 2
+        );
+        if (linkedRaked) return false;
+      }
       if (linkedRoofEdgeIds.has(wall.edgeId) && wall.bottomZ < 0.2) return false;
       return true;
     });

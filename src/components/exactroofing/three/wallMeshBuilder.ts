@@ -2,12 +2,16 @@ import * as THREE from 'three';
 import {
   WallCladdingType,
   WallFacet,
+  WallFilterMode,
   WallOpening,
   WallPlan
 } from '../../../types/exactRoofing';
 import {
   clampWallOpeningToFacet,
-  getWallCladdingMeta
+  clampWallRegionToFacet,
+  computeWallTakeoffSummary,
+  getWallCladdingMeta,
+  isWallFacetUndetailed
 } from '../../../utils/wallCladdingEngine';
 import { Roof3DShadingMode } from './roofMaterials';
 import { Roof3DBounds } from './roofMeshBuilder';
@@ -27,8 +31,12 @@ interface SanitizedOpening {
  */
 function sanitizeOpeningsForExtrusion(facet: WallFacet): SanitizedOpening[] {
   const L = facet.lengthM;
+  const maxProfileH =
+    facet.roofProfile && facet.roofProfile.length > 0
+      ? Math.max(facet.heightM, ...facet.roofProfile.map((p) => p.topZ - facet.bottomZ))
+      : facet.heightM;
   const H = facet.heightM;
-  if (L < 0.25 || H < 0.25) return [];
+  if (L < 0.25 || maxProfileH < 0.25) return [];
 
   const minCornerJamb = Math.min(0.04, L * 0.05);
   const minHeadJamb = Math.min(0.04, H * 0.05);
@@ -60,6 +68,124 @@ function sanitizeOpeningsForExtrusion(facet: WallFacet): SanitizedOpening[] {
   }
 
   return accepted;
+}
+
+/**
+ * Builds one or more manifold-safe THREE.Shape polygons for rectangular cladding region
+ * [u0..u1] x [v0..v1] (or optional sloped top profile when fullHeight & fullSpan).
+ */
+function buildWallRegionShapes(params: {
+  u0: number;
+  u1: number;
+  v0: number;
+  v1: number;
+  openings: SanitizedOpening[];
+  roofProfilePts?: { u: number; v: number }[];
+}): THREE.Shape[] {
+  const { u0, u1, v0, v1, openings, roofProfilePts } = params;
+  if (u1 - u0 < 0.06 || v1 - v0 < 0.06) return [];
+
+  const eps = 0.02;
+  const overlapping = openings.filter(
+    (op) => op.u1 > u0 + eps && op.u0 < u1 - eps && op.v1 > v0 + eps && op.v0 < v1 - eps
+  );
+
+  // Split horizontally around any opening that completely cuts through [v0..v1]
+  const fullCutters = overlapping
+    .filter((op) => op.v0 <= v0 + eps && op.v1 >= v1 - eps)
+    .sort((a, b) => a.u0 - b.u0);
+
+  const subSpans: [number, number][] = [];
+  let cursorU = u0;
+  fullCutters.forEach((op) => {
+    const cutStart = Math.max(u0, op.u0);
+    const cutEnd = Math.min(u1, op.u1);
+    if (cutStart - cursorU >= 0.06) {
+      subSpans.push([cursorU, cutStart]);
+    }
+    cursorU = Math.max(cursorU, cutEnd);
+  });
+  if (u1 - cursorU >= 0.06) {
+    subSpans.push([cursorU, u1]);
+  }
+
+  const shapes: THREE.Shape[] = [];
+  subSpans.forEach(([su0, su1]) => {
+    const spanOps = overlapping.filter((op) => op.u1 > su0 + eps && op.u0 < su1 - eps);
+    const bottomNotches = spanOps
+      .filter((op) => op.v0 <= v0 + eps && op.v1 < v1 - eps)
+      .sort((a, b) => a.u0 - b.u0);
+    const topNotches = spanOps
+      .filter((op) => op.v0 > v0 + eps && op.v1 >= v1 - eps && !roofProfilePts)
+      .sort((a, b) => b.u0 - a.u0); // reversed right-to-left along top edge
+    const interiorHoles = spanOps.filter(
+      (op) => op.v0 > v0 + eps && op.v1 < v1 - eps
+    );
+
+    const shape = new THREE.Shape();
+    shape.moveTo(su0, v0);
+    bottomNotches.forEach((op) => {
+      const nu0 = Math.max(su0 + 0.015, op.u0);
+      const nu1 = Math.min(su1 - 0.015, op.u1);
+      if (nu1 - nu0 < 0.05) return;
+      shape.lineTo(nu0, v0);
+      shape.lineTo(nu0, op.v1);
+      shape.lineTo(nu1, op.v1);
+      shape.lineTo(nu1, v0);
+    });
+    shape.lineTo(su1, v0);
+
+    if (roofProfilePts && roofProfilePts.length >= 2) {
+      const clippedTop = roofProfilePts
+        .filter((p) => p.u >= su0 - 0.02 && p.u <= su1 + 0.02)
+        .map((p) => ({
+          u: Math.max(su0, Math.min(su1, p.u)),
+          v: Math.max(v0 + 0.15, p.v)
+        }))
+        .sort((a, b) => b.u - a.u);
+
+      const firstRightV =
+        clippedTop[0]?.v ??
+        Math.max(v0 + 0.15, roofProfilePts[roofProfilePts.length - 1].v);
+      shape.lineTo(su1, firstRightV);
+      clippedTop.forEach((pt) => {
+        shape.lineTo(pt.u, pt.v);
+      });
+      const lastLeftV =
+        clippedTop[clippedTop.length - 1]?.v ?? Math.max(v0 + 0.15, roofProfilePts[0].v);
+      shape.lineTo(su0, lastLeftV);
+    } else {
+      shape.lineTo(su1, v1);
+      topNotches.forEach((op) => {
+        const nu0 = Math.max(su0 + 0.015, op.u0);
+        const nu1 = Math.min(su1 - 0.015, op.u1);
+        if (nu1 - nu0 < 0.05) return;
+        shape.lineTo(nu1, v1);
+        shape.lineTo(nu1, op.v0);
+        shape.lineTo(nu0, op.v0);
+        shape.lineTo(nu0, v1);
+      });
+      shape.lineTo(su0, v1);
+    }
+    shape.closePath();
+
+    interiorHoles.forEach((op) => {
+      const hu0 = Math.max(su0 + 0.02, op.u0);
+      const hu1 = Math.min(su1 - 0.02, op.u1);
+      if (hu1 - hu0 < 0.08) return;
+      const hole = new THREE.Path();
+      hole.moveTo(hu0, op.v0);
+      hole.lineTo(hu0, op.v1);
+      hole.lineTo(hu1, op.v1);
+      hole.lineTo(hu1, op.v0);
+      hole.closePath();
+      shape.holes.push(hole);
+    });
+
+    shapes.push(shape);
+  });
+
+  return shapes;
 }
 
 function getCladdingVisualProps(
@@ -118,6 +244,7 @@ export function buildWallPlan3DGroup(params: {
   wallPlan: WallPlan;
   bounds: Roof3DBounds;
   selectedWallFacetId?: string | null;
+  wallFilterMode?: WallFilterMode;
   shadingMode: Roof3DShadingMode;
   wallNormalMap: THREE.CanvasTexture;
   rootGroup: THREE.Group;
@@ -129,6 +256,7 @@ export function buildWallPlan3DGroup(params: {
     wallPlan,
     bounds,
     selectedWallFacetId,
+    wallFilterMode = 'all',
     shadingMode,
     wallNormalMap,
     rootGroup,
@@ -141,6 +269,8 @@ export function buildWallPlan3DGroup(params: {
 
   const isWireframe = shadingMode === 'wireframe';
   const wallThickness = 0.14;
+  const takeoffSummary = computeWallTakeoffSummary(wallPlan.facets);
+  const returnFacetIdSet = new Set(takeoffSummary.returnFacetIds);
 
   // Shared opening frame / glazing / door materials
   const frameMat = trackMat(
@@ -205,84 +335,116 @@ export function buildWallPlan3DGroup(params: {
     );
     facetGroup.rotation.y = rotY;
 
-    const sanitizedOpenings = sanitizeOpeningsForExtrusion(facet);
-    const thresholdNotches = sanitizedOpenings.filter((o) => o.isThreshold);
-    const holeOpenings = sanitizedOpenings.filter((o) => !o.isThreshold);
-
-    // Outer wall silhouette in local (u: 0..L, v: 0..H) with clean door/garage threshold notches
-    const wallShape = new THREE.Shape();
-    wallShape.moveTo(0, 0);
-    thresholdNotches.forEach((notch) => {
-      wallShape.lineTo(notch.u0, 0);
-      wallShape.lineTo(notch.u0, notch.v1);
-      wallShape.lineTo(notch.u1, notch.v1);
-      wallShape.lineTo(notch.u1, 0);
-    });
-    wallShape.lineTo(L, 0);
-    wallShape.lineTo(L, H);
-    wallShape.lineTo(0, H);
-    wallShape.closePath();
-
-    // Interior elevated openings (windows & voids) as clockwise holes
-    holeOpenings.forEach((op) => {
-      const hole = new THREE.Path();
-      hole.moveTo(op.u0, op.v0);
-      hole.lineTo(op.u0, op.v1);
-      hole.lineTo(op.u1, op.v1);
-      hole.lineTo(op.u1, op.v0);
-      hole.closePath();
-      wallShape.holes.push(hole);
-    });
-
-    const wallGeo = trackGeo(
-      new THREE.ExtrudeGeometry(wallShape, {
-        depth: wallThickness,
-        bevelEnabled: false,
-        steps: 1
-      })
-    );
-    wallGeo.translate(0, 0, -wallThickness / 2);
-
-    const vis = getCladdingVisualProps(facet.claddingType, shadingMode, wallNormalMap);
     const isSelected = Boolean(selectedWallFacetId && selectedWallFacetId === facet.id);
-    const baseEmissiveHex = isSelected ? '#0284c7' : '#000000';
-    const baseEmissiveIntensity = isSelected ? 0.34 : 0;
+    const isUndetailed = isWallFacetUndetailed(facet);
+    const isReturn = returnFacetIdSet.has(facet.id);
+    const isDimmedByFilter =
+      (wallFilterMode === 'undetailed' && !isUndetailed) ||
+      (wallFilterMode === 'returns' && !isReturn);
+    const isHighlightedByFilter =
+      (wallFilterMode === 'undetailed' && isUndetailed) ||
+      (wallFilterMode === 'returns' && isReturn);
 
-    const wallMat = trackMat(
-      new THREE.MeshStandardMaterial({
-        color: new THREE.Color(vis.color),
-        roughness: vis.roughness,
-        metalness: vis.metalness,
-        normalMap: vis.useNormal ? wallNormalMap : null,
-        normalScale: new THREE.Vector2(vis.normalScale, vis.normalScale),
-        emissive: new THREE.Color(baseEmissiveHex),
-        emissiveIntensity: baseEmissiveIntensity,
-        wireframe: isWireframe
-      })
-    );
+    const sanitizedOpenings = sanitizeOpeningsForExtrusion(facet);
+    const roofProfileLocal =
+      facet.heightSource === 'roof' && facet.roofProfile && facet.roofProfile.length >= 2
+        ? facet.roofProfile.map((p) => ({
+            u: Math.max(0, Math.min(L, p.distM)),
+            v: Math.max(0.25, p.topZ - facet.bottomZ)
+          }))
+        : undefined;
 
-    const wallMesh = new THREE.Mesh(wallGeo, wallMat);
-    wallMesh.castShadow = true;
-    wallMesh.receiveShadow = true;
-    wallMesh.userData = {
-      wallFacetId: facet.id,
-      baseEmissiveHex,
-      baseEmissiveIntensity
-    };
-    facetGroup.add(wallMesh);
-    selectableMeshes.push(wallMesh);
+    const regionsToBuild =
+      facet.regions && facet.regions.length > 0
+        ? facet.regions.slice(0, 3).map((r) => clampWallRegionToFacet(facet, r))
+        : [
+            {
+              id: 'full',
+              claddingType: facet.claddingType,
+              uStartM: 0,
+              uEndM: L,
+              vStartM: 0,
+              vEndM: H
+            }
+          ];
 
-    if (isSelected || isWireframe) {
-      const edgesGeo = trackGeo(new THREE.EdgesGeometry(wallGeo, 25));
-      const edgeMat = trackMat(
-        new THREE.LineBasicMaterial({
-          color: isSelected ? '#38bdf8' : '#7dd3fc',
-          transparent: true,
-          opacity: isSelected ? 0.95 : 0.45
+    regionsToBuild.forEach((reg) => {
+      const useRoofProfile =
+        Boolean(roofProfileLocal) &&
+        Math.abs(reg.vEndM - H) < 0.08 &&
+        reg.uEndM - reg.uStartM > 0.25;
+      const shapes = buildWallRegionShapes({
+        u0: reg.uStartM,
+        u1: reg.uEndM,
+        v0: reg.vStartM,
+        v1: reg.vEndM,
+        openings: sanitizedOpenings,
+        roofProfilePts: useRoofProfile ? roofProfileLocal : undefined
+      });
+
+      const vis = getCladdingVisualProps(reg.claddingType, shadingMode, wallNormalMap);
+      const baseEmissiveHex = isSelected
+        ? '#0284c7'
+        : isHighlightedByFilter
+        ? wallFilterMode === 'undetailed'
+          ? '#d97706'
+          : '#0ea5e9'
+        : '#000000';
+      const baseEmissiveIntensity = isSelected ? 0.34 : isHighlightedByFilter ? 0.28 : 0;
+
+      const wallMat = trackMat(
+        new THREE.MeshStandardMaterial({
+          color: new THREE.Color(vis.color),
+          roughness: vis.roughness,
+          metalness: vis.metalness,
+          normalMap: vis.useNormal ? wallNormalMap : null,
+          normalScale: new THREE.Vector2(vis.normalScale, vis.normalScale),
+          emissive: new THREE.Color(baseEmissiveHex),
+          emissiveIntensity: baseEmissiveIntensity,
+          transparent: isDimmedByFilter,
+          opacity: isDimmedByFilter ? 0.24 : 1,
+          wireframe: isWireframe
         })
       );
-      facetGroup.add(new THREE.LineSegments(edgesGeo, edgeMat));
-    }
+
+      shapes.forEach((shape) => {
+        const wallGeo = trackGeo(
+          new THREE.ExtrudeGeometry(shape, {
+            depth: wallThickness,
+            bevelEnabled: false,
+            steps: 1
+          })
+        );
+        wallGeo.translate(0, 0, -wallThickness / 2);
+
+        const wallMesh = new THREE.Mesh(wallGeo, wallMat);
+        wallMesh.castShadow = !isDimmedByFilter;
+        wallMesh.receiveShadow = true;
+        wallMesh.userData = {
+          wallFacetId: facet.id,
+          baseEmissiveHex,
+          baseEmissiveIntensity
+        };
+        facetGroup.add(wallMesh);
+        selectableMeshes.push(wallMesh);
+
+        if (isSelected || isHighlightedByFilter || isWireframe) {
+          const edgesGeo = trackGeo(new THREE.EdgesGeometry(wallGeo, 25));
+          const edgeMat = trackMat(
+            new THREE.LineBasicMaterial({
+              color: isSelected
+                ? '#38bdf8'
+                : isHighlightedByFilter
+                ? '#fbbf24'
+                : '#7dd3fc',
+              transparent: true,
+              opacity: isSelected || isHighlightedByFilter ? 0.95 : 0.45
+            })
+          );
+          facetGroup.add(new THREE.LineSegments(edgesGeo, edgeMat));
+        }
+      });
+    });
 
     // Crisp Opening Trim Frames, Window Glazing & Recessed Door/Garage Leaves
     sanitizedOpenings.forEach((op) => {

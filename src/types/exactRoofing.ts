@@ -512,6 +512,42 @@ export interface WallOpening {
   label?: string;
 }
 
+export type WallHeightSource = 'manual' | 'roof';
+
+export interface WallElevationUnderlay {
+  id: string;
+  name: string;
+  imageUrl: string;
+  opacity: number;
+  visible: boolean;
+  worldWidthM: number;
+  worldHeightM: number;
+  offsetXM: number;
+  offsetYM: number;
+  calibrationMode: 'fit_face' | 'two_point' | 'manual_size';
+  calibrationPtsNorm?: [Point2D, Point2D];
+  calibratedDistanceM?: number;
+  calibratedAt?: string;
+  planId?: string;
+}
+
+export interface WallCladdingRegion {
+  id: string;
+  label?: string;
+  claddingType: WallCladdingType;
+  uStartM: number;
+  uEndM: number;
+  vStartM: number;
+  vEndM: number;
+}
+
+export interface WallRoofProfilePoint {
+  distM: number;
+  topZ: number;
+}
+
+export type WallFilterMode = 'all' | 'undetailed' | 'returns';
+
 export interface WallFacet {
   id: string;
   code: string; // A, B, C...
@@ -522,8 +558,12 @@ export interface WallFacet {
   heightM: number;
   bottomZ: number;
   topZ: number;
+  heightSource?: WallHeightSource;
+  roofProfile?: WallRoofProfilePoint[];
   claddingType: WallCladdingType;
   openings: WallOpening[];
+  regions?: WallCladdingRegion[];
+  underlay?: WallElevationUnderlay | null;
   /** Optional link to matching PlanEdge in the roof footprint */
   roofEdgeId?: string;
 }

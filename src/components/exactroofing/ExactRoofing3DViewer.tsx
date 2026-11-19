@@ -18,6 +18,7 @@ import {
   RoofOutline,
   RoofPlane,
   SkeletonLine,
+  WallFilterMode,
   WallPlan
 } from '../../types/exactRoofing';
 import {
@@ -54,6 +55,8 @@ interface Props {
   onSelectPlane?: (planeId: string | null) => void;
   selectedWallFacetId?: string | null;
   onSelectWallFacet?: (facetId: string | null) => void;
+  wallFilterMode?: WallFilterMode;
+  onChangeWallFilterMode?: (mode: WallFilterMode) => void;
   roofProfileName?: string;
   coilColorName?: string;
 }
@@ -72,6 +75,8 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
   onSelectPlane,
   selectedWallFacetId,
   onSelectWallFacet,
+  wallFilterMode: propWallFilterMode,
+  onChangeWallFilterMode,
   roofProfileName,
   coilColorName
 }) => {
@@ -88,6 +93,12 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
   const [showFlashings, setShowFlashings] = useState<boolean>(true);
   const [showWalls, setShowWalls] = useState<boolean>(true);
   const [showSheetSeams, setShowSheetSeams] = useState<boolean>(true);
+  const [localWallFilter, setLocalWallFilter] = useState<WallFilterMode>('all');
+  const activeWallFilter = propWallFilterMode ?? localWallFilter;
+  const setActiveWallFilter = (m: WallFilterMode) => {
+    setLocalWallFilter(m);
+    onChangeWallFilterMode?.(m);
+  };
   const [sunAzimuthDeg, setSunAzimuthDeg] = useState<number>(38);
   const [isAutoRotating, setIsAutoRotating] = useState<boolean>(false);
   const [isDockOpen, setIsDockOpen] = useState<boolean>(() => !isMobile);
@@ -556,6 +567,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       wallPlan,
       selectedPlaneId,
       selectedWallFacetId,
+      wallFilterMode: activeWallFilter,
       shadingMode,
       swatch: activeSwatch,
       textures: ctx.profileTextures,
@@ -594,6 +606,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     wallPlan,
     selectedPlaneId,
     selectedWallFacetId,
+    activeWallFilter,
     shadingMode,
     activeSwatch,
     profileKey,
@@ -692,6 +705,10 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
         {badgeWallFacet && (() => {
           const wallMeta = getWallCladdingMeta(badgeWallFacet.claddingType);
           const metrics = computeWallFacetMetrics(badgeWallFacet);
+          const regionLabel =
+            badgeWallFacet.regions && badgeWallFacet.regions.length > 0
+              ? `${badgeWallFacet.regions.length} zones`
+              : wallMeta.shortLabel;
           return (
             <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-[#0b101d]/92 border border-amber-500/45 text-[11px] font-bold text-slate-100 shadow-md w-fit tabular-nums">
               <span
@@ -699,7 +716,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
                 style={{ backgroundColor: wallMeta.hex }}
               />
               <span className="truncate">
-                Wall {badgeWallFacet.code} · {badgeWallFacet.lengthM.toFixed(2)}×{badgeWallFacet.heightM.toFixed(2)}m · {wallMeta.shortLabel} · {metrics.netCladdingAreaM2.toFixed(1)} m² net
+                Wall {badgeWallFacet.code} · {badgeWallFacet.lengthM.toFixed(2)}×{badgeWallFacet.heightM.toFixed(2)}m · {regionLabel} · {metrics.netCladdingAreaM2.toFixed(1)} m² net
               </span>
             </div>
           );
@@ -914,6 +931,31 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
                 >
                   Seams
                 </button>
+                {wallPlan && wallPlan.facets.length > 0 && showWalls && (
+                  <div className="flex items-center p-0.5 rounded-lg bg-slate-900 border border-slate-800">
+                    {(
+                      [
+                        { id: 'all', label: 'All Walls' },
+                        { id: 'undetailed', label: 'Needs Detail' },
+                        { id: 'returns', label: 'Returns' }
+                      ] as const
+                    ).map((fOpt) => (
+                      <button
+                        key={fOpt.id}
+                        type="button"
+                        onClick={() => setActiveWallFilter(fOpt.id)}
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-bold cursor-pointer transition-colors ${
+                          activeWallFilter === fOpt.id
+                            ? 'bg-amber-500 text-slate-950'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {fOpt.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
                 <label className="flex items-center gap-1.5 text-slate-400 font-bold">
                   <Sun className="w-3.5 h-3.5 text-amber-400" />
                   <input

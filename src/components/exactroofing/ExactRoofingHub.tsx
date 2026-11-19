@@ -21,6 +21,7 @@ import {
   RoofBomSummary,
   RoofPlanUnderlay,
   WallFacet,
+  WallFilterMode,
   WallPlan
 } from '../../types/exactRoofing';
 import {
@@ -46,7 +47,10 @@ import {
   computeFlashingPieceBreakdown,
   dist
 } from '../../utils/exactRoofingEngine';
-import { deriveWallPlanFromRoofLevels } from '../../utils/wallCladdingEngine';
+import {
+  deriveWallPlanFromRoofLevels,
+  syncWallPlanWithRoof
+} from '../../utils/wallCladdingEngine';
 import {
   getDefaultMitreNotes,
   getFlashingKindDisplayLabel,
@@ -336,6 +340,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [selectedWallFacetId, setSelectedWallFacetId] = useState<string | null>(null);
   const [wallSubView, setWallSubView] = useState<'plan' | 'elevation'>('plan');
   const [wallViewKey, setWallViewKey] = useState<number>(0);
+  const [wallFilterMode, setWallFilterMode] = useState<WallFilterMode>('all');
   const [openPlanModalSignal, setOpenPlanModalSignal] = useState<number>(0);
 
   // Selected Roof Area / Asset / PitchBreak ID for cross-view synchronization
@@ -775,9 +780,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
       const updatedLvl = nextLevels.find((l) => l.id === levelId);
       if (updatedLvl) setOutline(updatedLvl.outline);
     }
-    setPlanes((prev) =>
-      prev.map((p) => ((p.levelId || 'level-1') === levelId ? { ...p, eaveHeightM: clampedZ } : p))
+    const nextPlanes = planes.map((p) =>
+      (p.levelId || 'level-1') === levelId ? { ...p, eaveHeightM: clampedZ } : p
     );
+    setPlanes(nextPlanes);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, nextLevels, nextPlanes) : prev));
     triggerNotice(`✓ Level Z set to ${clampedZ}m`);
   };
 
@@ -1076,9 +1083,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
       const updated = nextLevels.find((l) => l.id === owningLvl.id);
       if (updated) setOutline(updated.outline);
     }
-    setPlanes((prev) =>
-      prev.map((p) => (p.eaveEdgeId === edgeId ? { ...p, eaveHeightM: clampedZ } : p))
+    const nextPlanes = planes.map((p) =>
+      p.eaveEdgeId === edgeId ? { ...p, eaveHeightM: clampedZ } : p
     );
+    setPlanes(nextPlanes);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, nextLevels, nextPlanes) : prev));
     triggerNotice(`✓ Eave Z set to ${clampedZ}m`);
   };
 
@@ -1123,28 +1132,28 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Live Pitch Adjustment
   const handleUpdatePlanePitch = (planeId: string, pitchDeg: number) => {
-    setPlanes((prev) =>
-      prev.map((plane) => {
-        if (plane.id !== planeId) return plane;
-        const owningLvl =
-          levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
-          levels.find((l) => l.outline.edges.some((e) => e.id === plane.eaveEdgeId)) ||
-          focusedLevel;
-        const edge = owningLvl.outline.edges.find((e) => e.id === plane.eaveEdgeId);
-        if (!edge) return { ...plane, pitchDeg };
-        return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
-          pitchDeg,
-          underlapSide: plane.underlapSide,
-          eaveHeightM: plane.eaveHeightM,
-          sheetRunEdgeId: plane.sheetRunEdgeId,
-          orderedSheetLengthM: plane.orderedSheetLengthM,
-          name: plane.name,
-          levelId: plane.levelId || owningLvl.id,
-          levelCode: plane.levelCode || owningLvl.code,
-          levelName: plane.levelName || owningLvl.name
-        });
-      })
-    );
+    const nextPlanes = planes.map((plane) => {
+      if (plane.id !== planeId) return plane;
+      const owningLvl =
+        levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
+        levels.find((l) => l.outline.edges.some((e) => e.id === plane.eaveEdgeId)) ||
+        focusedLevel;
+      const edge = owningLvl.outline.edges.find((e) => e.id === plane.eaveEdgeId);
+      if (!edge) return { ...plane, pitchDeg };
+      return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
+        pitchDeg,
+        underlapSide: plane.underlapSide,
+        eaveHeightM: plane.eaveHeightM,
+        sheetRunEdgeId: plane.sheetRunEdgeId,
+        orderedSheetLengthM: plane.orderedSheetLengthM,
+        name: plane.name,
+        levelId: plane.levelId || owningLvl.id,
+        levelCode: plane.levelCode || owningLvl.code,
+        levelName: plane.levelName || owningLvl.name
+      });
+    });
+    setPlanes(nextPlanes);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, levels, nextPlanes) : prev));
   };
 
   // Live Lay Direction Adjustment
@@ -1246,7 +1255,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     const derived = deriveWallPlanFromRoofLevels(
       levels,
       levels[0]?.eaveHeightM || 2.7,
-      wallPlan?.facets
+      wallPlan?.facets,
+      planes
     );
     if (!derived) return;
     setWallPlan(derived);
@@ -2355,11 +2365,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 key={wallViewKey}
                 wallPlan={wallPlan}
                 levels={levels}
+                roofPlanes={planes}
+                projectPlans={projectPlans}
                 planUnderlay={planUnderlay}
                 selectedWallFacetId={selectedWallFacetId}
                 onSelectWallFacet={handleSelectWallFacet}
                 onUpdateWallPlan={handleUpdateWallPlan}
                 onUpdateWallFacet={handleUpdateWallFacet}
+                wallFilterMode={wallFilterMode}
+                onChangeWallFilterMode={setWallFilterMode}
                 initialSubView={wallSubView}
                 readOnly={isReadOnlyGeometry}
               />
@@ -2379,6 +2393,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onSelectPlane={handleSelectPlane}
               selectedWallFacetId={selectedWallFacetId}
               onSelectWallFacet={handleSelectWallFacet}
+              wallFilterMode={wallFilterMode}
+              onChangeWallFilterMode={setWallFilterMode}
               roofProfileName={project?.profile}
               coilColorName={project?.colorName}
             />
@@ -2716,6 +2732,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onOpenWallElevation={handleOpenWallElevation}
           onUpdateWallFacet={handleUpdateWallFacet}
           onBuildWallFaces={handleBuildWallFaces}
+          wallFilterMode={wallFilterMode}
+          onChangeWallFilterMode={setWallFilterMode}
         />
 
         {/* Modals */}
@@ -3331,11 +3349,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
               key={wallViewKey}
               wallPlan={wallPlan}
               levels={levels}
+              roofPlanes={planes}
+              projectPlans={projectPlans}
               planUnderlay={planUnderlay}
               selectedWallFacetId={selectedWallFacetId}
               onSelectWallFacet={handleSelectWallFacet}
               onUpdateWallPlan={handleUpdateWallPlan}
               onUpdateWallFacet={handleUpdateWallFacet}
+              wallFilterMode={wallFilterMode}
+              onChangeWallFilterMode={setWallFilterMode}
               initialSubView={wallSubView}
               readOnly={isReadOnlyGeometry}
             />
@@ -3354,6 +3376,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onSelectPlane={handleSelectPlane}
               selectedWallFacetId={selectedWallFacetId}
               onSelectWallFacet={handleSelectWallFacet}
+              wallFilterMode={wallFilterMode}
+              onChangeWallFilterMode={setWallFilterMode}
               roofProfileName={project?.profile}
               coilColorName={project?.colorName}
             />
@@ -3520,6 +3544,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onOpenWallElevation={handleOpenWallElevation}
           onUpdateWallFacet={handleUpdateWallFacet}
           onBuildWallFaces={handleBuildWallFaces}
+          wallFilterMode={wallFilterMode}
+          onChangeWallFilterMode={setWallFilterMode}
         />
       </div>
 

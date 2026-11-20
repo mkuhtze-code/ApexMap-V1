@@ -7,9 +7,11 @@ import {
   ChevronDown,
   ChevronUp,
   Layers,
+  Moon,
   Rotate3d,
   RotateCcw,
-  Sun
+  Sun,
+  Sunset
 } from 'lucide-react';
 import {
   PitchBreakLine,
@@ -25,12 +27,14 @@ import {
   COLORSTEEL_SWATCHES,
   createContactShadowTexture,
   createProfileTextureSet,
-  createWallCladdingTexture,
+  createWallCladdingTextureSet,
   ProceduralRoofTextureSet,
   resolveColorsteelSwatch,
   resolveProfileKey,
+  Roof3DLightingMode,
   Roof3DProfileKey,
-  Roof3DShadingMode
+  Roof3DShadingMode,
+  WallCladdingTextureSet
 } from './three/roofMaterials';
 import {
   buildRoofSceneGroup,
@@ -63,6 +67,82 @@ interface Props {
 
 type CameraPreset = 'iso' | 'top' | 'north' | 'east' | 'south' | 'west';
 
+interface LightingPreset {
+  skyBg: string;
+  fogDensity: number;
+  groundColor: string;
+  gridOpacity: number;
+  hemiSky: string;
+  hemiGround: string;
+  hemiIntensity: number;
+  keyColor: string;
+  keyIntensity: number;
+  rimColor: string;
+  rimIntensity: number;
+  envIntensity: number;
+  exposure: number;
+  contactOpacity: number;
+  glassEmissiveColor: string;
+  glassEmissiveIntensity: number;
+}
+
+const LIGHTING_PRESETS: Record<Roof3DLightingMode, LightingPreset> = {
+  day: {
+    skyBg: '#cad9e8',
+    fogDensity: 0.0042,
+    groundColor: '#bac6d4',
+    gridOpacity: 0.38,
+    hemiSky: '#f0f7ff',
+    hemiGround: '#64748b',
+    hemiIntensity: 0.96,
+    keyColor: '#fff8ed',
+    keyIntensity: 2.85,
+    rimColor: '#bae6fd',
+    rimIntensity: 0.72,
+    envIntensity: 0.94,
+    exposure: 1.04,
+    contactOpacity: 0.56,
+    glassEmissiveColor: '#000000',
+    glassEmissiveIntensity: 0.0
+  },
+  dusk: {
+    skyBg: '#1e273e',
+    fogDensity: 0.0072,
+    groundColor: '#161f32',
+    gridOpacity: 0.42,
+    hemiSky: '#fdba74',
+    hemiGround: '#1e293b',
+    hemiIntensity: 0.68,
+    keyColor: '#ffedd5',
+    keyIntensity: 1.95,
+    rimColor: '#60a5fa',
+    rimIntensity: 0.88,
+    envIntensity: 0.56,
+    exposure: 1.05,
+    contactOpacity: 0.74,
+    glassEmissiveColor: '#f59e0b',
+    glassEmissiveIntensity: 0.34
+  },
+  night: {
+    skyBg: '#060b16',
+    fogDensity: 0.0092,
+    groundColor: '#091222',
+    gridOpacity: 0.48,
+    hemiSky: '#436494',
+    hemiGround: '#172236',
+    hemiIntensity: 0.66,
+    keyColor: '#bfdbfe',
+    keyIntensity: 1.18,
+    rimColor: '#60a5fa',
+    rimIntensity: 0.86,
+    envIntensity: 0.36,
+    exposure: 1.0,
+    contactOpacity: 0.82,
+    glassEmissiveColor: '#fbbf24',
+    glassEmissiveIntensity: 0.78
+  }
+};
+
 export const ExactRoofing3DViewer: React.FC<Props> = ({
   outline,
   skeleton,
@@ -84,6 +164,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
   const mountRef = useRef<HTMLDivElement>(null);
 
   const [shadingMode, setShadingMode] = useState<Roof3DShadingMode>('studio_finish');
+  const [lightingMode, setLightingMode] = useState<Roof3DLightingMode>('day');
   const [profileKey, setProfileKey] = useState<Roof3DProfileKey>(() =>
     resolveProfileKey(roofProfileName)
   );
@@ -161,18 +242,30 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     groundGrid: THREE.GridHelper;
     selectableMeshes: THREE.Mesh[];
     planeMeshById: Map<string, THREE.Mesh[]>;
+    glazingMaterials: THREE.MeshPhysicalMaterial[];
     builtDispose: (() => void) | null;
     profileTextures: ProceduralRoofTextureSet | null;
-    wallNormalMap: THREE.CanvasTexture;
+    wallTextures: WallCladdingTextureSet;
     isSoftwareGl: boolean;
     requestRender: () => void;
     applyCameraPreset: (preset: CameraPreset) => void;
+    setLightingTarget: (mode: Roof3DLightingMode) => void;
+    syncGlazingToCurrentLighting: (mats: THREE.MeshPhysicalMaterial[]) => void;
+    setSpinActive: (active: boolean) => void;
   } | null>(null);
 
   const onSelectPlaneRef = useRef(onSelectPlane);
   onSelectPlaneRef.current = onSelectPlane;
   const onSelectWallFacetRef = useRef(onSelectWallFacet);
   onSelectWallFacetRef.current = onSelectWallFacet;
+  const boundsRef = useRef(bounds);
+  boundsRef.current = bounds;
+  const allLevelsRef = useRef(allLevels);
+  allLevelsRef.current = allLevels;
+  const planesRef = useRef(planes);
+  planesRef.current = planes;
+  const wallPlanRef = useRef(wallPlan);
+  wallPlanRef.current = wallPlan;
 
   // 1. Initialize Three.js WebGL Studio Renderer, Environment IBL, 3-Point Lights & Controls
   useEffect(() => {
@@ -182,7 +275,6 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     let isDisposed = false;
     let renderer: THREE.WebGLRenderer;
 
-    // Detect software GL before creating final renderer options
     let isSoftwareGl = false;
     try {
       const probeCanvas = document.createElement('canvas');
@@ -200,7 +292,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
         return;
       }
     } catch {
-      // ignore probe failure and proceed with standard WebGL attempt
+      // Proceed with default WebGL creation attempt
     }
 
     try {
@@ -217,12 +309,16 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     setWebglError(null);
     const width = Math.max(320, container.clientWidth);
     const height = Math.max(240, container.clientHeight);
+    const getTargetDpr = () =>
+      isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 2);
 
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+    const initPreset = LIGHTING_PRESETS.day;
+
+    renderer.setPixelRatio(getTargetDpr());
     renderer.setSize(width, height);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.12;
+    renderer.toneMappingExposure = initPreset.exposure;
     renderer.shadowMap.enabled = !isSoftwareGl;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.domElement.style.display = 'block';
@@ -233,15 +329,17 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    const bgHex = 0x09101e;
-    scene.background = new THREE.Color(bgHex);
-    scene.fog = new THREE.FogExp2(bgHex, 0.0085);
+    const bgColor = new THREE.Color(initPreset.skyBg);
+    scene.background = bgColor.clone();
+    const sceneFog = new THREE.FogExp2(initPreset.skyBg, initPreset.fogDensity);
+    scene.fog = sceneFog;
 
     // PMREM Studio RoomEnvironment for crisp metallic PBR reflections
     const pmrem = new THREE.PMREMGenerator(renderer);
     const roomEnv = new RoomEnvironment();
     const envTarget = pmrem.fromScene(roomEnv, 0.04);
     scene.environment = envTarget.texture;
+    scene.environmentIntensity = initPreset.envIntensity;
     roomEnv.dispose();
     pmrem.dispose();
 
@@ -253,7 +351,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, targetY, 0);
     controls.enableDamping = !isSoftwareGl;
-    controls.dampingFactor = 0.06;
+    controls.dampingFactor = 0.065;
     controls.maxPolarAngle = Math.PI * 0.485;
     controls.minDistance = 4;
     controls.maxDistance = 95;
@@ -263,27 +361,32 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     controls.update();
 
     // 3-Point Architectural Lighting Rig
-    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 0.82);
+    const hemiLight = new THREE.HemisphereLight(
+      initPreset.hemiSky,
+      initPreset.hemiGround,
+      initPreset.hemiIntensity
+    );
     hemiLight.position.set(0, 32, 0);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfff6ea, 2.55);
+    const shadowMapRes = isMobile ? 1024 : 2048;
+    const keyLight = new THREE.DirectionalLight(initPreset.keyColor, initPreset.keyIntensity);
     keyLight.position.set(18, 26, 16);
     keyLight.castShadow = !isSoftwareGl;
-    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.mapSize.set(shadowMapRes, shadowMapRes);
     keyLight.shadow.bias = -0.00025;
     keyLight.shadow.normalBias = 0.025;
-    keyLight.shadow.radius = 3.2;
+    keyLight.shadow.radius = isMobile ? 2.4 : 3.2;
     scene.add(keyLight);
     scene.add(keyLight.target);
 
-    const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.95);
+    const rimLight = new THREE.DirectionalLight(initPreset.rimColor, initPreset.rimIntensity);
     rimLight.position.set(-18, 12, -20);
     scene.add(rimLight);
 
     // Architectural Stage Ground & Contact Shadow
     const groundMat = new THREE.MeshStandardMaterial({
-      color: 0x0d1526,
+      color: initPreset.groundColor,
       roughness: 0.94,
       metalness: 0.04
     });
@@ -298,51 +401,202 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       map: shadowTex,
       transparent: true,
       depthWrite: false,
-      opacity: 0.9
+      opacity: initPreset.contactOpacity
     });
     const groundShadow = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), contactMat);
     groundShadow.rotation.x = -Math.PI / 2;
     groundShadow.position.y = 0.002;
     scene.add(groundShadow);
 
-    const groundGrid = new THREE.GridHelper(60, 30, 0x1e3a5f, 0x132038);
+    const groundGrid = new THREE.GridHelper(60, 30, 0x64748b, 0x94a3b8);
     groundGrid.position.y = 0.005;
-    (groundGrid.material as THREE.Material).transparent = true;
-    (groundGrid.material as THREE.Material).opacity = 0.52;
+    const gridMat = groundGrid.material as THREE.Material;
+    gridMat.transparent = true;
+    gridMat.opacity = initPreset.gridOpacity;
     scene.add(groundGrid);
 
     const roofContainer = new THREE.Group();
     scene.add(roofContainer);
 
-    const wallNormalMap = createWallCladdingTexture(
+    const wallTextures = createWallCladdingTextureSet(
       renderer.capabilities.getMaxAnisotropy()
     );
 
-    // Coalesced On-Demand Render Loop (renders on interaction, resize, prop change, or spin)
+    // Mutable Lighting Transition State (smooth exponential damping)
+    let targetLightingMode: Roof3DLightingMode = 'day';
+    let lightingTransitionActive = false;
+    let curHemiIntensity = initPreset.hemiIntensity;
+    let curKeyIntensity = initPreset.keyIntensity;
+    let curRimIntensity = initPreset.rimIntensity;
+    let curEnvIntensity = initPreset.envIntensity;
+    let curExposure = initPreset.exposure;
+    let curFogDensity = initPreset.fogDensity;
+    let curContactOpacity = initPreset.contactOpacity;
+    let curGridOpacity = initPreset.gridOpacity;
+    let curGlassEmissiveInt = initPreset.glassEmissiveIntensity;
+    const curGlassEmissiveColor = new THREE.Color(initPreset.glassEmissiveColor);
+    const tmpTargetColor = new THREE.Color();
+
+    const syncGlazingToCurrentLighting = (mats: THREE.MeshPhysicalMaterial[]) => {
+      mats.forEach((m) => {
+        m.emissive.copy(curGlassEmissiveColor);
+        m.emissiveIntensity = curGlassEmissiveInt;
+      });
+    };
+
+    const stepLightingTransition = (dt: number): boolean => {
+      const target = LIGHTING_PRESETS[targetLightingMode];
+      const lambda = 6.8;
+      const colorAlpha = 1 - Math.exp(-lambda * dt);
+
+      curHemiIntensity = THREE.MathUtils.damp(curHemiIntensity, target.hemiIntensity, lambda, dt);
+      curKeyIntensity = THREE.MathUtils.damp(curKeyIntensity, target.keyIntensity, lambda, dt);
+      curRimIntensity = THREE.MathUtils.damp(curRimIntensity, target.rimIntensity, lambda, dt);
+      curEnvIntensity = THREE.MathUtils.damp(curEnvIntensity, target.envIntensity, lambda, dt);
+      curExposure = THREE.MathUtils.damp(curExposure, target.exposure, lambda, dt);
+      curFogDensity = THREE.MathUtils.damp(curFogDensity, target.fogDensity, lambda, dt);
+      curContactOpacity = THREE.MathUtils.damp(curContactOpacity, target.contactOpacity, lambda, dt);
+      curGridOpacity = THREE.MathUtils.damp(curGridOpacity, target.gridOpacity, lambda, dt);
+      curGlassEmissiveInt = THREE.MathUtils.damp(
+        curGlassEmissiveInt,
+        target.glassEmissiveIntensity,
+        lambda,
+        dt
+      );
+
+      hemiLight.intensity = curHemiIntensity;
+      keyLight.intensity = curKeyIntensity;
+      rimLight.intensity = curRimIntensity;
+      scene.environmentIntensity = curEnvIntensity;
+      renderer.toneMappingExposure = curExposure;
+      sceneFog.density = curFogDensity;
+      contactMat.opacity = curContactOpacity;
+      gridMat.opacity = curGridOpacity;
+
+      if (scene.background instanceof THREE.Color) {
+        tmpTargetColor.set(target.skyBg);
+        scene.background.lerp(tmpTargetColor, colorAlpha);
+        sceneFog.color.copy(scene.background);
+      }
+      tmpTargetColor.set(target.groundColor);
+      groundMat.color.lerp(tmpTargetColor, colorAlpha);
+
+      tmpTargetColor.set(target.hemiSky);
+      hemiLight.color.lerp(tmpTargetColor, colorAlpha);
+
+      tmpTargetColor.set(target.hemiGround);
+      hemiLight.groundColor.lerp(tmpTargetColor, colorAlpha);
+
+      tmpTargetColor.set(target.keyColor);
+      keyLight.color.lerp(tmpTargetColor, colorAlpha);
+
+      tmpTargetColor.set(target.rimColor);
+      rimLight.color.lerp(tmpTargetColor, colorAlpha);
+
+      tmpTargetColor.set(target.glassEmissiveColor);
+      curGlassEmissiveColor.lerp(tmpTargetColor, colorAlpha);
+
+      const ctx = sceneCtxRef.current;
+      if (ctx) {
+        syncGlazingToCurrentLighting(ctx.glazingMaterials);
+      }
+
+      const maxDiff = Math.max(
+        Math.abs(curKeyIntensity - target.keyIntensity),
+        Math.abs(curHemiIntensity - target.hemiIntensity),
+        Math.abs(curGlassEmissiveInt - target.glassEmissiveIntensity),
+        Math.abs(curExposure - target.exposure),
+        scene.background instanceof THREE.Color
+          ? Math.abs(scene.background.r - tmpTargetColor.set(target.skyBg).r)
+          : 0
+      );
+
+      if (maxDiff < 0.0025) {
+        // Snap cleanly to final state and pause animation loop
+        hemiLight.intensity = target.hemiIntensity;
+        keyLight.intensity = target.keyIntensity;
+        rimLight.intensity = target.rimIntensity;
+        scene.environmentIntensity = target.envIntensity;
+        renderer.toneMappingExposure = target.exposure;
+        sceneFog.density = target.fogDensity;
+        contactMat.opacity = target.contactOpacity;
+        gridMat.opacity = target.gridOpacity;
+        if (scene.background instanceof THREE.Color) {
+          scene.background.set(target.skyBg);
+          sceneFog.color.set(target.skyBg);
+        }
+        groundMat.color.set(target.groundColor);
+        hemiLight.color.set(target.hemiSky);
+        hemiLight.groundColor.set(target.hemiGround);
+        keyLight.color.set(target.keyColor);
+        rimLight.color.set(target.rimColor);
+        curGlassEmissiveInt = target.glassEmissiveIntensity;
+        curGlassEmissiveColor.set(target.glassEmissiveColor);
+        if (ctx) {
+          syncGlazingToCurrentLighting(ctx.glazingMaterials);
+        }
+        lightingTransitionActive = false;
+        return false;
+      }
+
+      return true;
+    };
+
+    // Coalesced On-Demand Render Loop with Software-GL Pacing & Visibility Pause
     let rafId: number | null = null;
+    let swTimerId: number | null = null;
     let renderQueued = false;
     let spinActive = false;
+    let lastFrameMs = performance.now();
 
-    const flushFrame = () => {
+    const clearScheduled = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (swTimerId !== null) {
+        window.clearTimeout(swTimerId);
+        swTimerId = null;
+      }
+    };
+
+    const flushFrame = (now: number) => {
       rafId = null;
-      if (isDisposed) return;
+      if (isDisposed || document.hidden) return;
 
-      // Update compass reading
-      const az = Math.atan2(camera.position.x - controls.target.x, camera.position.z - controls.target.z);
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameMs) / 1000));
+      lastFrameMs = now;
+
+      const az = Math.atan2(
+        camera.position.x - controls.target.x,
+        camera.position.z - controls.target.z
+      );
       const deg = Math.round((az * 180) / Math.PI);
       setCompassDeg((prev) => (prev === deg ? prev : deg));
 
+      const stillLighting = lightingTransitionActive ? stepLightingTransition(dt) : false;
       const needsDampingTick = controls.enableDamping && controls.update();
-      renderer.render(scene, camera);
 
-      if (renderQueued || needsDampingTick || spinActive) {
+      const tDraw0 = isSoftwareGl ? performance.now() : 0;
+      renderer.render(scene, camera);
+      const drawDurationMs = isSoftwareGl ? performance.now() - tDraw0 : 0;
+
+      if (renderQueued || needsDampingTick || spinActive || stillLighting) {
         renderQueued = false;
-        scheduleFrame();
+        if (isSoftwareGl && (spinActive || stillLighting)) {
+          // Gentle pacing after software draw so CPU WebGL never starves UI
+          swTimerId = window.setTimeout(() => {
+            swTimerId = null;
+            scheduleFrame();
+          }, Math.max(18, Math.min(90, Math.round(drawDurationMs * 1.35))));
+        } else {
+          scheduleFrame();
+        }
       }
     };
 
     const scheduleFrame = () => {
-      if (isDisposed || rafId !== null) return;
+      if (isDisposed || document.hidden || rafId !== null || swTimerId !== null) return;
       rafId = requestAnimationFrame(flushFrame);
     };
 
@@ -353,9 +607,25 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
 
     controls.addEventListener('change', requestRender);
 
-    // Camera Presets
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        clearScheduled();
+      } else {
+        lastFrameMs = performance.now();
+        if (spinActive || lightingTransitionActive || renderQueued) {
+          requestRender();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // Camera Presets (uses current ref bounds including WallPlan footprint)
     const applyCameraPreset = (preset: CameraPreset) => {
-      const b = computeRoof3DBounds(allLevels, planes);
+      const b = computeRoof3DBounds(
+        allLevelsRef.current,
+        planesRef.current,
+        wallPlanRef.current
+      );
       const tY = Math.max(1.2, b.midZ * 0.72);
       const d = Math.max(14, b.span * 1.48);
       controls.target.set(0, tY, 0);
@@ -396,12 +666,26 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       groundGrid,
       selectableMeshes: [],
       planeMeshById: new Map(),
+      glazingMaterials: [],
       builtDispose: null,
       profileTextures: null,
-      wallNormalMap,
+      wallTextures,
       isSoftwareGl,
       requestRender,
-      applyCameraPreset
+      applyCameraPreset,
+      setLightingTarget: (mode: Roof3DLightingMode) => {
+        targetLightingMode = mode;
+        lightingTransitionActive = true;
+        lastFrameMs = performance.now();
+        requestRender();
+      },
+      syncGlazingToCurrentLighting,
+      setSpinActive: (active: boolean) => {
+        spinActive = active;
+        controls.autoRotate = active && !isSoftwareGl;
+        controls.autoRotateSpeed = 1.65;
+        if (active) requestRender();
+      }
     };
 
     // Raycaster Click & Hover Selection (suppress click if user dragged to orbit)
@@ -465,6 +749,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       const h = Math.max(200, Math.floor(entry.contentRect.height));
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
+      renderer.setPixelRatio(getTargetDpr());
       renderer.setSize(w, h);
       requestRender();
     });
@@ -473,10 +758,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     // WebGL Context Loss safety
     const handleContextLost = (e: Event) => {
       e.preventDefault();
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
-      }
+      clearScheduled();
     };
     const handleContextRestored = () => {
       requestRender();
@@ -484,20 +766,12 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     renderer.domElement.addEventListener('webglcontextlost', handleContextLost);
     renderer.domElement.addEventListener('webglcontextrestored', handleContextRestored);
 
-    // Expose spin toggle listener via ref property
-    const ctxRef = sceneCtxRef.current;
-    (ctxRef as any).setSpinActive = (active: boolean) => {
-      spinActive = active;
-      controls.autoRotate = active && !isSoftwareGl;
-      controls.autoRotateSpeed = 1.65;
-      if (active) requestRender();
-    };
-
     requestRender();
 
     return () => {
       isDisposed = true;
-      if (rafId !== null) cancelAnimationFrame(rafId);
+      clearScheduled();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       resizeObserver.disconnect();
       controls.removeEventListener('change', requestRender);
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
@@ -508,12 +782,13 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       controls.dispose();
       sceneCtxRef.current?.builtDispose?.();
       sceneCtxRef.current?.profileTextures?.dispose();
-      wallNormalMap.dispose();
+      wallTextures.dispose();
       shadowTex.dispose();
       contactMat.dispose();
       groundMat.dispose();
       groundMesh.geometry.dispose();
       groundShadow.geometry.dispose();
+      groundGrid.dispose();
       envTarget.dispose();
       renderer.dispose();
       sceneCtxRef.current = null;
@@ -524,13 +799,15 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
 
   // 2. Sync Auto-Spin State
   useEffect(() => {
-    const ctx = sceneCtxRef.current as any;
-    if (ctx?.setSpinActive) {
-      ctx.setSpinActive(isAutoRotating);
-    }
+    sceneCtxRef.current?.setSpinActive(isAutoRotating);
   }, [isAutoRotating]);
 
-  // 3. Rebuild Procedural Profile Textures when profile switches
+  // 3. Smoothly cross-fade Day / Dusk / Night Lighting Studio
+  useEffect(() => {
+    sceneCtxRef.current?.setLightingTarget(lightingMode);
+  }, [lightingMode]);
+
+  // 4. Rebuild Procedural Profile Textures when profile switches
   useEffect(() => {
     const ctx = sceneCtxRef.current;
     if (!ctx) return;
@@ -541,7 +818,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     );
   }, [profileKey]);
 
-  // 4. Rebuild 3D Roof Scene Geometry cleanly whenever roof model / materials change
+  // 5. Rebuild 3D Roof Scene Geometry cleanly whenever roof model / materials change
   useEffect(() => {
     const ctx = sceneCtxRef.current;
     if (!ctx) return;
@@ -553,7 +830,6 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       );
     }
 
-    // Clear previous geometry
     ctx.builtDispose?.();
     ctx.roofContainer.clear();
 
@@ -571,15 +847,18 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       shadingMode,
       swatch: activeSwatch,
       textures: ctx.profileTextures,
-      wallNormalMap: ctx.wallNormalMap,
+      wallTextures: ctx.wallTextures,
       showFlashings,
       showWalls,
-      showSheetSeams
+      showSheetSeams,
+      isSoftwareGl: ctx.isSoftwareGl
     });
 
     ctx.roofContainer.add(built.rootGroup);
     ctx.selectableMeshes = built.selectableMeshes;
     ctx.planeMeshById = built.planeMeshById;
+    ctx.glazingMaterials = built.glazingMaterials;
+    ctx.syncGlazingToCurrentLighting(built.glazingMaterials);
     ctx.builtDispose = built.dispose;
 
     // Fit Ground Shadow & Light Shadow Frustum tightly to model span
@@ -615,21 +894,22 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     showSheetSeams
   ]);
 
-  // 5. Update Sun Key Light Angle smoothly without rebuilding geometry
+  // 6. Update Sun / Moon Key Light Angle smoothly without rebuilding geometry
   useEffect(() => {
     const ctx = sceneCtxRef.current;
     if (!ctx) return;
     const rad = (sunAzimuthDeg * Math.PI) / 180;
     const radius = Math.max(22, bounds.span * 1.8);
+    const elevScale = lightingMode === 'dusk' ? 0.92 : lightingMode === 'night' ? 1.45 : 1.65;
     ctx.keyLight.position.set(
       Math.cos(rad) * radius,
-      Math.max(20, bounds.span * 1.65),
+      Math.max(14, bounds.span * elevScale),
       Math.sin(rad) * radius
     );
     ctx.requestRender();
-  }, [sunAzimuthDeg, bounds.span]);
+  }, [sunAzimuthDeg, bounds.span, lightingMode]);
 
-  // 6. Lightweight Hover Highlight Lift (mutates material emissive without rebuilding meshes)
+  // 7. Lightweight Hover Highlight Lift (mutates material emissive without rebuilding meshes)
   useEffect(() => {
     const ctx = sceneCtxRef.current;
     if (!ctx) return;
@@ -661,10 +941,11 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     [wallPlan, hoveredWallFacetId]
   );
   const badgePlane = hoveredPlane || (!hoveredWallFacet ? selectedPlane : null);
-  const badgeWallFacet = hoveredWallFacet || (!hoveredPlane && !selectedPlane ? selectedWallFacet : null);
+  const badgeWallFacet =
+    hoveredWallFacet || (!hoveredPlane && !selectedPlane ? selectedWallFacet : null);
 
   return (
-    <div className="relative w-full h-full flex-1 min-h-[360px] sm:min-h-[480px] rounded-2xl sm:rounded-3xl overflow-hidden bg-[#09101e] border border-slate-800 shadow-2xl select-none">
+    <div className="relative w-full h-full flex-1 min-h-[360px] sm:min-h-[480px] rounded-2xl sm:rounded-3xl overflow-hidden bg-[#cad9e8] border border-slate-800 shadow-2xl select-none">
       {/* Dedicated Empty WebGL Canvas Container */}
       <div ref={mountRef} className="w-full h-full touch-none" />
 
@@ -750,7 +1031,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
 
       {/* Collapsible Bottom Studio Control Dock (Zero Side Card Clutter) */}
       <div className="absolute bottom-3 left-3 right-3 z-10 flex flex-col items-center pointer-events-none">
-        <div className="pointer-events-auto max-w-3xl w-full sm:w-auto bg-[#0b101d]/95 border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden">
+        <div className="pointer-events-auto max-w-4xl w-full sm:w-auto bg-[#0b101d]/95 border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden">
           {/* Compact Primary Strip */}
           <div className="px-2.5 py-1.5 flex items-center justify-between gap-1.5 flex-wrap">
             {/* Camera Presets */}
@@ -784,8 +1065,41 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
               </button>
             </div>
 
-            {/* Shading & Turntable + Dock Collapse Toggle */}
-            <div className="flex items-center gap-1">
+            {/* Day/Dusk/Night, Shading, Spin & Studio Drawer Toggle */}
+            <div className="flex items-center gap-1 flex-wrap">
+              <div
+                className="flex items-center p-0.5 rounded-lg bg-slate-950 border border-slate-800"
+                role="group"
+                aria-label="Scene Lighting Mode"
+              >
+                {(
+                  [
+                    { id: 'day', label: 'Day', Icon: Sun },
+                    { id: 'dusk', label: 'Dusk', Icon: Sunset },
+                    { id: 'night', label: 'Night', Icon: Moon }
+                  ] as const
+                ).map(({ id, label, Icon }) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setLightingMode(id)}
+                    aria-pressed={lightingMode === id}
+                    className={`px-2 py-1 rounded-md text-[11px] font-extrabold flex items-center gap-1 cursor-pointer transition-colors ${
+                      lightingMode === id
+                        ? id === 'day'
+                          ? 'bg-amber-400 text-slate-950'
+                          : id === 'dusk'
+                          ? 'bg-orange-500 text-white'
+                          : 'bg-indigo-600 text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Icon className="w-3 h-3" />
+                    <span className="hidden sm:inline">{label}</span>
+                  </button>
+                ))}
+              </div>
+
               <div className="flex items-center p-0.5 rounded-lg bg-slate-950 border border-slate-800">
                 {(
                   [
@@ -896,7 +1210,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
                 </div>
               </div>
 
-              {/* Layer & Sun Azimuth Controls */}
+              {/* Layer & Sun/Moon Azimuth Controls */}
               <div className="flex items-center gap-2 flex-wrap">
                 <button
                   type="button"
@@ -957,7 +1271,11 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
                 )}
 
                 <label className="flex items-center gap-1.5 text-slate-400 font-bold">
-                  <Sun className="w-3.5 h-3.5 text-amber-400" />
+                  {lightingMode === 'night' ? (
+                    <Moon className="w-3.5 h-3.5 text-sky-300" />
+                  ) : (
+                    <Sun className="w-3.5 h-3.5 text-amber-400" />
+                  )}
                   <input
                     type="range"
                     min={0}
@@ -965,7 +1283,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
                     value={sunAzimuthDeg}
                     onChange={(e) => setSunAzimuthDeg(Number(e.target.value))}
                     className="w-16 accent-amber-400 cursor-pointer"
-                    aria-label="Sun Azimuth Angle"
+                    aria-label="Sun or Moon Azimuth Angle"
                   />
                 </label>
               </div>

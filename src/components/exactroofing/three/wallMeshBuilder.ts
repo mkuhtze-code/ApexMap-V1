@@ -13,7 +13,10 @@ import {
   getWallCladdingMeta,
   isWallFacetUndetailed
 } from '../../../utils/wallCladdingEngine';
-import { Roof3DShadingMode } from './roofMaterials';
+import {
+  Roof3DShadingMode,
+  WallCladdingTextureSet
+} from './roofMaterials';
 import { Roof3DBounds } from './roofMeshBuilder';
 
 interface SanitizedOpening {
@@ -191,21 +194,25 @@ function buildWallRegionShapes(params: {
 function getCladdingVisualProps(
   claddingType: WallCladdingType,
   shadingMode: Roof3DShadingMode,
-  wallNormalMap: THREE.CanvasTexture
+  wallTextures: WallCladdingTextureSet
 ): {
   color: string;
   roughness: number;
   metalness: number;
-  useNormal: boolean;
+  normalMap: THREE.CanvasTexture | null;
+  map: THREE.CanvasTexture | null;
   normalScale: number;
 } {
   const meta = getWallCladdingMeta(claddingType);
+  const texEntry = wallTextures.getEntry(claddingType);
+
   if (shadingMode === 'wireframe') {
     return {
       color: '#38bdf8',
       roughness: 0.6,
       metalness: 0.2,
-      useNormal: false,
+      normalMap: null,
+      map: null,
       normalScale: 0
     };
   }
@@ -223,20 +230,18 @@ function getCladdingVisualProps(
       color: facetTint[claddingType] || meta.hex,
       roughness: 0.58,
       metalness: 0.12,
-      useNormal: true,
-      normalScale: 0.35
+      normalMap: texEntry?.normalMap || null,
+      map: null,
+      normalScale: texEntry ? Math.min(0.45, texEntry.normalScale) : 0
     };
   }
   return {
     color: meta.hex,
     roughness: meta.roughness,
     metalness: meta.metalness,
-    useNormal:
-      claddingType === 'weatherboard' ||
-      claddingType === 'profiled_metal' ||
-      claddingType === 'fibre_cement' ||
-      claddingType === 'brick',
-    normalScale: claddingType === 'weatherboard' || claddingType === 'profiled_metal' ? 0.55 : 0.22
+    normalMap: texEntry?.normalMap || null,
+    map: texEntry?.map || null,
+    normalScale: texEntry?.normalScale ?? 0.35
   };
 }
 
@@ -246,7 +251,8 @@ export function buildWallPlan3DGroup(params: {
   selectedWallFacetId?: string | null;
   wallFilterMode?: WallFilterMode;
   shadingMode: Roof3DShadingMode;
-  wallNormalMap: THREE.CanvasTexture;
+  wallTextures: WallCladdingTextureSet;
+  glassMat: THREE.MeshPhysicalMaterial;
   rootGroup: THREE.Group;
   selectableMeshes: THREE.Mesh[];
   trackGeo: <T extends THREE.BufferGeometry>(g: T) => T;
@@ -258,7 +264,8 @@ export function buildWallPlan3DGroup(params: {
     selectedWallFacetId,
     wallFilterMode = 'all',
     shadingMode,
-    wallNormalMap,
+    wallTextures,
+    glassMat,
     rootGroup,
     selectableMeshes,
     trackGeo,
@@ -272,26 +279,12 @@ export function buildWallPlan3DGroup(params: {
   const takeoffSummary = computeWallTakeoffSummary(wallPlan.facets);
   const returnFacetIdSet = new Set(takeoffSummary.returnFacetIds);
 
-  // Shared opening frame / glazing / door materials
+  // Shared opening joinery & leaf materials
   const frameMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#1e293b',
-      metalness: 0.55,
-      roughness: 0.35,
-      wireframe: isWireframe
-    })
-  );
-
-  const glassMat = trackMat(
-    new THREE.MeshPhysicalMaterial({
-      color: '#7dd3fc',
-      metalness: 0.08,
-      roughness: 0.08,
-      clearcoat: 1.0,
-      clearcoatRoughness: 0.05,
-      transparent: true,
-      opacity: isWireframe ? 0.35 : 0.72,
-      envMapIntensity: 1.7,
+      metalness: 0.58,
+      roughness: 0.34,
       wireframe: isWireframe
     })
   );
@@ -299,17 +292,17 @@ export function buildWallPlan3DGroup(params: {
   const doorLeafMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#334155',
-      roughness: 0.55,
-      metalness: 0.22,
+      roughness: 0.52,
+      metalness: 0.24,
       wireframe: isWireframe
     })
   );
 
   const garageLeafMat = trackMat(
     new THREE.MeshStandardMaterial({
-      color: '#64748b',
-      normalMap: wallNormalMap,
-      normalScale: new THREE.Vector2(0.75, 0.75),
+      color: '#5a6575',
+      normalMap: wallTextures.garageDoor,
+      normalScale: new THREE.Vector2(0.85, 0.85),
       roughness: 0.42,
       metalness: 0.45,
       wireframe: isWireframe
@@ -382,7 +375,7 @@ export function buildWallPlan3DGroup(params: {
         roofProfilePts: useRoofProfile ? roofProfileLocal : undefined
       });
 
-      const vis = getCladdingVisualProps(reg.claddingType, shadingMode, wallNormalMap);
+      const vis = getCladdingVisualProps(reg.claddingType, shadingMode, wallTextures);
       const baseEmissiveHex = isSelected
         ? '#0284c7'
         : isHighlightedByFilter
@@ -395,9 +388,10 @@ export function buildWallPlan3DGroup(params: {
       const wallMat = trackMat(
         new THREE.MeshStandardMaterial({
           color: new THREE.Color(vis.color),
+          map: vis.map,
           roughness: vis.roughness,
           metalness: vis.metalness,
-          normalMap: vis.useNormal ? wallNormalMap : null,
+          normalMap: vis.normalMap,
           normalScale: new THREE.Vector2(vis.normalScale, vis.normalScale),
           emissive: new THREE.Color(baseEmissiveHex),
           emissiveIntensity: baseEmissiveIntensity,
@@ -446,14 +440,14 @@ export function buildWallPlan3DGroup(params: {
       });
     });
 
-    // Crisp Opening Trim Frames, Window Glazing & Recessed Door/Garage Leaves
+    // Crisp Opening Joinery Frames, Architectural Glazing & Recessed Door/Garage Leaves
     sanitizedOpenings.forEach((op) => {
       const w = op.u1 - op.u0;
       const h = op.v1 - op.v0;
       const uMid = (op.u0 + op.u1) / 2;
       const vMid = (op.v0 + op.v1) / 2;
       const jambW = 0.045;
-      const frameDepth = wallThickness + 0.03;
+      const frameDepth = wallThickness + 0.032;
 
       // Head & Jamb frames
       const headMesh = new THREE.Mesh(
@@ -461,6 +455,7 @@ export function buildWallPlan3DGroup(params: {
         frameMat
       );
       headMesh.position.set(uMid, op.v1 - jambW / 2, 0);
+      headMesh.castShadow = !isDimmedByFilter;
       facetGroup.add(headMesh);
 
       const leftJamb = new THREE.Mesh(
@@ -468,6 +463,7 @@ export function buildWallPlan3DGroup(params: {
         frameMat
       );
       leftJamb.position.set(op.u0 + jambW / 2, vMid, 0);
+      leftJamb.castShadow = !isDimmedByFilter;
       facetGroup.add(leftJamb);
 
       const rightJamb = new THREE.Mesh(
@@ -475,6 +471,7 @@ export function buildWallPlan3DGroup(params: {
         frameMat
       );
       rightJamb.position.set(op.u1 - jambW / 2, vMid, 0);
+      rightJamb.castShadow = !isDimmedByFilter;
       facetGroup.add(rightJamb);
 
       if (!op.isThreshold) {
@@ -483,6 +480,7 @@ export function buildWallPlan3DGroup(params: {
           frameMat
         );
         sillMesh.position.set(uMid, op.v0 + jambW / 2, 0);
+        sillMesh.castShadow = !isDimmedByFilter;
         facetGroup.add(sillMesh);
       }
 
@@ -494,7 +492,19 @@ export function buildWallPlan3DGroup(params: {
           glassMat
         );
         glassMesh.position.set(uMid, vMid, 0);
+        glassMesh.castShadow = false;
+        glassMesh.receiveShadow = true;
         facetGroup.add(glassMesh);
+
+        // Architectural center mullion on wider windows (>= 1.15m)
+        if (innerW >= 1.15) {
+          const mullionMesh = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(0.032, innerH, 0.042)),
+            frameMat
+          );
+          mullionMesh.position.set(uMid, vMid, 0);
+          facetGroup.add(mullionMesh);
+        }
       } else if (op.raw.type === 'door') {
         const innerW = Math.max(0.08, w - jambW * 1.8);
         const innerH = Math.max(0.1, h - jambW);
@@ -503,7 +513,8 @@ export function buildWallPlan3DGroup(params: {
           doorLeafMat
         );
         doorMesh.position.set(uMid, op.v0 + innerH / 2, 0);
-        doorMesh.castShadow = true;
+        doorMesh.castShadow = !isDimmedByFilter;
+        doorMesh.receiveShadow = true;
         facetGroup.add(doorMesh);
       } else if (op.raw.type === 'garage') {
         const innerW = Math.max(0.1, w - jambW * 1.8);
@@ -513,7 +524,8 @@ export function buildWallPlan3DGroup(params: {
           garageLeafMat
         );
         garageMesh.position.set(uMid, op.v0 + innerH / 2, 0);
-        garageMesh.castShadow = true;
+        garageMesh.castShadow = !isDimmedByFilter;
+        garageMesh.receiveShadow = true;
         facetGroup.add(garageMesh);
       }
     });
@@ -533,9 +545,9 @@ export function buildWallPlan3DGroup(params: {
     padGeo.rotateX(Math.PI / 2);
     const padMat = trackMat(
       new THREE.MeshStandardMaterial({
-        color: '#1e293b',
+        color: '#283244',
         roughness: 0.92,
-        metalness: 0.06,
+        metalness: 0.05,
         wireframe: isWireframe
       })
     );

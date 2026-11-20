@@ -18,6 +18,8 @@ import {
   RoofLevel,
   RoofLifecycleStage,
   RoofPlane,
+  SheetOrderComparisonSummary,
+  SheetOrderMode,
   TakeoffCompletenessReport,
   WallPlan
 } from '../../types/exactRoofing';
@@ -33,7 +35,8 @@ import {
   buildQuoteSpreadsheetFromRoofBom,
   exportOrderPackToCsv,
   exportOrderPackToJson,
-  exportRoofBomToCsv
+  exportRoofBomToCsv,
+  getSheetOrderAssumptionText
 } from '../../utils/exactRoofingBomBridge';
 import {
   MODULAR_COIL_MATERIALS,
@@ -43,6 +46,8 @@ import { formatNZDWithDecimals } from '../../utils/formatters';
 import {
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Download,
   ExternalLink,
   FileSpreadsheet,
@@ -75,6 +80,9 @@ interface Props {
   wallPlan?: WallPlan | null;
   completenessReport?: TakeoffCompletenessReport;
   orderPack?: OrderPack | null;
+  sheetOrderMode?: SheetOrderMode;
+  onChangeSheetOrderMode?: (mode: SheetOrderMode) => void;
+  sheetOrderComparison?: SheetOrderComparisonSummary;
   initialModalTab?: 'orders' | 'order_pack' | 'quote';
   onSelectLineToAssign: (line: AssignableRoofLine) => void;
   onRemoveAssignment: (lineId: string) => void;
@@ -115,6 +123,9 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   wallPlan = null,
   completenessReport,
   orderPack: propOrderPack = null,
+  sheetOrderMode,
+  onChangeSheetOrderMode,
+  sheetOrderComparison,
   initialModalTab,
   onSelectLineToAssign,
   onRemoveAssignment,
@@ -176,6 +187,12 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   const [replaceQuoteSections, setReplaceQuoteSections] = useState<boolean>(false);
 
   const [dispatchedNotice, setDispatchedNotice] = useState<string | null>(null);
+  const [expandedOrderPackGroupMm, setExpandedOrderPackGroupMm] = useState<number | null>(null);
+  const [expandedBomGroupMm, setExpandedBomGroupMm] = useState<number | null>(null);
+
+  const activeOrderMode: SheetOrderMode =
+    sheetOrderMode ?? bom.sheetOrderMode ?? layout?.sheetOrderMode ?? 'practical';
+  const resolvedComparison = sheetOrderComparison ?? bom.comparisonSummary;
 
   const assignmentMap = useMemo(() => {
     const map = new Map<string, RoofFlashingAssignment>();
@@ -232,7 +249,9 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
         assets,
         wallPlan,
         completenessReport,
-        locked: measureLocked
+        locked: measureLocked,
+        sheetOrderMode: activeOrderMode,
+        comparisonSummary: resolvedComparison
       }),
     [
       propOrderPack,
@@ -247,7 +266,9 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
       assets,
       wallPlan,
       completenessReport,
-      measureLocked
+      measureLocked,
+      activeOrderMode,
+      resolvedComparison
     ]
   );
 
@@ -756,52 +777,116 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
           ) : modalTab === 'order_pack' ? (
             /* ===================== TAB: COMMERCIAL-NEUTRAL ORDER PACK ===================== */
             <div className="space-y-4">
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase border ${
-                        resolvedOrderPack.locked
-                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                          : 'bg-slate-800 text-slate-300 border-slate-700'
-                      }`}
-                    >
-                      {resolvedOrderPack.locked ? 'Locked Order Pack' : 'Draft Preview (Unlockable)'}
-                    </span>
-                    <span className="text-[11px] font-mono text-emerald-400 font-bold">
-                      Quantities &amp; Product Codes Only · Zero $
-                    </span>
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase border ${
+                          resolvedOrderPack.locked
+                            ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                            : 'bg-slate-800 text-slate-300 border-slate-700'
+                        }`}
+                      >
+                        {resolvedOrderPack.locked ? 'Locked Order Pack' : 'Draft Preview (Unlockable)'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/35 text-sky-300 text-[10px] font-extrabold">
+                        {(resolvedOrderPack.assumptions.sheetOrderMode || activeOrderMode) === 'practical'
+                          ? 'Practical (Site Cut List)'
+                          : 'Optimized (Tight Nest)'}
+                      </span>
+                      <span className="text-[11px] font-mono text-emerald-400 font-bold">
+                        Quantities &amp; Product Codes Only · Zero $
+                      </span>
+                    </div>
+                    <div className="text-xs text-slate-300">
+                      {resolvedOrderPack.assumptions.profile} · {resolvedOrderPack.assumptions.material} ·{' '}
+                      {resolvedOrderPack.assumptions.color}
+                    </div>
                   </div>
-                  <div className="text-xs text-slate-300">
-                    {resolvedOrderPack.assumptions.profile} · {resolvedOrderPack.assumptions.material} ·{' '}
-                    {resolvedOrderPack.assumptions.color}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleDownloadOrderPackCsv}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Export Order Pack CSV</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownloadOrderPackJson}
+                      className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Export JSON</span>
+                    </button>
                   </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleDownloadOrderPackCsv}
-                    className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>Export Order Pack CSV</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleDownloadOrderPackJson}
-                    className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>Export JSON</span>
-                  </button>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 pt-1.5 border-t border-slate-800/80">
+                  <span>
+                    {resolvedOrderPack.assumptions.sheetOrderAssumption ||
+                      getSheetOrderAssumptionText(
+                        resolvedOrderPack.assumptions.sheetOrderMode || activeOrderMode
+                      )}
+                  </span>
+                  {(resolvedOrderPack.assumptions.comparisonSummary || resolvedComparison) && (
+                    <span className="font-mono text-slate-300 tabular-nums">
+                      Practical:{' '}
+                      {(
+                        resolvedOrderPack.assumptions.comparisonSummary || resolvedComparison!
+                      ).practicalOrderedLm.toFixed(1)}{' '}
+                      lm (
+                      {(
+                        resolvedOrderPack.assumptions.comparisonSummary || resolvedComparison!
+                      ).practicalDistinctLengths}{' '}
+                      len) · Optimized:{' '}
+                      {(
+                        resolvedOrderPack.assumptions.comparisonSummary || resolvedComparison!
+                      ).optimizedOrderedLm.toFixed(1)}{' '}
+                      lm (
+                      {(
+                        resolvedOrderPack.assumptions.comparisonSummary || resolvedComparison!
+                      ).optimizedDistinctLengths}{' '}
+                      len)
+                    </span>
+                  )}
                 </div>
               </div>
 
               {/* Sheets Schedule */}
               <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-2.5">
-                <div className="text-xs font-extrabold uppercase tracking-wider text-white">
-                  1. Sheet Schedule ({resolvedOrderPack.totals.totalSheets} sheets ·{' '}
-                  {resolvedOrderPack.totals.totalOrderedLm.toFixed(3)} lm ordered)
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs font-extrabold uppercase tracking-wider text-white">
+                    1. Sheet Schedule ({resolvedOrderPack.totals.totalSheets} sheets ·{' '}
+                    {resolvedOrderPack.totals.totalOrderedLm.toFixed(3)} lm ordered)
+                  </div>
+                  {!measureLocked && !isInstalling && onChangeSheetOrderMode && (
+                    <div className="inline-flex rounded-xl bg-slate-950 border border-slate-800 p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => onChangeSheetOrderMode('practical')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                          activeOrderMode === 'practical'
+                            ? 'bg-sky-600 text-white shadow-xs'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Practical (Site Cut List)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onChangeSheetOrderMode('optimized')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                          activeOrderMode === 'optimized'
+                            ? 'bg-sky-600 text-white shadow-xs'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Optimized (Tight Nest)
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <div className="overflow-x-auto border border-slate-800 rounded-xl bg-slate-950/70">
                   <table className="w-full text-left text-xs">
@@ -810,31 +895,86 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                         <th className="py-2 px-3">Code</th>
                         <th className="py-2 px-3 text-right">Qty</th>
                         <th className="py-2 px-3 text-right">Order Cut</th>
-                        <th className="py-2 px-3">Faces &amp; Override</th>
+                        <th className="py-2 px-3">Faces &amp; Cut Details</th>
                         <th className="py-2 px-3 text-right">Total lm</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
-                      {resolvedOrderPack.sheets.map((sh) => (
-                        <tr key={`${sh.code}-${sh.length_mm}`}>
-                          <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">{sh.code}</td>
-                          <td className="py-2 px-3 text-right font-black text-white">{sh.qty}</td>
-                          <td className="py-2 px-3 text-right font-extrabold text-white whitespace-nowrap">
-                            {sh.length_mm}mm
-                          </td>
-                          <td className="py-2 px-3 font-sans text-slate-300">
-                            <span>{sh.notes}</span>
-                            {sh.is_override && (
-                              <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold">
-                                Site Override (was {sh.modeled_length_mm}mm)
-                              </span>
+                      {resolvedOrderPack.sheets.map((sh) => {
+                        const cutDetails = sh.cut_details || [];
+                        const hasCutDowns = cutDetails.some((d) => d.requiredCutMm < sh.length_mm - 2);
+                        const isExpanded = expandedOrderPackGroupMm === sh.length_mm;
+                        return (
+                          <React.Fragment key={`${sh.code}-${sh.length_mm}`}>
+                            <tr>
+                              <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">{sh.code}</td>
+                              <td className="py-2 px-3 text-right font-black text-white">{sh.qty}</td>
+                              <td className="py-2 px-3 text-right font-extrabold text-white whitespace-nowrap">
+                                {sh.length_mm}mm
+                              </td>
+                              <td className="py-2 px-3 font-sans text-slate-300">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span>{sh.notes}</span>
+                                  {sh.is_override && (
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold">
+                                      Site Override (was {sh.modeled_length_mm}mm)
+                                    </span>
+                                  )}
+                                  {hasCutDowns && (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setExpandedOrderPackGroupMm(isExpanded ? null : sh.length_mm)
+                                      }
+                                      className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 cursor-pointer inline-flex items-center gap-1"
+                                    >
+                                      <span>
+                                        {isExpanded
+                                          ? 'Hide cut details'
+                                          : `Cut details (${cutDetails.length})`}
+                                      </span>
+                                      {isExpanded ? (
+                                        <ChevronUp className="w-3 h-3" />
+                                      ) : (
+                                        <ChevronDown className="w-3 h-3" />
+                                      )}
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-2 px-3 text-right font-bold text-emerald-400 whitespace-nowrap">
+                                {sh.total_lm.toFixed(3)}
+                              </td>
+                            </tr>
+                            {isExpanded && cutDetails.length > 0 && (
+                              <tr className="bg-slate-900/50">
+                                <td colSpan={5} className="px-3 py-2 text-[11px] text-slate-300">
+                                  <div className="space-y-1">
+                                    {cutDetails.map((d) => (
+                                      <div
+                                        key={`${d.faceCode}-${d.requiredCutMm}`}
+                                        className="flex items-center justify-between gap-2"
+                                      >
+                                        <span>
+                                          {d.qty} × <strong className="text-white">{d.requiredCutMm} mm</strong>{' '}
+                                          <span className="font-sans text-slate-400">
+                                            ({d.faceCode} · {d.faceName})
+                                          </span>
+                                        </span>
+                                        <span className="font-sans text-[10px] text-sky-300">
+                                          {d.requiredCutMm < sh.length_mm - 2
+                                            ? `cut from ${sh.length_mm}mm`
+                                            : `full ${sh.length_mm}mm run`}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </td>
+                              </tr>
                             )}
-                          </td>
-                          <td className="py-2 px-3 text-right font-bold text-emerald-400 whitespace-nowrap">
-                            {sh.total_lm.toFixed(3)}
-                          </td>
-                        </tr>
-                      ))}
+                          </React.Fragment>
+                        );
+                      })}
                     </tbody>
                     <tfoot className="bg-slate-900/90 border-t border-slate-700 font-mono tabular-nums">
                       <tr>
@@ -1009,16 +1149,53 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                 <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
-                      <h4 className="text-xs font-extrabold uppercase tracking-wider text-white">
-                        1. Roof Sheets to Order ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} lm ordered)
-                      </h4>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                          1. Roof Sheets to Order ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} lm ordered)
+                        </h4>
+                        <span className="px-2 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/35 text-sky-300 text-[10px] font-bold">
+                          {activeOrderMode === 'practical' ? 'Practical (Site Cut List)' : 'Optimized (Tight Nest)'}
+                        </span>
+                      </div>
                       <p className="text-[11px] text-slate-400 mt-0.5 font-mono tabular-nums">
-                        {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'} · Net roof {bom.totalNetRoofLm.toFixed(1)} lm
+                        {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'} · Net roof {bom.totalNetRoofLm.toFixed(1)} lm · {bom.totalOffcutsReused ?? 0} offcuts repressed (+{bom.savedOffcutLm.toFixed(1)}m saved)
                       </p>
                     </div>
-                    <span className="text-[11px] font-mono text-emerald-400 tabular-nums">
-                      {bom.totalOffcutsReused ?? 0} offcuts repressed (+{bom.savedOffcutLm.toFixed(1)}m saved)
-                    </span>
+                    {!measureLocked && !isInstalling && onChangeSheetOrderMode && (
+                      <div className="inline-flex rounded-xl bg-slate-950 border border-slate-800 p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => onChangeSheetOrderMode('practical')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                            activeOrderMode === 'practical'
+                              ? 'bg-sky-600 text-white shadow-xs'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Practical (Site Cut List)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onChangeSheetOrderMode('optimized')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                            activeOrderMode === 'optimized'
+                              ? 'bg-sky-600 text-white shadow-xs'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Optimized (Tight Nest)
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 bg-slate-950/60 border border-slate-800/80 rounded-xl px-3 py-2">
+                    <span>{bom.sheetOrderAssumption || getSheetOrderAssumptionText(activeOrderMode)}</span>
+                    {resolvedComparison && (
+                      <span className="font-mono text-slate-300 tabular-nums">
+                        Practical: {resolvedComparison.practicalOrderedLm.toFixed(1)} lm ({resolvedComparison.practicalDistinctLengths} len) · Optimized: {resolvedComparison.optimizedOrderedLm.toFixed(1)} lm ({resolvedComparison.optimizedDistinctLengths} len)
+                      </span>
+                    )}
                   </div>
 
                   <div className="overflow-x-auto border border-slate-800 rounded-xl bg-slate-950/70">
@@ -1032,26 +1209,83 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
-                        {bom.sheetGroups.map((grp) => (
-                          <tr key={grp.lengthMm} className="hover:bg-slate-900/50">
-                            <td className="py-2 px-3 font-black text-white">{grp.count} @</td>
-                            <td className="py-2 px-3 font-extrabold text-sky-400">
-                              {grp.lengthMm} mm ({grp.lengthMm % 10 !== 0 ? grp.lengthM.toFixed(3) : grp.lengthM.toFixed(2)}m)
-                              {grp.hasSiteOverride && (
-                                <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-sans font-bold">
-                                  Site Override (was {grp.modeledLengthMm}mm)
-                                </span>
+                        {bom.sheetGroups.map((grp) => {
+                          const cutDetails = grp.cutDetails || [];
+                          const hasCutDowns = cutDetails.some((d) => d.requiredCutMm < grp.lengthMm - 2);
+                          const isExpanded = expandedBomGroupMm === grp.lengthMm;
+                          return (
+                            <React.Fragment key={grp.lengthMm}>
+                              <tr className="hover:bg-slate-900/50">
+                                <td className="py-2 px-3 font-black text-white">{grp.count} @</td>
+                                <td className="py-2 px-3 font-extrabold text-sky-400">
+                                  {grp.lengthMm} mm ({grp.lengthMm % 10 !== 0 ? grp.lengthM.toFixed(3) : grp.lengthM.toFixed(2)}m)
+                                  {grp.hasSiteOverride && (
+                                    <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-sans font-bold">
+                                      Site Override (was {grp.modeledLengthMm}mm)
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-2 px-3 font-sans text-slate-300">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span>
+                                      Faces {grp.targetCodes.join(', ') || 'Main'}
+                                      {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
+                                    </span>
+                                    {hasCutDowns && (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setExpandedBomGroupMm(isExpanded ? null : grp.lengthMm)
+                                        }
+                                        className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 cursor-pointer inline-flex items-center gap-1"
+                                      >
+                                        <span>
+                                          {isExpanded
+                                            ? 'Hide cuts'
+                                            : `Cut breakdown (${cutDetails.length})`}
+                                        </span>
+                                        {isExpanded ? (
+                                          <ChevronUp className="w-3 h-3" />
+                                        ) : (
+                                          <ChevronDown className="w-3 h-3" />
+                                        )}
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="py-2 px-3 text-right font-bold text-slate-200">
+                                  {(grp.count * grp.lengthM).toFixed(2)} lm
+                                </td>
+                              </tr>
+                              {isExpanded && cutDetails.length > 0 && (
+                                <tr className="bg-slate-900/50">
+                                  <td colSpan={4} className="px-3 py-2 text-[11px] text-slate-300">
+                                    <div className="space-y-1">
+                                      {cutDetails.map((d) => (
+                                        <div
+                                          key={`${d.faceCode}-${d.requiredCutMm}`}
+                                          className="flex items-center justify-between gap-2"
+                                        >
+                                          <span>
+                                            {d.qty} × <strong className="text-white">{d.requiredCutMm} mm</strong>{' '}
+                                            <span className="font-sans text-slate-400">
+                                              ({d.faceCode} · {d.faceName})
+                                            </span>
+                                          </span>
+                                          <span className="font-sans text-[10px] text-sky-300">
+                                            {d.requiredCutMm < grp.lengthMm - 2
+                                              ? `cut from ${grp.lengthMm}mm`
+                                              : `full ${grp.lengthMm}mm run`}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </td>
+                                </tr>
                               )}
-                            </td>
-                            <td className="py-2 px-3 font-sans text-slate-300">
-                              Faces {grp.targetCodes.join(', ') || 'Main'}
-                              {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
-                            </td>
-                            <td className="py-2 px-3 text-right font-bold text-slate-200">
-                              {(grp.count * grp.lengthM).toFixed(2)} lm
-                            </td>
-                          </tr>
-                        ))}
+                            </React.Fragment>
+                          );
+                        })}
                       </tbody>
                       <tfoot className="bg-slate-900/90 border-t border-slate-700 font-mono tabular-nums">
                         <tr>

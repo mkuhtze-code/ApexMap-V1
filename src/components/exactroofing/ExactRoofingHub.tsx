@@ -24,7 +24,9 @@ import {
   WallFacet,
   WallFilterMode,
   WallPlan,
-  OrderPack
+  OrderPack,
+  SheetOrderComparisonSummary,
+  SheetOrderMode
 } from '../../types/exactRoofing';
 import {
   getPresetOutline,
@@ -179,6 +181,7 @@ interface SavedRoofState {
   installProgress?: RoofInstallProgress;
   planUnderlay?: RoofPlanUnderlay | null;
   wallPlan?: WallPlan | null;
+  sheetOrderMode?: SheetOrderMode;
 }
 
 const DEFAULT_INSTALL_PROGRESS: RoofInstallProgress = {
@@ -350,6 +353,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [frozenOrderPack, setFrozenOrderPack] = useState<OrderPack | null>(
     project?.roofPlanModel?.orderPack || activeQuote?.roofPlanModel?.orderPack || null
   );
+  const [sheetOrderMode, setSheetOrderMode] = useState<SheetOrderMode>(
+    activeQuote?.roofPlanModel?.sheetOrderMode ||
+      project?.roofPlanModel?.sheetOrderMode ||
+      initialState.sheetOrderMode ||
+      'practical'
+  );
   const [selectedWallFacetId, setSelectedWallFacetId] = useState<string | null>(null);
   const [wallSubView, setWallSubView] = useState<'plan' | 'elevation'>('plan');
   const [wallViewKey, setWallViewKey] = useState<number>(0);
@@ -454,6 +463,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       );
       setFrozenOrderPack(snap.orderPack || null);
       setMeasureLocked(Boolean(snap.measureLocked));
+      setSheetOrderMode(snap.sheetOrderMode || 'practical');
       setInstallProgress(snap.installProgress || DEFAULT_INSTALL_PROGRESS);
       if (initialStage) {
         setLifecycleStage(initialStage);
@@ -491,7 +501,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
         measureLocked,
         installProgress,
         planUnderlay,
-        wallPlan
+        wallPlan,
+        sheetOrderMode
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {
@@ -512,7 +523,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     measureLocked,
     installProgress,
     planUnderlay,
-    wallPlan
+    wallPlan,
+    sheetOrderMode
   ]);
 
   // Close dropdowns on outside click
@@ -722,17 +734,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
   };
 
-  // Recompute layout whenever roof areas, specs, assets, pitch breaks, or start edge change
+  // Recompute layout whenever roof areas, specs, assets, pitch breaks, start edge, or ordering mode change
   useEffect(() => {
     if (planes.length > 0) {
       const res = generateCuttingLayout(planes, sheetSpec, {
         startPlaneId: startPlaneId || undefined,
         assets,
-        pitchBreaks
+        pitchBreaks,
+        sheetOrderMode
       });
       setLayoutResult(res);
     }
-  }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks]);
+  }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks, sheetOrderMode]);
 
   const handleSetStartPlane = (planeId: string) => {
     setStartPlaneId(planeId);
@@ -1632,7 +1645,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
         const res = generateCuttingLayout(autoPlanes, sheetSpec, {
           startPlaneId: startPlaneId || undefined,
           assets,
-          pitchBreaks
+          pitchBreaks,
+          sheetOrderMode
         });
         setLayoutResult(res);
         setActiveTab('layout_results');
@@ -1647,7 +1661,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     const res = generateCuttingLayout(planes, sheetSpec, {
       startPlaneId: startPlaneId || undefined,
       assets,
-      pitchBreaks
+      pitchBreaks,
+      sheetOrderMode
     });
     setLayoutResult(res);
     setActiveTab('layout_results');
@@ -1681,6 +1696,38 @@ export const ExactRoofingHub: React.FC<Props> = ({
     [levels, planes, assignableLines, flashingAssignments, wallPlan, assets]
   );
 
+  const sheetOrderComparison = useMemo<SheetOrderComparisonSummary | undefined>(() => {
+    if (planes.length === 0) return undefined;
+    const prac =
+      layoutResult && (layoutResult.sheetOrderMode || 'practical') === 'practical'
+        ? layoutResult
+        : generateCuttingLayout(planes, sheetSpec, {
+            startPlaneId: startPlaneId || undefined,
+            assets,
+            pitchBreaks,
+            sheetOrderMode: 'practical'
+          });
+    const opt =
+      layoutResult && layoutResult.sheetOrderMode === 'optimized'
+        ? layoutResult
+        : generateCuttingLayout(planes, sheetSpec, {
+            startPlaneId: startPlaneId || undefined,
+            assets,
+            pitchBreaks,
+            sheetOrderMode: 'optimized'
+          });
+    const countDistinctMm = (parents: LayoutResult['parents']) =>
+      new Set(parents.map((p) => Math.round(p.length * 1000))).size;
+    return {
+      practicalOrderedLm: +prac.totalOrderedMetres.toFixed(2),
+      practicalSheetsCount: prac.parents.length,
+      practicalDistinctLengths: countDistinctMm(prac.parents),
+      optimizedOrderedLm: +opt.totalOrderedMetres.toFixed(2),
+      optimizedSheetsCount: opt.parents.length,
+      optimizedDistinctLengths: countDistinctMm(opt.parents)
+    };
+  }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks, layoutResult]);
+
   // Computed BOM & Site Roofing Packs
   const roofBom = useMemo(
     () =>
@@ -1689,9 +1736,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
         layout: layoutResult,
         assignments: flashingAssignments,
         assignableLines,
-        assets
+        assets,
+        sheetOrderMode,
+        comparisonSummary: sheetOrderComparison
       }),
-    [planes, layoutResult, flashingAssignments, assignableLines, assets]
+    [planes, layoutResult, flashingAssignments, assignableLines, assets, sheetOrderMode, sheetOrderComparison]
   );
 
   const roofingPacks = useMemo(
@@ -1731,7 +1780,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       completenessReport,
       locked: measureLocked,
       confirmedAt: project?.roofPlanModel?.measureConfirmedAt,
-      confirmedBy: project?.roofPlanModel?.measureConfirmedBy
+      confirmedBy: project?.roofPlanModel?.measureConfirmedBy,
+      sheetOrderMode,
+      comparisonSummary: sheetOrderComparison
     });
   }, [
     measureLocked,
@@ -1746,11 +1797,23 @@ export const ExactRoofingHub: React.FC<Props> = ({
     libraryProfiles,
     assets,
     wallPlan,
-    completenessReport
+    completenessReport,
+    sheetOrderMode,
+    sheetOrderComparison
   ]);
 
   const isReadOnlyGeometry =
     lifecycleStage === 'installing' || (lifecycleStage === 'measuring' && measureLocked);
+
+  const handleChangeSheetOrderMode = (nextMode: SheetOrderMode) => {
+    if (measureLocked || lifecycleStage === 'installing') return;
+    setSheetOrderMode(nextMode);
+    triggerNotice(
+      nextMode === 'practical'
+        ? 'Sheet Ordering: Practical (Simple Site Cut List)'
+        : 'Sheet Ordering: Optimized (Tight Repress Nest)'
+    );
+  };
 
   const buildCurrentSnapshot = (overrides?: Partial<ExactRoofModelSnapshot>): ExactRoofModelSnapshot => ({
     version: 2,
@@ -1758,6 +1821,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     measureLocked: overrides?.measureLocked ?? measureLocked,
     measureConfirmedAt: overrides?.measureConfirmedAt ?? project?.roofPlanModel?.measureConfirmedAt,
     measureConfirmedBy: overrides?.measureConfirmedBy ?? project?.roofPlanModel?.measureConfirmedBy,
+    sheetOrderMode: overrides?.sheetOrderMode ?? sheetOrderMode,
     selectedPreset,
     outline,
     skeleton,
@@ -1841,7 +1905,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
         ? generateCuttingLayout(planes, sheetSpec, {
             startPlaneId: startPlaneId || undefined,
             assets,
-            pitchBreaks
+            pitchBreaks,
+            sheetOrderMode
           })
         : null);
     if (nextLayout && !layoutResult) {
@@ -1852,7 +1917,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       layout: nextLayout,
       assignments: flashingAssignments,
       assignableLines,
-      assets
+      assets,
+      sheetOrderMode,
+      comparisonSummary: sheetOrderComparison
     });
     const emittedOrderPack = buildOrderPack({
       project,
@@ -1868,7 +1935,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       completenessReport,
       locked: true,
       confirmedAt,
-      confirmedBy
+      confirmedBy,
+      sheetOrderMode,
+      comparisonSummary: sheetOrderComparison
     });
 
     const nextSnap = buildCurrentSnapshot({
@@ -2673,6 +2742,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 wallPlan={wallPlan}
                 completenessReport={completenessReport}
                 measureLocked={measureLocked}
+                sheetOrderMode={sheetOrderMode}
+                onChangeSheetOrderMode={handleChangeSheetOrderMode}
+                sheetOrderComparison={sheetOrderComparison}
                 onSelectPlane={(planeId) => {
                   handleSelectPlane(planeId);
                   setIsInspectorOpen(true);
@@ -3657,6 +3729,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
               roofingPacks={roofingPacks}
               installProgress={installProgress}
               onUpdateInstallProgress={handleUpdateInstallProgress}
+              sheetOrderMode={sheetOrderMode}
+              onChangeSheetOrderMode={handleChangeSheetOrderMode}
+              sheetOrderComparison={sheetOrderComparison}
             />
           )}
 
@@ -3672,6 +3747,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
               wallPlan={wallPlan}
               completenessReport={completenessReport}
               measureLocked={measureLocked}
+              sheetOrderMode={sheetOrderMode}
+              onChangeSheetOrderMode={handleChangeSheetOrderMode}
+              sheetOrderComparison={sheetOrderComparison}
               onSelectPlane={(planeId) => {
                 handleSelectPlane(planeId);
                 setIsInspectorOpen(true);
@@ -3902,6 +3980,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
         wallPlan={wallPlan}
         completenessReport={completenessReport}
         orderPack={liveOrderPack}
+        sheetOrderMode={sheetOrderMode}
+        onChangeSheetOrderMode={handleChangeSheetOrderMode}
+        sheetOrderComparison={sheetOrderComparison}
         initialModalTab={orderModalTab}
         onSelectLineToAssign={(line) => setActiveFlashingLineId(line.lineId)}
         onRemoveAssignment={handleRemoveFlashingAssignment}

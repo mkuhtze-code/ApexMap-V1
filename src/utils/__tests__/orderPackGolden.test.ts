@@ -593,4 +593,63 @@ assert.equal(parsedJson.commercialNeutral, true);
 assert.equal(parsedJson.penetrations.length, 2);
 console.log('✓ Pillar 4 Passed: OrderPack CSV & JSON include structured takeoff & zero dollar figures.');
 
+// =========================================================================
+// PILLAR 5: PRACTICAL SHEET ORDERING (SIMPLE CUT LISTS) IN ORDER PACK
+// =========================================================================
+
+assert.equal(rectPack.assumptions.sheetOrderMode, 'practical', 'OrderPack defaults to practical sheetOrderMode');
+assert.equal(rectPack.sheets.length, 1, '14x10 Hip OrderPack consolidates into 1 practical order length');
+assert.ok(
+  (rectPack.sheets[0].cut_details?.length || 0) >= 2 &&
+    rectPack.sheets[0].cut_details!.every((d) => d.requiredCutMm <= rectPack.sheets[0].length_mm),
+  'OrderPack practical sheet line includes valid cut_details'
+);
+assert.equal(gablePack.sheets.length, 1, 'Straight Gable OrderPack consolidates into 1 practical order length');
+
+const splitPreset5 = getMultiLevelPreset('two_storey_split', 22.5);
+const splitLayout5 = generateCuttingLayout(splitPreset5.planes, DEFAULT_SHEET_SPEC);
+const splitOptLayout5 = generateCuttingLayout(splitPreset5.planes, DEFAULT_SHEET_SPEC, {
+  sheetOrderMode: 'optimized'
+});
+const splitLines5 = getAssignableRoofLinesMultiLevel(splitPreset5.levels, splitPreset5.planes);
+const splitAssigns5 = buildAutoAssignmentsForLines(splitLines5);
+const splitComp5 = {
+  practicalOrderedLm: splitLayout5.totalOrderedMetres,
+  practicalSheetsCount: splitLayout5.parents.length,
+  practicalDistinctLengths: new Set(splitLayout5.parents.map((p) => Math.round(p.length * 1000))).size,
+  optimizedOrderedLm: splitOptLayout5.totalOrderedMetres,
+  optimizedSheetsCount: splitOptLayout5.parents.length,
+  optimizedDistinctLengths: new Set(splitOptLayout5.parents.map((p) => Math.round(p.length * 1000))).size
+};
+const splitBom5 = buildRoofBillOfMaterials({
+  planes: splitPreset5.planes,
+  layout: splitLayout5,
+  assignments: splitAssigns5,
+  assignableLines: splitLines5,
+  sheetOrderMode: 'practical',
+  comparisonSummary: splitComp5
+});
+const splitPack5 = buildOrderPack({
+  planes: splitPreset5.planes,
+  levels: splitPreset5.levels,
+  layout: splitLayout5,
+  bom: splitBom5,
+  assignableLines: splitLines5,
+  assignments: splitAssigns5,
+  sheetOrderMode: 'practical',
+  comparisonSummary: splitComp5,
+  locked: true
+});
+assert.ok(
+  splitPack5.sheets.length >= 2 && splitPack5.sheets.length <= 3,
+  `2-storey split OrderPack should select 2-3 Practical lengths, got ${splitPack5.sheets.length}`
+);
+assertStrictSheetReconciliation('Pillar 5: 2-Storey Practical OrderPack', splitLayout5, splitBom5, splitPack5);
+assertZeroDollarLeakage('Pillar 5: 2-Storey Practical OrderPack', splitPack5);
+
+const splitCsv5 = exportOrderPackToCsv(splitPack5);
+assert.ok(splitCsv5.includes('Practical (Site Cut List)'), 'OrderPack CSV prints Practical sheet order mode');
+assert.ok(splitCsv5.includes('Mode Comparison (lm only)'), 'OrderPack CSV prints comparison lm summary without $');
+console.log('✓ Pillar 5 Passed: Practical simple cut lists, cut_details & zero-$ comparison verified across OrderPack.');
+
 console.log('ALL ORDER PACK GOLDEN ACCURACY TESTS PASSED DETERMINISTICALLY! ✓');

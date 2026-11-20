@@ -23,7 +23,8 @@ import {
   RoofJunctionNode,
   AssignableRoofLine,
   RoofLineFlashingKind,
-  RoofPlanUnderlay
+  RoofPlanUnderlay,
+  SheetOrderMode
 } from '../types/exactRoofing';
 
 export const EPSILON = 1e-4;
@@ -3453,10 +3454,12 @@ export function generateCuttingLayout(
     startEdgeId?: string;
     assets?: RoofAsset[];
     pitchBreaks?: PitchBreakLine[];
+    sheetOrderMode?: SheetOrderMode;
   }
 ): LayoutResult {
   const cover = sheetSpec.coverWidth || 0.762;
   const maxLen = sheetSpec.maxLength || 6.0;
+  const sheetOrderMode: SheetOrderMode = options?.sheetOrderMode || 'practical';
 
   const hasAssetsOrBreaks =
     (options?.assets && options.assets.length > 0) ||
@@ -3851,11 +3854,12 @@ export function generateCuttingLayout(
     .reduce((sum, item) => sum + item.cutLength, 0)
     .toFixed(3);
 
-  // Step 2: True Ordered Parents + Separate Offcut Repress Pass
-  // - Never manufactures longer higher-waste mother blanks (e.g. no 4.0m/2.0m artificial floors)
-  // - Only represses when:
-  //   (A) Linear leftover tail on an ordered sheet covers another piece (remaining >= cutLength + 0.02m), OR
-  //   (B) Diagonal hip/valley complementary cutoff saves >= 0.12m AND fits within practical body run <= maxLen
+  // Step 2: Sheet Ordering Strategy
+  // - 'practical' (DEFAULT): Simple site cut lists. Clusters non-override runs into 1-3 practical
+  //   stock order lengths (quantized up to 10mm increments, merging lengths within 600mm, and adding a
+  //   2nd/3rd shorter length only when it saves >= 4.0 lm AND >= 4% ordered metres). Shorter runs and
+  //   diagonal/linear offcuts cut down from those shared stock lengths. Site overrides stay exact 1mm.
+  // - 'optimized' (OPT-IN): Tight multi-length diagonal/linear repress nesting for minimum steel lm.
   const parentSheets: ParentSheet[] = [];
   const parentMetaByIndex: Array<{
     linearRemaining: number;
@@ -3899,292 +3903,14 @@ export function generateCuttingLayout(
   const offcutTransfers: TransferredPieceInfo[] = [];
 
   const quantizeMm = (lenM: number) => +(Math.round(lenM * 1000) / 1000).toFixed(3);
+  const ceil10mm = (lenM: number) => {
+    const mm = Math.max(100, Math.round(lenM * 1000));
+    const rounded10Mm = Math.ceil(mm / 10) * 10;
+    const capMm = Math.max(mm, Math.round(maxLen * 1000));
+    return +(Math.min(capMm, rounded10Mm) / 1000).toFixed(3);
+  };
   const KERF_LIN = 0.02;
 
-  const evalDiagonalRepress = (
-    p1: NeededSheetStrip,
-    p2: NeededSheetStrip
-  ): { parentBlankLen: number; savings: number } | null => {
-    if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) return null;
-    const canFlip180 = p1.underlapSide !== p2.underlapSide || p1.planeId !== p2.planeId;
-    if (!canFlip180) return null;
-
-    // Protect site-measured full body runs from being altered or swallowed
-    if (p2.hasOrderedOverride && !p2.isTriangularRake) return null;
-
-    const p1Taper = p1.cutLength - p1.shortLength;
-    const p2Taper = p2.cutLength - p2.shortLength;
-    if (p1Taper < 0.08 && p2Taper < 0.08) return null;
-
-    const diagKerf = p1.shortLength > 0.25 && p2.shortLength > 0.25 ? 0.015 : 0;
-    const nestedRaw = Math.max(
-      p1.cutLength + p2.shortLength,
-      p1.shortLength + p2.cutLength + diagKerf
-    );
-    const parentBlankLen = quantizeMm(Math.max(p1.cutLength, nestedRaw));
-
-    if (parentBlankLen > maxLen + 0.001) return null;
-    if (p1.hasOrderedOverride && p1.targetOrderedLen && parentBlankLen > p1.targetOrderedLen + 0.001) {
-      return null;
-    }
-
-    const practicalCap = Math.min(
-      maxLen,
-      Math.max(p1.planeMaxCutLen, p2.planeMaxCutLen, p1.cutLength, p2.cutLength) + 0.05
-    );
-    if (parentBlankLen > practicalCap + 0.001) return null;
-
-    const standalonePairLen = p1.cutLength + p2.cutLength;
-    const savings = +(standalonePairLen - parentBlankLen).toFixed(3);
-    if (savings < 0.12) return null;
-
-    return { parentBlankLen, savings };
-  };
-
-  const commitRepressPair = (
-    p1Idx: number,
-    p2Idx: number,
-    parentBlankLen: number,
-    ruleApplied: TransferredPieceInfo['ruleApplied']
-  ) => {
-    const p1 = allNeededPieces[p1Idx];
-    const p2 = allNeededPieces[p2Idx];
-    pairedPieceIndices.add(p1Idx);
-    pairedPieceIndices.add(p2Idx);
-
-    const parentId = `parent-sheet-${sheetNumberCounter}`;
-    const color = PARENT_PALETTE[(sheetNumberCounter - 1) % PARENT_PALETTE.length];
-
-    const piece1Note =
-      ruleApplied === 'adjacent_hip_run' || ruleApplied === 'next_sequence_slope'
-        ? `Ordered run on ${p1.planeName} – diagonal offcut repressed into ${p2.planeName}`
-        : `Ordered sheet #${sheetNumberCounter} (offcut reused)`;
-
-    const piece2Note =
-      p1.planeId !== p2.planeId
-        ? `Repressed 180° offcut from ${p1.planeName}`
-        : `Opposite hip 180° offcut from ${p1.planeName}`;
-
-    const piece1: CutPiece = {
-      id: `piece-${p1.planeId}-${p1.colIndex}-${p1.segIndex}`,
-      parentSheetId: parentId,
-      length: p1.cutLength,
-      width: p1.colWidth,
-      cutFrom: 0,
-      orientation: 'normal',
-      targetPlaneId: p1.planeId,
-      placement: { origin: { x: p1.uCenter, y: p1.minV }, rotation: 0, flipped: false },
-      underlapSide: p1.underlapSide,
-      facetName: p1.planeName,
-      colIndex: p1.colIndex,
-      minV: p1.minV,
-      maxV: p1.maxV,
-      splitFromAssetId: p1.splitFromAssetId,
-      note: piece1Note
-    };
-
-    const piece2: CutPiece = {
-      id: `piece-${p2.planeId}-${p2.colIndex}-${p2.segIndex}`,
-      parentSheetId: parentId,
-      length: p2.cutLength,
-      width: p2.colWidth,
-      cutFrom: quantizeMm(Math.max(0, parentBlankLen - p2.cutLength)),
-      orientation: 'flipped180',
-      targetPlaneId: p2.planeId,
-      placement: { origin: { x: p2.uCenter, y: p2.minV }, rotation: 180, flipped: true },
-      underlapSide: p2.underlapSide,
-      facetName: p2.planeName,
-      colIndex: p2.colIndex,
-      minV: p2.minV,
-      maxV: p2.maxV,
-      splitFromAssetId: p2.splitFromAssetId,
-      note: piece2Note
-    };
-
-    if (p1.planeId !== p2.planeId) {
-      transferMatrix[p1.planeId][p2.planeId] = (transferMatrix[p1.planeId][p2.planeId] || 0) + 1;
-      offcutTransfers.push({
-        sourcePlaneId: p1.planeId,
-        targetPlaneId: p2.planeId,
-        sourcePlanCenter: p1.planCenter,
-        targetPlanCenter: p2.planCenter,
-        piece: piece2,
-        uCenter: p2.uCenter,
-        width: p2.colWidth,
-        cutLength: p2.cutLength,
-        ruleApplied
-      });
-    }
-
-    const midSum = p1.midLength + p2.midLength;
-    const naturalDrop = +Math.max(0, parentBlankLen - midSum).toFixed(3);
-    const parentSheet: ParentSheet = {
-      id: parentId,
-      sheetNumber: sheetNumberCounter++,
-      length: parentBlankLen,
-      color,
-      pieces: [piece1, piece2],
-      remaining: naturalDrop,
-      utilization: +Math.min(100, (midSum / parentBlankLen) * 100).toFixed(1)
-    };
-
-    parentSheets.push(parentSheet);
-    parentMetaByIndex.push({
-      linearRemaining: +Math.max(0, parentBlankLen - (p1.cutLength + p2.cutLength)).toFixed(3),
-      hasOrderedOverride: p1.hasOrderedOverride,
-      targetOrderedLen: p1.targetOrderedLen,
-      pitchDeg: p1.pitchDeg,
-      underlapSide: p1.underlapSide,
-      midSum
-    });
-    placedPieces.push(piece1, piece2);
-
-    addToPlacementMap(placementMap, p1.planeId, {
-      pieceId: piece1.id,
-      parentId,
-      parentSheetNumber: parentSheet.sheetNumber,
-      length: piece1.length,
-      isOffcut: false,
-      orientation: 'normal',
-      note: piece1Note,
-      color
-    });
-
-    addToPlacementMap(placementMap, p2.planeId, {
-      pieceId: piece2.id,
-      parentId,
-      parentSheetNumber: parentSheet.sheetNumber,
-      length: piece2.length,
-      isOffcut: true,
-      orientation: 'flipped180',
-      note: `➔ ${piece2Note}`,
-      color
-    });
-  };
-
-  // PASS 1: Strict Progressive Perimeter Flow per roof level ring (P_k.exit -> P_{(k+1)%N}.entry)
-  // Models laying along main/current face into exit hip, then flipping offcuts across the hip into next face's entry side
-  const levelRings = new Map<string, RoofPlane[]>();
-  orderedMain.forEach((p) => {
-    const key = p.levelId || 'level-1';
-    const arr = levelRings.get(key) || [];
-    arr.push(p);
-    levelRings.set(key, arr);
-  });
-
-  levelRings.forEach((ringPlanes) => {
-    const ringLen = ringPlanes.length;
-    if (ringLen < 2) return;
-    for (let k = 0; k < ringLen; k++) {
-      const srcPlane = ringPlanes[k];
-      const tgtPlane = ringPlanes[(k + 1) % ringLen];
-      if (!srcPlane || !tgtPlane || srcPlane.id === tgtPlane.id) continue;
-      if (Math.abs(srcPlane.pitchDeg - tgtPlane.pitchDeg) > 0.5) continue;
-      if (!arePlanesAdjacentAtHip(srcPlane, tgtPlane)) continue;
-
-      const srcExitIndices = allNeededPieces
-        .map((item, idx) => ({ item, idx }))
-        .filter(
-          ({ item, idx }) =>
-            !pairedPieceIndices.has(idx) &&
-            item.planeId === srcPlane.id &&
-            item.isTriangularRake &&
-            item.zoneRole === 'exit'
-        )
-        .sort((a, b) => b.item.cutLength - a.item.cutLength);
-
-      for (const { item: p1, idx: p1Idx } of srcExitIndices) {
-        if (pairedPieceIndices.has(p1Idx)) continue;
-
-        let bestIdx = -1;
-        let bestBlankLen = 0;
-        let bestScore = -Infinity;
-
-        for (let j = 0; j < allNeededPieces.length; j++) {
-          if (pairedPieceIndices.has(j)) continue;
-          const p2 = allNeededPieces[j];
-          if (p2.planeId !== tgtPlane.id || !p2.isTriangularRake || p2.zoneRole !== 'entry') continue;
-
-          const fit = evalDiagonalRepress(p1, p2);
-          if (!fit) continue;
-
-          // Prioritize highest material saved and smallest natural drop
-          const score = fit.savings * 100 - (fit.parentBlankLen - (p1.midLength + p2.midLength)) * 10;
-          if (score > bestScore) {
-            bestScore = score;
-            bestIdx = j;
-            bestBlankLen = fit.parentBlankLen;
-          }
-        }
-
-        if (bestIdx >= 0) {
-          commitRepressPair(p1Idx, bestIdx, bestBlankLen, 'adjacent_hip_run');
-        }
-      }
-    }
-  });
-
-  // PASS 2: Cleanup / Mixed-Pitch & Remaining Unpaired Rakes
-  const remainingRakeIndices = allNeededPieces
-    .map((item, idx) => ({ item, idx }))
-    .filter(({ item, idx }) => item.isTriangularRake && !pairedPieceIndices.has(idx))
-    .sort((a, b) => b.item.cutLength - a.item.cutLength);
-
-  for (const { item: p1, idx: p1Idx } of remainingRakeIndices) {
-    if (pairedPieceIndices.has(p1Idx)) continue;
-
-    let bestIdx = -1;
-    let bestBlankLen = 0;
-    let highestScore = -Infinity;
-    let bestRule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
-
-    for (const { item: p2, idx: p2Idx } of remainingRakeIndices) {
-      if (p2Idx === p1Idx || pairedPieceIndices.has(p2Idx)) continue;
-
-      const fit = evalDiagonalRepress(p1, p2);
-      if (!fit) continue;
-
-      const plane1 = orderedPlanes[p1.seqPos];
-      const plane2 = orderedPlanes[p2.seqPos];
-      const isAdjacentHip = plane1 && plane2 && arePlanesAdjacentAtHip(plane1, plane2);
-      const isEndSlopeMatch = plane1 && plane2 && isMatchingEndSlopeSegment(plane1, plane2);
-      const forwardDiff = (p2.seqPos - p1.seqPos + nPlanes) % nPlanes;
-
-      let tierScore = 0;
-      let rule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
-
-      if (p1.planeId !== p2.planeId && isAdjacentHip) {
-        tierScore = 140000 - (forwardDiff === 1 ? 0 : forwardDiff * 3000);
-        rule = 'adjacent_hip_run';
-      } else if (p1.planeId === p2.planeId && p1.zoneRole !== p2.zoneRole) {
-        tierScore = 110000;
-        rule = 'opposite_hip_same_slope';
-      } else if (p1.planeId !== p2.planeId && isEndSlopeMatch && forwardDiff > 0 && forwardDiff <= 2) {
-        tierScore = 105000 - forwardDiff * 2500;
-        rule = 'matching_end_slope';
-      } else if (p1.planeId !== p2.planeId && forwardDiff > 0) {
-        tierScore = 75000 - forwardDiff * 3500;
-        rule = 'next_sequence_slope';
-      } else {
-        tierScore = 30000;
-        rule = 'geometric_fallback';
-      }
-
-      const score = tierScore + fit.savings * 2000;
-      if (score > highestScore) {
-        highestScore = score;
-        bestIdx = p2Idx;
-        bestBlankLen = fit.parentBlankLen;
-        bestRule = rule;
-      }
-    }
-
-    if (bestIdx >= 0) {
-      commitRepressPair(p1Idx, bestIdx, bestBlankLen, bestRule);
-    }
-  }
-
-  // PASS 2B: Aperture / Short Split Pieces & Dormer/Apron Diagonal Repress
   const derivedOrSplitPlaneIds = new Set(
     orderedPlanes
       .filter((p) => p.isVirtualAssetPlane || p.pitchZoneRole === 'lower_apron' || p.pitchZoneRole === 'upper_main')
@@ -4193,182 +3919,1110 @@ export function generateCuttingLayout(
   const isAssetSplitOrDerived = (item: NeededSheetStrip): boolean =>
     Boolean(item.splitFromAssetId) || derivedOrSplitPlaneIds.has(item.planeId);
 
-  if (hasAssetsOrBreaks) {
-    const shortSplitCandidates = allNeededPieces
+  const levelRings = new Map<string, RoofPlane[]>();
+  orderedMain.forEach((p) => {
+    const key = p.levelId || 'level-1';
+    const arr = levelRings.get(key) || [];
+    arr.push(p);
+    levelRings.set(key, arr);
+  });
+
+  if (sheetOrderMode === 'practical') {
+    /**
+     * PRACTICAL SHEET ORDERING (DEFAULT)
+     * 1. Partition site-measured overrides (`hasOrderedOverride`) into exact-1mm isolated buckets.
+     * 2. For standard (non-override) pieces:
+     *    - Collect each plane's max sheet need quantized UP to 10mm (`ceil10mm`).
+     *    - Merge candidates within `600mm` upward into the longer run so trivial variations don't
+     *      create fragmented bundles.
+     *    - Start with 1 length `[L_max]` and greedily admit up to `MAX_PRACTICAL_LENGTHS = 3`
+     *      shorter shared lengths ONLY when adding a length saves >= 4.0 lm AND >= 4% total steel.
+     * 3. Pack pieces strictly onto the chosen stock lengths (never inventing oddball lengths):
+     *    - Diagonal 180° hip/rake offcut pairs only emit a sheet at a chosen stock length `L`.
+     *    - Linear tails on open sheets accept shorter runs cleanly (cut-down from ordered stock).
+     */
+    const MIN_CLUSTER_SEPARATION_M = 0.6;
+    const MAX_PRACTICAL_LENGTHS = 3;
+    const MIN_SAVINGS_ABS_LM = 4.0;
+    const MIN_SAVINGS_PCT = 0.04;
+
+    const overrideIndices = allNeededPieces
       .map((item, idx) => ({ item, idx }))
-      .filter(
-        ({ item, idx }) =>
-          !pairedPieceIndices.has(idx) &&
-          (isAssetSplitOrDerived(item) || item.cutLength <= maxLen * 0.58)
-      )
+      .filter(({ item }) => Boolean(item.hasOrderedOverride && item.targetOrderedLen));
+    const standardIndices = allNeededPieces
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ item }) => !(item.hasOrderedOverride && item.targetOrderedLen));
+
+    const runPracticalPacking = (
+      stockLengthsDesc: number[],
+      commitOutput: boolean
+    ): { totalOrderedLm: number } => {
+      const stocksAsc = [...stockLengthsDesc].sort((a, b) => a - b);
+      const minStockFor = (neededLen: number): number | null => {
+        for (const s of stocksAsc) {
+          if (s >= neededLen - 0.0005) return s;
+        }
+        return stocksAsc.length > 0 ? stocksAsc[stocksAsc.length - 1] : null;
+      };
+
+      const localPaired = new Set<number>();
+      let localSheetNum = sheetNumberCounter;
+      let totalLmAccum = 0;
+
+      interface LocalParentState {
+        parentIdx: number;
+        sheetNumber: number;
+        length: number;
+        linearRemaining: number;
+        pitchDeg: number;
+        isOverride: boolean;
+        targetOrderedLen?: number;
+        primaryPlaneId: string;
+        primaryPlaneName: string;
+        color: string;
+        midSum: number;
+      }
+      const localParents: LocalParentState[] = [];
+
+      const recordPair = (
+        p1Idx: number,
+        p2Idx: number,
+        stockLen: number,
+        ruleApplied: TransferredPieceInfo['ruleApplied'],
+        isOverridePair: boolean
+      ) => {
+        const p1 = allNeededPieces[p1Idx];
+        const p2 = allNeededPieces[p2Idx];
+        localPaired.add(p1Idx);
+        localPaired.add(p2Idx);
+        totalLmAccum += stockLen;
+
+        const sheetNum = localSheetNum++;
+        const midSum = p1.midLength + p2.midLength;
+        const linearRemaining = +Math.max(0, stockLen - (p1.cutLength + p2.cutLength)).toFixed(3);
+        const color = PARENT_PALETTE[(sheetNum - 1) % PARENT_PALETTE.length];
+
+        localParents.push({
+          parentIdx: commitOutput ? parentSheets.length : localParents.length,
+          sheetNumber: sheetNum,
+          length: stockLen,
+          linearRemaining,
+          pitchDeg: p1.pitchDeg,
+          isOverride: isOverridePair,
+          targetOrderedLen: isOverridePair ? stockLen : undefined,
+          primaryPlaneId: p1.planeId,
+          primaryPlaneName: p1.planeName,
+          color,
+          midSum
+        });
+
+        if (!commitOutput) return;
+
+        pairedPieceIndices.add(p1Idx);
+        pairedPieceIndices.add(p2Idx);
+        sheetNumberCounter = localSheetNum;
+
+        const parentId = `parent-sheet-${sheetNum}`;
+        const stockMm = Math.round(stockLen * 1000);
+        const cutNote1 =
+          Math.round(p1.cutLength * 1000) < stockMm - 2
+            ? `Cut ${Math.round(p1.cutLength * 1000)}mm from ${stockMm}mm (${p1.planeName})`
+            : `Ordered run on ${p1.planeName} – diagonal offcut repressed into ${p2.planeName}`;
+        const cutNote2 =
+          p1.planeId !== p2.planeId
+            ? `Repressed 180° offcut (${Math.round(p2.cutLength * 1000)}mm) from ${p1.planeName} (${stockMm}mm)`
+            : `Opposite hip 180° offcut (${Math.round(p2.cutLength * 1000)}mm) from ${p1.planeName}`;
+
+        const piece1: CutPiece = {
+          id: `piece-${p1.planeId}-${p1.colIndex}-${p1.segIndex}`,
+          parentSheetId: parentId,
+          length: p1.cutLength,
+          width: p1.colWidth,
+          cutFrom: 0,
+          orientation: 'normal',
+          targetPlaneId: p1.planeId,
+          placement: { origin: { x: p1.uCenter, y: p1.minV }, rotation: 0, flipped: false },
+          underlapSide: p1.underlapSide,
+          facetName: p1.planeName,
+          colIndex: p1.colIndex,
+          minV: p1.minV,
+          maxV: p1.maxV,
+          splitFromAssetId: p1.splitFromAssetId,
+          note: cutNote1
+        };
+
+        const piece2: CutPiece = {
+          id: `piece-${p2.planeId}-${p2.colIndex}-${p2.segIndex}`,
+          parentSheetId: parentId,
+          length: p2.cutLength,
+          width: p2.colWidth,
+          cutFrom: quantizeMm(Math.max(0, stockLen - p2.cutLength)),
+          orientation: 'flipped180',
+          targetPlaneId: p2.planeId,
+          placement: { origin: { x: p2.uCenter, y: p2.minV }, rotation: 180, flipped: true },
+          underlapSide: p2.underlapSide,
+          facetName: p2.planeName,
+          colIndex: p2.colIndex,
+          minV: p2.minV,
+          maxV: p2.maxV,
+          splitFromAssetId: p2.splitFromAssetId,
+          note: cutNote2
+        };
+
+        if (p1.planeId !== p2.planeId) {
+          transferMatrix[p1.planeId][p2.planeId] = (transferMatrix[p1.planeId][p2.planeId] || 0) + 1;
+          offcutTransfers.push({
+            sourcePlaneId: p1.planeId,
+            targetPlaneId: p2.planeId,
+            sourcePlanCenter: p1.planCenter,
+            targetPlanCenter: p2.planCenter,
+            piece: piece2,
+            uCenter: p2.uCenter,
+            width: p2.colWidth,
+            cutLength: p2.cutLength,
+            ruleApplied
+          });
+        }
+
+        const parentSheet: ParentSheet = {
+          id: parentId,
+          sheetNumber: sheetNum,
+          length: stockLen,
+          color,
+          pieces: [piece1, piece2],
+          remaining: +Math.max(0, stockLen - midSum).toFixed(3),
+          utilization: +Math.min(100, (midSum / stockLen) * 100).toFixed(1)
+        };
+
+        parentSheets.push(parentSheet);
+        parentMetaByIndex.push({
+          linearRemaining,
+          hasOrderedOverride: isOverridePair,
+          targetOrderedLen: isOverridePair ? stockLen : undefined,
+          pitchDeg: p1.pitchDeg,
+          underlapSide: p1.underlapSide,
+          midSum
+        });
+        placedPieces.push(piece1, piece2);
+
+        addToPlacementMap(placementMap, p1.planeId, {
+          pieceId: piece1.id,
+          parentId,
+          parentSheetNumber: sheetNum,
+          length: piece1.length,
+          isOffcut: false,
+          orientation: 'normal',
+          note: cutNote1,
+          color
+        });
+
+        addToPlacementMap(placementMap, p2.planeId, {
+          pieceId: piece2.id,
+          parentId,
+          parentSheetNumber: sheetNum,
+          length: piece2.length,
+          isOffcut: true,
+          orientation: 'flipped180',
+          note: `➔ ${cutNote2}`,
+          color
+        });
+      };
+
+      const recordSingleOrLinear = (itemIdx: number, fixedStockLen: number, isOverrideItem: boolean) => {
+        const item = allNeededPieces[itemIdx];
+        localPaired.add(itemIdx);
+
+        // Try packing linearly into an already-allocated sheet tail within same override/pitch bucket
+        let donorStateIdx = -1;
+        let bestWasteLeft = Infinity;
+        for (let si = 0; si < localParents.length; si++) {
+          const st = localParents[si];
+          if (st.isOverride !== isOverrideItem) continue;
+          if (isOverrideItem && Math.abs((st.targetOrderedLen || st.length) - fixedStockLen) > 0.001) continue;
+          if (st.linearRemaining < item.cutLength + KERF_LIN) continue;
+          if (Math.abs(st.pitchDeg - item.pitchDeg) > 0.5) continue;
+          const wasteLeft = st.linearRemaining - (item.cutLength + KERF_LIN);
+          if (wasteLeft < bestWasteLeft) {
+            bestWasteLeft = wasteLeft;
+            donorStateIdx = si;
+          }
+        }
+
+        if (donorStateIdx >= 0) {
+          const st = localParents[donorStateIdx];
+          const cutFrom = quantizeMm(st.length - st.linearRemaining);
+          st.linearRemaining = +Math.max(0, st.linearRemaining - item.cutLength - KERF_LIN).toFixed(3);
+          st.midSum += item.midLength;
+
+          if (!commitOutput) return;
+          pairedPieceIndices.add(itemIdx);
+          const donorParent = parentSheets[st.parentIdx];
+          const donorMeta = parentMetaByIndex[st.parentIdx];
+          const stockMm = Math.round(donorParent.length * 1000);
+          const cutMm = Math.round(item.cutLength * 1000);
+
+          const repressedPiece: CutPiece = {
+            id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
+            parentSheetId: donorParent.id,
+            length: item.cutLength,
+            width: item.colWidth,
+            cutFrom,
+            orientation: 'flipped180',
+            targetPlaneId: item.planeId,
+            placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 180, flipped: true },
+            underlapSide: item.underlapSide,
+            facetName: item.planeName,
+            colIndex: item.colIndex,
+            minV: item.minV,
+            maxV: item.maxV,
+            splitFromAssetId: item.splitFromAssetId,
+            note: `Cut ${cutMm}mm from tail of Stock #${donorParent.sheetNumber} (${stockMm}mm)`
+          };
+
+          donorParent.pieces.push(repressedPiece);
+          donorMeta.linearRemaining = st.linearRemaining;
+          donorMeta.midSum = st.midSum;
+          donorParent.remaining = +Math.max(0, donorParent.length - st.midSum).toFixed(3);
+          donorParent.utilization = +Math.min(100, (st.midSum / donorParent.length) * 100).toFixed(1);
+          placedPieces.push(repressedPiece);
+
+          addToPlacementMap(placementMap, item.planeId, {
+            pieceId: repressedPiece.id,
+            parentId: donorParent.id,
+            parentSheetNumber: donorParent.sheetNumber,
+            length: repressedPiece.length,
+            isOffcut: true,
+            orientation: 'flipped180',
+            note: `➔ ${repressedPiece.note}`,
+            color: donorParent.color || '#3b82f6'
+          });
+
+          if (st.primaryPlaneId !== item.planeId) {
+            transferMatrix[st.primaryPlaneId][item.planeId] =
+              (transferMatrix[st.primaryPlaneId][item.planeId] || 0) + 1;
+            const srcPlane = orderedPlanes.find((p) => p.id === st.primaryPlaneId);
+            offcutTransfers.push({
+              sourcePlaneId: st.primaryPlaneId,
+              targetPlaneId: item.planeId,
+              sourcePlanCenter: srcPlane ? polygonCentroid(srcPlane.planPolygon) : item.planCenter,
+              targetPlanCenter: item.planCenter,
+              piece: repressedPiece,
+              uCenter: item.uCenter,
+              width: item.colWidth,
+              cutLength: item.cutLength,
+              ruleApplied: 'geometric_fallback'
+            });
+          }
+          return;
+        }
+
+        // Open a new sheet strictly at fixedStockLen
+        const sheetNum = localSheetNum++;
+        totalLmAccum += fixedStockLen;
+        const linearRemaining = +Math.max(0, fixedStockLen - item.cutLength).toFixed(3);
+        const color = PARENT_PALETTE[(sheetNum - 1) % PARENT_PALETTE.length];
+
+        localParents.push({
+          parentIdx: commitOutput ? parentSheets.length : localParents.length,
+          sheetNumber: sheetNum,
+          length: fixedStockLen,
+          linearRemaining,
+          pitchDeg: item.pitchDeg,
+          isOverride: isOverrideItem,
+          targetOrderedLen: isOverrideItem ? fixedStockLen : undefined,
+          primaryPlaneId: item.planeId,
+          primaryPlaneName: item.planeName,
+          color,
+          midSum: item.midLength
+        });
+
+        if (!commitOutput) return;
+        pairedPieceIndices.add(itemIdx);
+        sheetNumberCounter = localSheetNum;
+
+        const parentId = `parent-sheet-${sheetNum}`;
+        const stockMm = Math.round(fixedStockLen * 1000);
+        const cutMm = Math.round(item.cutLength * 1000);
+        const pieceNote =
+          cutMm < stockMm - 2
+            ? `Cut ${cutMm}mm from ${stockMm}mm stock (#${sheetNum})`
+            : item.splitFromAssetId
+            ? `Cut around opening (#${sheetNum})`
+            : `Direct run sheet #${sheetNum}`;
+
+        const piece: CutPiece = {
+          id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
+          parentSheetId: parentId,
+          length: item.cutLength,
+          width: item.colWidth,
+          cutFrom: 0,
+          orientation: 'normal',
+          targetPlaneId: item.planeId,
+          placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 0, flipped: false },
+          underlapSide: item.underlapSide,
+          facetName: item.planeName,
+          colIndex: item.colIndex,
+          minV: item.minV,
+          maxV: item.maxV,
+          splitFromAssetId: item.splitFromAssetId,
+          note: pieceNote
+        };
+
+        const parentSheet: ParentSheet = {
+          id: parentId,
+          sheetNumber: sheetNum,
+          length: fixedStockLen,
+          color,
+          pieces: [piece],
+          remaining: +Math.max(0, fixedStockLen - item.midLength).toFixed(3),
+          utilization: +Math.min(100, (item.midLength / fixedStockLen) * 100).toFixed(1)
+        };
+
+        parentSheets.push(parentSheet);
+        parentMetaByIndex.push({
+          linearRemaining,
+          hasOrderedOverride: isOverrideItem,
+          targetOrderedLen: isOverrideItem ? fixedStockLen : undefined,
+          pitchDeg: item.pitchDeg,
+          underlapSide: item.underlapSide,
+          midSum: item.midLength
+        });
+        placedPieces.push(piece);
+
+        addToPlacementMap(placementMap, item.planeId, {
+          pieceId: piece.id,
+          parentId,
+          parentSheetNumber: sheetNum,
+          length: piece.length,
+          isOffcut: false,
+          orientation: 'normal',
+          note: pieceNote,
+          color
+        });
+      };
+
+      // A. Handle override pieces first (exact 1mm site-measured lengths never clustered)
+      if (commitOutput && overrideIndices.length > 0) {
+        const overrideRakes = overrideIndices
+          .filter(({ item }) => item.isTriangularRake)
+          .sort((a, b) => b.item.cutLength - a.item.cutLength);
+        for (const { item: p1, idx: p1Idx } of overrideRakes) {
+          if (localPaired.has(p1Idx)) continue;
+          const fixedLen = quantizeMm(p1.targetOrderedLen!);
+          let bestIdx = -1;
+          let bestSavings = 0;
+          for (const { item: p2, idx: p2Idx } of overrideRakes) {
+            if (p2Idx === p1Idx || localPaired.has(p2Idx)) continue;
+            if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) continue;
+            if (Math.abs((p2.targetOrderedLen || 0) - fixedLen) > 0.001) continue;
+            if (!(p1.underlapSide !== p2.underlapSide || p1.planeId !== p2.planeId)) continue;
+            const diagKerf = p1.shortLength > 0.25 && p2.shortLength > 0.25 ? 0.015 : 0;
+            const nestedRaw = Math.max(p1.cutLength + p2.shortLength, p1.shortLength + p2.cutLength + diagKerf);
+            if (nestedRaw > fixedLen + 0.001) continue;
+            if (fixedLen >= 0.12 && fixedLen > bestSavings) {
+              bestSavings = fixedLen;
+              bestIdx = p2Idx;
+            }
+          }
+          if (bestIdx >= 0) {
+            recordPair(p1Idx, bestIdx, fixedLen, 'opposite_hip_same_slope', true);
+          }
+        }
+
+        const remainingOverrides = overrideIndices
+          .filter(({ idx }) => !localPaired.has(idx))
+          .sort((a, b) => b.item.cutLength - a.item.cutLength);
+        for (const { item, idx } of remainingOverrides) {
+          if (localPaired.has(idx)) continue;
+          recordSingleOrLinear(idx, quantizeMm(item.targetOrderedLen!), true);
+        }
+      }
+
+      // B. Standard (non-override) Practical fixed-stock packing across stockLengthsDesc
+      if (standardIndices.length > 0 && stocksAsc.length > 0) {
+        const stdIndexSet = new Set(standardIndices.map((x) => x.idx));
+
+        const evalPracticalDiagonal = (
+          p1: NeededSheetStrip,
+          p2: NeededSheetStrip
+        ): { stockLen: number; savings: number } | null => {
+          if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) return null;
+          const canFlip180 = p1.underlapSide !== p2.underlapSide || p1.planeId !== p2.planeId;
+          if (!canFlip180) return null;
+
+          const p1Taper = p1.cutLength - p1.shortLength;
+          const p2Taper = p2.cutLength - p2.shortLength;
+          if (p1Taper < 0.08 && p2Taper < 0.08) return null;
+
+          const diagKerf = p1.shortLength > 0.25 && p2.shortLength > 0.25 ? 0.015 : 0;
+          const nestedRaw = Math.max(
+            p1.cutLength + p2.shortLength,
+            p1.shortLength + p2.cutLength + diagKerf
+          );
+          const reqLen = Math.max(p1.cutLength, p2.cutLength, nestedRaw);
+          const stockLen = minStockFor(reqLen);
+          if (!stockLen || stockLen < reqLen - 0.0005) return null;
+
+          const s1 = minStockFor(p1.cutLength) ?? stockLen;
+          const s2 = minStockFor(p2.cutLength) ?? stockLen;
+          const savings = +(s1 + s2 - stockLen).toFixed(3);
+          if (savings < 0.12) return null;
+
+          return { stockLen, savings };
+        };
+
+        // Pass 1: Adjacent Hip Exit -> Entry across level rings
+        levelRings.forEach((ringPlanes) => {
+          const ringLen = ringPlanes.length;
+          if (ringLen < 2) return;
+          for (let k = 0; k < ringLen; k++) {
+            const srcPlane = ringPlanes[k];
+            const tgtPlane = ringPlanes[(k + 1) % ringLen];
+            if (!srcPlane || !tgtPlane || srcPlane.id === tgtPlane.id) continue;
+            if (Math.abs(srcPlane.pitchDeg - tgtPlane.pitchDeg) > 0.5) continue;
+            if (!arePlanesAdjacentAtHip(srcPlane, tgtPlane)) continue;
+
+            const srcExit = standardIndices
+              .filter(
+                ({ item, idx }) =>
+                  !localPaired.has(idx) &&
+                  item.planeId === srcPlane.id &&
+                  item.isTriangularRake &&
+                  item.zoneRole === 'exit'
+              )
+              .sort((a, b) => b.item.cutLength - a.item.cutLength);
+
+            for (const { item: p1, idx: p1Idx } of srcExit) {
+              if (localPaired.has(p1Idx)) continue;
+              let bestIdx = -1;
+              let bestStockLen = 0;
+              let bestScore = -Infinity;
+
+              for (const { item: p2, idx: p2Idx } of standardIndices) {
+                if (localPaired.has(p2Idx)) continue;
+                if (p2.planeId !== tgtPlane.id || !p2.isTriangularRake || p2.zoneRole !== 'entry') continue;
+                const fit = evalPracticalDiagonal(p1, p2);
+                if (!fit) continue;
+                const score = fit.savings * 100 - (fit.stockLen - (p1.midLength + p2.midLength)) * 10;
+                if (score > bestScore) {
+                  bestScore = score;
+                  bestIdx = p2Idx;
+                  bestStockLen = fit.stockLen;
+                }
+              }
+
+              if (bestIdx >= 0) {
+                recordPair(p1Idx, bestIdx, bestStockLen, 'adjacent_hip_run', false);
+              }
+            }
+          }
+        });
+
+        // Pass 2: Remaining unpaired standard rakes
+        const remainingRakes = standardIndices
+          .filter(({ item, idx }) => item.isTriangularRake && !localPaired.has(idx))
+          .sort((a, b) => b.item.cutLength - a.item.cutLength);
+
+        for (const { item: p1, idx: p1Idx } of remainingRakes) {
+          if (localPaired.has(p1Idx)) continue;
+          let bestIdx = -1;
+          let bestStockLen = 0;
+          let highestScore = -Infinity;
+          let bestRule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
+
+          for (const { item: p2, idx: p2Idx } of remainingRakes) {
+            if (p2Idx === p1Idx || localPaired.has(p2Idx)) continue;
+            const fit = evalPracticalDiagonal(p1, p2);
+            if (!fit) continue;
+
+            const plane1 = orderedPlanes[p1.seqPos];
+            const plane2 = orderedPlanes[p2.seqPos];
+            const isAdjacentHip = plane1 && plane2 && arePlanesAdjacentAtHip(plane1, plane2);
+            const isEndSlopeMatch = plane1 && plane2 && isMatchingEndSlopeSegment(plane1, plane2);
+            const forwardDiff = (p2.seqPos - p1.seqPos + nPlanes) % nPlanes;
+
+            let tierScore = 30000;
+            let rule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
+            if (p1.planeId !== p2.planeId && isAdjacentHip) {
+              tierScore = 140000 - (forwardDiff === 1 ? 0 : forwardDiff * 3000);
+              rule = 'adjacent_hip_run';
+            } else if (p1.planeId === p2.planeId && p1.zoneRole !== p2.zoneRole) {
+              tierScore = 110000;
+              rule = 'opposite_hip_same_slope';
+            } else if (p1.planeId !== p2.planeId && isEndSlopeMatch && forwardDiff > 0 && forwardDiff <= 2) {
+              tierScore = 105000 - forwardDiff * 2500;
+              rule = 'matching_end_slope';
+            } else if (p1.planeId !== p2.planeId && forwardDiff > 0) {
+              tierScore = 75000 - forwardDiff * 3500;
+              rule = 'next_sequence_slope';
+            }
+
+            const score = tierScore + fit.savings * 2000;
+            if (score > highestScore) {
+              highestScore = score;
+              bestIdx = p2Idx;
+              bestStockLen = fit.stockLen;
+              bestRule = rule;
+            }
+          }
+
+          if (bestIdx >= 0) {
+            recordPair(p1Idx, bestIdx, bestStockLen, bestRule, false);
+          }
+        }
+
+        // Pass 2B: Asset splits & dormer/apron short diagonal pairs inside chosen stocks
+        if (hasAssetsOrBreaks) {
+          const splitCandidates = standardIndices
+            .filter(
+              ({ item, idx }) =>
+                stdIndexSet.has(idx) &&
+                !localPaired.has(idx) &&
+                (isAssetSplitOrDerived(item) || item.cutLength <= maxLen * 0.58)
+            )
+            .sort((a, b) => b.item.cutLength - a.item.cutLength);
+
+          for (const { item: p1, idx: p1Idx } of splitCandidates) {
+            if (localPaired.has(p1Idx)) continue;
+            let bestIdx = -1;
+            let bestStockLen = 0;
+            let bestSavings = 0;
+            for (const { item: p2, idx: p2Idx } of splitCandidates) {
+              if (p2Idx === p1Idx || localPaired.has(p2Idx)) continue;
+              if (!isAssetSplitOrDerived(p1) && !isAssetSplitOrDerived(p2)) continue;
+              const fit = evalPracticalDiagonal(p1, p2);
+              if (fit && fit.savings > bestSavings) {
+                bestSavings = fit.savings;
+                bestStockLen = fit.stockLen;
+                bestIdx = p2Idx;
+              }
+            }
+            if (bestIdx >= 0) {
+              recordPair(p1Idx, bestIdx, bestStockLen, 'geometric_fallback', false);
+            }
+          }
+        }
+
+        // Pass 3: Remaining unpaired standard pieces pack into open tails or open tightest chosen stock
+        const remainingStd = standardIndices
+          .filter(({ idx }) => !localPaired.has(idx))
+          .sort((a, b) => b.item.cutLength - a.item.cutLength);
+        for (const { item, idx } of remainingStd) {
+          if (localPaired.has(idx)) continue;
+          const chosenLen = minStockFor(item.cutLength)!;
+          recordSingleOrLinear(idx, chosenLen, false);
+        }
+      }
+
+      return { totalOrderedLm: +totalLmAccum.toFixed(3) };
+    };
+
+    // Build merged candidate stock lengths from non-override per-plane maxima (quantized UP to 10mm)
+    let chosenStocks: number[] = [];
+    if (standardIndices.length > 0) {
+      const planeMaxMap = new Map<string, number>();
+      standardIndices.forEach(({ item }) => {
+        const q = ceil10mm(item.cutLength);
+        const prev = planeMaxMap.get(item.planeId) || 0;
+        if (q > prev) planeMaxMap.set(item.planeId, q);
+      });
+
+      const uniqueMaxDesc = Array.from(new Set(planeMaxMap.values())).sort((a, b) => b - a);
+      const mergedCandidates: number[] = [];
+      for (const len of uniqueMaxDesc) {
+        if (mergedCandidates.length === 0) {
+          mergedCandidates.push(len);
+        } else {
+          const nearestLonger = mergedCandidates[mergedCandidates.length - 1];
+          if (nearestLonger - len >= MIN_CLUSTER_SEPARATION_M) {
+            mergedCandidates.push(len);
+          }
+        }
+      }
+
+      chosenStocks = [mergedCandidates[0]];
+      let bestSim = runPracticalPacking(chosenStocks, false);
+      const remainingPool = mergedCandidates.slice(1);
+
+      while (chosenStocks.length < MAX_PRACTICAL_LENGTHS && remainingPool.length > 0) {
+        let bestAddIdx = -1;
+        let bestAddLm = bestSim.totalOrderedLm;
+        for (let ci = 0; ci < remainingPool.length; ci++) {
+          const trialStocks = [...chosenStocks, remainingPool[ci]].sort((a, b) => b - a);
+          const sim = runPracticalPacking(trialStocks, false);
+          if (sim.totalOrderedLm < bestAddLm) {
+            bestAddLm = sim.totalOrderedLm;
+            bestAddIdx = ci;
+          }
+        }
+        const savedLm = +(bestSim.totalOrderedLm - bestAddLm).toFixed(3);
+        const minRequiredSavings = Math.max(
+          MIN_SAVINGS_ABS_LM,
+          bestSim.totalOrderedLm * MIN_SAVINGS_PCT
+        );
+        if (bestAddIdx >= 0 && savedLm >= minRequiredSavings) {
+          const picked = remainingPool.splice(bestAddIdx, 1)[0];
+          chosenStocks = [...chosenStocks, picked].sort((a, b) => b - a);
+          bestSim = { totalOrderedLm: bestAddLm };
+        } else {
+          break;
+        }
+      }
+    }
+
+    // Commit final Practical sheet layout using chosenStocks + exact 1mm override buckets
+    runPracticalPacking(chosenStocks, true);
+  } else {
+    // OPTIMIZED MODE (existing tight multi-length diagonal/linear repress nesting)
+    const evalDiagonalRepress = (
+      p1: NeededSheetStrip,
+      p2: NeededSheetStrip
+    ): { parentBlankLen: number; savings: number } | null => {
+      if (Math.abs(p1.pitchDeg - p2.pitchDeg) > 0.5) return null;
+      const canFlip180 = p1.underlapSide !== p2.underlapSide || p1.planeId !== p2.planeId;
+      if (!canFlip180) return null;
+
+      // Protect site-measured full body runs from being altered or swallowed
+      if (p2.hasOrderedOverride && !p2.isTriangularRake) return null;
+
+      const p1Taper = p1.cutLength - p1.shortLength;
+      const p2Taper = p2.cutLength - p2.shortLength;
+      if (p1Taper < 0.08 && p2Taper < 0.08) return null;
+
+      const diagKerf = p1.shortLength > 0.25 && p2.shortLength > 0.25 ? 0.015 : 0;
+      const nestedRaw = Math.max(
+        p1.cutLength + p2.shortLength,
+        p1.shortLength + p2.cutLength + diagKerf
+      );
+      const parentBlankLen = quantizeMm(Math.max(p1.cutLength, nestedRaw));
+
+      if (parentBlankLen > maxLen + 0.001) return null;
+      if (p1.hasOrderedOverride && p1.targetOrderedLen && parentBlankLen > p1.targetOrderedLen + 0.001) {
+        return null;
+      }
+
+      const practicalCap = Math.min(
+        maxLen,
+        Math.max(p1.planeMaxCutLen, p2.planeMaxCutLen, p1.cutLength, p2.cutLength) + 0.05
+      );
+      if (parentBlankLen > practicalCap + 0.001) return null;
+
+      const standalonePairLen = p1.cutLength + p2.cutLength;
+      const savings = +(standalonePairLen - parentBlankLen).toFixed(3);
+      if (savings < 0.12) return null;
+
+      return { parentBlankLen, savings };
+    };
+
+    const commitRepressPair = (
+      p1Idx: number,
+      p2Idx: number,
+      parentBlankLen: number,
+      ruleApplied: TransferredPieceInfo['ruleApplied']
+    ) => {
+      const p1 = allNeededPieces[p1Idx];
+      const p2 = allNeededPieces[p2Idx];
+      pairedPieceIndices.add(p1Idx);
+      pairedPieceIndices.add(p2Idx);
+
+      const parentId = `parent-sheet-${sheetNumberCounter}`;
+      const color = PARENT_PALETTE[(sheetNumberCounter - 1) % PARENT_PALETTE.length];
+
+      const piece1Note =
+        ruleApplied === 'adjacent_hip_run' || ruleApplied === 'next_sequence_slope'
+          ? `Ordered run on ${p1.planeName} – diagonal offcut repressed into ${p2.planeName}`
+          : `Ordered sheet #${sheetNumberCounter} (offcut reused)`;
+
+      const piece2Note =
+        p1.planeId !== p2.planeId
+          ? `Repressed 180° offcut from ${p1.planeName}`
+          : `Opposite hip 180° offcut from ${p1.planeName}`;
+
+      const piece1: CutPiece = {
+        id: `piece-${p1.planeId}-${p1.colIndex}-${p1.segIndex}`,
+        parentSheetId: parentId,
+        length: p1.cutLength,
+        width: p1.colWidth,
+        cutFrom: 0,
+        orientation: 'normal',
+        targetPlaneId: p1.planeId,
+        placement: { origin: { x: p1.uCenter, y: p1.minV }, rotation: 0, flipped: false },
+        underlapSide: p1.underlapSide,
+        facetName: p1.planeName,
+        colIndex: p1.colIndex,
+        minV: p1.minV,
+        maxV: p1.maxV,
+        splitFromAssetId: p1.splitFromAssetId,
+        note: piece1Note
+      };
+
+      const piece2: CutPiece = {
+        id: `piece-${p2.planeId}-${p2.colIndex}-${p2.segIndex}`,
+        parentSheetId: parentId,
+        length: p2.cutLength,
+        width: p2.colWidth,
+        cutFrom: quantizeMm(Math.max(0, parentBlankLen - p2.cutLength)),
+        orientation: 'flipped180',
+        targetPlaneId: p2.planeId,
+        placement: { origin: { x: p2.uCenter, y: p2.minV }, rotation: 180, flipped: true },
+        underlapSide: p2.underlapSide,
+        facetName: p2.planeName,
+        colIndex: p2.colIndex,
+        minV: p2.minV,
+        maxV: p2.maxV,
+        splitFromAssetId: p2.splitFromAssetId,
+        note: piece2Note
+      };
+
+      if (p1.planeId !== p2.planeId) {
+        transferMatrix[p1.planeId][p2.planeId] = (transferMatrix[p1.planeId][p2.planeId] || 0) + 1;
+        offcutTransfers.push({
+          sourcePlaneId: p1.planeId,
+          targetPlaneId: p2.planeId,
+          sourcePlanCenter: p1.planCenter,
+          targetPlanCenter: p2.planCenter,
+          piece: piece2,
+          uCenter: p2.uCenter,
+          width: p2.colWidth,
+          cutLength: p2.cutLength,
+          ruleApplied
+        });
+      }
+
+      const midSum = p1.midLength + p2.midLength;
+      const naturalDrop = +Math.max(0, parentBlankLen - midSum).toFixed(3);
+      const parentSheet: ParentSheet = {
+        id: parentId,
+        sheetNumber: sheetNumberCounter++,
+        length: parentBlankLen,
+        color,
+        pieces: [piece1, piece2],
+        remaining: naturalDrop,
+        utilization: +Math.min(100, (midSum / parentBlankLen) * 100).toFixed(1)
+      };
+
+      parentSheets.push(parentSheet);
+      parentMetaByIndex.push({
+        linearRemaining: +Math.max(0, parentBlankLen - (p1.cutLength + p2.cutLength)).toFixed(3),
+        hasOrderedOverride: p1.hasOrderedOverride,
+        targetOrderedLen: p1.targetOrderedLen,
+        pitchDeg: p1.pitchDeg,
+        underlapSide: p1.underlapSide,
+        midSum
+      });
+      placedPieces.push(piece1, piece2);
+
+      addToPlacementMap(placementMap, p1.planeId, {
+        pieceId: piece1.id,
+        parentId,
+        parentSheetNumber: parentSheet.sheetNumber,
+        length: piece1.length,
+        isOffcut: false,
+        orientation: 'normal',
+        note: piece1Note,
+        color
+      });
+
+      addToPlacementMap(placementMap, p2.planeId, {
+        pieceId: piece2.id,
+        parentId,
+        parentSheetNumber: parentSheet.sheetNumber,
+        length: piece2.length,
+        isOffcut: true,
+        orientation: 'flipped180',
+        note: `➔ ${piece2Note}`,
+        color
+      });
+    };
+
+    // PASS 1: Strict Progressive Perimeter Flow per roof level ring (P_k.exit -> P_{(k+1)%N}.entry)
+    levelRings.forEach((ringPlanes) => {
+      const ringLen = ringPlanes.length;
+      if (ringLen < 2) return;
+      for (let k = 0; k < ringLen; k++) {
+        const srcPlane = ringPlanes[k];
+        const tgtPlane = ringPlanes[(k + 1) % ringLen];
+        if (!srcPlane || !tgtPlane || srcPlane.id === tgtPlane.id) continue;
+        if (Math.abs(srcPlane.pitchDeg - tgtPlane.pitchDeg) > 0.5) continue;
+        if (!arePlanesAdjacentAtHip(srcPlane, tgtPlane)) continue;
+
+        const srcExitIndices = allNeededPieces
+          .map((item, idx) => ({ item, idx }))
+          .filter(
+            ({ item, idx }) =>
+              !pairedPieceIndices.has(idx) &&
+              item.planeId === srcPlane.id &&
+              item.isTriangularRake &&
+              item.zoneRole === 'exit'
+          )
+          .sort((a, b) => b.item.cutLength - a.item.cutLength);
+
+        for (const { item: p1, idx: p1Idx } of srcExitIndices) {
+          if (pairedPieceIndices.has(p1Idx)) continue;
+
+          let bestIdx = -1;
+          let bestBlankLen = 0;
+          let bestScore = -Infinity;
+
+          for (let j = 0; j < allNeededPieces.length; j++) {
+            if (pairedPieceIndices.has(j)) continue;
+            const p2 = allNeededPieces[j];
+            if (p2.planeId !== tgtPlane.id || !p2.isTriangularRake || p2.zoneRole !== 'entry') continue;
+
+            const fit = evalDiagonalRepress(p1, p2);
+            if (!fit) continue;
+
+            const score = fit.savings * 100 - (fit.parentBlankLen - (p1.midLength + p2.midLength)) * 10;
+            if (score > bestScore) {
+              bestScore = score;
+              bestIdx = j;
+              bestBlankLen = fit.parentBlankLen;
+            }
+          }
+
+          if (bestIdx >= 0) {
+            commitRepressPair(p1Idx, bestIdx, bestBlankLen, 'adjacent_hip_run');
+          }
+        }
+      }
+    });
+
+    // PASS 2: Cleanup / Mixed-Pitch & Remaining Unpaired Rakes
+    const remainingRakeIndices = allNeededPieces
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ item, idx }) => item.isTriangularRake && !pairedPieceIndices.has(idx))
       .sort((a, b) => b.item.cutLength - a.item.cutLength);
 
-    for (const { item: p1, idx: p1Idx } of shortSplitCandidates) {
+    for (const { item: p1, idx: p1Idx } of remainingRakeIndices) {
       if (pairedPieceIndices.has(p1Idx)) continue;
+
       let bestIdx = -1;
       let bestBlankLen = 0;
-      let bestSavings = 0;
+      let highestScore = -Infinity;
+      let bestRule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
 
-      for (const { item: p2, idx: p2Idx } of shortSplitCandidates) {
+      for (const { item: p2, idx: p2Idx } of remainingRakeIndices) {
         if (p2Idx === p1Idx || pairedPieceIndices.has(p2Idx)) continue;
-        if (!isAssetSplitOrDerived(p1) && !isAssetSplitOrDerived(p2)) continue;
+
         const fit = evalDiagonalRepress(p1, p2);
-        if (fit && fit.savings > bestSavings) {
-          bestSavings = fit.savings;
-          bestBlankLen = fit.parentBlankLen;
+        if (!fit) continue;
+
+        const plane1 = orderedPlanes[p1.seqPos];
+        const plane2 = orderedPlanes[p2.seqPos];
+        const isAdjacentHip = plane1 && plane2 && arePlanesAdjacentAtHip(plane1, plane2);
+        const isEndSlopeMatch = plane1 && plane2 && isMatchingEndSlopeSegment(plane1, plane2);
+        const forwardDiff = (p2.seqPos - p1.seqPos + nPlanes) % nPlanes;
+
+        let tierScore = 0;
+        let rule: TransferredPieceInfo['ruleApplied'] = 'geometric_fallback';
+
+        if (p1.planeId !== p2.planeId && isAdjacentHip) {
+          tierScore = 140000 - (forwardDiff === 1 ? 0 : forwardDiff * 3000);
+          rule = 'adjacent_hip_run';
+        } else if (p1.planeId === p2.planeId && p1.zoneRole !== p2.zoneRole) {
+          tierScore = 110000;
+          rule = 'opposite_hip_same_slope';
+        } else if (p1.planeId !== p2.planeId && isEndSlopeMatch && forwardDiff > 0 && forwardDiff <= 2) {
+          tierScore = 105000 - forwardDiff * 2500;
+          rule = 'matching_end_slope';
+        } else if (p1.planeId !== p2.planeId && forwardDiff > 0) {
+          tierScore = 75000 - forwardDiff * 3500;
+          rule = 'next_sequence_slope';
+        } else {
+          tierScore = 30000;
+          rule = 'geometric_fallback';
+        }
+
+        const score = tierScore + fit.savings * 2000;
+        if (score > highestScore) {
+          highestScore = score;
           bestIdx = p2Idx;
+          bestBlankLen = fit.parentBlankLen;
+          bestRule = rule;
         }
       }
 
       if (bestIdx >= 0) {
-        commitRepressPair(p1Idx, bestIdx, bestBlankLen, 'geometric_fallback');
-      }
-    }
-  }
-
-  // Step 3: Allocate Standalone Ordered Parents for Remaining Pieces + Linear Leftover Tail Repress
-  const remainingIndices = allNeededPieces
-    .map((item, idx) => ({ item, idx }))
-    .filter(({ idx }) => !pairedPieceIndices.has(idx))
-    .sort((a, b) => b.item.cutLength - a.item.cutLength);
-
-  for (const { item, idx: itemIdx } of remainingIndices) {
-    if (pairedPieceIndices.has(itemIdx)) continue;
-
-    // First try straight linear leftover tail repress into an already ordered ParentSheet (without lengthening it)
-    let linearDonorIdx = -1;
-    let bestWasteLeft = Infinity;
-    for (let pi = 0; pi < parentSheets.length; pi++) {
-      const meta = parentMetaByIndex[pi];
-      if (!meta || meta.linearRemaining < item.cutLength + KERF_LIN) continue;
-      if (Math.abs(meta.pitchDeg - item.pitchDeg) > 0.5) continue;
-      const wasteLeft = meta.linearRemaining - (item.cutLength + KERF_LIN);
-      if (wasteLeft < bestWasteLeft) {
-        bestWasteLeft = wasteLeft;
-        linearDonorIdx = pi;
+        commitRepressPair(p1Idx, bestIdx, bestBlankLen, bestRule);
       }
     }
 
-    if (linearDonorIdx >= 0) {
-      const donorParent = parentSheets[linearDonorIdx];
-      const donorMeta = parentMetaByIndex[linearDonorIdx];
-      const primary = donorParent.pieces[0];
-      const cutFrom = quantizeMm(donorParent.length - donorMeta.linearRemaining);
+    // PASS 2B: Aperture / Short Split Pieces & Dormer/Apron Diagonal Repress
+    if (hasAssetsOrBreaks) {
+      const shortSplitCandidates = allNeededPieces
+        .map((item, idx) => ({ item, idx }))
+        .filter(
+          ({ item, idx }) =>
+            !pairedPieceIndices.has(idx) &&
+            (isAssetSplitOrDerived(item) || item.cutLength <= maxLen * 0.58)
+        )
+        .sort((a, b) => b.item.cutLength - a.item.cutLength);
 
-      const repressedPiece: CutPiece = {
+      for (const { item: p1, idx: p1Idx } of shortSplitCandidates) {
+        if (pairedPieceIndices.has(p1Idx)) continue;
+        let bestIdx = -1;
+        let bestBlankLen = 0;
+        let bestSavings = 0;
+
+        for (const { item: p2, idx: p2Idx } of shortSplitCandidates) {
+          if (p2Idx === p1Idx || pairedPieceIndices.has(p2Idx)) continue;
+          if (!isAssetSplitOrDerived(p1) && !isAssetSplitOrDerived(p2)) continue;
+          const fit = evalDiagonalRepress(p1, p2);
+          if (fit && fit.savings > bestSavings) {
+            bestSavings = fit.savings;
+            bestBlankLen = fit.parentBlankLen;
+            bestIdx = p2Idx;
+          }
+        }
+
+        if (bestIdx >= 0) {
+          commitRepressPair(p1Idx, bestIdx, bestBlankLen, 'geometric_fallback');
+        }
+      }
+    }
+
+    // Step 3: Allocate Standalone Ordered Parents for Remaining Pieces + Linear Leftover Tail Repress
+    const remainingIndices = allNeededPieces
+      .map((item, idx) => ({ item, idx }))
+      .filter(({ idx }) => !pairedPieceIndices.has(idx))
+      .sort((a, b) => b.item.cutLength - a.item.cutLength);
+
+    for (const { item, idx: itemIdx } of remainingIndices) {
+      if (pairedPieceIndices.has(itemIdx)) continue;
+
+      let linearDonorIdx = -1;
+      let bestWasteLeft = Infinity;
+      for (let pi = 0; pi < parentSheets.length; pi++) {
+        const meta = parentMetaByIndex[pi];
+        if (!meta || meta.linearRemaining < item.cutLength + KERF_LIN) continue;
+        if (Math.abs(meta.pitchDeg - item.pitchDeg) > 0.5) continue;
+        const wasteLeft = meta.linearRemaining - (item.cutLength + KERF_LIN);
+        if (wasteLeft < bestWasteLeft) {
+          bestWasteLeft = wasteLeft;
+          linearDonorIdx = pi;
+        }
+      }
+
+      if (linearDonorIdx >= 0) {
+        const donorParent = parentSheets[linearDonorIdx];
+        const donorMeta = parentMetaByIndex[linearDonorIdx];
+        const primary = donorParent.pieces[0];
+        const cutFrom = quantizeMm(donorParent.length - donorMeta.linearRemaining);
+
+        const repressedPiece: CutPiece = {
+          id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
+          parentSheetId: donorParent.id,
+          length: item.cutLength,
+          width: item.colWidth,
+          cutFrom,
+          orientation: 'flipped180',
+          targetPlaneId: item.planeId,
+          placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 180, flipped: true },
+          underlapSide: item.underlapSide,
+          facetName: item.planeName,
+          colIndex: item.colIndex,
+          minV: item.minV,
+          maxV: item.maxV,
+          splitFromAssetId: item.splitFromAssetId,
+          note: `Repressed from leftover tail of Stock #${donorParent.sheetNumber} (${primary?.facetName || 'Main'})`
+        };
+
+        donorParent.pieces.push(repressedPiece);
+        donorMeta.linearRemaining = +Math.max(0, donorMeta.linearRemaining - item.cutLength - KERF_LIN).toFixed(3);
+        donorMeta.midSum += item.midLength;
+        donorParent.remaining = +Math.max(0, donorParent.length - donorMeta.midSum).toFixed(3);
+        donorParent.utilization = +Math.min(100, (donorMeta.midSum / donorParent.length) * 100).toFixed(1);
+
+        placedPieces.push(repressedPiece);
+        pairedPieceIndices.add(itemIdx);
+
+        addToPlacementMap(placementMap, item.planeId, {
+          pieceId: repressedPiece.id,
+          parentId: donorParent.id,
+          parentSheetNumber: donorParent.sheetNumber,
+          length: repressedPiece.length,
+          isOffcut: true,
+          orientation: 'flipped180',
+          note: `➔ ${repressedPiece.note}`,
+          color: donorParent.color || '#3b82f6'
+        });
+
+        if (primary && primary.targetPlaneId !== item.planeId) {
+          transferMatrix[primary.targetPlaneId][item.planeId] =
+            (transferMatrix[primary.targetPlaneId][item.planeId] || 0) + 1;
+          const srcPlane = orderedPlanes.find((p) => p.id === primary.targetPlaneId);
+          offcutTransfers.push({
+            sourcePlaneId: primary.targetPlaneId,
+            targetPlaneId: item.planeId,
+            sourcePlanCenter: srcPlane ? polygonCentroid(srcPlane.planPolygon) : item.planCenter,
+            targetPlanCenter: item.planCenter,
+            piece: repressedPiece,
+            uCenter: item.uCenter,
+            width: item.colWidth,
+            cutLength: item.cutLength,
+            ruleApplied: 'geometric_fallback'
+          });
+        }
+        continue;
+      }
+
+      const parentId = `parent-sheet-${sheetNumberCounter}`;
+      const color = PARENT_PALETTE[(sheetNumberCounter - 1) % PARENT_PALETTE.length];
+      const orderLength = quantizeMm(item.cutLength);
+
+      const piece: CutPiece = {
         id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
-        parentSheetId: donorParent.id,
+        parentSheetId: parentId,
         length: item.cutLength,
         width: item.colWidth,
-        cutFrom,
-        orientation: 'flipped180',
+        cutFrom: 0,
+        orientation: 'normal',
         targetPlaneId: item.planeId,
-        placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 180, flipped: true },
+        placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 0, flipped: false },
         underlapSide: item.underlapSide,
         facetName: item.planeName,
         colIndex: item.colIndex,
         minV: item.minV,
         maxV: item.maxV,
         splitFromAssetId: item.splitFromAssetId,
-        note: `Repressed from leftover tail of Stock #${donorParent.sheetNumber} (${primary?.facetName || 'Main'})`
+        note: item.splitFromAssetId
+          ? `Cut around opening (#${sheetNumberCounter})`
+          : `Direct run sheet #${sheetNumberCounter}`
       };
 
-      donorParent.pieces.push(repressedPiece);
-      donorMeta.linearRemaining = +Math.max(0, donorMeta.linearRemaining - item.cutLength - KERF_LIN).toFixed(3);
-      donorMeta.midSum += item.midLength;
-      donorParent.remaining = +Math.max(0, donorParent.length - donorMeta.midSum).toFixed(3);
-      donorParent.utilization = +Math.min(100, (donorMeta.midSum / donorParent.length) * 100).toFixed(1);
+      const naturalDrop = +Math.max(0, orderLength - item.midLength).toFixed(3);
+      const parentSheet: ParentSheet = {
+        id: parentId,
+        sheetNumber: sheetNumberCounter++,
+        length: orderLength,
+        color,
+        pieces: [piece],
+        remaining: naturalDrop,
+        utilization: +Math.min(100, (item.midLength / orderLength) * 100).toFixed(1)
+      };
 
-      placedPieces.push(repressedPiece);
-      pairedPieceIndices.add(itemIdx);
+      parentSheets.push(parentSheet);
+      parentMetaByIndex.push({
+        linearRemaining: +Math.max(0, orderLength - item.cutLength).toFixed(3),
+        hasOrderedOverride: item.hasOrderedOverride,
+        targetOrderedLen: item.targetOrderedLen,
+        pitchDeg: item.pitchDeg,
+        underlapSide: item.underlapSide,
+        midSum: item.midLength
+      });
+      placedPieces.push(piece);
 
       addToPlacementMap(placementMap, item.planeId, {
-        pieceId: repressedPiece.id,
-        parentId: donorParent.id,
-        parentSheetNumber: donorParent.sheetNumber,
-        length: repressedPiece.length,
-        isOffcut: true,
-        orientation: 'flipped180',
-        note: `➔ ${repressedPiece.note}`,
-        color: donorParent.color || '#3b82f6'
+        pieceId: piece.id,
+        parentId,
+        parentSheetNumber: parentSheet.sheetNumber,
+        length: piece.length,
+        isOffcut: false,
+        orientation: 'normal',
+        note: `Ordered blank #${parentSheet.sheetNumber}`,
+        color
       });
-
-      if (primary && primary.targetPlaneId !== item.planeId) {
-        transferMatrix[primary.targetPlaneId][item.planeId] =
-          (transferMatrix[primary.targetPlaneId][item.planeId] || 0) + 1;
-        const srcPlane = orderedPlanes.find((p) => p.id === primary.targetPlaneId);
-        offcutTransfers.push({
-          sourcePlaneId: primary.targetPlaneId,
-          targetPlaneId: item.planeId,
-          sourcePlanCenter: srcPlane ? polygonCentroid(srcPlane.planPolygon) : item.planCenter,
-          targetPlanCenter: item.planCenter,
-          piece: repressedPiece,
-          uCenter: item.uCenter,
-          width: item.colWidth,
-          cutLength: item.cutLength,
-          ruleApplied: 'geometric_fallback'
-        });
-      }
-      continue;
     }
-
-    // Otherwise order 1 parent sheet for this piece at its exact cutLength (no 2.0m artificial floor)
-    const parentId = `parent-sheet-${sheetNumberCounter}`;
-    const color = PARENT_PALETTE[(sheetNumberCounter - 1) % PARENT_PALETTE.length];
-    const orderLength = quantizeMm(item.cutLength);
-
-    const piece: CutPiece = {
-      id: `piece-${item.planeId}-${item.colIndex}-${item.segIndex}`,
-      parentSheetId: parentId,
-      length: item.cutLength,
-      width: item.colWidth,
-      cutFrom: 0,
-      orientation: 'normal',
-      targetPlaneId: item.planeId,
-      placement: { origin: { x: item.uCenter, y: item.minV }, rotation: 0, flipped: false },
-      underlapSide: item.underlapSide,
-      facetName: item.planeName,
-      colIndex: item.colIndex,
-      minV: item.minV,
-      maxV: item.maxV,
-      splitFromAssetId: item.splitFromAssetId,
-      note: item.splitFromAssetId
-        ? `Cut around opening (#${sheetNumberCounter})`
-        : `Direct run sheet #${sheetNumberCounter}`
-    };
-
-    const naturalDrop = +Math.max(0, orderLength - item.midLength).toFixed(3);
-    const parentSheet: ParentSheet = {
-      id: parentId,
-      sheetNumber: sheetNumberCounter++,
-      length: orderLength,
-      color,
-      pieces: [piece],
-      remaining: naturalDrop,
-      utilization: +Math.min(100, (item.midLength / orderLength) * 100).toFixed(1)
-    };
-
-    parentSheets.push(parentSheet);
-    parentMetaByIndex.push({
-      linearRemaining: +Math.max(0, orderLength - item.cutLength).toFixed(3),
-      hasOrderedOverride: item.hasOrderedOverride,
-      targetOrderedLen: item.targetOrderedLen,
-      pitchDeg: item.pitchDeg,
-      underlapSide: item.underlapSide,
-      midSum: item.midLength
-    });
-    placedPieces.push(piece);
-
-    addToPlacementMap(placementMap, item.planeId, {
-      pieceId: piece.id,
-      parentId,
-      parentSheetNumber: parentSheet.sheetNumber,
-      length: piece.length,
-      isOffcut: false,
-      orientation: 'normal',
-      note: `Ordered blank #${parentSheet.sheetNumber}`,
-      color
-    });
   }
 
   // Calculate Reconciled Metrics (Honest & Reconciled 100% with ParentSheet[] and Roof Geometry)
@@ -4640,6 +5294,7 @@ export function generateCuttingLayout(
   });
 
   return {
+    sheetOrderMode,
     parents: parentSheets,
     pieces: placedPieces,
     sections,

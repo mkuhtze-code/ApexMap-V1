@@ -16,6 +16,7 @@ import {
   LayoutResult,
   OrderPack,
   RoofAsset,
+  RoofBomSheetCutDetail,
   RoofBomSheetGroup,
   RoofBomSummary,
   RoofFlashingAssignment,
@@ -24,6 +25,8 @@ import {
   RoofPackLengthGroup,
   RoofPackOffcutTransfer,
   RoofPlane,
+  SheetOrderComparisonSummary,
+  SheetOrderMode,
   TakeoffCompletenessReport,
   WallPlan
 } from '../types/exactRoofing';
@@ -106,14 +109,31 @@ function normalizeGirthTier(tier?: string, girthMm?: number): FlashingGirthTier 
   return '901-1200mm';
 }
 
+export function getSheetOrderAssumptionText(mode: SheetOrderMode = 'practical'): string {
+  return mode === 'optimized'
+    ? 'Optimized (tight nest): Mill-exact multi-length diagonal and linear repress nesting for minimum steel metres.'
+    : 'Practical (default): Runs consolidated into minimal shared order lengths (rounded up to 10mm stock increments); shorter runs are cut down on site without changing roof geometry.';
+}
+
 export function buildRoofBillOfMaterials(params: {
   planes: RoofPlane[];
   layout: LayoutResult | null;
   assignments: RoofFlashingAssignment[];
   assignableLines?: AssignableRoofLine[];
   assets?: RoofAsset[];
+  sheetOrderMode?: SheetOrderMode;
+  comparisonSummary?: SheetOrderComparisonSummary;
 }): RoofBomSummary {
-  const { planes, layout, assignments, assignableLines = [], assets = [] } = params;
+  const {
+    planes,
+    layout,
+    assignments,
+    assignableLines = [],
+    assets = [],
+    sheetOrderMode,
+    comparisonSummary
+  } = params;
+  const resolvedOrderMode: SheetOrderMode = sheetOrderMode ?? layout?.sheetOrderMode ?? 'practical';
   const displayPlanes = getDisplayPlanes(planes, layout);
   const planeById = new Map<string, RoofPlane>();
   displayPlanes.forEach((p) => planeById.set(p.id, p));
@@ -129,6 +149,7 @@ export function buildRoofBillOfMaterials(params: {
       modeledLengthMm?: number;
       hasSiteOverride: boolean;
       overrideNotes: Set<string>;
+      cutDetailMap: Map<string, RoofBomSheetCutDetail>;
     }
   >();
 
@@ -143,12 +164,28 @@ export function buildRoofBillOfMaterials(params: {
         hasOffcutHarvest: false,
         modeledLengthMm: undefined as number | undefined,
         hasSiteOverride: false,
-        overrideNotes: new Set<string>()
+        overrideNotes: new Set<string>(),
+        cutDetailMap: new Map<string, RoofBomSheetCutDetail>()
       };
       existing.count += 1;
       parent.pieces.forEach((pc) => {
         const p = planeById.get(pc.targetPlaneId);
+        const faceCode = p?.code || pc.targetPlaneId;
+        const faceName = pc.facetName || p?.name || faceCode;
         if (p?.code) existing.targetCodes.add(p.code);
+        const requiredCutMm = Math.max(100, Math.round(pc.length * 1000));
+        const detailKey = `${faceCode}::${requiredCutMm}`;
+        const prevDetail = existing.cutDetailMap.get(detailKey);
+        if (prevDetail) {
+          prevDetail.qty += 1;
+        } else {
+          existing.cutDetailMap.set(detailKey, {
+            faceCode,
+            faceName,
+            requiredCutMm,
+            qty: 1
+          });
+        }
       });
       const primaryPlane = parent.pieces[0] ? planeById.get(parent.pieces[0].targetPlaneId) : undefined;
       if (primaryPlane) {
@@ -183,7 +220,10 @@ export function buildRoofBillOfMaterials(params: {
       hasOffcutHarvest: g.hasOffcutHarvest,
       modeledLengthMm: g.modeledLengthMm ?? g.lengthMm,
       hasSiteOverride: g.hasSiteOverride,
-      overrideNotes: g.overrideNotes.size > 0 ? Array.from(g.overrideNotes).join('; ') : undefined
+      overrideNotes: g.overrideNotes.size > 0 ? Array.from(g.overrideNotes).join('; ') : undefined,
+      cutDetails: Array.from(g.cutDetailMap.values()).sort(
+        (a, b) => b.requiredCutMm - a.requiredCutMm || a.faceCode.localeCompare(b.faceCode)
+      )
     }))
     .sort((a, b) => b.lengthMm - a.lengthMm);
 
@@ -227,6 +267,9 @@ export function buildRoofBillOfMaterials(params: {
   ).length;
 
   return {
+    sheetOrderMode: resolvedOrderMode,
+    sheetOrderAssumption: getSheetOrderAssumptionText(resolvedOrderMode),
+    ...(comparisonSummary ? { comparisonSummary } : {}),
     totalRoofAreaM2,
     totalSheetsCount,
     totalOrderedLm,
@@ -935,12 +978,22 @@ export function exportRoofBomToCsv(params: {
   const lines: string[] = [];
   const esc = (v: string | number) => `"${String(v).replace(/"/g, '""')}"`;
 
-  lines.push(['Project', esc(projectName), 'Roof Area (m2)', bom.totalRoofAreaM2, 'Waste (%)', bom.wastePercent].join(','));
+  const modeLabel =
+    (bom.sheetOrderMode || 'practical') === 'optimized'
+      ? 'Optimized (Tight Nest)'
+      : 'Practical (Site Cut List)';
+  lines.push(['Project', esc(projectName), 'Roof Area (m2)', bom.totalRoofAreaM2, 'Waste (%)', bom.wastePercent, 'Sheet Order Mode', esc(modeLabel)].join(','));
+  if (bom.sheetOrderAssumption) {
+    lines.push(['Sheet Order Assumption', esc(bom.sheetOrderAssumption)].join(','));
+  }
   lines.push('');
   lines.push(['SECTION 1: MILL STOCK SHEET SCHEDULE'].join(','));
-  lines.push(['Cut Length (mm)', 'Cut Length (m)', 'Qty (Sheets)', 'Total Lineal Metres (lm)', 'Target Faces', 'Offcut Harvest'].join(','));
+  lines.push(['Cut Length (mm)', 'Cut Length (m)', 'Qty (Sheets)', 'Total Lineal Metres (lm)', 'Target Faces', 'Offcut Harvest', 'Cut Breakdown'].join(','));
   bom.sheetGroups.forEach((g) => {
-    lines.push([g.lengthMm, formatLengthM(g.lengthMm, g.lengthM), g.count, g.totalLm.toFixed(2), esc(g.targetCodes.join(' ')), g.hasOffcutHarvest ? 'Yes (180 deg flip)' : 'No'].join(','));
+    const cutSummary = (g.cutDetails || [])
+      .map((d) => `${d.qty}x ${d.requiredCutMm}mm (${d.faceCode})`)
+      .join(' | ');
+    lines.push([g.lengthMm, formatLengthM(g.lengthMm, g.lengthM), g.count, g.totalLm.toFixed(2), esc(g.targetCodes.join(' ')), g.hasOffcutHarvest ? 'Yes (180 deg flip)' : 'No', esc(cutSummary)].join(','));
   });
 
   lines.push('');
@@ -1041,6 +1094,8 @@ export function buildOrderPack(params: {
   coverWidthMm?: number;
   endLapMm?: number;
   overhangMm?: number;
+  sheetOrderMode?: SheetOrderMode;
+  comparisonSummary?: SheetOrderComparisonSummary;
 }): OrderPack {
   const {
     project,
@@ -1057,7 +1112,9 @@ export function buildOrderPack(params: {
     confirmedBy,
     coverWidthMm = 762,
     endLapMm = 150,
-    overhangMm = 50
+    overhangMm = 50,
+    sheetOrderMode,
+    comparisonSummary
   } = params;
 
   const bom =
@@ -1067,8 +1124,16 @@ export function buildOrderPack(params: {
       layout,
       assignments,
       assignableLines,
-      assets
+      assets,
+      sheetOrderMode,
+      comparisonSummary
     });
+
+  const resolvedOrderMode: SheetOrderMode =
+    sheetOrderMode ?? bom.sheetOrderMode ?? layout?.sheetOrderMode ?? 'practical';
+  const resolvedAssumptionText =
+    bom.sheetOrderAssumption || getSheetOrderAssumptionText(resolvedOrderMode);
+  const resolvedComparison = comparisonSummary ?? bom.comparisonSummary;
 
   const completenessReport =
     params.completenessReport ||
@@ -1089,6 +1154,7 @@ export function buildOrderPack(params: {
   const sheets = bom.sheetGroups.map((g) => {
     const modeledMm = g.modeledLengthMm ?? g.lengthMm;
     const isOverride = Boolean(g.hasSiteOverride && modeledMm !== g.lengthMm);
+    const hasCutDowns = Boolean(g.cutDetails && g.cutDetails.some((d) => d.requiredCutMm < g.lengthMm - 2));
     return {
       code: `${sheetBaseCode}-${g.lengthMm}`,
       description: `${profileName} · ${colorName} · ${g.lengthMm}mm Sheet`,
@@ -1103,10 +1169,12 @@ export function buildOrderPack(params: {
       notes: [
         `Faces ${g.targetCodes.join(', ') || 'Main'}`,
         isOverride ? `Site override (modeled ${modeledMm}mm)` : '',
-        g.hasOffcutHarvest ? 'Includes repressed offcut harvest' : ''
+        g.hasOffcutHarvest ? 'Includes repressed offcut harvest' : '',
+        hasCutDowns ? `Shorter runs cut down from ${g.lengthMm}mm` : ''
       ]
         .filter(Boolean)
-        .join(' · ')
+        .join(' · '),
+      ...(g.cutDetails ? { cut_details: g.cutDetails } : {})
     };
   });
 
@@ -1283,7 +1351,13 @@ export function buildOrderPack(params: {
       coverWidthMm,
       endLapMm,
       overhangMm,
-      sheetRoundingNote: 'Mill-exact 1mm cut precision; site overrides adjust cut length without altering 3D roof geometry.',
+      sheetOrderMode: resolvedOrderMode,
+      sheetOrderAssumption: resolvedAssumptionText,
+      ...(resolvedComparison ? { comparisonSummary: resolvedComparison } : {}),
+      sheetRoundingNote:
+        resolvedOrderMode === 'practical'
+          ? 'Practical cut list clusters standard runs to minimal 10mm-increment stock lengths; site overrides retain exact 1mm cut precision without altering 3D roof geometry.'
+          : 'Optimized mill-exact 1mm cut precision; site overrides adjust cut length without altering 3D roof geometry.',
       productCodePolicy: 'Known catalog codes resolved where mapped; custom profiles flagged as UNCODED-<KIND>.'
     },
     totals: {
@@ -1320,9 +1394,23 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
   lines.push(
     ['ORDER PACK (COMMERCIAL-NEUTRAL)', esc(orderPack.projectNumber), esc(orderPack.projectTitle), 'Locked', orderPack.locked ? 'YES' : 'NO'].join(',')
   );
+  const modeLabel =
+    (orderPack.assumptions.sheetOrderMode || 'practical') === 'optimized'
+      ? 'Optimized (Tight Nest)'
+      : 'Practical (Site Cut List)';
   lines.push(
-    ['Profile', esc(orderPack.assumptions.profile), 'Material', esc(orderPack.assumptions.material), 'Colour', esc(orderPack.assumptions.color)].join(',')
+    ['Profile', esc(orderPack.assumptions.profile), 'Material', esc(orderPack.assumptions.material), 'Colour', esc(orderPack.assumptions.color), 'Sheet Order Mode', esc(modeLabel)].join(',')
   );
+  if (orderPack.assumptions.sheetOrderAssumption) {
+    lines.push(['Sheet Ordering Assumption', esc(orderPack.assumptions.sheetOrderAssumption)].join(','));
+  }
+  if (orderPack.assumptions.comparisonSummary) {
+    const cmp = orderPack.assumptions.comparisonSummary;
+    lines.push([
+      'Mode Comparison (lm only)',
+      esc(`Practical ${cmp.practicalOrderedLm.toFixed(1)} lm (${cmp.practicalDistinctLengths} lengths / ${cmp.practicalSheetsCount} sheets) vs Optimized ${cmp.optimizedOrderedLm.toFixed(1)} lm (${cmp.optimizedDistinctLengths} lengths / ${cmp.optimizedSheetsCount} sheets)`)
+    ].join(','));
+  }
   lines.push('');
 
   // Unified Schedule Header

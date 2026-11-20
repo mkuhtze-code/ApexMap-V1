@@ -7,10 +7,13 @@ import {
   RoofBomSummary,
   RoofFlashingAssignment,
   RoofPlane,
+  SheetOrderComparisonSummary,
+  SheetOrderMode,
   TakeoffCompletenessIssue,
   TakeoffCompletenessReport,
   WallPlan
 } from '../../types/exactRoofing';
+import { getSheetOrderAssumptionText } from '../../utils/exactRoofingBomBridge';
 import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBridge';
 import { computeAssetPlacementMetrics, dist } from '../../utils/exactRoofingEngine';
 import { computeWallTakeoffSummary } from '../../utils/wallCladdingEngine';
@@ -19,6 +22,8 @@ import {
   Building2,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Compass,
   Lock,
   PenTool,
@@ -39,6 +44,9 @@ interface Props {
   wallPlan?: WallPlan | null;
   completenessReport?: TakeoffCompletenessReport;
   measureLocked: boolean;
+  sheetOrderMode?: SheetOrderMode;
+  onChangeSheetOrderMode?: (mode: SheetOrderMode) => void;
+  sheetOrderComparison?: SheetOrderComparisonSummary;
   onSelectPlane: (planeId: string) => void;
   onUpdatePlaneOrderedSheetLength?: (planeId: string, lengthM: number | undefined) => void;
   onOpenPlanTab: () => void;
@@ -61,6 +69,9 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   wallPlan = null,
   completenessReport,
   measureLocked,
+  sheetOrderMode,
+  onChangeSheetOrderMode,
+  sheetOrderComparison,
   onSelectPlane,
   onUpdatePlaneOrderedSheetLength,
   onOpenPlanTab,
@@ -75,6 +86,11 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   const [checkedSheetsOk, setCheckedSheetsOk] = useState<boolean>(false);
   const [checkedFlashingsOk, setCheckedFlashingsOk] = useState<boolean>(false);
   const [draftSheetMmByPlane, setDraftSheetMmByPlane] = useState<Record<string, string>>({});
+  const [expandedGroupMm, setExpandedGroupMm] = useState<number | null>(null);
+
+  const activeOrderMode: SheetOrderMode =
+    sheetOrderMode ?? bom.sheetOrderMode ?? layout?.sheetOrderMode ?? 'practical';
+  const resolvedComparison = sheetOrderComparison ?? bom.comparisonSummary;
 
   const displayPlanes = useMemo(
     () => (layout?.effectivePlanes && layout.effectivePlanes.length > 0 ? layout.effectivePlanes : planes),
@@ -472,22 +488,62 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
       <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h3 className="text-sm font-black text-white flex items-center gap-2">
+            <h3 className="text-sm font-black text-white flex flex-wrap items-center gap-2">
               <Scissors className="w-4 h-4 text-sky-400" />
               <span>Section 2: Ordered Sheet Lengths ({bom.totalSheetsCount} Sheets · {bom.totalOrderedLm.toFixed(1)} lm ordered)</span>
+              <span className="px-2 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/35 text-sky-300 text-[10px] font-bold">
+                {activeOrderMode === 'practical' ? 'Practical (Site Cut List)' : 'Optimized (Tight Nest)'}
+              </span>
             </h3>
-            <p className="text-xs text-slate-400 font-mono tabular-nums">
+            <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
               {project?.profile || 'TRS Corrugate 0.55mm'} · {project?.colorName || 'FlaxPod'} · Net roof {bom.totalNetRoofLm.toFixed(1)} lm · Waste {bom.wastePercent}% · {bom.totalOffcutsReused ?? 0} offcuts repressed (+{bom.savedOffcutLm.toFixed(1)} lm saved)
             </p>
           </div>
-          {!measureLocked && (
-            <button
-              type="button"
-              onClick={onRecalculateLayout}
-              className="px-3 py-1.5 rounded-xl bg-blue-600/25 hover:bg-blue-600 text-sky-300 hover:text-white border border-blue-500/40 text-xs font-bold cursor-pointer"
-            >
-              Recalculate Cuts
-            </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {!measureLocked && onChangeSheetOrderMode && (
+              <div className="inline-flex rounded-xl bg-slate-950 border border-slate-800 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => onChangeSheetOrderMode('practical')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                    activeOrderMode === 'practical'
+                      ? 'bg-sky-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Practical (Site Cut List)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onChangeSheetOrderMode('optimized')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                    activeOrderMode === 'optimized'
+                      ? 'bg-sky-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Optimized (Tight Nest)
+                </button>
+              </div>
+            )}
+            {!measureLocked && (
+              <button
+                type="button"
+                onClick={onRecalculateLayout}
+                className="px-3 py-1.5 rounded-xl bg-blue-600/25 hover:bg-blue-600 text-sky-300 hover:text-white border border-blue-500/40 text-xs font-bold cursor-pointer"
+              >
+                Recalculate Cuts
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 bg-slate-950/60 border border-slate-800/80 rounded-xl px-3 py-2">
+          <span>{bom.sheetOrderAssumption || getSheetOrderAssumptionText(activeOrderMode)}</span>
+          {resolvedComparison && (
+            <span className="font-mono text-slate-300 tabular-nums">
+              Practical: {resolvedComparison.practicalOrderedLm.toFixed(1)} lm ({resolvedComparison.practicalDistinctLengths} len) · Optimized: {resolvedComparison.optimizedOrderedLm.toFixed(1)} lm ({resolvedComparison.optimizedDistinctLengths} len)
+            </span>
           )}
         </div>
 
@@ -498,30 +554,63 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
         ) : (
           <div className="space-y-2">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-              {bom.sheetGroups.map((grp) => (
-                <div
-                  key={grp.lengthMm}
-                  className="bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2 font-mono text-xs tabular-nums"
-                >
-                  <div>
-                    <div className="text-sm font-black text-white flex items-center gap-1.5">
-                      <span>
-                        {grp.count} @ <span className="text-sky-400">{grp.lengthMm} mm</span>
-                      </span>
-                      {grp.hasSiteOverride && (
-                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-sans font-bold">
-                          Site Override (was {grp.modeledLengthMm}mm)
-                        </span>
-                      )}
+              {bom.sheetGroups.map((grp) => {
+                const cutDetails = grp.cutDetails || [];
+                const hasCutDowns = cutDetails.some((d) => d.requiredCutMm < grp.lengthMm - 2);
+                const isExpanded = expandedGroupMm === grp.lengthMm;
+                return (
+                  <div
+                    key={grp.lengthMm}
+                    className="bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 space-y-2 font-mono text-xs tabular-nums"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-sm font-black text-white flex flex-wrap items-center gap-1.5">
+                          <span>
+                            {grp.count} @ <span className="text-sky-400">{grp.lengthMm} mm</span>
+                          </span>
+                          {grp.hasSiteOverride && (
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-sans font-bold">
+                              Site Override (was {grp.modeledLengthMm}mm)
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] font-sans text-slate-400">
+                          Faces {grp.targetCodes.join(', ') || 'Main'}
+                          {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
+                        </div>
+                      </div>
+                      <span className="text-slate-300 font-bold shrink-0">{(grp.count * grp.lengthM).toFixed(2)} lm</span>
                     </div>
-                    <div className="text-[11px] font-sans text-slate-400">
-                      Faces {grp.targetCodes.join(', ') || 'Main'}
-                      {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
-                    </div>
+                    {hasCutDowns && (
+                      <div className="pt-1 border-t border-slate-800/80">
+                        <button
+                          type="button"
+                          onClick={() => setExpandedGroupMm(isExpanded ? null : grp.lengthMm)}
+                          className="text-[10px] font-sans font-bold text-sky-300 hover:text-sky-200 flex items-center gap-1 cursor-pointer"
+                        >
+                          <span>{isExpanded ? 'Hide cut details' : `Cut details (${cutDetails.length})`}</span>
+                          {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                        </button>
+                        {isExpanded && (
+                          <div className="mt-1.5 space-y-1 text-[11px] text-slate-300">
+                            {cutDetails.map((d) => (
+                              <div key={`${d.faceCode}-${d.requiredCutMm}`} className="flex items-center justify-between gap-2">
+                                <span>
+                                  {d.qty} × <strong className="text-white">{d.requiredCutMm} mm</strong> ({d.faceCode})
+                                </span>
+                                <span className="font-sans text-[10px] text-sky-300">
+                                  cut from {grp.lengthMm} mm
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <span className="text-slate-300 font-bold shrink-0">{(grp.count * grp.lengthM).toFixed(2)} lm</span>
-                </div>
-              ))}
+                );
+              })}
             </div>
             <div className="pt-2 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 font-mono text-xs tabular-nums">
               <span className="font-bold text-sky-300">

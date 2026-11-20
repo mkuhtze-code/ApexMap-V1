@@ -2,10 +2,13 @@ import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   FaceRoofingPack,
   LayoutResult,
+  RoofBomSheetCutDetail,
   RoofInstallProgress,
   RoofLifecycleStage,
   RoofPlane,
-  SectionSummary
+  SectionSummary,
+  SheetOrderComparisonSummary,
+  SheetOrderMode
 } from '../../types/exactRoofing';
 import {
   AlertTriangle,
@@ -52,6 +55,9 @@ interface Props {
   roofingPacks?: FaceRoofingPack[];
   installProgress?: RoofInstallProgress;
   onUpdateInstallProgress?: (next: RoofInstallProgress) => void;
+  sheetOrderMode?: SheetOrderMode;
+  onChangeSheetOrderMode?: (mode: SheetOrderMode) => void;
+  sheetOrderComparison?: SheetOrderComparisonSummary;
 }
 
 export const OffcutLayoutVisualizer: React.FC<Props> = ({
@@ -71,7 +77,10 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
   measureLocked = false,
   roofingPacks = [],
   installProgress,
-  onUpdateInstallProgress
+  onUpdateInstallProgress,
+  sheetOrderMode,
+  onChangeSheetOrderMode,
+  sheetOrderComparison
 }) => {
   // Toggle chips state
   const [showLengths, setShowLengths] = useState<boolean>(true);
@@ -92,7 +101,9 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
   const [isMobileStatsOpen, setIsMobileStatsOpen] = useState<boolean>(false);
   const [isMobileLayersOpen, setIsMobileLayersOpen] = useState<boolean>(false);
   const [showMobilePacksSheet, setShowMobilePacksSheet] = useState<boolean>(false);
+  const [expandedGroupMm, setExpandedGroupMm] = useState<number | null>(null);
   const { isMobile } = useDeviceDetection();
+  const activeOrderMode: SheetOrderMode = sheetOrderMode ?? layout.sheetOrderMode ?? 'practical';
 
   // Dynamic ResizeObserver so mobile portrait screen fills edge-to-edge without letterboxing
   const svgViewportRef = useRef<HTMLDivElement>(null);
@@ -444,9 +455,19 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
 
   // Exact reconciled mill order groups directly from layout.parents
   const orderedSheetGroups = useMemo(() => {
+    const planeCodeMap = new Map<string, { code: string; name: string }>();
+    displayPlanes.forEach((pl) => planeCodeMap.set(pl.id, { code: pl.code || pl.id, name: pl.name || pl.code }));
+
     const gMap = new Map<
       number,
-      { lengthMm: number; lengthM: number; count: number; totalLm: number; repressedCount: number }
+      {
+        lengthMm: number;
+        lengthM: number;
+        count: number;
+        totalLm: number;
+        repressedCount: number;
+        cutDetailMap: Map<string, RoofBomSheetCutDetail>;
+      }
     >();
     layout.parents.forEach((par) => {
       const lengthMm = Math.max(100, Math.round((par.length || 0) * 1000));
@@ -456,15 +477,40 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
         lengthM,
         count: 0,
         totalLm: 0,
-        repressedCount: 0
+        repressedCount: 0,
+        cutDetailMap: new Map<string, RoofBomSheetCutDetail>()
       };
       cur.count += 1;
       cur.totalLm = +(cur.count * lengthM).toFixed(3);
       cur.repressedCount += Math.max(0, par.pieces.length - 1);
+      par.pieces.forEach((pc) => {
+        const meta = planeCodeMap.get(pc.targetPlaneId);
+        const faceCode = meta?.code || pc.targetPlaneId;
+        const faceName = pc.facetName || meta?.name || faceCode;
+        const requiredCutMm = Math.max(100, Math.round(pc.length * 1000));
+        const key = `${faceCode}::${requiredCutMm}`;
+        const prev = cur.cutDetailMap.get(key);
+        if (prev) {
+          prev.qty += 1;
+        } else {
+          cur.cutDetailMap.set(key, { faceCode, faceName, requiredCutMm, qty: 1 });
+        }
+      });
       gMap.set(lengthMm, cur);
     });
-    return Array.from(gMap.values()).sort((a, b) => b.lengthMm - a.lengthMm);
-  }, [layout.parents]);
+    return Array.from(gMap.values())
+      .map((g) => ({
+        lengthMm: g.lengthMm,
+        lengthM: g.lengthM,
+        count: g.count,
+        totalLm: g.totalLm,
+        repressedCount: g.repressedCount,
+        cutDetails: Array.from(g.cutDetailMap.values()).sort(
+          (a, b) => b.requiredCutMm - a.requiredCutMm || a.faceCode.localeCompare(b.faceCode)
+        )
+      }))
+      .sort((a, b) => b.lengthMm - a.lengthMm);
+  }, [layout.parents, displayPlanes]);
 
   const reconciledTotalOrderedLm = useMemo(() => {
     const totalMm = orderedSheetGroups.reduce((s, g) => s + g.count * g.lengthMm, 0);
@@ -1222,12 +1268,43 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
 
                 {orderedSheetGroups.length > 0 && (
                   <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
-                    <div className="flex items-center justify-between text-[10px] font-bold text-slate-400">
-                      <span>Ordered Sheets Schedule</span>
+                    <div className="flex items-center justify-between gap-2 text-[10px] font-bold text-slate-400">
+                      <span>
+                        Ordered Sheets ·{' '}
+                        <span className="text-sky-300">
+                          {activeOrderMode === 'practical' ? 'Practical' : 'Optimized'}
+                        </span>
+                      </span>
                       <span className="font-mono text-sky-300 tabular-nums">
                         {layout.parents.length} sheets · {reconciledTotalOrderedLm.toFixed(1)} lm
                       </span>
                     </div>
+                    {!measureLocked && lifecycleStage !== 'installing' && onChangeSheetOrderMode && (
+                      <div className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-slate-950 border border-slate-800">
+                        <button
+                          type="button"
+                          onClick={() => onChangeSheetOrderMode('practical')}
+                          className={`py-1 px-2 rounded-md text-[10px] font-bold cursor-pointer transition-colors ${
+                            activeOrderMode === 'practical'
+                              ? 'bg-sky-600 text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Practical (Site)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onChangeSheetOrderMode('optimized')}
+                          className={`py-1 px-2 rounded-md text-[10px] font-bold cursor-pointer transition-colors ${
+                            activeOrderMode === 'optimized'
+                              ? 'bg-sky-600 text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Optimized (Nest)
+                        </button>
+                      </div>
+                    )}
                     <div className="max-h-28 overflow-y-auto divide-y divide-slate-800/70 font-mono text-[11px] tabular-nums">
                       {orderedSheetGroups.map((g) => (
                         <div key={g.lengthMm} className="py-1 flex items-center justify-between">
@@ -1819,29 +1896,108 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
           {/* 2.2 RECONCILED ORDERED SHEETS SCHEDULE + SEPARATE OFFCUT REPRESS NOTE */}
           {orderedSheetGroups.length > 0 && (
             <div className="bg-[#101726] border border-slate-800/90 rounded-2xl p-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <div className="lg:col-span-2 space-y-2">
-                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                  <h3 className="text-xs font-bold text-slate-200 tracking-tight">
-                    Ordered Sheets Schedule
-                  </h3>
-                  <span className="text-xs font-mono text-slate-400 tabular-nums">
-                    {layout.totalRoofArea.toFixed(1)} m² roof area
-                  </span>
+              <div className="lg:col-span-2 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-xs font-bold text-slate-200 tracking-tight">
+                      Ordered Sheets Schedule
+                    </h3>
+                    <span className="px-2 py-0.5 rounded-md bg-sky-500/15 border border-sky-500/35 text-sky-300 text-[10px] font-bold">
+                      {activeOrderMode === 'practical' ? 'Practical (Site Cut List)' : 'Optimized (Tight Nest)'}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {!measureLocked && lifecycleStage !== 'installing' && onChangeSheetOrderMode && (
+                      <div className="inline-flex rounded-xl bg-slate-950 border border-slate-800 p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => onChangeSheetOrderMode('practical')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                            activeOrderMode === 'practical'
+                              ? 'bg-sky-600 text-white shadow-xs'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Practical (Site Cut List)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onChangeSheetOrderMode('optimized')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                            activeOrderMode === 'optimized'
+                              ? 'bg-sky-600 text-white shadow-xs'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          Optimized (Tight Nest)
+                        </button>
+                      </div>
+                    )}
+                    <span className="text-xs font-mono text-slate-400 tabular-nums">
+                      {layout.totalRoofArea.toFixed(1)} m² roof area
+                    </span>
+                  </div>
                 </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                  <span>
+                    {activeOrderMode === 'practical'
+                      ? 'Shared stock lengths (10mm increments); shorter runs & rakes cut down on site.'
+                      : 'Multi-length diagonal & linear repress nesting for minimum steel metres.'}
+                  </span>
+                  {sheetOrderComparison && (
+                    <span className="font-mono text-slate-300 tabular-nums">
+                      Practical: {sheetOrderComparison.practicalOrderedLm.toFixed(1)} lm ({sheetOrderComparison.practicalDistinctLengths} len) · Optimized: {sheetOrderComparison.optimizedOrderedLm.toFixed(1)} lm ({sheetOrderComparison.optimizedDistinctLengths} len)
+                    </span>
+                  )}
+                </div>
+
                 <div className="divide-y divide-slate-800/70 font-mono text-xs tabular-nums">
-                  {orderedSheetGroups.map((g) => (
-                    <div
-                      key={g.lengthMm}
-                      className="py-1.5 flex items-center justify-between gap-4"
-                    >
-                      <span className="font-bold text-white">
-                        {g.count} @ {g.lengthMm} mm
-                      </span>
-                      <span className="text-slate-400">
-                        {(g.count * g.lengthM).toFixed(1)} lm
-                      </span>
-                    </div>
-                  ))}
+                  {orderedSheetGroups.map((g) => {
+                    const isExpanded = expandedGroupMm === g.lengthMm;
+                    const hasCutDowns = g.cutDetails.some((d) => d.requiredCutMm < g.lengthMm - 2);
+                    return (
+                      <div key={g.lengthMm} className="py-1.5 space-y-1.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-bold text-white">
+                              {g.count} @ {g.lengthMm} mm
+                            </span>
+                            {hasCutDowns && (
+                              <button
+                                type="button"
+                                onClick={() => setExpandedGroupMm(isExpanded ? null : g.lengthMm)}
+                                className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-sans font-semibold text-sky-300 cursor-pointer flex items-center gap-1"
+                              >
+                                <span>{isExpanded ? 'Hide cuts' : `Cut breakdown (${g.cutDetails.length})`}</span>
+                                {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                              </button>
+                            )}
+                          </div>
+                          <span className="text-slate-400">
+                            {(g.count * g.lengthM).toFixed(1)} lm
+                          </span>
+                        </div>
+                        {isExpanded && g.cutDetails.length > 0 && (
+                          <div className="pl-3 pr-2 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800/80 space-y-1 text-[11px] text-slate-300">
+                            {g.cutDetails.map((d) => (
+                              <div key={`${d.faceCode}-${d.requiredCutMm}`} className="flex items-center justify-between gap-2">
+                                <span>
+                                  {d.qty} × <strong className="text-white">{d.requiredCutMm} mm</strong>{' '}
+                                  <span className="font-sans text-slate-400">({d.faceCode} · {d.faceName})</span>
+                                </span>
+                                <span className="text-[10px] font-sans text-sky-300">
+                                  {d.requiredCutMm < g.lengthMm - 2
+                                    ? `cut from ${g.lengthMm}mm`
+                                    : `full ${g.lengthMm}mm run`}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
                 <div className="pt-2 border-t border-slate-700 flex items-center justify-between font-mono text-xs font-extrabold tabular-nums">
                   <span className="text-sky-300">

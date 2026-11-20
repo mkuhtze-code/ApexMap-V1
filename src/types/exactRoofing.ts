@@ -192,6 +192,17 @@ export interface OffcutReceivingZone {
   ruleApplied?: 'adjacent_hip_run' | 'matching_end_slope' | 'next_sequence_slope' | 'opposite_hip_same_slope' | 'geometric_fallback';
 }
 
+export type SheetOrderMode = 'practical' | 'optimized';
+
+export interface SheetOrderComparisonSummary {
+  practicalOrderedLm: number;
+  practicalSheetsCount: number;
+  practicalDistinctLengths: number;
+  optimizedOrderedLm: number;
+  optimizedSheetsCount: number;
+  optimizedDistinctLengths: number;
+}
+
 export interface SheetSpec {
   coverWidth: number; // e.g. 0.762m
   maxLength: number; // e.g. 6.0m
@@ -288,6 +299,7 @@ export interface InstallationStep {
 }
 
 export interface LayoutResult {
+  sheetOrderMode?: SheetOrderMode;
   parents: ParentSheet[];
   pieces: CutPiece[];
   sections: SectionSummary[];
@@ -454,6 +466,13 @@ export interface FaceRoofingPack {
   outOfOrderOffcutWarning?: string;
 }
 
+export interface RoofBomSheetCutDetail {
+  faceCode: string;
+  faceName: string;
+  requiredCutMm: number;
+  qty: number;
+}
+
 export interface RoofBomSheetGroup {
   lengthMm: number;
   lengthM: number;
@@ -464,9 +483,13 @@ export interface RoofBomSheetGroup {
   modeledLengthMm?: number;
   hasSiteOverride?: boolean;
   overrideNotes?: string;
+  cutDetails?: RoofBomSheetCutDetail[];
 }
 
 export interface RoofBomSummary {
+  sheetOrderMode?: SheetOrderMode;
+  sheetOrderAssumption?: string;
+  comparisonSummary?: SheetOrderComparisonSummary;
   totalRoofAreaM2: number;
   totalSheetsCount: number;
   totalOrderedLm: number;
@@ -610,6 +633,7 @@ export interface OrderPackSheetLine {
   faces: string[];
   has_offcut_harvest: boolean;
   notes: string;
+  cut_details?: RoofBomSheetCutDetail[];
 }
 
 export interface OrderPackFlashingLine {
@@ -699,6 +723,9 @@ export interface OrderPack {
     coverWidthMm: number;
     endLapMm: number;
     overhangMm: number;
+    sheetOrderMode?: SheetOrderMode;
+    sheetOrderAssumption?: string;
+    comparisonSummary?: SheetOrderComparisonSummary;
     sheetRoundingNote: string;
     productCodePolicy: string;
   };
@@ -741,6 +768,7 @@ export interface ExactRoofModelSnapshot {
   measureLocked: boolean;
   measureConfirmedAt?: string;
   measureConfirmedBy?: string;
+  sheetOrderMode?: SheetOrderMode;
   selectedPreset: RoofOutlinePresetKey;
   outline: RoofOutline;
   skeleton: SkeletonLine[];

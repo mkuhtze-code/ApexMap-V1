@@ -16,7 +16,7 @@ import {
   isEdgeColinearWithSegment,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
-import type { PlanEdge, RoofLevel, RoofOutline } from '../../types/exactRoofing';
+import type { PlanEdge, RoofLevel, RoofOutline, RoofPlane, SheetSpec } from '../../types/exactRoofing';
 
 console.log('--- Starting Exact Roofing Engine Test Suite ---');
 
@@ -81,7 +81,7 @@ const layout = generateCuttingLayout(planes, {
   maxLength: 6.0,
   endLap: 0.15,
   overhang: 0.05
-});
+}, { sheetOrderMode: 'optimized' });
 
 console.log('Test 3 (Layout Results):', {
   parentSheetsCount: layout.parents.length,
@@ -171,7 +171,7 @@ const lLayout = generateCuttingLayout(lPlanes, {
   maxLength: 6.0,
   endLap: 0.15,
   overhang: 0.05
-});
+}, { sheetOrderMode: 'optimized' });
 
 if (lLayout.parents.length === 0 || lLayout.wastePercent > 12) {
   throw new Error('Failed to solve L-Shape mixed-pitch roof');
@@ -453,7 +453,7 @@ const lUniformLayout = generateCuttingLayout(lUniformPlanes, {
   maxLength: 6.0,
   endLap: 0.15,
   overhang: 0.05
-});
+}, { sheetOrderMode: 'optimized' });
 
 if (lUniformLayout.pairingLinks.length !== 6) {
   throw new Error(`Expected 6 progressive hip/valley loop links on uniform L-Shape, got ${lUniformLayout.pairingLinks.length}`);
@@ -1457,7 +1457,7 @@ const erPlanes = erOutline.edges.map((e, idx) =>
 const erLayout = generateCuttingLayout(
   erPlanes,
   { coverWidth: 0.762, maxLength: 6.34, endLap: 0.15, overhang: 0.05 },
-  { startPlaneId: erPlanes[0].id }
+  { startPlaneId: erPlanes[0].id, sheetOrderMode: 'optimized' }
 );
 
 if (Math.abs(erLayout.totalRoofArea - 201.2) > 0.5) {
@@ -1490,8 +1490,20 @@ if (erComputedReused !== erLayout.totalOffcutsReused) {
   );
 }
 
+const erPracticalLayout = generateCuttingLayout(
+  erPlanes,
+  { coverWidth: 0.762, maxLength: 6.34, endLap: 0.15, overhang: 0.05 },
+  { startPlaneId: erPlanes[0].id }
+);
+const erPracticalLengths = new Set(erPracticalLayout.parents.map((p) => Math.round(p.length * 1000)));
+if (erPracticalLayout.sheetOrderMode !== 'practical' || erPracticalLengths.size !== 1) {
+  throw new Error(
+    `Expected Practical default on uniform ExactRoof benchmark to use 1 stock length, got ${erPracticalLengths.size} (${Array.from(erPracticalLengths).join(',')})`
+  );
+}
+
 console.log(
-  `✓ Test 26 Passed: ExactRoof Benchmark (${erLayout.totalRoofArea} m², ${erLayout.parents.length} sheets, ${erLayout.totalOrderedMetres} lm ordered, max sheet ${Math.round(erMaxParentLen * 1000)}mm, ${erLayout.totalOffcutsReused} offcuts repressed saving ${erLayout.savedMetres}m) verified.`
+  `✓ Test 26 Passed: ExactRoof Benchmark (Optimized: ${erLayout.parents.length} sheets / ${erLayout.totalOrderedMetres} lm; Practical default: ${erPracticalLayout.parents.length} sheets @ ${Array.from(erPracticalLengths)[0]}mm) verified.`
 );
 
 // 27. TEST 27: Additive Multi-Body Drawing & Draw-From-Wall/Eave Edge (Zero Auto-Skeleton)
@@ -2159,6 +2171,68 @@ if (!completeReport.isComplete || completeReport.totalIssuesCount !== 0) {
 }
 console.log(
   '✓ Test 35 Passed: Takeoff completeness gate catches undetailed walls/returns, missing flashings & orphan penetrations and clears when resolved.'
+);
+
+// 36. TEST 36: Practical Sheet Ordering (Default Simple Cut List vs Optimized Toggle)
+const pracSpec: SheetSpec = { coverWidth: 0.762, maxLength: 6.5, endLap: 0.15, overhang: 0.05 };
+
+// 36a. Simple 14x10 4-hip roof -> Practical default picks 1 dominant length and covers every piece
+const pracHipLayout = generateCuttingLayout(planes, pracSpec);
+const optHipLayout = generateCuttingLayout(planes, pracSpec, { sheetOrderMode: 'optimized' });
+const pracHipDistinct = new Set(pracHipLayout.parents.map((p) => Math.round(p.length * 1000)));
+const optHipDistinct = new Set(optHipLayout.parents.map((p) => Math.round(p.length * 1000)));
+
+if (pracHipLayout.sheetOrderMode !== 'practical') {
+  throw new Error(`Expected default sheetOrderMode to be 'practical', got ${pracHipLayout.sheetOrderMode}`);
+}
+if (pracHipDistinct.size !== 1) {
+  throw new Error(`Simple 14x10 hip should use 1 Practical stock length, got ${pracHipDistinct.size} (${Array.from(pracHipDistinct).join(',')})`);
+}
+if (optHipLayout.totalOrderedMetres > pracHipLayout.totalOrderedMetres + 0.05) {
+  throw new Error(`Optimized mode (${optHipLayout.totalOrderedMetres}m) should not significantly exceed Practical (${pracHipLayout.totalOrderedMetres}m)`);
+}
+if (optHipDistinct.size <= pracHipDistinct.size) {
+  throw new Error(`Expected Optimized mode to use more distinct lengths than 1-length Practical on 4-hip`);
+}
+pracHipLayout.parents.forEach((par) => {
+  par.pieces.forEach((pc) => {
+    if (pc.length > par.length + 0.002) {
+      throw new Error(`Parent ${par.id} (${par.length}m) shorter than piece ${pc.id} (${pc.length}m)`);
+    }
+  });
+});
+
+// 36b. Multi-body disparate roof (two_storey_split: main upper ~5.4m + lower wing ~3.2m) -> 2-3 Practical lengths
+const splitPreset36 = getMultiLevelPreset('two_storey_split', 22.5);
+const pracSplitLayout = generateCuttingLayout(splitPreset36.planes, pracSpec);
+const pracSplitDistinct = new Set(pracSplitLayout.parents.map((p) => Math.round(p.length * 1000)));
+if (pracSplitDistinct.size < 2 || pracSplitDistinct.size > 3) {
+  throw new Error(
+    `Expected multi-body 2-storey roof in Practical mode to use 2-3 stock lengths, got ${pracSplitDistinct.size} (${Array.from(pracSplitDistinct).join(',')})`
+  );
+}
+const pracSplitExactSum = +pracSplitLayout.parents.reduce((s, p) => s + p.length, 0).toFixed(2);
+if (Math.abs(pracSplitExactSum - pracSplitLayout.totalOrderedMetres) > 0.02) {
+  throw new Error(
+    `Practical multi-body sum (${pracSplitExactSum}) must strictly reconcile with totalOrderedMetres (${pracSplitLayout.totalOrderedMetres})`
+  );
+}
+
+// 36c. Site-measured sheet override in Practical mode keeps exact 1mm override while non-override stays Practical
+const pracOverridePlanes: RoofPlane[] = planes.map((p, idx) =>
+  idx === 0 ? { ...p, orderedSheetLengthM: 5.435 } : p
+);
+const pracOverrideLayout = generateCuttingLayout(pracOverridePlanes, pracSpec);
+const pracOverrideLengths = new Set(pracOverrideLayout.parents.map((p) => Math.round(p.length * 1000)));
+if (!pracOverrideLengths.has(5435)) {
+  throw new Error(`Expected exact 5435mm override preserved in Practical mode, got ${Array.from(pracOverrideLengths).join(',')}`);
+}
+if (pracOverrideLengths.size > 2) {
+  throw new Error(`Expected 5435mm override + 1 Practical stock length, got ${pracOverrideLengths.size} lengths`);
+}
+
+console.log(
+  `✓ Test 36 Passed: Practical default uses ${pracHipDistinct.size} length on 4-hip (${pracHipLayout.totalOrderedMetres}m vs Optimized ${optHipLayout.totalOrderedMetres}m across ${optHipDistinct.size} lengths), ${pracSplitDistinct.size} lengths on 2-storey split, and exact 5435mm site override intact.`
 );
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

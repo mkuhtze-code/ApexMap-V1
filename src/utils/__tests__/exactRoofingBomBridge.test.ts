@@ -231,5 +231,36 @@ assert.ok(
   `Packs fresh ordered metres (${packsFreshLm}) must reconcile with bom.totalOrderedLm (${benchBom.totalOrderedLm})`
 );
 
+// 7. Practical Mode Cut Details, Comparison Summary & CSV Verification
+assert.equal(bom.sheetOrderMode, 'practical', 'BOM must default to practical sheetOrderMode');
+assert.ok(bom.sheetOrderAssumption && bom.sheetOrderAssumption.length > 10, 'BOM must include sheet order assumption');
+assert.ok(bom.sheetGroups.length === 1, `14x10 hip in Practical mode should consolidate to 1 sheet group, got ${bom.sheetGroups.length}`);
+assert.ok((bom.sheetGroups[0].cutDetails?.length || 0) >= 2, 'Practical sheet group should record cutDetails breakdown for shorter runs');
+
+const optLayout = generateCuttingLayout(planes, sheetSpec, {
+  startPlaneId: planes[0].id,
+  sheetOrderMode: 'optimized'
+});
+const bomWithComparison = buildRoofBillOfMaterials({
+  planes,
+  layout,
+  assignments,
+  assignableLines: [],
+  sheetOrderMode: 'practical',
+  comparisonSummary: {
+    practicalOrderedLm: layout.totalOrderedMetres,
+    practicalSheetsCount: layout.parents.length,
+    practicalDistinctLengths: bom.sheetGroups.length,
+    optimizedOrderedLm: optLayout.totalOrderedMetres,
+    optimizedSheetsCount: optLayout.parents.length,
+    optimizedDistinctLengths: new Set(optLayout.parents.map((p) => Math.round(p.length * 1000))).size
+  }
+});
+assert.ok(bomWithComparison.comparisonSummary, 'Comparison summary should attach to BOM');
+const pracCsv = exportRoofBomToCsv({ bom: bomWithComparison, packs: customPacks, projectName: 'Practical CSV Test' });
+assert.ok(pracCsv.includes('Sheet Order Mode,"Practical (Site Cut List)"'), 'BOM CSV records Practical mode');
+assert.ok(pracCsv.includes('Cut Breakdown'), 'BOM CSV includes Cut Breakdown column');
+assert.ok(!pracCsv.includes('$'), 'BOM CSV must stay commercial-neutral (zero $)');
+
 console.log('✓ exactRoofingBomBridge unit tests passed');
 

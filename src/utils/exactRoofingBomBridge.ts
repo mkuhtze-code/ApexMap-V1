@@ -1,6 +1,7 @@
 import {
   CoilMaterial,
   FlashingGirthTier,
+  FlashingProfile,
   FlashingType,
   OnsiteMaterialOrder,
   Project,
@@ -13,14 +14,18 @@ import {
   AssignableRoofLine,
   FaceRoofingPack,
   LayoutResult,
+  OrderPack,
   RoofAsset,
   RoofBomSheetGroup,
   RoofBomSummary,
   RoofFlashingAssignment,
+  RoofLevel,
   RoofLineFlashingKind,
   RoofPackLengthGroup,
   RoofPackOffcutTransfer,
-  RoofPlane
+  RoofPlane,
+  TakeoffCompletenessReport,
+  WallPlan
 } from '../types/exactRoofing';
 import { LongRunProfileKey, RoofFacet } from '../types/longrun';
 import {
@@ -29,6 +34,18 @@ import {
   MODULAR_TRAY_PROFILES
 } from './pricingMatrix';
 import { calculateGST } from './formatters';
+import {
+  groupFlashingScheduleLines,
+  resolveFlashingProductCode
+} from './exactRoofingFlashingBridge';
+import { computeAssetPlacementMetrics } from './exactRoofingEngine';
+import { evaluateTakeoffCompleteness } from './takeoffCompleteness';
+import {
+  analyzeWallPlanTopology,
+  buildWallOpeningsSchedule,
+  computeWallTakeoffSummary,
+  getWallCladdingMeta
+} from './wallCladdingEngine';
 
 function getDisplayPlanes(planes: RoofPlane[], layout?: LayoutResult | null): RoofPlane[] {
   if (layout?.effectivePlanes && layout.effectivePlanes.length > 0) {
@@ -107,9 +124,11 @@ export function buildRoofBillOfMaterials(params: {
       lengthMm: number;
       lengthM: number;
       count: number;
-      totalLm: number;
       targetCodes: Set<string>;
       hasOffcutHarvest: boolean;
+      modeledLengthMm?: number;
+      hasSiteOverride: boolean;
+      overrideNotes: Set<string>;
     }
   >();
 
@@ -120,16 +139,33 @@ export function buildRoofBillOfMaterials(params: {
         lengthMm,
         lengthM,
         count: 0,
-        totalLm: 0,
         targetCodes: new Set<string>(),
-        hasOffcutHarvest: false
+        hasOffcutHarvest: false,
+        modeledLengthMm: undefined as number | undefined,
+        hasSiteOverride: false,
+        overrideNotes: new Set<string>()
       };
       existing.count += 1;
-      existing.totalLm = +(existing.totalLm + parent.length).toFixed(3);
       parent.pieces.forEach((pc) => {
         const p = planeById.get(pc.targetPlaneId);
         if (p?.code) existing.targetCodes.add(p.code);
       });
+      const primaryPlane = parent.pieces[0] ? planeById.get(parent.pieces[0].targetPlaneId) : undefined;
+      if (primaryPlane) {
+        const modeledMm = Math.max(100, Math.round((primaryPlane.slopeLength || 0) * 1000));
+        const orderedOverrideMm = primaryPlane.orderedSheetLengthM
+          ? Math.max(100, Math.round(primaryPlane.orderedSheetLengthM * 1000))
+          : null;
+        if (orderedOverrideMm && lengthMm === orderedOverrideMm && orderedOverrideMm !== modeledMm) {
+          existing.hasSiteOverride = true;
+          existing.modeledLengthMm = modeledMm;
+          existing.overrideNotes.add(
+            `${primaryPlane.code}: site ${orderedOverrideMm}mm vs modeled ${modeledMm}mm`
+          );
+        } else if (existing.modeledLengthMm === undefined) {
+          existing.modeledLengthMm = lengthMm;
+        }
+      }
       if (parent.pieces.length > 1) {
         existing.hasOffcutHarvest = true;
       }
@@ -144,16 +180,20 @@ export function buildRoofBillOfMaterials(params: {
       count: g.count,
       totalLm: +(g.count * g.lengthM).toFixed(3),
       targetCodes: Array.from(g.targetCodes).sort(),
-      hasOffcutHarvest: g.hasOffcutHarvest
+      hasOffcutHarvest: g.hasOffcutHarvest,
+      modeledLengthMm: g.modeledLengthMm ?? g.lengthMm,
+      hasSiteOverride: g.hasSiteOverride,
+      overrideNotes: g.overrideNotes.size > 0 ? Array.from(g.overrideNotes).join('; ') : undefined
     }))
     .sort((a, b) => b.lengthMm - a.lengthMm);
 
   const fallbackAreaM2 = displayPlanes.reduce((s, p) => s + (p.area || 0), 0);
   const totalRoofAreaM2 = +(layout?.totalRoofArea ?? fallbackAreaM2).toFixed(2);
   const totalSheetsCount = sheetGroups.reduce((s, g) => s + g.count, 0) || layout?.parents.length || 0;
-  const totalOrderedLm = +sheetGroups.reduce((s, g) => s + g.count * g.lengthM, 0).toFixed(2);
-  const totalNetRoofLm = +(layout?.totalRoofMetres || 0).toFixed(2);
-  const savedOffcutLm = +(layout?.savedMetres || 0).toFixed(2);
+  const totalOrderedMm = sheetGroups.reduce((s, g) => s + g.count * g.lengthMm, 0);
+  const totalOrderedLm = +(totalOrderedMm / 1000).toFixed(3);
+  const totalNetRoofLm = +(layout?.totalRoofMetres || 0).toFixed(3);
+  const savedOffcutLm = +(layout?.savedMetres || 0).toFixed(3);
   const totalOffcutsReused =
     layout?.totalOffcutsReused ??
     (layout?.parents.reduce((s, p) => s + Math.max(0, p.pieces.length - 1), 0) || 0);
@@ -905,9 +945,41 @@ export function exportRoofBomToCsv(params: {
 
   lines.push('');
   lines.push(['SECTION 2: FLASHING SCHEDULE'].join(','));
-  lines.push(['Line Label', 'Profile Name', 'Kind', 'Girth Tier', 'Sticks', 'Stick Length (m)', 'Total (lm)'].join(','));
+  lines.push([
+    'Product Code',
+    'Line Label',
+    'Profile Name',
+    'Kind',
+    'Girth (mm)',
+    'Girth Tier',
+    'Bends',
+    'Hem/Crush',
+    'Sticks',
+    'Stick Length (m)',
+    'Total (lm)',
+    'Notes'
+  ].join(','));
   bom.flashingAssignments.forEach((f) => {
-    lines.push([esc(f.lineLabel), esc(f.profileName), f.flashingKind, esc(f.girthTier || 'Custom'), f.quantity, f.pieceLengthLm.toFixed(2), f.totalLinearMetres.toFixed(2)].join(','));
+    const code = resolveFlashingProductCode({
+      profileId: f.profileId,
+      flashingKind: f.flashingKind,
+      explicitCode: f.productCode,
+      blankWidthMm: f.developedBlankWidthMm
+    });
+    lines.push([
+      esc(code),
+      esc(f.lineLabel),
+      esc(f.profileName),
+      f.flashingKind,
+      Math.round(f.developedBlankWidthMm || 350),
+      esc(f.girthTier || 'Custom'),
+      f.bendCount ?? 0,
+      f.hasHemCrush ? 'Yes' : 'No',
+      f.quantity,
+      f.pieceLengthLm.toFixed(2),
+      f.totalLinearMetres.toFixed(2),
+      esc(f.notes || '')
+    ].join(','));
   });
 
   lines.push('');
@@ -935,6 +1007,459 @@ export function exportRoofBomToCsv(params: {
   lines.push(['Penetration Boot Kits', bom.penetrationKitCount, 'kits'].join(','));
 
   return lines.join('\n');
+}
+
+function resolveSheetProductCode(profile: string): string {
+  const lower = profile.toLowerCase();
+  if (lower.includes('corrugate')) return lower.includes('0.40') ? 'SHT-COR-040' : 'SHT-COR-055';
+  if (lower.includes('plumbdeck')) return lower.includes('0.40') ? 'SHT-PLM-040' : 'SHT-PLM-055';
+  if (lower.includes('trimform')) return 'SHT-TRM-055';
+  if (lower.includes('super seam')) return 'SHT-SSM-055';
+  if (lower.includes('snaplock')) return 'SHT-SNP-055';
+  return 'SHT-ROOF-CUSTOM';
+}
+
+/**
+ * Builds the single commercial-neutral Order Pack emitted when Confirm & Lock Measure completes.
+ * Contains strictly quantities, lengths (mm/m), bend/girth specs, assumptions, and product codes — ZERO dollar figures.
+ */
+export function buildOrderPack(params: {
+  project?: Project;
+  planes: RoofPlane[];
+  levels?: RoofLevel[];
+  layout: LayoutResult | null;
+  bom?: RoofBomSummary;
+  assignableLines?: AssignableRoofLine[];
+  assignments: RoofFlashingAssignment[];
+  libraryProfiles?: FlashingProfile[];
+  assets?: RoofAsset[];
+  wallPlan?: WallPlan | null;
+  completenessReport?: TakeoffCompletenessReport;
+  locked?: boolean;
+  confirmedAt?: string;
+  confirmedBy?: string;
+  coverWidthMm?: number;
+  endLapMm?: number;
+  overhangMm?: number;
+}): OrderPack {
+  const {
+    project,
+    planes,
+    levels = [],
+    layout,
+    assignableLines = [],
+    assignments,
+    libraryProfiles = [],
+    assets = [],
+    wallPlan = null,
+    locked = false,
+    confirmedAt,
+    confirmedBy,
+    coverWidthMm = 762,
+    endLapMm = 150,
+    overhangMm = 50
+  } = params;
+
+  const bom =
+    params.bom ||
+    buildRoofBillOfMaterials({
+      planes,
+      layout,
+      assignments,
+      assignableLines,
+      assets
+    });
+
+  const completenessReport =
+    params.completenessReport ||
+    evaluateTakeoffCompleteness({
+      levels,
+      planes,
+      assignableLines,
+      flashingAssignments: assignments,
+      wallPlan,
+      assets
+    });
+
+  const profileName = project?.profile || 'TRS Corrugate 0.55mm';
+  const materialName = project?.material || 'Kiwicolour® Vitor+ PVDF (The Roofing Store)';
+  const colorName = project?.colorName || 'FlaxPod';
+  const sheetBaseCode = resolveSheetProductCode(profileName);
+
+  const sheets = bom.sheetGroups.map((g) => {
+    const modeledMm = g.modeledLengthMm ?? g.lengthMm;
+    const isOverride = Boolean(g.hasSiteOverride && modeledMm !== g.lengthMm);
+    return {
+      code: `${sheetBaseCode}-${g.lengthMm}`,
+      description: `${profileName} · ${colorName} · ${g.lengthMm}mm Sheet`,
+      qty: g.count,
+      unit: 'sheets' as const,
+      length_mm: g.lengthMm,
+      modeled_length_mm: modeledMm,
+      is_override: isOverride,
+      total_lm: +(g.count * (g.lengthMm / 1000)).toFixed(3),
+      faces: g.targetCodes,
+      has_offcut_harvest: g.hasOffcutHarvest,
+      notes: [
+        `Faces ${g.targetCodes.join(', ') || 'Main'}`,
+        isOverride ? `Site override (modeled ${modeledMm}mm)` : '',
+        g.hasOffcutHarvest ? 'Includes repressed offcut harvest' : ''
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    };
+  });
+
+  const groupedFlashings = groupFlashingScheduleLines(assignments, libraryProfiles, colorName);
+  const flashings = groupedFlashings.map((g) => ({
+    code: g.productCode,
+    description: `${g.profileName} (${g.girthMm}mm blank · ${g.bendCount} bends${g.hasHemCrush ? ' · Crush/Hem' : ''})`,
+    profile_id: g.profileId,
+    flashing_kind: g.flashingKind,
+    girth_mm: g.girthMm,
+    girth_tier: g.girthTier,
+    bend_count: g.bendCount,
+    key_angles_deg: g.keyAnglesDeg,
+    has_hem_crush: g.hasHemCrush,
+    qty: g.quantity,
+    unit: 'sticks' as const,
+    length_mm: g.pieceLengthMm,
+    total_lm: g.totalLinearMetres,
+    color: g.colorName,
+    line_labels: g.lineLabels,
+    notes: `${g.lineLabels.join(' + ')}${g.notes ? ` · ${g.notes}` : ''}`
+  }));
+
+  const displayPlanes = getDisplayPlanes(planes, layout);
+  const planeById = new Map<string, RoofPlane>();
+  displayPlanes.forEach((p) => planeById.set(p.id, p));
+
+  const penetrations = assets.map((asset) => {
+    const hp = planeById.get(asset.planeId);
+    const metrics = hp ? computeAssetPlacementMetrics(hp, asset) : null;
+    const widthMm = Math.round((asset.widthM || 0) * 1000);
+    const depthMm = Math.round((asset.depthM || 0) * 1000);
+    const code =
+      asset.type === 'skylight'
+        ? `PEN-SKY-${widthMm}X${depthMm}`
+        : asset.type === 'chimney'
+        ? `PEN-CHM-${widthMm}X${depthMm}`
+        : `PEN-DRM-${widthMm}X${depthMm}`;
+    return {
+      id: asset.id,
+      type: asset.type,
+      code,
+      description: `${asset.label || asset.type.replace('_', ' ')} (${widthMm}×${depthMm}mm)`,
+      host_plane_code: hp?.code || 'UNLINKED',
+      width_mm: widthMm,
+      depth_mm: depthMm,
+      eave_dist_m: +(metrics?.distFromEaveM ?? asset.distFromEaveM ?? 0).toFixed(3),
+      apex_dist_m: +(metrics?.distFromApexM ?? asset.distFromApexM ?? 0).toFixed(3),
+      qty: 1,
+      unit: 'ea' as const,
+      notes: hp
+        ? `Host Face ${hp.code} · Eave ${(metrics?.distFromEaveM ?? 0).toFixed(2)}m · Apex ${(metrics?.distFromApexM ?? 0).toFixed(2)}m`
+        : 'Host face missing'
+    };
+  });
+
+  const hardware = [
+    ...(bom.estimatedScrewBoxes > 0
+      ? [
+          {
+            code: 'HW-TEK-CREST-500',
+            description: `Class 4 Self-Drilling Crest Screws (500/box · ~${bom.estimatedScrewCount} screws)`,
+            qty: bom.estimatedScrewBoxes,
+            unit: 'boxes',
+            notes: `8.5 screws/m2 (${bom.totalRoofAreaM2.toFixed(1)}m2)`
+          }
+        ]
+      : []),
+    ...(bom.estimatedUnderlayRolls > 0
+      ? [
+          {
+            code: 'HW-UL-SYN-75M2',
+            description: 'Synthetic Roof Underlay (75m2 gross / 65m2 net)',
+            qty: bom.estimatedUnderlayRolls,
+            unit: 'rolls',
+            notes: '150mm overlap allowance'
+          }
+        ]
+      : []),
+    ...(bom.estimatedFoamClosureM > 0
+      ? [
+          {
+            code: 'HW-FOAM-CLOSURE',
+            description: 'Profiled Foam Ridge & Eave Closure Strips',
+            qty: bom.estimatedFoamClosureM,
+            unit: 'lm',
+            notes: 'Ridge, hip & eave seal'
+          }
+        ]
+      : []),
+    ...(bom.penetrationKitCount > 0
+      ? [
+          {
+            code: 'HW-PEN-BOOT-KIT',
+            description: 'Skylight / Chimney Soaker & Seal Kit',
+            qty: bom.penetrationKitCount,
+            unit: 'kits',
+            notes: 'Includes back-gutter apron & fasteners'
+          }
+        ]
+      : [])
+  ];
+
+  let wallsSection: OrderPack['walls'] | undefined = undefined;
+  if (wallPlan && wallPlan.facets.length > 0) {
+    const wallSum = computeWallTakeoffSummary(wallPlan.facets);
+    const topology = analyzeWallPlanTopology(wallPlan.facets);
+    const openSched = buildWallOpeningsSchedule(wallPlan.facets);
+
+    wallsSection = {
+      totalFaces: wallSum.totalFaces,
+      detailedFaces: wallSum.detailedFacesCount,
+      externalCornersCount: topology.externalCornersCount,
+      internalCornersCount: topology.internalCornersCount,
+      returnFacesCount: topology.returnFacesCount,
+      totalNetAreaM2: wallSum.totalNetAreaM2,
+      totalOpeningsAreaM2: wallSum.totalOpeningsAreaM2,
+      byCladding: wallSum.byCladding
+        .filter((g) => g.claddingType !== 'none')
+        .map((g) => ({
+          code: `WALL-${g.claddingType.toUpperCase()}`,
+          cladding_type: g.claddingType,
+          description: getWallCladdingMeta(g.claddingType).label,
+          faces_count: g.faceCount,
+          gross_area_m2: g.grossAreaM2,
+          openings_area_m2: g.openingsAreaM2,
+          net_area_m2: g.netAreaM2,
+          lineal_m: g.linealM,
+          unit: 'm2' as const,
+          notes: `${g.faceCount} face(s) · ${g.linealM.toFixed(2)}m perimeter`
+        })),
+      openingsSchedule: openSched.rows.map((op) => ({
+        id: op.id,
+        wall_code: op.facetCode,
+        wall_name: `Wall ${op.facetCode}`,
+        type: op.type,
+        label: op.label,
+        width_mm: Math.round(op.widthM * 1000),
+        height_mm: Math.round(op.heightM * 1000),
+        sill_mm: Math.round(op.sillHeightM * 1000),
+        dist_from_start_m: op.distFromStartM,
+        area_m2: op.areaM2
+      })),
+      returnNotes: topology.returnFacetIds
+        .map((rid) => wallPlan.facets.find((f) => f.id === rid))
+        .filter((f): f is NonNullable<typeof f> => Boolean(f))
+        .map(
+          (f) =>
+            `Return Wall ${f.code}: ${f.lengthM.toFixed(2)}m × ${f.heightM.toFixed(2)}m (${getWallCladdingMeta(f.claddingType).label})`
+        )
+    };
+  }
+
+  const totalOrderedLmExact = +sheets.reduce((s, sh) => s + sh.qty * (sh.length_mm / 1000), 0).toFixed(3);
+  const flashingTotalLmExact = +flashings.reduce((s, fl) => s + fl.qty * (fl.length_mm / 1000), 0).toFixed(3);
+  const flashingSticksExact = flashings.reduce((s, fl) => s + fl.qty, 0);
+
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    locked,
+    confirmedAt,
+    confirmedBy,
+    projectNumber: project?.projectNumber || 'ER-PLAN',
+    projectTitle: project?.title || 'Exact Roofing Plan',
+    siteAddress: project?.siteAddress,
+    commercialNeutral: true,
+    assumptions: {
+      profile: profileName,
+      material: materialName,
+      color: colorName,
+      windZone: project?.windZone,
+      exposureZone: project?.exposureZone,
+      coverWidthMm,
+      endLapMm,
+      overhangMm,
+      sheetRoundingNote: 'Mill-exact 1mm cut precision; site overrides adjust cut length without altering 3D roof geometry.',
+      productCodePolicy: 'Known catalog codes resolved where mapped; custom profiles flagged as UNCODED-<KIND>.'
+    },
+    totals: {
+      roofAreaM2: bom.totalRoofAreaM2,
+      totalSheets: sheets.reduce((s, sh) => s + sh.qty, 0),
+      totalOrderedLm: totalOrderedLmExact,
+      totalNetRoofLm: bom.totalNetRoofLm,
+      savedOffcutLm: bom.savedOffcutLm,
+      offcutsReusedCount: bom.totalOffcutsReused ?? 0,
+      wastePercent: bom.wastePercent,
+      flashingSticks: flashingSticksExact,
+      flashingTotalLm: flashingTotalLmExact,
+      penetrationCount: penetrations.length,
+      wallNetAreaM2: wallsSection?.totalNetAreaM2,
+      wallOpeningsCount: wallsSection?.openingsSchedule.length
+    },
+    sheets,
+    flashings,
+    penetrations,
+    hardware,
+    walls: wallsSection,
+    completenessReport
+  };
+}
+
+/**
+ * Exports a commercial-neutral CSV compatible with yard/Buildxact takeoff ingestion (ZERO dollar columns).
+ */
+export function exportOrderPackToCsv(orderPack: OrderPack): string {
+  const esc = (v: string | number | boolean | undefined) =>
+    `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const lines: string[] = [];
+
+  lines.push(
+    ['ORDER PACK (COMMERCIAL-NEUTRAL)', esc(orderPack.projectNumber), esc(orderPack.projectTitle), 'Locked', orderPack.locked ? 'YES' : 'NO'].join(',')
+  );
+  lines.push(
+    ['Profile', esc(orderPack.assumptions.profile), 'Material', esc(orderPack.assumptions.material), 'Colour', esc(orderPack.assumptions.color)].join(',')
+  );
+  lines.push('');
+
+  // Unified Schedule Header
+  lines.push(['SECTION', 'code', 'description', 'qty', 'unit', 'length_mm', 'modeled_length_mm', 'is_override', 'total_lm', 'girth_mm', 'bend_count', 'has_hem_crush', 'notes'].join(','));
+
+  orderPack.sheets.forEach((sh) => {
+    lines.push([
+      'SHEETS',
+      esc(sh.code),
+      esc(sh.description),
+      sh.qty,
+      sh.unit,
+      sh.length_mm,
+      sh.modeled_length_mm,
+      sh.is_override ? 'YES' : 'NO',
+      sh.total_lm.toFixed(3),
+      '',
+      '',
+      '',
+      esc(sh.notes)
+    ].join(','));
+  });
+
+  orderPack.flashings.forEach((fl) => {
+    lines.push([
+      'FLASHINGS',
+      esc(fl.code),
+      esc(fl.description),
+      fl.qty,
+      fl.unit,
+      fl.length_mm,
+      '',
+      'NO',
+      fl.total_lm.toFixed(3),
+      fl.girth_mm,
+      fl.bend_count,
+      fl.has_hem_crush ? 'YES' : 'NO',
+      esc(fl.notes)
+    ].join(','));
+  });
+
+  orderPack.penetrations.forEach((pen) => {
+    lines.push([
+      'PENETRATIONS',
+      esc(pen.code),
+      esc(pen.description),
+      pen.qty,
+      pen.unit,
+      pen.depth_mm,
+      '',
+      'NO',
+      '',
+      '',
+      '',
+      '',
+      esc(pen.notes)
+    ].join(','));
+  });
+
+  orderPack.hardware.forEach((hw) => {
+    lines.push([
+      'HARDWARE',
+      esc(hw.code),
+      esc(hw.description),
+      hw.qty,
+      esc(hw.unit),
+      '',
+      '',
+      'NO',
+      '',
+      '',
+      '',
+      '',
+      esc(hw.notes)
+    ].join(','));
+  });
+
+  if (orderPack.walls) {
+    orderPack.walls.byCladding.forEach((wl) => {
+      lines.push([
+        'WALL_CLADDING',
+        esc(wl.code),
+        esc(wl.description),
+        wl.net_area_m2.toFixed(2),
+        wl.unit,
+        '',
+        '',
+        'NO',
+        wl.lineal_m.toFixed(2),
+        '',
+        '',
+        '',
+        esc(wl.notes)
+      ].join(','));
+    });
+
+    orderPack.walls.openingsSchedule.forEach((op) => {
+      lines.push([
+        'WALL_OPENING',
+        esc(`${op.wall_code}-${op.type.toUpperCase()}`),
+        esc(`${op.wall_name}: ${op.label} (${op.width_mm}x${op.height_mm}mm)`),
+        1,
+        'ea',
+        op.width_mm,
+        op.height_mm,
+        'NO',
+        '',
+        '',
+        '',
+        '',
+        esc(`Sill ${op.sill_mm}mm · Dist ${op.dist_from_start_m.toFixed(2)}m`)
+      ].join(','));
+    });
+  }
+
+  lines.push('');
+  lines.push([
+    'RECONCILIATION_TOTALS',
+    'Total Sheets',
+    orderPack.totals.totalSheets,
+    'Ordered lm',
+    orderPack.totals.totalOrderedLm.toFixed(3),
+    'Flashing Sticks',
+    orderPack.totals.flashingSticks,
+    'Flashing lm',
+    orderPack.totals.flashingTotalLm.toFixed(3),
+    'Blockers',
+    orderPack.completenessReport.blockersCount,
+    'Warnings',
+    orderPack.completenessReport.warningsCount
+  ].join(','));
+
+  return lines.join('\n');
+}
+
+export function exportOrderPackToJson(orderPack: OrderPack): string {
+  return JSON.stringify(orderPack, null, 2);
 }
 
 export function convertExactLayoutToRoofFacets(params: {

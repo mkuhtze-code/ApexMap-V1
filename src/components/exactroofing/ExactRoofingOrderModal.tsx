@@ -11,18 +11,28 @@ import {
   AssignableRoofLine,
   FaceRoofingPack,
   LayoutResult,
+  OrderPack,
+  RoofAsset,
   RoofBomSummary,
   RoofFlashingAssignment,
-  RoofLifecycleStage
+  RoofLevel,
+  RoofLifecycleStage,
+  RoofPlane,
+  TakeoffCompletenessReport,
+  WallPlan
 } from '../../types/exactRoofing';
 import { ProfileThumbnail } from '../FlashingWorkshop';
 import {
   getFlashingKindDisplayLabel,
-  pushAssignmentsToFlashingWorkshop
+  pushAssignmentsToFlashingWorkshop,
+  resolveFlashingProductCode
 } from '../../utils/exactRoofingFlashingBridge';
 import {
   buildCompleteBomMaterialOrder,
+  buildOrderPack,
   buildQuoteSpreadsheetFromRoofBom,
+  exportOrderPackToCsv,
+  exportOrderPackToJson,
   exportRoofBomToCsv
 } from '../../utils/exactRoofingBomBridge';
 import {
@@ -59,7 +69,13 @@ interface Props {
   layout: LayoutResult | null;
   bom: RoofBomSummary;
   packs?: FaceRoofingPack[];
-  initialModalTab?: 'orders' | 'quote';
+  planes?: RoofPlane[];
+  levels?: RoofLevel[];
+  assets?: RoofAsset[];
+  wallPlan?: WallPlan | null;
+  completenessReport?: TakeoffCompletenessReport;
+  orderPack?: OrderPack | null;
+  initialModalTab?: 'orders' | 'order_pack' | 'quote';
   onSelectLineToAssign: (line: AssignableRoofLine) => void;
   onRemoveAssignment: (lineId: string) => void;
   onMarkOrdered: (opts: { workshop?: boolean; crm?: boolean }) => void;
@@ -93,6 +109,12 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   layout,
   bom,
   packs = [],
+  planes = [],
+  levels = [],
+  assets = [],
+  wallPlan = null,
+  completenessReport,
+  orderPack: propOrderPack = null,
   initialModalTab,
   onSelectLineToAssign,
   onRemoveAssignment,
@@ -101,8 +123,13 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   onPushBomToQuote,
   onOpenFlashingOrders
 }) => {
-  const [modalTab, setModalTab] = useState<'orders' | 'quote'>(
-    initialModalTab || (lifecycleStage === 'quoting' ? 'quote' : 'orders')
+  const [modalTab, setModalTab] = useState<'orders' | 'order_pack' | 'quote'>(
+    initialModalTab ||
+      (measureLocked || lifecycleStage === 'installing'
+        ? 'order_pack'
+        : lifecycleStage === 'quoting'
+        ? 'quote'
+        : 'orders')
   );
 
   // Ordering tab state
@@ -190,21 +217,69 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
     quoteIncLabour
   ]);
 
+  const resolvedOrderPack = useMemo(
+    () =>
+      propOrderPack ||
+      buildOrderPack({
+        project,
+        planes,
+        levels,
+        layout,
+        bom,
+        assignableLines,
+        assignments,
+        libraryProfiles,
+        assets,
+        wallPlan,
+        completenessReport,
+        locked: measureLocked
+      }),
+    [
+      propOrderPack,
+      project,
+      planes,
+      levels,
+      layout,
+      bom,
+      assignableLines,
+      assignments,
+      libraryProfiles,
+      assets,
+      wallPlan,
+      completenessReport,
+      measureLocked
+    ]
+  );
+
   React.useEffect(() => {
     if (!isOpen) return;
-    if (lifecycleStage !== 'quoting') {
-      setModalTab('orders');
-    } else if (initialModalTab) {
+    if (initialModalTab && (initialModalTab !== 'quote' || lifecycleStage === 'quoting')) {
       setModalTab(initialModalTab);
-    } else {
+    } else if (measureLocked || lifecycleStage === 'installing') {
+      setModalTab('order_pack');
+    } else if (lifecycleStage === 'quoting') {
       setModalTab('quote');
+    } else {
+      setModalTab('orders');
     }
-  }, [isOpen, lifecycleStage, initialModalTab]);
+  }, [isOpen, lifecycleStage, measureLocked, initialModalTab]);
 
   if (!isOpen) return null;
 
   const isInstalling = lifecycleStage === 'installing';
   const showQuoteTab = lifecycleStage === 'quoting' && Boolean(onPushBomToQuote);
+
+  const triggerDownload = (content: string, filename: string, mime: string) => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
 
   const handleDownloadBomCsv = () => {
     const csv = exportRoofBomToCsv({
@@ -212,18 +287,32 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
       packs,
       projectName: project ? `${project.projectNumber} ${project.title}` : 'ApexMap Roof BOM'
     });
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `ApexMap_BOM_${project?.projectNumber || 'ROOF'}_${new Date()
-      .toISOString()
-      .slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    triggerDownload(
+      csv,
+      `ApexMap_BOM_${project?.projectNumber || 'ROOF'}_${new Date().toISOString().slice(0, 10)}.csv`,
+      'text/csv;charset=utf-8;'
+    );
     setDispatchedNotice('Exported Bill of Materials & Pack Schedule to CSV.');
+  };
+
+  const handleDownloadOrderPackCsv = () => {
+    const csv = exportOrderPackToCsv(resolvedOrderPack);
+    triggerDownload(
+      csv,
+      `ApexMap_OrderPack_${resolvedOrderPack.projectNumber}_${new Date().toISOString().slice(0, 10)}.csv`,
+      'text/csv;charset=utf-8;'
+    );
+    setDispatchedNotice('Exported commercial-neutral Order Pack CSV.');
+  };
+
+  const handleDownloadOrderPackJson = () => {
+    const json = exportOrderPackToJson(resolvedOrderPack);
+    triggerDownload(
+      json,
+      `ApexMap_OrderPack_${resolvedOrderPack.projectNumber}_${new Date().toISOString().slice(0, 10)}.json`,
+      'application/json;charset=utf-8;'
+    );
+    setDispatchedNotice('Exported structured Order Pack JSON.');
   };
 
   const handleSendToWorkshop = () => {
@@ -359,21 +448,33 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Mode Tabs: Material Sheet vs Quote Pricing (Only in Quoting stage) */}
-        {showQuoteTab && (
-          <div className="px-4 sm:px-5 py-2 border-b border-slate-800/80 bg-slate-950/40 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setModalTab('orders')}
-              className={`px-3.5 py-2 min-h-[40px] rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all ${
-                modalTab === 'orders'
-                  ? 'bg-emerald-600 text-white shadow-sm'
-                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-              }`}
-            >
-              <ShoppingCart className="w-3.5 h-3.5" />
-              <span>1. Material List</span>
-            </button>
+        {/* Mode Tabs: Material List · Order Pack · Quote Pricing (Quoting stage only) */}
+        <div className="px-4 sm:px-5 py-2 border-b border-slate-800/80 bg-slate-950/40 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setModalTab('orders')}
+            className={`px-3.5 py-2 min-h-[40px] rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all ${
+              modalTab === 'orders'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+            }`}
+          >
+            <ShoppingCart className="w-3.5 h-3.5" />
+            <span>Material List</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setModalTab('order_pack')}
+            className={`px-3.5 py-2 min-h-[40px] rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all ${
+              modalTab === 'order_pack'
+                ? 'bg-amber-600 text-white shadow-sm'
+                : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+            }`}
+          >
+            <Lock className="w-3.5 h-3.5" />
+            <span>Order Pack · CSV/JSON</span>
+          </button>
+          {showQuoteTab && (
             <button
               type="button"
               onClick={() => setModalTab('quote')}
@@ -384,16 +485,16 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
               }`}
             >
               <FileSpreadsheet className="w-3.5 h-3.5" />
-              <span>2. Quote Pricing</span>
+              <span>Quote Pricing</span>
             </button>
-            {measureLocked && (
-              <span className="ml-auto text-[11px] font-bold text-amber-300 flex items-center gap-1">
-                <Lock className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Measure Locked</span>
-              </span>
-            )}
-          </div>
-        )}
+          )}
+          {measureLocked && (
+            <span className="ml-auto text-[11px] font-bold text-amber-300 flex items-center gap-1">
+              <Lock className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Measure Locked · Quantities Frozen</span>
+            </span>
+          )}
+        </div>
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-5">
@@ -652,6 +753,254 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                 </div>
               </div>
             </div>
+          ) : modalTab === 'order_pack' ? (
+            /* ===================== TAB: COMMERCIAL-NEUTRAL ORDER PACK ===================== */
+            <div className="space-y-4">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase border ${
+                        resolvedOrderPack.locked
+                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                          : 'bg-slate-800 text-slate-300 border-slate-700'
+                      }`}
+                    >
+                      {resolvedOrderPack.locked ? 'Locked Order Pack' : 'Draft Preview (Unlockable)'}
+                    </span>
+                    <span className="text-[11px] font-mono text-emerald-400 font-bold">
+                      Quantities &amp; Product Codes Only · Zero $
+                    </span>
+                  </div>
+                  <div className="text-xs text-slate-300">
+                    {resolvedOrderPack.assumptions.profile} · {resolvedOrderPack.assumptions.material} ·{' '}
+                    {resolvedOrderPack.assumptions.color}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDownloadOrderPackCsv}
+                    className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Export Order Pack CSV</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownloadOrderPackJson}
+                    className="px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Export JSON</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Sheets Schedule */}
+              <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-2.5">
+                <div className="text-xs font-extrabold uppercase tracking-wider text-white">
+                  1. Sheet Schedule ({resolvedOrderPack.totals.totalSheets} sheets ·{' '}
+                  {resolvedOrderPack.totals.totalOrderedLm.toFixed(3)} lm ordered)
+                </div>
+                <div className="overflow-x-auto border border-slate-800 rounded-xl bg-slate-950/70">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-900 text-slate-400 uppercase text-[10px] font-bold border-b border-slate-800">
+                      <tr>
+                        <th className="py-2 px-3">Code</th>
+                        <th className="py-2 px-3 text-right">Qty</th>
+                        <th className="py-2 px-3 text-right">Order Cut</th>
+                        <th className="py-2 px-3">Faces &amp; Override</th>
+                        <th className="py-2 px-3 text-right">Total lm</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                      {resolvedOrderPack.sheets.map((sh) => (
+                        <tr key={`${sh.code}-${sh.length_mm}`}>
+                          <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">{sh.code}</td>
+                          <td className="py-2 px-3 text-right font-black text-white">{sh.qty}</td>
+                          <td className="py-2 px-3 text-right font-extrabold text-white whitespace-nowrap">
+                            {sh.length_mm}mm
+                          </td>
+                          <td className="py-2 px-3 font-sans text-slate-300">
+                            <span>{sh.notes}</span>
+                            {sh.is_override && (
+                              <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold">
+                                Site Override (was {sh.modeled_length_mm}mm)
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right font-bold text-emerald-400 whitespace-nowrap">
+                            {sh.total_lm.toFixed(3)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="bg-slate-900/90 border-t border-slate-700 font-mono tabular-nums">
+                      <tr>
+                        <td className="py-2 px-3 font-black text-sky-300" colSpan={4}>
+                          Reconciled Sheet Sum ({resolvedOrderPack.totals.totalSheets} sheets ·{' '}
+                          {resolvedOrderPack.totals.offcutsReusedCount} offcuts repressed separately)
+                        </td>
+                        <td className="py-2 px-3 text-right font-black text-sky-300">
+                          {resolvedOrderPack.totals.totalOrderedLm.toFixed(3)} lm
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+
+              {/* Flashings Schedule */}
+              <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-2.5">
+                <div className="text-xs font-extrabold uppercase tracking-wider text-white">
+                  2. Grouped Flashing Schedule ({resolvedOrderPack.totals.flashingSticks} sticks ·{' '}
+                  {resolvedOrderPack.totals.flashingTotalLm.toFixed(2)} lm)
+                </div>
+                {resolvedOrderPack.flashings.length === 0 ? (
+                  <div className="text-xs text-slate-400 p-3 rounded-xl bg-slate-950/60 border border-slate-800">
+                    No flashing assignments recorded yet.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-slate-800 rounded-xl bg-slate-950/70">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-900 text-slate-400 uppercase text-[10px] font-bold border-b border-slate-800">
+                        <tr>
+                          <th className="py-2 px-3">Code</th>
+                          <th className="py-2 px-3">Profile &amp; Bends</th>
+                          <th className="py-2 px-3 text-right">Qty × Stick</th>
+                          <th className="py-2 px-3 text-right">Total lm</th>
+                          <th className="py-2 px-3">Runs &amp; Notes</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                        {resolvedOrderPack.flashings.map((fl, idx) => (
+                          <tr key={`${fl.code}-${fl.length_mm}-${idx}`}>
+                            <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">{fl.code}</td>
+                            <td className="py-2 px-3 font-sans">
+                              <div className="font-bold text-white">{fl.description}</div>
+                              <div className="text-[11px] font-mono text-slate-400">
+                                {fl.girth_tier} · {fl.color}
+                                {fl.key_angles_deg.length > 0
+                                  ? ` · [${fl.key_angles_deg.join('°/')}°]`
+                                  : ''}
+                              </div>
+                            </td>
+                            <td className="py-2 px-3 text-right font-bold text-white whitespace-nowrap">
+                              {fl.qty} × {fl.length_mm}mm
+                            </td>
+                            <td className="py-2 px-3 text-right font-bold text-emerald-400 whitespace-nowrap">
+                              {fl.total_lm.toFixed(2)}
+                            </td>
+                            <td className="py-2 px-3 font-sans text-slate-300">{fl.notes}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Penetrations & Hardware */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-2">
+                  <div className="text-xs font-extrabold uppercase tracking-wider text-white">
+                    3. Penetrations ({resolvedOrderPack.penetrations.length})
+                  </div>
+                  {resolvedOrderPack.penetrations.length === 0 ? (
+                    <div className="text-xs text-slate-500">None modeled</div>
+                  ) : (
+                    <div className="space-y-1.5 text-xs">
+                      {resolvedOrderPack.penetrations.map((pen) => (
+                        <div
+                          key={pen.id}
+                          className="p-2 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-mono font-bold text-cyan-300">{pen.code}</div>
+                            <div className="text-[11px] text-slate-400 truncate">{pen.notes}</div>
+                          </div>
+                          <span className="font-mono font-bold text-white shrink-0">1 ea</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-2">
+                  <div className="text-xs font-extrabold uppercase tracking-wider text-white">
+                    4. Hardware &amp; Underlay
+                  </div>
+                  <div className="space-y-1.5 text-xs">
+                    {resolvedOrderPack.hardware.map((hw) => (
+                      <div
+                        key={hw.code}
+                        className="p-2 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-mono font-bold text-sky-300">{hw.code}</div>
+                          <div className="text-[11px] text-slate-300 truncate">{hw.description}</div>
+                        </div>
+                        <span className="font-mono font-bold text-white shrink-0">
+                          {hw.qty} {hw.unit}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Wall Cladding & Openings Schedule (when present) */}
+              {resolvedOrderPack.walls && (
+                <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-4 space-y-2.5">
+                  <div className="text-xs font-extrabold uppercase tracking-wider text-white">
+                    5. Wall Cladding &amp; Returns ({resolvedOrderPack.walls.detailedFaces}/
+                    {resolvedOrderPack.walls.totalFaces} faces ·{' '}
+                    {resolvedOrderPack.walls.totalNetAreaM2.toFixed(1)} m² net ·{' '}
+                    {resolvedOrderPack.walls.returnFacesCount} returns)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                    {resolvedOrderPack.walls.byCladding.map((wl) => (
+                      <div
+                        key={wl.code}
+                        className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2"
+                      >
+                        <div>
+                          <div className="font-mono font-bold text-emerald-300">{wl.code}</div>
+                          <div className="text-slate-300 font-semibold">{wl.description}</div>
+                          <div className="text-[11px] text-slate-400">{wl.notes}</div>
+                        </div>
+                        <span className="font-mono font-black text-white">
+                          {wl.net_area_m2.toFixed(1)} m²
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  {resolvedOrderPack.walls.openingsSchedule.length > 0 && (
+                    <div className="text-[11px] font-mono text-slate-300 bg-slate-950/70 border border-slate-800 rounded-xl p-2.5">
+                      Openings ({resolvedOrderPack.walls.openingsSchedule.length}):{' '}
+                      {resolvedOrderPack.walls.openingsSchedule
+                        .map((op) => `${op.wall_code} ${op.label} ${op.width_mm}×${op.height_mm}mm`)
+                        .join(' · ')}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Assumptions & Completeness */}
+              <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-3.5 text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  Cover {resolvedOrderPack.assumptions.coverWidthMm}mm · End-lap{' '}
+                  {resolvedOrderPack.assumptions.endLapMm}mm · Overhang{' '}
+                  {resolvedOrderPack.assumptions.overhangMm}mm ·{' '}
+                  {resolvedOrderPack.assumptions.productCodePolicy}
+                </span>
+                <span className="font-mono font-bold text-slate-300">
+                  Blockers: {resolvedOrderPack.completenessReport.blockersCount} · Warnings:{' '}
+                  {resolvedOrderPack.completenessReport.warningsCount}
+                </span>
+              </div>
+            </div>
           ) : (
             /* ===================== TAB 1: CLEAN PLAIN-ENGLISH MATERIAL ORDER SHEET ===================== */
             <div className="space-y-4">
@@ -688,13 +1037,18 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                             <td className="py-2 px-3 font-black text-white">{grp.count} @</td>
                             <td className="py-2 px-3 font-extrabold text-sky-400">
                               {grp.lengthMm} mm ({grp.lengthMm % 10 !== 0 ? grp.lengthM.toFixed(3) : grp.lengthM.toFixed(2)}m)
+                              {grp.hasSiteOverride && (
+                                <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-sans font-bold">
+                                  Site Override (was {grp.modeledLengthMm}mm)
+                                </span>
+                              )}
                             </td>
                             <td className="py-2 px-3 font-sans text-slate-300">
                               Faces {grp.targetCodes.join(', ') || 'Main'}
                               {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
                             </td>
                             <td className="py-2 px-3 text-right font-bold text-slate-200">
-                              {(grp.count * grp.lengthM).toFixed(1)} lm
+                              {(grp.count * grp.lengthM).toFixed(2)} lm
                             </td>
                           </tr>
                         ))}
@@ -705,7 +1059,7 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                             {bom.totalSheetsCount} sheets ordered · {bom.totalOffcutsReused ?? 0} offcuts repressed separately
                           </td>
                           <td className="py-2 px-3 text-right font-black text-sky-300">
-                            {bom.totalOrderedLm.toFixed(1)} lm
+                            {bom.totalOrderedLm.toFixed(2)} lm
                           </td>
                         </tr>
                       </tfoot>
@@ -771,10 +1125,10 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                                 {assign.lineLabel} · {getFlashingKindDisplayLabel(assign.flashingKind)}
                               </div>
                               <div className="text-xs font-semibold text-sky-400 truncate">
-                                {assign.profileName}
+                                [{resolveFlashingProductCode({ profileId: assign.profileId, flashingKind: assign.flashingKind, explicitCode: assign.productCode, blankWidthMm: assign.developedBlankWidthMm })}] {assign.profileName}
                               </div>
                               <div className="text-[11px] font-mono text-slate-300 tabular-nums">
-                                Order: <strong className="text-white">{assign.quantity} × {assign.pieceLengthLm.toFixed(2)}m</strong> ({assign.totalLinearMetres.toFixed(1)}m total) · Girth {assign.developedBlankWidthMm || 350}mm · {assign.colorName || 'FlaxPod'}
+                                Order: <strong className="text-white">{assign.quantity} × {assign.pieceLengthLm.toFixed(2)}m</strong> ({assign.totalLinearMetres.toFixed(1)}m total) · Girth {assign.developedBlankWidthMm || 350}mm{assign.bendCount !== undefined ? ` · ${assign.bendCount} bends` : ''}{assign.hasHemCrush ? ' · Hem/Crush' : ''} · {assign.colorName || 'FlaxPod'}
                               </div>
                             </div>
                           </div>

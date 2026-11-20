@@ -23,7 +23,8 @@ import {
   TakeoffCompletenessIssue,
   WallFacet,
   WallFilterMode,
-  WallPlan
+  WallPlan,
+  OrderPack
 } from '../../types/exactRoofing';
 import {
   getPresetOutline,
@@ -51,16 +52,19 @@ import {
 import {
   deriveRoofOutlineFromWallPlan,
   deriveWallPlanFromRoofLevels,
+  ensureUniqueWallFacetIds,
   syncWallPlanWithRoof
 } from '../../utils/wallCladdingEngine';
 import { evaluateTakeoffCompleteness } from '../../utils/takeoffCompleteness';
 import {
+  extractAssignmentFlashingSpecs,
   getDefaultMitreNotes,
   getFlashingKindDisplayLabel,
   getMergedFlashingLibrary,
   saveProfileToSharedFlashingLibrary
 } from '../../utils/exactRoofingFlashingBridge';
 import {
+  buildOrderPack,
   buildRoofBillOfMaterials,
   computeRoofingPacks,
   convertExactLayoutToRoofFacets
@@ -334,11 +338,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
       initialState.planUnderlay ||
       null
   );
-  const [wallPlan, setWallPlan] = useState<WallPlan | null>(
-    project?.roofPlanModel?.wallPlan ||
+  const [wallPlan, setWallPlan] = useState<WallPlan | null>(() => {
+    const seed =
+      project?.roofPlanModel?.wallPlan ||
       activeQuote?.roofPlanModel?.wallPlan ||
       initialState.wallPlan ||
-      null
+      null;
+    if (!seed) return null;
+    return { ...seed, facets: ensureUniqueWallFacetIds(seed.facets || []) };
+  });
+  const [frozenOrderPack, setFrozenOrderPack] = useState<OrderPack | null>(
+    project?.roofPlanModel?.orderPack || activeQuote?.roofPlanModel?.orderPack || null
   );
   const [selectedWallFacetId, setSelectedWallFacetId] = useState<string | null>(null);
   const [wallSubView, setWallSubView] = useState<'plan' | 'elevation'>('plan');
@@ -395,7 +405,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [isAiDrawerOpen, setIsAiDrawerOpen] = useState<boolean>(false);
   const [activeFlashingLineId, setActiveFlashingLineId] = useState<string | null>(null);
   const [isOrderModalOpen, setIsOrderModalOpen] = useState<boolean>(false);
-  const [orderModalTab, setOrderModalTab] = useState<'orders' | 'quote' | undefined>(undefined);
+  const [orderModalTab, setOrderModalTab] = useState<'orders' | 'order_pack' | 'quote' | undefined>(undefined);
   const [pendingWallPlanForRoof, setPendingWallPlanForRoof] = useState<WallPlan | null>(null);
   const [isMeasureLockGateOpen, setIsMeasureLockGateOpen] = useState<boolean>(false);
   const [libraryVersion, setLibraryVersion] = useState<number>(0);
@@ -437,7 +447,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setPitchBreaks(Array.isArray(snap.pitchBreaks) ? snap.pitchBreaks : []);
       setFlashingAssignments(Array.isArray(snap.flashingAssignments) ? snap.flashingAssignments : []);
       setPlanUnderlay(snap.planUnderlay || null);
-      setWallPlan(snap.wallPlan || null);
+      setWallPlan(
+        snap.wallPlan
+          ? { ...snap.wallPlan, facets: ensureUniqueWallFacetIds(snap.wallPlan.facets || []) }
+          : null
+      );
+      setFrozenOrderPack(snap.orderPack || null);
       setMeasureLocked(Boolean(snap.measureLocked));
       setInstallProgress(snap.installProgress || DEFAULT_INSTALL_PROGRESS);
       if (initialStage) {
@@ -1695,6 +1710,45 @@ export const ExactRoofingHub: React.FC<Props> = ({
     return map;
   }, [roofingPacks]);
 
+  const libraryProfiles = useMemo(
+    () => getMergedFlashingLibrary(project),
+    [project, project?.flashingProfiles, libraryVersion]
+  );
+
+  const liveOrderPack = useMemo(() => {
+    if (measureLocked && frozenOrderPack) return frozenOrderPack;
+    return buildOrderPack({
+      project,
+      planes,
+      levels,
+      layout: layoutResult,
+      bom: roofBom,
+      assignableLines,
+      assignments: flashingAssignments,
+      libraryProfiles,
+      assets,
+      wallPlan,
+      completenessReport,
+      locked: measureLocked,
+      confirmedAt: project?.roofPlanModel?.measureConfirmedAt,
+      confirmedBy: project?.roofPlanModel?.measureConfirmedBy
+    });
+  }, [
+    measureLocked,
+    frozenOrderPack,
+    project,
+    planes,
+    levels,
+    layoutResult,
+    roofBom,
+    assignableLines,
+    flashingAssignments,
+    libraryProfiles,
+    assets,
+    wallPlan,
+    completenessReport
+  ]);
+
   const isReadOnlyGeometry =
     lifecycleStage === 'installing' || (lifecycleStage === 'measuring' && measureLocked);
 
@@ -1719,6 +1773,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
     wallPlan: overrides?.wallPlan !== undefined ? overrides.wallPlan : wallPlan,
     layout: layoutResult || undefined,
     bom: roofBom,
+    orderPack:
+      overrides?.orderPack !== undefined
+        ? overrides.orderPack
+        : measureLocked
+        ? frozenOrderPack || liveOrderPack
+        : undefined,
     lastUpdatedAt: new Date().toISOString(),
     updatedBy: activeMemberName || 'ApexMap User'
   });
@@ -1768,24 +1828,67 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleConfirmLockMeasure = () => {
+    if (!completenessReport.canLockMeasure) {
+      setIsMeasureLockGateOpen(true);
+      triggerNotice(`Resolve ${completenessReport.blockersCount} blocker(s) before locking measure`);
+      return;
+    }
     const confirmedAt = new Date().toISOString();
     const confirmedBy = activeMemberName || 'Site Lead';
+    const nextLayout =
+      layoutResult ||
+      (planes.length > 0
+        ? generateCuttingLayout(planes, sheetSpec, {
+            startPlaneId: startPlaneId || undefined,
+            assets,
+            pitchBreaks
+          })
+        : null);
+    if (nextLayout && !layoutResult) {
+      setLayoutResult(nextLayout);
+    }
+    const nextBom = buildRoofBillOfMaterials({
+      planes,
+      layout: nextLayout,
+      assignments: flashingAssignments,
+      assignableLines,
+      assets
+    });
+    const emittedOrderPack = buildOrderPack({
+      project,
+      planes,
+      levels,
+      layout: nextLayout,
+      bom: nextBom,
+      assignableLines,
+      assignments: flashingAssignments,
+      libraryProfiles,
+      assets,
+      wallPlan,
+      completenessReport,
+      locked: true,
+      confirmedAt,
+      confirmedBy
+    });
+
     const nextSnap = buildCurrentSnapshot({
       stage: 'installing',
       measureLocked: true,
       measureConfirmedAt: confirmedAt,
-      measureConfirmedBy: confirmedBy
+      measureConfirmedBy: confirmedBy,
+      orderPack: emittedOrderPack
     });
+    setFrozenOrderPack(emittedOrderPack);
     setIsMeasureLockGateOpen(false);
     setMeasureLocked(true);
     setLifecycleStage('installing');
     setActiveTab('layout_results');
     persistSnapshotToProject(nextSnap);
-    triggerNotice('Measure confirmed & locked · Ready for site Installation');
+    triggerNotice('Measure confirmed & locked · Order Pack emitted for site & yard');
   };
 
   const handleRequestLockMeasure = () => {
-    if (!completenessReport.isComplete) {
+    if (!completenessReport.canLockMeasure || completenessReport.warningsCount > 0) {
       setIsMeasureLockGateOpen(true);
       return;
     }
@@ -1843,8 +1946,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const handleUnlockMeasure = () => {
     const nextSnap = buildCurrentSnapshot({
       stage: 'measuring',
-      measureLocked: false
+      measureLocked: false,
+      orderPack: null
     });
+    setFrozenOrderPack(null);
     setMeasureLocked(false);
     setLifecycleStage('measuring');
     persistSnapshotToProject(nextSnap);
@@ -1876,11 +1981,6 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const activeFlashingLine = useMemo(
     () => assignableLines.find((l) => l.lineId === activeFlashingLineId) || null,
     [assignableLines, activeFlashingLineId]
-  );
-
-  const libraryProfiles = useMemo(
-    () => getMergedFlashingLibrary(project),
-    [project, project?.flashingProfiles, libraryVersion]
   );
 
   const designerProject = useMemo(
@@ -1928,11 +2028,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       targetLine.trueSlopeLengthM,
       targetLine.flashingKind
     );
-    const blankWidth = Math.round(
-      profile.developedBlankWidthMm ||
-        profile.developedLengthMm ||
-        profile.segments.reduce((sum, s) => sum + s.lengthMm, 0)
-    );
+    const specs = extractAssignmentFlashingSpecs(profile, targetLine.flashingKind);
+    const pieceLengthMm = Math.max(100, Math.round(breakdown.recommendedPieceLengthM * 1000));
+    const pieceLengthLm = +(pieceLengthMm / 1000).toFixed(3);
 
     const assignment: RoofFlashingAssignment = {
       id: `assign-${targetLine.lineId}`,
@@ -1941,15 +2039,20 @@ export const ExactRoofingHub: React.FC<Props> = ({
       flashingKind: targetLine.flashingKind,
       profileId: profile.id,
       profileName: profile.name,
-      developedBlankWidthMm: blankWidth,
-      girthTier: profile.girthTier || '301-450mm',
+      productCode: specs.productCode,
+      developedBlankWidthMm: specs.developedBlankWidthMm,
+      girthTier: specs.girthTier,
+      bendCount: specs.bendCount,
+      keyAnglesDeg: specs.keyAnglesDeg,
+      hasHemCrush: specs.hasHemCrush,
       material: profile.material || project?.material || '0.55mm ColorCote Vitor+',
       colorName: profile.colorName || project?.colorName || 'FlaxPod',
       planLengthM: targetLine.planLengthM,
       trueSlopeLengthM: targetLine.trueSlopeLengthM,
-      pieceLengthLm: breakdown.recommendedPieceLengthM,
+      pieceLengthLm,
+      pieceLengthMm,
       quantity: breakdown.recommendedQuantity,
-      totalLinearMetres: breakdown.totalOrderLengthM,
+      totalLinearMetres: +(breakdown.recommendedQuantity * pieceLengthLm).toFixed(3),
       notes: getDefaultMitreNotes(targetLine.flashingKind),
       assignedAt: new Date().toISOString(),
       orderedToWorkshop: false,
@@ -3774,7 +3877,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         onRemoveAssignment={handleRemoveFlashingAssignment}
       />
 
-      {/* Combined BOM Hub: Orders, CNC Queue & Quote Pricing */}
+      {/* Combined BOM Hub: Orders, Order Pack, CNC Queue & Quote Pricing */}
       <ExactRoofingOrderModal
         isOpen={isOrderModalOpen}
         onClose={() => {
@@ -3793,6 +3896,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
         layout={layoutResult}
         bom={roofBom}
         packs={roofingPacks}
+        planes={planes}
+        levels={levels}
+        assets={assets}
+        wallPlan={wallPlan}
+        completenessReport={completenessReport}
+        orderPack={liveOrderPack}
         initialModalTab={orderModalTab}
         onSelectLineToAssign={(line) => setActiveFlashingLineId(line.lineId)}
         onRemoveAssignment={handleRemoveFlashingAssignment}
@@ -3907,39 +4016,56 @@ export const ExactRoofingHub: React.FC<Props> = ({
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-lg bg-[#0b101d] border border-amber-500/50 rounded-2xl p-5 space-y-4 shadow-2xl text-white"
+            className={`w-full max-w-lg bg-[#0b101d] rounded-2xl p-5 space-y-4 shadow-2xl text-white border ${
+              completenessReport.blockersCount > 0 ? 'border-rose-500/60' : 'border-amber-500/50'
+            }`}
           >
             <div className="space-y-1">
-              <div className="text-xs font-extrabold uppercase tracking-wider text-amber-400">
-                Takeoff Completeness Check
+              <div
+                className={`text-xs font-extrabold uppercase tracking-wider ${
+                  completenessReport.blockersCount > 0 ? 'text-rose-400' : 'text-amber-400'
+                }`}
+              >
+                {completenessReport.blockersCount > 0
+                  ? 'Pre-Lock Completeness Gate · Blocked'
+                  : 'Pre-Lock Completeness Check · Warnings Only'}
               </div>
               <h3 className="text-base font-black text-white">
-                {completenessReport.totalIssuesCount} items still need attention before locking
+                {completenessReport.blockersCount > 0
+                  ? `${completenessReport.blockersCount} blocker(s) must be resolved before locking measure`
+                  : `${completenessReport.warningsCount} optional warning(s) detected`}
               </h3>
               <p className="text-xs text-slate-300">
-                Review undetailed walls, internal return faces, missing flashings, or roof planes so nothing is missed from quantities.
+                {completenessReport.blockersCount > 0
+                  ? 'Return wall faces, critical flashings (ridge/hip/valley/barge/apron), roof face pitch/run, and penetrations must be valid before issuing an Order Pack.'
+                  : 'No structural blockers remain. Review non-critical warnings or lock measure now to emit the frozen Order Pack.'}
               </p>
             </div>
 
             <div className="flex flex-wrap gap-1.5 text-[11px] font-bold">
               {completenessReport.undetailedReturnsCount > 0 && (
                 <span className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-200">
-                  {completenessReport.undetailedReturnsCount} Undetailed Returns
-                </span>
-              )}
-              {completenessReport.undetailedWallsCount > 0 && (
-                <span className="px-2.5 py-1 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-200">
-                  {completenessReport.undetailedWallsCount} Undetailed Walls
+                  {completenessReport.undetailedReturnsCount} Undetailed Returns (Blocker)
                 </span>
               )}
               {completenessReport.unassignedFlashingsCount > 0 && (
-                <span className="px-2.5 py-1 rounded-lg bg-sky-950/60 border border-sky-500/40 text-sky-200">
-                  {completenessReport.unassignedFlashingsCount} Unassigned Flashings
+                <span className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-200">
+                  {completenessReport.unassignedFlashingsCount} Unassigned Flashings (Blocker)
                 </span>
               )}
               {completenessReport.incompletePlanesCount > 0 && (
                 <span className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-200">
-                  {completenessReport.incompletePlanesCount} Incomplete Roof Faces
+                  {completenessReport.incompletePlanesCount} Incomplete Roof Faces (Blocker)
+                </span>
+              )}
+              {completenessReport.incompletePenetrationsCount > 0 && (
+                <span className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-200">
+                  {completenessReport.incompletePenetrationsCount} Incomplete Penetrations (Blocker)
+                </span>
+              )}
+              {completenessReport.warningsCount > 0 && (
+                <span className="px-2.5 py-1 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-200">
+                  {completenessReport.warningsCount} Warnings
                 </span>
               )}
             </div>
@@ -3948,10 +4074,23 @@ export const ExactRoofingHub: React.FC<Props> = ({
               {completenessReport.issues.map((issue) => (
                 <div
                   key={issue.id}
-                  className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2 text-xs"
+                  className={`p-2.5 rounded-xl bg-slate-950 flex items-center justify-between gap-2 text-xs border ${
+                    issue.severity === 'blocker' ? 'border-rose-500/45' : 'border-amber-500/35'
+                  }`}
                 >
                   <div className="min-w-0">
-                    <div className="font-bold text-slate-100 truncate">{issue.title}</div>
+                    <div className="font-bold text-slate-100 flex items-center gap-1.5 truncate">
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase shrink-0 ${
+                          issue.severity === 'blocker'
+                            ? 'bg-rose-600 text-white'
+                            : 'bg-amber-500/20 text-amber-300'
+                        }`}
+                      >
+                        {issue.severity}
+                      </span>
+                      <span className="truncate">{issue.title}</span>
+                    </div>
                     <div className="text-[11px] text-slate-400 truncate">{issue.detail}</div>
                   </div>
                   <button
@@ -3975,10 +4114,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
               </button>
               <button
                 type="button"
+                disabled={!completenessReport.canLockMeasure}
                 onClick={handleConfirmLockMeasure}
-                className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold cursor-pointer"
+                className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-extrabold cursor-pointer"
               >
-                Lock Measure Anyway
+                {completenessReport.canLockMeasure
+                  ? 'Lock with Warnings & Emit Order Pack'
+                  : `Resolve ${completenessReport.blockersCount} Blocker(s) First`}
               </button>
             </div>
           </div>

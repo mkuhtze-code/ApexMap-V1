@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx src/utils/__tests__/sheetMetalGeometry.test.ts && tsx src/utils/__tests__/flashingDrawingGeometry.test.ts && tsx src/utils/__tests__/quoteVersioning.test.ts && tsx src/utils/__tests__/pricingMatrix.test.ts && tsx src/utils/__tests__/smartRoofingEngine.test.ts && tsx src/utils/__tests__/longRunRoofEngine.test.ts && tsx src/utils/__tests__/offcutEngine.test.ts && tsx src/utils/__tests__/sectionLayoutEngine.test.ts && tsx src/utils/__tests__/exactRoofingEngine.test.ts"
+    "test": "tsx src/utils/__tests__/sheetMetalGeometry.test.ts && tsx src/utils/__tests__/flashingDrawingGeometry.test.ts && tsx src/utils/__tests__/quoteVersioning.test.ts && tsx src/utils/__tests__/pricingMatrix.test.ts && tsx src/utils/__tests__/smartRoofingEngine.test.ts && tsx src/utils/__tests__/longRunRoofEngine.test.ts && tsx src/utils/__tests__/offcutEngine.test.ts && tsx src/utils/__tests__/sectionLayoutEngine.test.ts && tsx src/utils/__tests__/exactRoofingEngine.test.ts && tsx src/utils/__tests__/wallCladdingEngine.test.ts && tsx src/utils/__tests__/exactRoofingBomBridge.test.ts && tsx src/utils/__tests__/orderPackGolden.test.ts"
   },
   "dependencies": {
     "@google/genai": "^3.4.0",

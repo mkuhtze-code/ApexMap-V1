@@ -14,6 +14,7 @@ import {
   createVerticalBaySplit,
   deriveRoofOutlineFromWallPlan,
   deriveWallPlanFromRoofLevels,
+  ensureUniqueWallFacetIds,
   fitWallFacetTopToRoof,
   isWallFacetUndetailed,
   linkWallFacetsToRoofLevels,
@@ -398,5 +399,60 @@ assert.equal(
   'linkWallFacetsToRoofLevels relinks all 8 exterior/return facets to roof edges'
 );
 console.log('✓ Test 10 Passed: Bidirectional Walls -> Roof seeding preserves 8 U-notch faces, overhang & edge links');
+
+// 11. Regression: Duplicate WallFacet IDs (e.g. `wall-facet-2`) on split edges or legacy snapshots
+const legacyWithDupes = [
+  { ...uFacets[0], id: 'wall-facet-2' },
+  { ...uFacets[1], id: 'wall-facet-2' },
+  { ...uFacets[2], id: 'wall-facet-2' }
+];
+const repairedLegacy = ensureUniqueWallFacetIds(legacyWithDupes);
+assert.equal(
+  new Set(repairedLegacy.map((f) => f.id)).size,
+  repairedLegacy.length,
+  'ensureUniqueWallFacetIds must eliminate duplicate wall-facet-2 IDs'
+);
+
+// Scenario: Existing facet at index 1 had id `wall-facet-2`, and edge 0 is split into two edges so
+// the newly minted run at index 1 would collide with `wall-facet-2` unless matched IDs are reserved up front.
+const splitPoints = [
+  { x: 0, y: 0 },
+  { x: 7, y: 0 },
+  { x: 14, y: 0 }, // collinear edge 0+1 merges back or non-mergeable edge at idx 1 after slight jog:
+  { x: 14, y: 4 },
+  { x: 13.8, y: 8 },
+  { x: 0, y: 8 }
+];
+const existingShifted = [
+  {
+    ...uFacets[1],
+    id: 'wall-facet-2',
+    from: { x: 0, y: 8 },
+    to: { x: 0, y: 0 },
+    claddingType: 'weatherboard' as const
+  },
+  {
+    ...uFacets[0],
+    id: 'wall-facet-1',
+    from: { x: 0, y: 0 },
+    to: { x: 14, y: 0 },
+    claddingType: 'brick' as const
+  }
+];
+const rebuiltNoDupe = buildWallFacetsFromPlan(
+  { points: splitPoints },
+  { existingFacets: existingShifted, mergeCollinear: false }
+);
+assert.equal(
+  new Set(rebuiltNoDupe.map((f) => f.id)).size,
+  rebuiltNoDupe.length,
+  'buildWallFacetsFromPlan must guarantee strictly unique facet IDs without repeating wall-facet-2'
+);
+assert.equal(
+  rebuiltNoDupe.filter((f) => f.id === 'wall-facet-2').length,
+  1,
+  'wall-facet-2 must appear at most once'
+);
+console.log('✓ Test 11 Passed: Zero duplicate wall-facet-2 IDs on rebuild or legacy repair');
 
 console.log('--- All Wall Cladding Phase 1 & Phase 2 + Bidirectional Tests Passed ---');

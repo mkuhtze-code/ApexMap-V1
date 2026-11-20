@@ -3,6 +3,7 @@ import { FlashingProfile, Project } from '../../types/crm';
 import { AssignableRoofLine, RoofFlashingAssignment } from '../../types/exactRoofing';
 import { ProfileThumbnail } from '../FlashingWorkshop';
 import {
+  extractAssignmentFlashingSpecs,
   findMatchingCategoryRank,
   getDefaultMitreNotes,
   getFlashingKindDisplayLabel
@@ -100,10 +101,10 @@ export const FlashingAssignmentModal: React.FC<Props> = ({
 
   const handleConfirm = () => {
     if (!selectedProfile) return;
-    const blankWidth =
-      selectedProfile.developedBlankWidthMm ||
-      selectedProfile.developedLengthMm ||
-      selectedProfile.segments.reduce((sum, s) => sum + s.lengthMm, 0);
+    const specs = extractAssignmentFlashingSpecs(selectedProfile, line.flashingKind);
+    const pieceLengthMm = Math.max(100, Math.round(Number(stickLengthM) * 1000));
+    const cleanLenLm = +(pieceLengthMm / 1000).toFixed(3);
+    const qty = Math.max(1, Math.round(quantity));
 
     onSaveAssignment({
       id: existingAssignment?.id || `assign-${line.lineId}`,
@@ -112,15 +113,20 @@ export const FlashingAssignmentModal: React.FC<Props> = ({
       flashingKind: line.flashingKind,
       profileId: selectedProfile.id,
       profileName: selectedProfile.name,
-      developedBlankWidthMm: Math.round(blankWidth),
-      girthTier: selectedProfile.girthTier || '301-450mm',
+      productCode: existingAssignment?.productCode || specs.productCode,
+      developedBlankWidthMm: specs.developedBlankWidthMm,
+      girthTier: specs.girthTier,
+      bendCount: specs.bendCount,
+      keyAnglesDeg: specs.keyAnglesDeg,
+      hasHemCrush: specs.hasHemCrush,
       material: selectedProfile.material || project?.material || '0.55mm ColorCote Vitor+',
       colorName: colorName.trim() || 'FlaxPod',
       planLengthM: line.planLengthM,
       trueSlopeLengthM: line.trueSlopeLengthM,
-      pieceLengthLm: +Number(stickLengthM).toFixed(2),
-      quantity: Math.max(1, Math.round(quantity)),
-      totalLinearMetres,
+      pieceLengthLm: cleanLenLm,
+      pieceLengthMm,
+      quantity: qty,
+      totalLinearMetres: +(qty * cleanLenLm).toFixed(3),
       notes: notes.trim() || undefined,
       assignedAt: new Date().toISOString(),
       orderedToWorkshop: false,
@@ -255,7 +261,7 @@ export const FlashingAssignmentModal: React.FC<Props> = ({
                       )}
                     </div>
                     <div className="text-[11px] font-mono text-slate-400 tabular-nums">
-                      {blankMm}mm blank · {profile.girthTier || '301-450mm'}
+                      {blankMm}mm blank · {Math.max(0, (profile.segments?.length || 1) - 1)} bends
                       {isCategoryMatch ? ' · Match' : ''}
                     </div>
                   </div>

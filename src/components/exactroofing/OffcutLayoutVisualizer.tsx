@@ -466,10 +466,10 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
     return Array.from(gMap.values()).sort((a, b) => b.lengthMm - a.lengthMm);
   }, [layout.parents]);
 
-  const reconciledTotalOrderedLm = useMemo(
-    () => +orderedSheetGroups.reduce((s, g) => s + g.count * g.lengthM, 0).toFixed(2),
-    [orderedSheetGroups]
-  );
+  const reconciledTotalOrderedLm = useMemo(() => {
+    const totalMm = orderedSheetGroups.reduce((s, g) => s + g.count * g.lengthMm, 0);
+    return +(totalMm / 1000).toFixed(3);
+  }, [orderedSheetGroups]);
 
   // CSV Export for Roll-Former
   const handleExportCsv = () => {

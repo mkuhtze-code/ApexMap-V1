@@ -142,17 +142,30 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
             className="min-h-[44px] px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap"
           >
             <ShoppingCart className="w-4 h-4" />
-            <span>Open Simple BOM &amp; Order</span>
+            <span>{measureLocked ? 'View Order Pack' : 'Open BOM & Order Pack'}</span>
           </button>
 
           {!measureLocked && (
             <button
               type="button"
               onClick={onConfirmLockMeasure}
-              className="min-h-[44px] px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap"
+              title={
+                completenessReport && !completenessReport.canLockMeasure
+                  ? `Resolve ${completenessReport.blockersCount} blocker(s) before locking`
+                  : 'Confirm & lock final site measure to emit Order Pack'
+              }
+              className={`min-h-[44px] px-4 py-2 rounded-xl text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap ${
+                completenessReport && !completenessReport.canLockMeasure
+                  ? 'bg-rose-700/80 hover:bg-rose-600 border border-rose-400/50'
+                  : 'bg-amber-600 hover:bg-amber-500'
+              }`}
             >
               <Lock className="w-4 h-4" />
-              <span>Confirm Measure &amp; Lock</span>
+              <span>
+                {completenessReport && !completenessReport.canLockMeasure
+                  ? `Review ${completenessReport.blockersCount} Blockers`
+                  : 'Confirm Measure & Lock'}
+              </span>
             </button>
           )}
         </div>
@@ -491,15 +504,22 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
                   className="bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2 font-mono text-xs tabular-nums"
                 >
                   <div>
-                    <div className="text-sm font-black text-white">
-                      {grp.count} @ <span className="text-sky-400">{grp.lengthMm} mm</span>
+                    <div className="text-sm font-black text-white flex items-center gap-1.5">
+                      <span>
+                        {grp.count} @ <span className="text-sky-400">{grp.lengthMm} mm</span>
+                      </span>
+                      {grp.hasSiteOverride && (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-sans font-bold">
+                          Site Override (was {grp.modeledLengthMm}mm)
+                        </span>
+                      )}
                     </div>
                     <div className="text-[11px] font-sans text-slate-400">
                       Faces {grp.targetCodes.join(', ') || 'Main'}
                       {grp.hasOffcutHarvest ? ' · includes repressed offcut' : ''}
                     </div>
                   </div>
-                  <span className="text-slate-300 font-bold shrink-0">{(grp.count * grp.lengthM).toFixed(1)} lm</span>
+                  <span className="text-slate-300 font-bold shrink-0">{(grp.count * grp.lengthM).toFixed(2)} lm</span>
                 </div>
               ))}
             </div>
@@ -689,17 +709,23 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
               </p>
             </div>
             {completenessReport && (
-              <span
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-extrabold border ${
-                  completenessReport.isComplete
-                    ? 'bg-emerald-950/50 text-emerald-300 border-emerald-500/40'
-                    : 'bg-amber-950/50 text-amber-300 border-amber-500/40'
-                }`}
-              >
-                {completenessReport.isComplete
-                  ? 'All Checks Ready'
-                  : `${completenessReport.totalIssuesCount} Open Items`}
-              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {completenessReport.blockersCount > 0 && (
+                  <span className="px-2.5 py-1 rounded-lg text-[11px] font-extrabold border bg-rose-950/60 text-rose-200 border-rose-500/50">
+                    {completenessReport.blockersCount} Blocker{completenessReport.blockersCount === 1 ? '' : 's'}
+                  </span>
+                )}
+                {completenessReport.warningsCount > 0 && (
+                  <span className="px-2.5 py-1 rounded-lg text-[11px] font-extrabold border bg-amber-950/50 text-amber-300 border-amber-500/40">
+                    {completenessReport.warningsCount} Warning{completenessReport.warningsCount === 1 ? '' : 's'}
+                  </span>
+                )}
+                {completenessReport.canLockMeasure && completenessReport.warningsCount === 0 && (
+                  <span className="px-2.5 py-1 rounded-lg text-[11px] font-extrabold border bg-emerald-950/50 text-emerald-300 border-emerald-500/40">
+                    Ready to Lock
+                  </span>
+                )}
+              </div>
             )}
           </div>
 
@@ -737,10 +763,29 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
               {completenessReport.issues.map((issue) => (
                 <div
                   key={issue.id}
-                  className="p-2.5 rounded-xl bg-amber-950/30 border border-amber-500/35 flex flex-wrap items-center justify-between gap-2 text-xs"
+                  className={`p-2.5 rounded-xl border flex flex-wrap items-center justify-between gap-2 text-xs ${
+                    issue.severity === 'blocker'
+                      ? 'bg-rose-950/35 border-rose-500/45'
+                      : 'bg-amber-950/30 border-amber-500/35'
+                  }`}
                 >
                   <div className="min-w-0">
-                    <div className="font-bold text-amber-200">{issue.title}</div>
+                    <div
+                      className={`font-bold flex items-center gap-1.5 ${
+                        issue.severity === 'blocker' ? 'text-rose-200' : 'text-amber-200'
+                      }`}
+                    >
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${
+                          issue.severity === 'blocker'
+                            ? 'bg-rose-600 text-white'
+                            : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        }`}
+                      >
+                        {issue.severity}
+                      </span>
+                      <span>{issue.title}</span>
+                    </div>
                     <div className="text-[11px] text-slate-400">{issue.detail}</div>
                   </div>
                   {!measureLocked && onJumpToCompletenessIssue && (

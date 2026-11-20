@@ -264,22 +264,28 @@ function findMatchingRoofEdgeId(
   return bestEdgeId;
 }
 
-function matchExistingFacet(
+function findExactExistingFacet(
   from: Point2D,
   to: Point2D,
-  existingFacets?: WallFacet[]
+  existingFacets: WallFacet[] | undefined,
+  usedExistingIds: Set<string>
 ): WallFacet | undefined {
   if (!existingFacets || existingFacets.length === 0) return undefined;
-
-  // 1. Exact endpoint match (same or reversed winding)
-  const exact = existingFacets.find(
+  return existingFacets.find(
     (f) =>
-      (pointsClose(f.from, from, 0.08) && pointsClose(f.to, to, 0.08)) ||
-      (pointsClose(f.from, to, 0.08) && pointsClose(f.to, from, 0.08))
+      !usedExistingIds.has(f.id) &&
+      ((pointsClose(f.from, from, 0.08) && pointsClose(f.to, to, 0.08)) ||
+        (pointsClose(f.from, to, 0.08) && pointsClose(f.to, from, 0.08)))
   );
-  if (exact) return exact;
+}
 
-  // 2. Fallback: collinear direction + very close midpoint (useful when stretching a wall length)
+function findCollinearExistingFacet(
+  from: Point2D,
+  to: Point2D,
+  existingFacets: WallFacet[] | undefined,
+  usedExistingIds: Set<string>
+): WallFacet | undefined {
+  if (!existingFacets || existingFacets.length === 0) return undefined;
   const len = dist(from, to);
   if (len < 0.05) return undefined;
   const ux = (to.x - from.x) / len;
@@ -287,15 +293,45 @@ function matchExistingFacet(
   const mid = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
 
   return existingFacets.find((f) => {
+    if (usedExistingIds.has(f.id)) return false;
     const fLen = dist(f.from, f.to);
     if (fLen < 0.05) return false;
     const fux = (f.to.x - f.from.x) / fLen;
     const fuy = (f.to.y - f.from.y) / fLen;
     if (ux * fux + uy * fuy < 0.985) return false;
     const fMid = { x: (f.from.x + f.to.x) / 2, y: (f.from.y + f.to.y) / 2 };
-    // Point-to-line distance from mid to f line < 0.06m and midpoints overlap segment range
     const perpDist = Math.abs((mid.x - f.from.x) * -fuy + (mid.y - f.from.y) * fux);
     return perpDist < 0.06 && dist(mid, fMid) < Math.max(len, fLen) * 0.45;
+  });
+}
+
+function allocateUniqueFacetId(
+  preferredId: string | undefined,
+  idx: number,
+  usedIds: Set<string>
+): string {
+  if (preferredId && !usedIds.has(preferredId)) {
+    usedIds.add(preferredId);
+    return preferredId;
+  }
+  let counter = idx + 1;
+  let candidate = `wall-facet-${counter}`;
+  while (usedIds.has(candidate)) {
+    counter += 1;
+    candidate = `wall-facet-${counter}`;
+  }
+  usedIds.add(candidate);
+  return candidate;
+}
+
+/**
+ * Repairs any duplicate WallFacet IDs (e.g. legacy snapshots) deterministically.
+ */
+export function ensureUniqueWallFacetIds(facets: WallFacet[]): WallFacet[] {
+  const used = new Set<string>();
+  return facets.map((facet, idx) => {
+    const id = allocateUniqueFacetId(facet.id, idx, used);
+    return id === facet.id ? facet : { ...facet, id };
   });
 }
 
@@ -340,6 +376,7 @@ export function buildWallFacetsFromPlan(
   options?: {
     defaultHeightM?: number;
     defaultBottomZ?: number;
+    defaultHeightSource?: 'roof' | 'manual';
     defaultCladdingType?: WallCladdingType;
     existingFacets?: WallFacet[];
     roofLevels?: RoofLevel[];
@@ -348,6 +385,7 @@ export function buildWallFacetsFromPlan(
 ): WallFacet[] {
   const defaultHeightM = +(options?.defaultHeightM ?? 2.7).toFixed(3);
   const defaultBottomZ = +(options?.defaultBottomZ ?? 0).toFixed(3);
+  const defaultHeightSource = options?.defaultHeightSource ?? 'manual';
   const defaultCladding = options?.defaultCladdingType ?? 'none';
   const mergeCollinear = options?.mergeCollinear ?? true;
 
@@ -379,8 +417,54 @@ export function buildWallFacetsFromPlan(
 
   const runs = mergeCollinear ? mergeCollinearWallRuns(rawSegments) : rawSegments;
 
+  // Two-pass matching so exact endpoint matches claim their existing facets before collinear fallbacks,
+  // and no existing facet (e.g. 'wall-facet-2') can ever be assigned to two runs.
+  const usedExistingIds = new Set<string>();
+  const matchedByRunIdx: (WallFacet | undefined)[] = runs.map((seg) => {
+    const exact = findExactExistingFacet(seg.from, seg.to, options?.existingFacets, usedExistingIds);
+    if (exact) usedExistingIds.add(exact.id);
+    return exact;
+  });
+  runs.forEach((seg, idx) => {
+    if (matchedByRunIdx[idx]) return;
+    const fallback = findCollinearExistingFacet(
+      seg.from,
+      seg.to,
+      options?.existingFacets,
+      usedExistingIds
+    );
+    if (fallback) {
+      usedExistingIds.add(fallback.id);
+      matchedByRunIdx[idx] = fallback;
+    }
+  });
+
+  // Reserve all matched IDs up front so an earlier unmatched index cannot mint `wall-facet-N`
+  // that collides with a later segment's preserved `wall-facet-N`.
+  const usedIds = new Set<string>();
+  matchedByRunIdx.forEach((prev) => {
+    if (prev?.id && !usedIds.has(prev.id)) {
+      usedIds.add(prev.id);
+    }
+  });
+  const allocatedIds: string[] = matchedByRunIdx.map((prev, idx) => {
+    if (prev?.id) return prev.id;
+    let counter = idx + 1;
+    let candidate = `wall-facet-${counter}`;
+    while (usedIds.has(candidate)) {
+      counter += 1;
+      candidate = `wall-facet-${counter}`;
+    }
+    usedIds.add(candidate);
+    return candidate;
+  });
+
+  // Final defensive pass guarantees strictly unique IDs even if existingFacets itself had duplicates.
+  const finalSeen = new Set<string>();
+
   return runs.map((seg, idx) => {
-    const prev = matchExistingFacet(seg.from, seg.to, options?.existingFacets);
+    const prev = matchedByRunIdx[idx];
+    const id = allocateUniqueFacetId(allocatedIds[idx], idx, finalSeen);
     const lengthM = +dist(seg.from, seg.to).toFixed(3);
     const heightM = +(prev?.heightM ?? seg.heightM ?? defaultHeightM).toFixed(3);
     const bottomZ = +(prev?.bottomZ ?? seg.bottomZ ?? defaultBottomZ).toFixed(3);
@@ -397,7 +481,7 @@ export function buildWallFacetsFromPlan(
       : undefined;
 
     return {
-      id: prev?.id || `wall-facet-${idx + 1}`,
+      id,
       code,
       name: prev?.name || `Wall ${code}`,
       from: seg.from,
@@ -406,7 +490,7 @@ export function buildWallFacetsFromPlan(
       heightM,
       bottomZ,
       topZ,
-      heightSource: prev?.heightSource ?? 'manual',
+      heightSource: prev?.heightSource ?? defaultHeightSource,
       roofProfile: prev?.roofProfile,
       claddingType: prev?.claddingType ?? defaultCladding,
       openings,
@@ -474,16 +558,11 @@ export function deriveWallPlanFromRoofLevels(
     { points: wallPoints, edges: wallEdges },
     {
       defaultHeightM: hM,
+      defaultHeightSource: 'roof',
       existingFacets,
       roofLevels: levels
     }
-  ).map((f) => {
-    const prev = matchExistingFacet(f.from, f.to, existingFacets);
-    return {
-      ...f,
-      heightSource: prev?.heightSource ?? ('roof' as const)
-    };
-  });
+  );
 
   const plan: WallPlan = {
     points: wallPoints,

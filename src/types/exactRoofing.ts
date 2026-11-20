@@ -366,13 +366,18 @@ export interface RoofFlashingAssignment {
   flashingKind: RoofLineFlashingKind;
   profileId: string;
   profileName: string;
+  productCode?: string;
   developedBlankWidthMm?: number;
   girthTier?: string;
+  bendCount?: number;
+  keyAnglesDeg?: number[];
+  hasHemCrush?: boolean;
   material?: string;
   colorName?: string;
   planLengthM: number;
   trueSlopeLengthM: number;
   pieceLengthLm: number;
+  pieceLengthMm?: number;
   quantity: number;
   totalLinearMetres: number;
   notes?: string;
@@ -456,6 +461,9 @@ export interface RoofBomSheetGroup {
   totalLm: number;
   targetCodes: string[];
   hasOffcutHarvest: boolean;
+  modeledLengthMm?: number;
+  hasSiteOverride?: boolean;
+  overrideNotes?: string;
 }
 
 export interface RoofBomSummary {
@@ -590,6 +598,143 @@ export interface WallPlan {
   builtAt?: string;
 }
 
+export interface OrderPackSheetLine {
+  code: string;
+  description: string;
+  qty: number;
+  unit: 'sheets';
+  length_mm: number;
+  modeled_length_mm: number;
+  is_override: boolean;
+  total_lm: number;
+  faces: string[];
+  has_offcut_harvest: boolean;
+  notes: string;
+}
+
+export interface OrderPackFlashingLine {
+  code: string;
+  description: string;
+  profile_id: string;
+  flashing_kind: RoofLineFlashingKind;
+  girth_mm: number;
+  girth_tier: string;
+  bend_count: number;
+  key_angles_deg: number[];
+  has_hem_crush: boolean;
+  qty: number;
+  unit: 'sticks';
+  length_mm: number;
+  total_lm: number;
+  color: string;
+  line_labels: string[];
+  notes: string;
+}
+
+export interface OrderPackPenetrationLine {
+  id: string;
+  type: RoofAssetType;
+  code: string;
+  description: string;
+  host_plane_code: string;
+  width_mm: number;
+  depth_mm: number;
+  eave_dist_m: number;
+  apex_dist_m: number;
+  qty: number;
+  unit: 'ea';
+  notes: string;
+}
+
+export interface OrderPackHardwareLine {
+  code: string;
+  description: string;
+  qty: number;
+  unit: string;
+  notes: string;
+}
+
+export interface OrderPackWallCladdingLine {
+  code: string;
+  cladding_type: WallCladdingType;
+  description: string;
+  faces_count: number;
+  gross_area_m2: number;
+  openings_area_m2: number;
+  net_area_m2: number;
+  lineal_m: number;
+  unit: 'm2';
+  notes: string;
+}
+
+export interface OrderPackWallOpeningLine {
+  id: string;
+  wall_code: string;
+  wall_name: string;
+  type: WallOpeningType;
+  label: string;
+  width_mm: number;
+  height_mm: number;
+  sill_mm: number;
+  dist_from_start_m: number;
+  area_m2: number;
+}
+
+export interface OrderPack {
+  version: 1;
+  generatedAt: string;
+  locked: boolean;
+  confirmedAt?: string;
+  confirmedBy?: string;
+  projectNumber: string;
+  projectTitle: string;
+  siteAddress?: string;
+  commercialNeutral: true;
+  assumptions: {
+    profile: string;
+    material: string;
+    color: string;
+    windZone?: string;
+    exposureZone?: string;
+    coverWidthMm: number;
+    endLapMm: number;
+    overhangMm: number;
+    sheetRoundingNote: string;
+    productCodePolicy: string;
+  };
+  totals: {
+    roofAreaM2: number;
+    totalSheets: number;
+    totalOrderedLm: number;
+    totalNetRoofLm: number;
+    savedOffcutLm: number;
+    offcutsReusedCount: number;
+    wastePercent: number;
+    flashingSticks: number;
+    flashingTotalLm: number;
+    penetrationCount: number;
+    wallNetAreaM2?: number;
+    wallOpeningsCount?: number;
+  };
+  sheets: OrderPackSheetLine[];
+  flashings: OrderPackFlashingLine[];
+  penetrations: OrderPackPenetrationLine[];
+  hardware: OrderPackHardwareLine[];
+  walls?: {
+    totalFaces: number;
+    detailedFaces: number;
+    externalCornersCount: number;
+    internalCornersCount: number;
+    returnFacesCount: number;
+    totalNetAreaM2: number;
+    totalOpeningsAreaM2: number;
+    byCladding: OrderPackWallCladdingLine[];
+    openingsSchedule: OrderPackWallOpeningLine[];
+    returnNotes: string[];
+  };
+  completenessReport: TakeoffCompletenessReport;
+}
+
 export interface ExactRoofModelSnapshot {
   version: 2;
   stage: RoofLifecycleStage;
@@ -611,6 +756,7 @@ export interface ExactRoofModelSnapshot {
   wallPlan?: WallPlan | null;
   layout?: LayoutResult;
   bom?: RoofBomSummary;
+  orderPack?: OrderPack | null;
   lastUpdatedAt: string;
   updatedBy?: string;
 }
@@ -634,10 +780,14 @@ export interface TakeoffCompletenessIssue {
 
 export interface TakeoffCompletenessReport {
   isComplete: boolean;
+  canLockMeasure: boolean;
+  blockersCount: number;
+  warningsCount: number;
   totalIssuesCount: number;
   undetailedWallsCount: number;
   undetailedReturnsCount: number;
   unassignedFlashingsCount: number;
+  optionalUnassignedEavesCount?: number;
   incompletePlanesCount: number;
   incompletePenetrationsCount: number;
   issues: TakeoffCompletenessIssue[];

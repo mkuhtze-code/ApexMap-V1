@@ -458,23 +458,54 @@ export function computeBendAngleAnnotations(
     const startPt = { x: vertex.x + u1.x * effectiveRadius, y: vertex.y + u1.y * effectiveRadius };
     const endPt = { x: vertex.x + u2.x * effectiveRadius, y: vertex.y + u2.y * effectiveRadius };
 
-    // Angle bisector for placing the label inside the corner
+    // Angle bisector for placing the label inside the corner (fallback perpendicular when vectors oppose 180 deg)
     const bisectorRaw = { x: u1.x + u2.x, y: u1.y + u2.y };
-    const bisector = normalize(bisectorRaw);
+    const bisectorLen = Math.hypot(bisectorRaw.x, bisectorRaw.y);
+    const bisector =
+      bisectorLen > 1e-4 ? { x: bisectorRaw.x / bisectorLen, y: bisectorRaw.y / bisectorLen } : { x: -u1.y, y: u1.x };
 
-    // Determine sweep flag for SVG Arc
-    const sweepCp = cross(u1, u2);
-    const sweepFlag = sweepCp > 0 ? 1 : 0;
-    const isLargeArc = interiorAngleDeg > 180 ? 1 : 0;
+    const isCrushOrHem =
+      storedInterior <= 5 ||
+      interiorAngleDeg <= 5 ||
+      seg?.kind === 'closed_hem' ||
+      seg?.kind === 'crush_fold' ||
+      seg?.kind === 'open_hem' ||
+      seg?.kind === 'hem';
 
-    const arcPath = `M ${startPt.x} ${startPt.y} A ${effectiveRadius} ${effectiveRadius} 0 ${isLargeArc} ${sweepFlag} ${endPt.x} ${endPt.y}`;
+    let arcPath: string;
+    let effectiveStartPt = startPt;
+    let effectiveEndPt = endPt;
+    let labelPos: Point2D;
 
-    // Label position: placed along bisector just outside the arc
-    const labelDistance = effectiveRadius + 11 * u;
-    const labelPos = {
-      x: vertex.x + bisector.x * labelDistance,
-      y: vertex.y + bisector.y * labelDistance
-    };
+    if (isCrushOrHem) {
+      // Draw a clean visible semicircular teardrop hem loop around the fold tangent instead of a 0-length arc
+      const hemR = Math.max(5 * u, Math.min(9 * u, Math.min(l1, l2) * 0.35));
+      const perpDir = cp >= 0 ? { x: -u1.y, y: u1.x } : { x: u1.y, y: -u1.x };
+      const topPt = { x: vertex.x + u1.x * hemR + perpDir.x * (hemR * 0.5), y: vertex.y + u1.y * hemR + perpDir.y * (hemR * 0.5) };
+      const botPt = { x: vertex.x + u1.x * hemR - perpDir.x * (hemR * 0.5), y: vertex.y + u1.y * hemR - perpDir.y * (hemR * 0.5) };
+      effectiveStartPt = topPt;
+      effectiveEndPt = botPt;
+      arcPath = `M ${topPt.x} ${topPt.y} A ${hemR} ${hemR} 0 1 ${cp >= 0 ? 0 : 1} ${botPt.x} ${botPt.y}`;
+      const outDir = { x: -u1.x, y: -u1.y };
+      labelPos = {
+        x: vertex.x + outDir.x * (hemR + 14 * u),
+        y: vertex.y + outDir.y * (hemR + 14 * u)
+      };
+    } else {
+      // Determine sweep flag for SVG Arc
+      const sweepCp = cross(u1, u2);
+      const sweepFlag = sweepCp > 0 ? 1 : 0;
+      const isLargeArc = interiorAngleDeg > 180 ? 1 : 0;
+
+      arcPath = `M ${startPt.x} ${startPt.y} A ${effectiveRadius} ${effectiveRadius} 0 ${isLargeArc} ${sweepFlag} ${endPt.x} ${endPt.y}`;
+
+      // Label position: placed along bisector just outside the arc
+      const labelDistance = effectiveRadius + 11 * u;
+      labelPos = {
+        x: vertex.x + bisector.x * labelDistance,
+        y: vertex.y + bisector.y * labelDistance
+      };
+    }
 
     // Zoom-level visibility: hide if adjacent legs in screen pixels are too cramped (< 22px)
     const minAdjScreenPx = Math.min(l1, l2) / u;
@@ -491,8 +522,8 @@ export function computeBendAngleAnnotations(
       turnDirection,
       arcPath,
       arcRadius: effectiveRadius,
-      startPt,
-      endPt,
+      startPt: effectiveStartPt,
+      endPt: effectiveEndPt,
       labelPos,
       isAcute: storedInterior < 90,
       visible

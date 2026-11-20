@@ -259,11 +259,28 @@ export const FlashingDesigner: React.FC<Props> = ({
     onUpdateProject({ ...project, flashingProfiles: next } as Project);
   };
 
-  // Model-to-screen scale factor (model units per screen pixel)
+  const [svgClientWidth, setSvgClientWidth] = useState<number>(600);
+  useEffect(() => {
+    const el = svgRef.current || containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const w = svgRef.current?.clientWidth || containerRef.current?.clientWidth || 600;
+      if (w > 0) setSvgClientWidth(w);
+    };
+    measure();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [viewMode, showInspector]);
+
+  // Model-to-screen scale factor (model units per screen pixel, stays screen-constant across resize & zoom)
   const modelUnitsPerScreenPixel = useMemo(() => {
-    const clientW = svgRef.current?.clientWidth || 600;
-    return viewBox.w / Math.max(1, clientW);
-  }, [viewBox.w]);
+    return viewBox.w / Math.max(1, svgClientWidth);
+  }, [viewBox.w, svgClientWidth]);
 
   // Convert client viewport coordinates to SVG model coordinates
   const clientToSvg = useCallback(
@@ -468,7 +485,10 @@ export const FlashingDesigner: React.FC<Props> = ({
       safePatch.lengthMm = Math.max(1, Math.min(10000, safePatch.lengthMm));
     }
     if (typeof safePatch.angleDeg === 'number') {
-      safePatch.angleDeg = Math.max(1, Math.min(179, safePatch.angleDeg));
+      safePatch.angleDeg = Math.max(0, Math.min(179, safePatch.angleDeg));
+      if (safePatch.angleDeg <= 2 && !safePatch.kind && selected.segments[index]?.kind === 'leg') {
+        safePatch.kind = 'crush_fold';
+      }
     }
 
     const segs = selected.segments.map((s, i) => (i === index ? { ...s, ...safePatch } : s));
@@ -1737,9 +1757,9 @@ export const FlashingDesigner: React.FC<Props> = ({
                       {/* Screen-Space Angle Value */}
                       <g transform={`translate(${bend.labelPos.x} ${bend.labelPos.y}) scale(${u})`}>
                         <rect
-                          x="-16"
+                          x={bend.interiorAngleDeg <= 2 ? '-22' : '-16'}
                           y="-7.5"
-                          width="32"
+                          width={bend.interiorAngleDeg <= 2 ? '44' : '32'}
                           height="15"
                           rx="3"
                           fill={isSelected ? '#0369a1' : '#0b0f19'}
@@ -1755,7 +1775,7 @@ export const FlashingDesigner: React.FC<Props> = ({
                           fontFamily="ui-monospace, monospace"
                           fontWeight="bold"
                         >
-                          {bend.interiorAngleDeg}°
+                          {bend.interiorAngleDeg <= 2 ? 'CRUSH' : `${bend.interiorAngleDeg}°`}
                         </text>
                       </g>
                     </g>
@@ -2102,7 +2122,7 @@ export const FlashingDesigner: React.FC<Props> = ({
                     <div className="flex items-center gap-1">
                       <input
                         type="number"
-                        min="1"
+                        min="0"
                         max="179"
                         value={activeBend.interiorAngleDeg}
                         onChange={(e) =>
@@ -2113,18 +2133,23 @@ export const FlashingDesigner: React.FC<Props> = ({
                       <span className="text-xs font-mono text-slate-500 px-1">deg</span>
                     </div>
 
-                    <div className="grid grid-cols-4 gap-1 mt-1.5">
-                      {[45, 90, 135, 150].map((ang) => (
+                    <div className="grid grid-cols-5 gap-1 mt-1.5">
+                      {[0, 45, 90, 135, 150].map((ang) => (
                         <button
                           key={ang}
-                          onClick={() => updateSegmentAt(activeBend.bendIndex, { angleDeg: ang })}
+                          onClick={() =>
+                            updateSegmentAt(activeBend.bendIndex, {
+                              angleDeg: ang,
+                              ...(ang === 0 ? { kind: 'crush_fold' } : {})
+                            })
+                          }
                           className={`py-1 rounded font-mono text-xs font-semibold transition-colors cursor-pointer ${
                             activeBend.interiorAngleDeg === ang
                               ? 'bg-amber-500 text-slate-950 font-bold'
                               : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                           }`}
                         >
-                          {ang}°
+                          {ang === 0 ? 'Crush' : `${ang}°`}
                         </button>
                       ))}
                     </div>

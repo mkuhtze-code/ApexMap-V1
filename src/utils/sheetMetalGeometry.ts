@@ -214,7 +214,10 @@ export function calculateFlashingEngineering(
     cumulativeLength += Number(leg.lengthMm) || 0;
 
     if (idx < legs.length - 1 && leg.interiorAngleDeg !== undefined) {
-      const isHem = leg.kind === 'closed_hem' || leg.kind === 'crush_fold';
+      const isHem =
+        leg.kind === 'closed_hem' ||
+        leg.kind === 'crush_fold' ||
+        ((leg.kind === 'safety_fold' || leg.kind === 'hem') && leg.interiorAngleDeg <= 15);
       const isOpenHem = leg.kind === 'open_hem';
 
       if (isHem) {
@@ -330,6 +333,85 @@ export function calculateDevelopedBlankWidth(
   }));
   const eng = calculateFlashingEngineering(legs, thicknessMm >= 0.7 ? 'magnaflow_075' : 'vitor_055');
   return eng.developedBlankWidthMm;
+}
+
+export interface FlashingProfileBendSummary {
+  bendCount: number;
+  keyAnglesDeg: number[];
+  hasHemCrush: boolean;
+  nominalSumMm: number;
+  developedBlankWidthMm: number;
+  totalBendDeductionMm: number;
+  girthTier: FlashingGirthTier;
+  recommendedSlitWidthMm: number;
+}
+
+/**
+ * Extracts complete bend count, key angles, crush/hem status, and developed blank width
+ * from an arbitrary array of FlashingSegments.
+ */
+export function summarizeFlashingProfileBends(
+  segments: { lengthMm: number; angleDeg?: number; kind?: any; turnDirection?: -1 | 1; hemGapMm?: number }[],
+  thicknessMm: number = 0.55
+): FlashingProfileBendSummary {
+  if (!segments || segments.length === 0) {
+    return {
+      bendCount: 0,
+      keyAnglesDeg: [],
+      hasHemCrush: false,
+      nominalSumMm: 0,
+      developedBlankWidthMm: 0,
+      totalBendDeductionMm: 0,
+      girthTier: '0-150mm',
+      recommendedSlitWidthMm: 100
+    };
+  }
+  const legs: FlashingLeg[] = segments.map((s, idx) => ({
+    id: `leg-${idx}`,
+    lengthMm: Number(s.lengthMm) || 0,
+    interiorAngleDeg: idx < segments.length - 1 ? (s.angleDeg !== undefined ? s.angleDeg : 90) : undefined,
+    turnDirection: s.turnDirection ?? 1,
+    kind:
+      s.kind === 'open_hem'
+        ? 'open_hem'
+        : s.kind === 'closed_hem' || s.kind === 'crush_fold'
+        ? 'closed_hem'
+        : s.kind === 'drip'
+        ? 'drip'
+        : s.kind === 'return'
+        ? 'return'
+        : s.kind === 'safety_fold'
+        ? 'safety_fold'
+        : s.kind === 'hem'
+        ? 'hem'
+        : 'leg',
+    hemGapMm: s.hemGapMm
+  }));
+  const eng = calculateFlashingEngineering(legs, thicknessMm >= 0.7 ? 'magnaflow_075' : 'vitor_055');
+  const bendSegs = segments.slice(0, Math.max(0, segments.length - 1));
+  const hasHemCrush = segments.some(
+    (s, idx) =>
+      s.kind === 'closed_hem' ||
+      s.kind === 'crush_fold' ||
+      s.kind === 'open_hem' ||
+      s.kind === 'hem' ||
+      (idx < segments.length - 1 &&
+        ((typeof s.angleDeg === 'number' && s.angleDeg <= 15) ||
+          (s.kind === 'safety_fold' && typeof s.angleDeg === 'number' && (s.angleDeg <= 15 || s.angleDeg >= 175))))
+  );
+  const keyAnglesDeg = bendSegs.map((s) =>
+    Math.round(typeof s.angleDeg === 'number' ? s.angleDeg : 90)
+  );
+  return {
+    bendCount: bendSegs.length,
+    keyAnglesDeg,
+    hasHemCrush,
+    nominalSumMm: eng.nominalSumMm,
+    developedBlankWidthMm: eng.developedBlankWidthMm,
+    totalBendDeductionMm: eng.totalBendDeductionMm,
+    girthTier: eng.girthTier,
+    recommendedSlitWidthMm: eng.recommendedSlitWidthMm
+  };
 }
 
 /**

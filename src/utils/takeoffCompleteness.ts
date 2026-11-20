@@ -66,24 +66,36 @@ export function evaluateTakeoffCompleteness(
     });
   }
 
-  // 2. Unassigned structural/critical roof flashings (exclude optional gutter eaves)
+  // 2. Roof flashings: structural lines block lock; optional eave drips warn only
   const assignedLineIds = new Set(flashingAssignments.map((a) => a.lineId));
   let unassignedFlashingsCount = 0;
+  let optionalUnassignedEavesCount = 0;
 
   assignableLines.forEach((line) => {
-    if (line.flashingKind === 'eave') return;
-    if (!assignedLineIds.has(line.lineId)) {
-      unassignedFlashingsCount += 1;
+    if (assignedLineIds.has(line.lineId)) return;
+    if (line.flashingKind === 'eave') {
+      optionalUnassignedEavesCount += 1;
       issues.push({
-        id: `issue-flash-${line.lineId}`,
+        id: `issue-flash-eave-${line.lineId}`,
         category: 'missing_flashing',
-        severity: 'blocker',
-        title: `${line.label} (${getFlashingKindDisplayLabel(line.flashingKind)}) unassigned`,
-        detail: `${line.trueSlopeLengthM.toFixed(2)}m sloped run has no flashing profile assigned.`,
+        severity: 'warning',
+        title: `${line.label} (${getFlashingKindDisplayLabel(line.flashingKind)}) optional`,
+        detail: `${line.trueSlopeLengthM.toFixed(2)}m perimeter eave has no drip flashing assigned (optional if gutter-only).`,
         targetId: line.lineId,
         targetCode: line.flashingKind
       });
+      return;
     }
+    unassignedFlashingsCount += 1;
+    issues.push({
+      id: `issue-flash-${line.lineId}`,
+      category: 'missing_flashing',
+      severity: 'blocker',
+      title: `${line.label} (${getFlashingKindDisplayLabel(line.flashingKind)}) unassigned`,
+      detail: `${line.trueSlopeLengthM.toFixed(2)}m sloped run has no flashing profile assigned.`,
+      targetId: line.lineId,
+      targetCode: line.flashingKind
+    });
   });
 
   // 3. Roof planes missing pitch / sheet-run basis or unclassified outline with 0 planes
@@ -158,12 +170,19 @@ export function evaluateTakeoffCompleteness(
     }
   });
 
+  const blockersCount = issues.filter((i) => i.severity === 'blocker').length;
+  const warningsCount = issues.filter((i) => i.severity === 'warning').length;
+
   return {
     isComplete: issues.length === 0,
+    canLockMeasure: blockersCount === 0,
+    blockersCount,
+    warningsCount,
     totalIssuesCount: issues.length,
     undetailedWallsCount,
     undetailedReturnsCount,
     unassignedFlashingsCount,
+    optionalUnassignedEavesCount,
     incompletePlanesCount,
     incompletePenetrationsCount,
     issues

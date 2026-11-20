@@ -2096,8 +2096,8 @@ if (
   );
 }
 
-// Resolve all issues: assign cladding to all 8 walls, assign all critical flashings, fix asset host plane
-const completeReport = evaluateTakeoffCompleteness({
+// Resolve all critical issues: assign cladding to all 8 walls, assign all critical flashings, fix asset host plane
+const canLockReport = evaluateTakeoffCompleteness({
   levels: gablePreset34.levels,
   planes: gablePreset34.planes,
   assignableLines: lines35,
@@ -2122,8 +2122,40 @@ const completeReport = evaluateTakeoffCompleteness({
   assets: [placedFromApex]
 });
 
+if (!canLockReport.canLockMeasure || canLockReport.blockersCount !== 0) {
+  throw new Error(
+    `Expected canLockMeasure=true and blockersCount=0 after resolving critical issues, got blockers=${canLockReport.blockersCount}`
+  );
+}
+
+// Resolve optional eave drips as well -> 0 total issues
+const completeReport = evaluateTakeoffCompleteness({
+  levels: gablePreset34.levels,
+  planes: gablePreset34.planes,
+  assignableLines: lines35,
+  flashingAssignments: lines35.map((l) => ({
+    id: `fa-${l.lineId}`,
+    lineId: l.lineId,
+    lineLabel: l.label,
+    flashingKind: l.flashingKind,
+    profileId: 'prof-1',
+    profileName: 'Standard Flashing',
+    planLengthM: l.planLengthM,
+    trueSlopeLengthM: l.trueSlopeLengthM,
+    pieceLengthLm: 4,
+    quantity: l.recommendedQuantity,
+    totalLinearMetres: l.totalOrderLengthM,
+    assignedAt: new Date().toISOString()
+  })),
+  wallPlan: {
+    ...uWallSeed35,
+    facets: uWallSeed35.facets.map((f) => ({ ...f, claddingType: 'weatherboard' }))
+  },
+  assets: [placedFromApex]
+});
+
 if (!completeReport.isComplete || completeReport.totalIssuesCount !== 0) {
-  throw new Error(`Expected completeReport.isComplete=true after resolving issues, got ${completeReport.totalIssuesCount}`);
+  throw new Error(`Expected completeReport.isComplete=true after resolving all issues, got ${completeReport.totalIssuesCount}`);
 }
 console.log(
   '✓ Test 35 Passed: Takeoff completeness gate catches undetailed walls/returns, missing flashings & orphan penetrations and clears when resolved.'

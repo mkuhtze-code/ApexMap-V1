@@ -5,7 +5,7 @@ import {
   RoofFlashingAssignment,
   RoofLineFlashingKind
 } from '../types/exactRoofing';
-import { DEFAULT_ARCHITECTURAL_PROFILES } from './sheetMetalGeometry';
+import { DEFAULT_ARCHITECTURAL_PROFILES, summarizeFlashingProfileBends } from './sheetMetalGeometry';
 import type { FlashingOrderLine } from '../components/FlashingWorkshop';
 
 export const FLASHING_LIBRARY_STORAGE_KEY = 'archtech_flashing_library';
@@ -132,6 +132,166 @@ export function findMatchingCategoryRank(
   return 2;
 }
 
+const KNOWN_PRODUCT_CODE_BY_PRESET_ID: Record<string, string> = {
+  'preset-apron-kick': 'FL-APR-150',
+  'preset-parapet-capping': 'FL-PAR-280',
+  'preset-barge-roll': 'FL-BRG-120',
+  'preset-ventilated-ridge': 'FL-RDG-V140',
+  'preset-valley-gutter': 'FL-VAL-150',
+  'preset-window-head': 'FL-WHD-075'
+};
+
+/**
+ * Deterministic commercial-neutral flashing product code (e.g. FL-RDG-V140 or UNCODED-RIDGE).
+ */
+export function resolveFlashingProductCode(params: {
+  profileId?: string;
+  flashingKind: RoofLineFlashingKind;
+  explicitCode?: string;
+  blankWidthMm?: number;
+}): string {
+  const cleanExplicit = params.explicitCode?.trim();
+  if (cleanExplicit) return cleanExplicit.toUpperCase();
+  if (params.profileId && KNOWN_PRODUCT_CODE_BY_PRESET_ID[params.profileId]) {
+    return KNOWN_PRODUCT_CODE_BY_PRESET_ID[params.profileId];
+  }
+  if (params.profileId && params.profileId.startsWith('preset-')) {
+    const slug = params.profileId.replace(/^preset-/, '').toUpperCase().slice(0, 12);
+    return `FL-${slug}`;
+  }
+  const kindToken = params.flashingKind.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  return `UNCODED-${kindToken}`;
+}
+
+export function extractAssignmentFlashingSpecs(
+  profile: Pick<FlashingProfile, 'id' | 'segments' | 'thicknessMm' | 'developedBlankWidthMm' | 'developedLengthMm' | 'girthTier'>,
+  flashingKind: RoofLineFlashingKind
+) {
+  const summary = summarizeFlashingProfileBends(profile.segments || [], profile.thicknessMm || 0.55);
+  const blankWidthMm = Math.round(
+    profile.developedBlankWidthMm ||
+      profile.developedLengthMm ||
+      summary.developedBlankWidthMm ||
+      (profile.segments || []).reduce((s, seg) => s + (Number(seg.lengthMm) || 0), 0) ||
+      350
+  );
+  return {
+    productCode: resolveFlashingProductCode({
+      profileId: profile.id,
+      flashingKind,
+      blankWidthMm
+    }),
+    developedBlankWidthMm: blankWidthMm,
+    girthTier: profile.girthTier || summary.girthTier,
+    bendCount: summary.bendCount,
+    keyAnglesDeg: summary.keyAnglesDeg,
+    hasHemCrush: summary.hasHemCrush
+  };
+}
+
+export interface GroupedFlashingScheduleItem {
+  groupKey: string;
+  productCode: string;
+  profileId: string;
+  profileName: string;
+  flashingKind: RoofLineFlashingKind;
+  girthMm: number;
+  girthTier: string;
+  bendCount: number;
+  keyAnglesDeg: number[];
+  hasHemCrush: boolean;
+  pieceLengthMm: number;
+  pieceLengthLm: number;
+  quantity: number;
+  totalLinearMetres: number;
+  colorName: string;
+  lineLabels: string[];
+  notes: string;
+}
+
+/**
+ * Groups flashing assignments by product code + profile + exact stick length (mm) + colour
+ * for clean yard ordering & contractor fabrication schedules.
+ */
+export function groupFlashingScheduleLines(
+  assignments: RoofFlashingAssignment[],
+  libraryProfiles: FlashingProfile[] = [],
+  defaultColor = 'FlaxPod'
+): GroupedFlashingScheduleItem[] {
+  const profileById = new Map<string, FlashingProfile>();
+  libraryProfiles.forEach((p) => profileById.set(p.id, p));
+
+  const map = new Map<string, GroupedFlashingScheduleItem>();
+
+  assignments.forEach((assign) => {
+    const matched = profileById.get(assign.profileId);
+    const derived = matched
+      ? extractAssignmentFlashingSpecs(matched, assign.flashingKind)
+      : {
+          productCode: resolveFlashingProductCode({
+            profileId: assign.profileId,
+            flashingKind: assign.flashingKind,
+            explicitCode: assign.productCode,
+            blankWidthMm: assign.developedBlankWidthMm
+          }),
+          developedBlankWidthMm: Math.round(assign.developedBlankWidthMm || 350),
+          girthTier: assign.girthTier || '301-450mm',
+          bendCount: assign.bendCount ?? 0,
+          keyAnglesDeg: assign.keyAnglesDeg ?? [],
+          hasHemCrush: Boolean(assign.hasHemCrush)
+        };
+
+    const productCode = assign.productCode || derived.productCode;
+    const girthMm = Math.round(assign.developedBlankWidthMm || derived.developedBlankWidthMm || 350);
+    const bendCount = assign.bendCount ?? derived.bendCount;
+    const keyAnglesDeg = assign.keyAnglesDeg && assign.keyAnglesDeg.length > 0 ? assign.keyAnglesDeg : derived.keyAnglesDeg;
+    const hasHemCrush = assign.hasHemCrush ?? derived.hasHemCrush;
+    const pieceLengthMm = assign.pieceLengthMm || Math.max(100, Math.round(assign.pieceLengthLm * 1000));
+    const pieceLengthLm = +(pieceLengthMm / 1000).toFixed(3);
+    const colorName = (assign.colorName || defaultColor).trim();
+
+    const groupKey = `${productCode}::${assign.profileId}::${pieceLengthMm}::${colorName.toLowerCase()}`;
+    const existing = map.get(groupKey);
+    const qty = Math.max(1, Math.round(assign.quantity || 1));
+    const lineLm = +(qty * pieceLengthLm).toFixed(3);
+
+    if (existing) {
+      existing.quantity += qty;
+      existing.totalLinearMetres = +(existing.quantity * existing.pieceLengthLm).toFixed(3);
+      if (!existing.lineLabels.includes(assign.lineLabel)) {
+        existing.lineLabels.push(assign.lineLabel);
+      }
+      if (assign.notes && !existing.notes.includes(assign.notes)) {
+        existing.notes = existing.notes ? `${existing.notes}; ${assign.notes}` : assign.notes;
+      }
+    } else {
+      map.set(groupKey, {
+        groupKey,
+        productCode,
+        profileId: assign.profileId,
+        profileName: assign.profileName,
+        flashingKind: assign.flashingKind,
+        girthMm,
+        girthTier: assign.girthTier || derived.girthTier,
+        bendCount,
+        keyAnglesDeg,
+        hasHemCrush,
+        pieceLengthMm,
+        pieceLengthLm,
+        quantity: qty,
+        totalLinearMetres: lineLm,
+        colorName,
+        lineLabels: [assign.lineLabel],
+        notes: assign.notes || getDefaultMitreNotes(assign.flashingKind)
+      });
+    }
+  });
+
+  return Array.from(map.values()).sort((a, b) =>
+    a.productCode.localeCompare(b.productCode) || b.pieceLengthMm - a.pieceLengthMm
+  );
+}
+
 export function pushAssignmentsToFlashingWorkshop(
   assignments: RoofFlashingAssignment[],
   project?: Project
@@ -216,12 +376,18 @@ export function buildCombinedRoofingMaterialOrder(params: {
 
   if (includeFlashings && assignments.length > 0) {
     assignments.forEach((fl, idx) => {
+      const code = resolveFlashingProductCode({
+        profileId: fl.profileId,
+        flashingKind: fl.flashingKind,
+        explicitCode: fl.productCode,
+        blankWidthMm: fl.developedBlankWidthMm
+      });
       items.push({
         id: `fl-ord-${idx + 1}-${Date.now()}`,
-        itemDescription: `${fl.profileName} (${fl.girthTier || 'Custom'}) · ${fl.lineLabel} · ${fl.pieceLengthLm.toFixed(2)}m sticks · ${fl.colorName || profileColor}${fl.notes ? ` · ${fl.notes}` : ''}`,
+        itemDescription: `[${code}] ${fl.profileName} (${fl.girthTier || 'Custom'}${fl.bendCount ? ` · ${fl.bendCount}b` : ''}${fl.hasHemCrush ? ' · Hem/Crush' : ''}) · ${fl.lineLabel} · ${fl.pieceLengthLm.toFixed(2)}m sticks · ${fl.colorName || profileColor}${fl.notes ? ` · ${fl.notes}` : ''}`,
         category: 'Flashings',
         quantity: fl.quantity,
-        unit: `${fl.pieceLengthLm.toFixed(1)}m sticks`
+        unit: `${fl.pieceLengthLm.toFixed(2)}m sticks`
       });
     });
   }

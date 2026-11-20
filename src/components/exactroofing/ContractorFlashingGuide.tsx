@@ -6,7 +6,10 @@ import {
   RoofFlashingAssignment
 } from '../../types/exactRoofing';
 import { ProfileThumbnail } from '../FlashingWorkshop';
-import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBridge';
+import {
+  getFlashingKindDisplayLabel,
+  groupFlashingScheduleLines
+} from '../../utils/exactRoofingFlashingBridge';
 import { Check, CheckCircle2, Lock, MapPin, PenTool, Ruler } from 'lucide-react';
 
 interface Props {
@@ -37,6 +40,11 @@ export const ContractorFlashingGuide: React.FC<Props> = ({
     assignments.forEach((a) => map.set(a.lineId, a));
     return map;
   }, [assignments]);
+
+  const groupedSchedule = useMemo(
+    () => groupFlashingScheduleLines(assignments, libraryProfiles, project?.colorName || 'FlaxPod'),
+    [assignments, libraryProfiles, project?.colorName]
+  );
 
   const unassignedKeyLines = useMemo(
     () => assignableLines.filter((l) => !assignmentMap.has(l.lineId) && l.flashingKind !== 'eave'),
@@ -74,6 +82,53 @@ export const ContractorFlashingGuide: React.FC<Props> = ({
           </div>
         </div>
       </div>
+
+      {/* Grouped Yard / Stick Order Summary (Read-Only, Zero $) */}
+      {groupedSchedule.length > 0 && (
+        <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-4 space-y-2.5">
+          <div className="text-xs font-extrabold uppercase tracking-wider text-sky-400">
+            Grouped Flashing Stick Schedule ({groupedSchedule.length} SKU / Length Groups)
+          </div>
+          <div className="overflow-x-auto border border-slate-800 rounded-xl">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-900/90 text-slate-400 uppercase text-[10px] font-bold border-b border-slate-800">
+                <tr>
+                  <th className="py-2 px-3">Code</th>
+                  <th className="py-2 px-3">Profile &amp; Bends</th>
+                  <th className="py-2 px-3">Runs Covered</th>
+                  <th className="py-2 px-3 text-right">Qty × Length</th>
+                  <th className="py-2 px-3 text-right">Total lm</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                {groupedSchedule.map((item) => (
+                  <tr key={item.groupKey} className="hover:bg-slate-900/50">
+                    <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">
+                      {item.productCode}
+                    </td>
+                    <td className="py-2 px-3 font-sans">
+                      <div className="font-bold text-white">{item.profileName}</div>
+                      <div className="text-[11px] font-mono text-slate-400">
+                        {item.girthMm}mm girth · {item.bendCount} bends
+                        {item.hasHemCrush ? ' · Crush/Hem' : ''}
+                      </div>
+                    </td>
+                    <td className="py-2 px-3 font-sans text-slate-300">
+                      {item.lineLabels.join(', ')}
+                    </td>
+                    <td className="py-2 px-3 text-right font-bold text-white whitespace-nowrap">
+                      {item.quantity} × {item.pieceLengthMm}mm
+                    </td>
+                    <td className="py-2 px-3 text-right font-bold text-emerald-400 whitespace-nowrap">
+                      {item.totalLinearMetres.toFixed(2)} lm
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Assigned Flashings Cards (Stranger-Friendly Diagrams + Exact Stick Lengths) */}
       {assignments.length === 0 ? (

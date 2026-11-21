@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import * as THREE from 'three';
 import {
+  addWingWallToPlan,
   analyzeWallPlanTopology,
+  batchUpdateWallFacetsInPlan,
   buildWallEdgesFromPoints,
   buildWallFacetsFromPlan,
   buildWallOpeningsSchedule,
@@ -11,14 +14,24 @@ import {
   computeWallTakeoffSummary,
   createDefaultWallOpening,
   createHorizontalDadoSplit,
+  createSecondaryZoneFromVoid,
   createVerticalBaySplit,
   deriveRoofOutlineFromWallPlan,
   deriveWallPlanFromRoofLevels,
+  duplicateWallOpening,
   ensureUniqueWallFacetIds,
+  findOpeningOverlaps,
   fitWallFacetTopToRoof,
   isWallFacetUndetailed,
   linkWallFacetsToRoofLevels,
+  removeSecondaryZone,
+  resolveOpeningOverlap,
+  sanitizeWallOpeningsForExtrusion,
+  splitWallFacetInPlan,
+  switchWallOpeningType,
   syncWallPlanWithRoof,
+  updateSecondaryZoneDepth,
+  updateWallFacetKind,
   updateWallPlanEdgeLength
 } from '../wallCladdingEngine';
 import {
@@ -28,6 +41,9 @@ import {
   getPresetOutline,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
+import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
+import { buildOrderPack, exportOrderPackToCsv } from '../exactRoofingBomBridge';
+import { buildWallPlan3DGroup } from '../../components/exactroofing/three/wallMeshBuilder';
 
 console.log('--- Starting Wall Cladding Phase 1 & Phase 2 Engine Tests ---');
 
@@ -455,4 +471,350 @@ assert.equal(
 );
 console.log('✓ Test 11 Passed: Zero duplicate wall-facet-2 IDs on rebuild or legacy repair');
 
-console.log('--- All Wall Cladding Phase 1 & Phase 2 + Bidirectional Tests Passed ---');
+// --- Wall Cladding Parity+ Tests ---
+
+// 12. Opening uRatio scaling on wall length edits + type switching + duplication
+const opBaseFacet = { ...uFacets[0], lengthM: 10.0, heightM: 2.7, topZ: 2.7, claddingType: 'weatherboard' as const };
+const centeredWin = clampWallOpeningToFacet(opBaseFacet, {
+  id: 'op-center',
+  type: 'window',
+  distFromStartM: 4.0, // center = 5.0m (uRatio = 0.50 on 10m wall)
+  sillHeightM: 0.9,
+  widthM: 2.0,
+  heightM: 1.2,
+  label: 'Center Win'
+});
+assert.ok(Math.abs((centeredWin.uRatio ?? 0) - 0.5) < 0.01, 'Centered window should record uRatio ~ 0.5');
+
+const basePlanForResize = {
+  points: [
+    { x: 0, y: 0 },
+    { x: 10, y: 0 },
+    { x: 10, y: 8 },
+    { x: 0, y: 8 }
+  ],
+  edges: buildWallEdgesFromPoints([
+    { x: 0, y: 0 },
+    { x: 10, y: 0 },
+    { x: 10, y: 8 },
+    { x: 0, y: 8 }
+  ]),
+  defaultHeightM: 2.7,
+  facets: buildWallFacetsFromPlan({
+    points: [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 8 },
+      { x: 0, y: 8 }
+    ]
+  }).map((f, i) => (i === 0 ? { ...f, claddingType: 'weatherboard' as const, openings: [centeredWin] } : f))
+};
+
+const stretchedPlan = updateWallPlanEdgeLength(basePlanForResize, basePlanForResize.edges[0].id, 14.0);
+const stretchedWin = stretchedPlan.facets[0].openings[0];
+// uRatio = 0.5 of 14.0m = 7.0m center -> distFromStartM = 6.0m (width 2.0)
+assert.ok(
+  Math.abs(stretchedWin.distFromStartM - 6.0) < 0.15,
+  `Resizing wall from 10m -> 14m should preserve relative uRatio (~6.0m start, got ${stretchedWin.distFromStartM})`
+);
+
+const switchedToDoor = switchWallOpeningType(opBaseFacet, centeredWin, 'door');
+assert.equal(switchedToDoor.type, 'door');
+assert.equal(switchedToDoor.sillHeightM, 0, 'Switching window -> door drops sill to ground threshold');
+const switchedBackToWin = switchWallOpeningType(opBaseFacet, switchedToDoor, 'window');
+assert.equal(switchedBackToWin.type, 'window');
+assert.ok(switchedBackToWin.sillHeightM >= 0.6, 'Switching door -> window raises sill off floor threshold within headroom');
+
+const dupRes = duplicateWallOpening({ ...opBaseFacet, openings: [centeredWin] }, centeredWin.id);
+assert.ok(dupRes, 'duplicateWallOpening should return cloned opening');
+assert.notEqual(dupRes.created.id, centeredWin.id);
+assert.ok(dupRes.created.distFromStartM >= centeredWin.distFromStartM + centeredWin.widthM);
+console.log('✓ Test 12 Passed: Opening uRatio scaling, type switching, & duplication');
+
+// 13. Vertical stacked openings (highlight window above door) & true overlap resolve
+const doorOp = createDefaultWallOpening(opBaseFacet, 'door', 2.0); // u: [2.0..2.92], v: [0..2.1]
+const tallFacet = { ...opBaseFacet, heightM: 3.6, openings: [doorOp] };
+const stackedHighlight = clampWallOpeningToFacet(
+  { lengthM: tallFacet.lengthM, heightM: tallFacet.heightM },
+  {
+    id: 'op-highlight',
+    type: 'window',
+    distFromStartM: 2.0,
+    sillHeightM: 2.3, // strictly above door head (2.1m) -> NO overlap!
+    widthM: 0.9,
+    heightM: 0.8,
+    label: 'Highlight'
+  }
+);
+assert.equal(
+  findOpeningOverlaps(tallFacet, stackedHighlight).hasOverlap,
+  false,
+  'Vertically stacked highlight window over door must NOT flag an overlap'
+);
+
+const collidingWin = clampWallOpeningToFacet(
+  { lengthM: opBaseFacet.lengthM, heightM: opBaseFacet.heightM },
+  {
+    id: 'op-collide',
+    type: 'window',
+    distFromStartM: 2.3,
+    sillHeightM: 0.9,
+    widthM: 1.4,
+    heightM: 1.2,
+    label: 'Colliding'
+  }
+);
+const doorCheckFacet = { ...opBaseFacet, openings: [doorOp, collidingWin] };
+assert.equal(findOpeningOverlaps(doorCheckFacet, collidingWin).hasOverlap, true, 'Colliding openings must be detected');
+const resolvedOps = resolveOpeningOverlap(doorCheckFacet, collidingWin.id);
+const resolvedColliding = resolvedOps.find((o) => o.id === collidingWin.id)!;
+assert.equal(
+  findOpeningOverlaps({ ...opBaseFacet, openings: [doorOp] }, resolvedColliding).hasOverlap,
+  false,
+  'resolveOpeningOverlap clears collision'
+);
+const extrusionClean = sanitizeWallOpeningsForExtrusion({
+  lengthM: opBaseFacet.lengthM,
+  heightM: 3.6,
+  openings: [doorOp, stackedHighlight]
+});
+assert.equal(extrusionClean.length, 2, 'Extrusion sanitizer keeps both vertically stacked openings intact');
+console.log('✓ Test 13 Passed: Vertically stacked openings preserved cleanly & true collisions resolved');
+
+// 14. Parapet wall kind: independent height on sync, coping lm, completeness & commercial-neutral Order Pack
+const parapetFacet = updateWallFacetKind(
+  { ...editedWalls.facets[0], claddingType: 'none' },
+  'parapet',
+  { parapetHeightM: 3.45, parapetAboveM: 0.45, hasCopingFlashing: true }
+);
+assert.equal(parapetFacet.kind, 'parapet');
+assert.equal(parapetFacet.heightM, 3.45);
+assert.equal(parapetFacet.heightSource, 'manual');
+
+const parapetPlan = {
+  ...editedWalls,
+  facets: editedWalls.facets.map((f, i) => (i === 0 ? parapetFacet : f))
+};
+const afterRoofSync = syncWallPlanWithRoof(parapetPlan, [raisedLvl], raisedPlanes, { forceAllLinked: true });
+assert.equal(
+  afterRoofSync.facets[0].heightM,
+  3.45,
+  'Parapet top height must stay independent even during Sync Roof Tops'
+);
+assert.equal(afterRoofSync.facets[0].kind, 'parapet');
+
+const parapetCompleteness = evaluateTakeoffCompleteness({
+  levels: [raisedLvl],
+  planes: raisedPlanes,
+  assignableLines: [],
+  flashingAssignments: [],
+  wallPlan: afterRoofSync,
+  assets: []
+});
+assert.ok(
+  parapetCompleteness.issues.some((i) => i.category === 'undetailed_parapet'),
+  'Undetailed parapet wall triggers undetailed_parapet issue cleanly'
+);
+
+const parapetOrderPack = buildOrderPack({
+  planes: raisedPlanes,
+  levels: [raisedLvl],
+  layout: null,
+  assignments: [],
+  wallPlan: {
+    ...afterRoofSync,
+    facets: afterRoofSync.facets.map((f) => ({ ...f, claddingType: 'profiled_metal' as const }))
+  }
+});
+assert.ok(parapetOrderPack.walls);
+assert.equal(parapetOrderPack.walls.parapetFacesCount, 1);
+assert.ok((parapetOrderPack.walls.parapetCopingLm ?? 0) > 1.0);
+const orderCsv = exportOrderPackToCsv(parapetOrderPack);
+assert.ok(orderCsv.includes('WALL-COPING-PARAPET'), 'Order Pack CSV exports parapet coping lm');
+assert.equal(orderCsv.includes('$'), false, 'Order Pack CSV must remain strictly free of dollar pricing');
+console.log('✓ Test 14 Passed: Parapet independent height, completeness warning, & commercial-neutral coping export');
+
+// 15. Open Wing / Spur polyline walls coexist without corrupting closed-ring topology or roof seeding
+const planWithWing = addWingWallToPlan(
+  uWallPlan,
+  [
+    { x: 14, y: 0 },
+    { x: 17.5, y: 0 },
+    { x: 17.5, y: 3.0 }
+  ],
+  { heightM: 2.1, claddingType: 'weatherboard' }
+);
+assert.equal(planWithWing.facets.length, 10, '8 closed facets + 2 open wing spur facets');
+const wingFacets = planWithWing.facets.filter((f) => f.kind === 'wing');
+assert.equal(wingFacets.length, 2);
+assert.equal(wingFacets[0].lengthM, 3.5);
+assert.equal(wingFacets[1].lengthM, 3.0);
+
+const wingTopology = analyzeWallPlanTopology(planWithWing.facets);
+assert.equal(wingTopology.externalCornersCount, 6, 'Open wing walls must not corrupt closed-ring external corner count');
+assert.equal(wingTopology.internalCornersCount, 2);
+assert.equal(wingTopology.returnFacesCount, 3);
+
+const wingRoofSeed = deriveRoofOutlineFromWallPlan(planWithWing, { levelId: 'lvl-1' });
+assert.ok(wingRoofSeed);
+assert.equal(wingRoofSeed.outline.points.length, 8, 'Roof seeding uses closed primary perimeter only');
+assert.equal(wingRoofSeed.linkedWallPlan.facets.length, 10, 'Roof seeding preserves wing walls on WallPlan');
+console.log('✓ Test 15 Passed: Open wing/spur polylines preserve topology & roof perimeter seeding');
+
+// 16. Splitting a wall facet partitions openings cleanly with unique IDs
+const facetWithTwoOps = {
+  ...basePlanForResize.facets[0],
+  openings: [
+    createDefaultWallOpening(opBaseFacet, 'window', 1.2), // left side [1.2..2.7]
+    createDefaultWallOpening(opBaseFacet, 'door', 7.5) // right side [7.5..8.4]
+  ]
+};
+const planToSplit = {
+  ...basePlanForResize,
+  facets: basePlanForResize.facets.map((f, i) => (i === 0 ? facetWithTwoOps : f))
+};
+const splitPlan = splitWallFacetInPlan(planToSplit, facetWithTwoOps.id, 5.0);
+assert.equal(splitPlan.facets.length, 5, 'Splitting 10m wall into 2 produces 5 total ring facets');
+assert.equal(splitPlan.facets[0].lengthM, 5.0);
+assert.equal(splitPlan.facets[1].lengthM, 5.0);
+assert.equal(splitPlan.facets[0].openings.length, 1);
+assert.equal(splitPlan.facets[1].openings.length, 1);
+assert.ok(Math.abs(splitPlan.facets[1].openings[0].distFromStartM - 2.5) < 0.05);
+assert.equal(new Set(splitPlan.facets.map((f) => f.id)).size, splitPlan.facets.length);
+console.log('✓ Test 16 Passed: Split facet cleanly partitions openings & maintains unique IDs');
+
+// 17. Promote Void Opening -> Secondary Wall Section (3 walls + depth update + batch edit + scoped takeoff + delete)
+const voidOpening = clampWallOpeningToFacet(opBaseFacet, {
+  id: 'op-patio-void',
+  type: 'void',
+  distFromStartM: 3.0,
+  sillHeightM: 0,
+  widthM: 4.0,
+  heightM: 2.4,
+  label: 'Patio Recess'
+});
+const planForVoid = {
+  ...basePlanForResize,
+  facets: basePlanForResize.facets.map((f, i) =>
+    i === 0 ? { ...f, claddingType: 'brick' as const, openings: [voidOpening] } : f
+  )
+};
+const promoted = createSecondaryZoneFromVoid(planForVoid, planForVoid.facets[0].id, voidOpening.id, {
+  depthM: 2.5,
+  direction: 'inward'
+});
+assert.ok(promoted, 'Should create 3 secondary enclave walls from void');
+assert.equal(promoted.createdFacets.length, 3, 'Secondary alcove creates Left Return, Back Wall, Right Return');
+assert.equal(promoted.createdFacets[0].lengthM, 2.5);
+assert.equal(promoted.createdFacets[1].lengthM, 4.0);
+assert.equal(promoted.createdFacets[2].lengthM, 2.5);
+
+// Update depth 2.5m -> 3.2m
+const deepened = updateSecondaryZoneDepth(promoted.wallPlan, promoted.zone.id, 3.2);
+const secFacetsAfter = deepened.facets.filter((f) => f.secondaryZoneId === promoted.zone.id);
+assert.equal(secFacetsAfter[0].lengthM, 3.2);
+assert.equal(secFacetsAfter[1].lengthM, 4.0);
+
+// Batch update secondary walls
+const batched = batchUpdateWallFacetsInPlan(
+  deepened,
+  secFacetsAfter.map((f) => f.id),
+  { claddingType: 'weatherboard', heightM: 2.55 }
+);
+const secSumOnly = computeWallTakeoffSummary(batched.facets, 'secondary');
+const primSumOnly = computeWallTakeoffSummary(batched.facets, 'primary');
+const allSum = computeWallTakeoffSummary(batched.facets, 'all');
+assert.equal(secSumOnly.totalFaces, 3);
+assert.equal(primSumOnly.totalFaces, 4);
+assert.equal(allSum.totalFaces, 7);
+assert.ok(secSumOnly.totalNetAreaM2 > 20);
+assert.equal(+(primSumOnly.totalNetAreaM2 + secSumOnly.totalNetAreaM2).toFixed(2), +allSum.totalNetAreaM2.toFixed(2));
+
+// Secondary metrics reflected in Order Pack
+const secOrderPack = buildOrderPack({
+  planes: raisedPlanes,
+  levels: [raisedLvl],
+  layout: null,
+  assignments: [],
+  wallPlan: batched
+});
+assert.equal(secOrderPack.walls?.secondaryFacesCount, 3);
+assert.ok((secOrderPack.walls?.secondaryNetAreaM2 ?? 0) > 20);
+
+const afterZoneDelete = removeSecondaryZone(batched, promoted.zone.id);
+assert.equal(afterZoneDelete.facets.length, 4);
+assert.equal(afterZoneDelete.secondaryZones?.length, 0);
+console.log('✓ Test 17 Passed: Void -> Secondary Wall Section creation, depth adjust, batch edit, scoped takeoff & removal');
+
+// 18. Headless Three.js 3D Extrusion Robustness (stacked openings, 0.28m nib, dado split, parapet, wing, secondary)
+const robustPlan: typeof batched = {
+  ...batched,
+  facets: [
+    // Stacked openings + horizontal dado split
+    {
+      ...batched.facets[0],
+      heightM: 3.6,
+      topZ: 3.6,
+      regions: createHorizontalDadoSplit({ ...batched.facets[0], heightM: 3.6 }, 1.2, 'brick', 'weatherboard'),
+      openings: [doorOp, stackedHighlight]
+    },
+    // Parapet with coping cap
+    updateWallFacetKind(batched.facets[1], 'parapet', { parapetHeightM: 3.3, hasCopingFlashing: true }),
+    // Ultra-short 0.28m nib
+    {
+      ...batched.facets[2],
+      to: { x: batched.facets[2].from.x, y: batched.facets[2].from.y + 0.28 },
+      lengthM: 0.28,
+      claddingType: 'profiled_metal'
+    },
+    // Plus remaining secondary & wing facets
+    ...batched.facets.slice(3),
+    ...wingFacets
+  ]
+};
+
+const rootGroup = new THREE.Group();
+const selectableMeshes: THREE.Mesh[] = [];
+const geos: THREE.BufferGeometry[] = [];
+const mats: THREE.Material[] = [];
+const stubTextures = { getEntry: () => null, garageDoor: null } as unknown as Parameters<typeof buildWallPlan3DGroup>[0]['wallTextures'];
+const testGlassMat = new THREE.MeshPhysicalMaterial({ color: '#88ccee' });
+
+buildWallPlan3DGroup({
+  wallPlan: robustPlan,
+  bounds: {
+    minX: 0,
+    maxX: 18,
+    minY: 0,
+    maxY: 10,
+    midX: 9,
+    midY: 5,
+    midZ: 1.5,
+    maxZ: 3.6,
+    span: 20
+  },
+  selectedWallFacetId: robustPlan.facets[0].id,
+  wallFilterMode: 'all',
+  shadingMode: 'studio_finish',
+  wallTextures: stubTextures,
+  glassMat: testGlassMat,
+  rootGroup,
+  selectableMeshes,
+  trackGeo: (g) => {
+    geos.push(g);
+    return g;
+  },
+  trackMat: (m) => {
+    mats.push(m);
+    return m;
+  }
+});
+
+assert.ok(selectableMeshes.length >= robustPlan.facets.length, 'All robust facets including short nib, parapet, wing & secondary must extrude cleanly');
+assert.ok(geos.length > 0 && mats.length > 0);
+geos.forEach((g) => g.dispose());
+mats.forEach((m) => m.dispose());
+testGlassMat.dispose();
+console.log('✓ Test 18 Passed: Headless 3D wall extrusion succeeds across stacked openings, short nibs, dado, parapet, wings & secondary');
+
+console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

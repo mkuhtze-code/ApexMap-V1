@@ -549,9 +549,22 @@ export interface WallOpening {
   widthM: number;
   heightM: number;
   label?: string;
+  /** Normalized center ratio (0..1) along facet length for length-edit preservation */
+  uRatio?: number;
+  /** Optional linked secondary enclosure zone promoted from a void */
+  linkedSecondaryZoneId?: string;
 }
 
 export type WallHeightSource = 'manual' | 'roof';
+
+export type WallFacetKind =
+  | 'exterior'
+  | 'return'
+  | 'parapet'
+  | 'wing'
+  | 'abutment'
+  | 'secondary'
+  | 'void_edge';
 
 export interface WallElevationUnderlay {
   id: string;
@@ -585,7 +598,13 @@ export interface WallRoofProfilePoint {
   topZ: number;
 }
 
-export type WallFilterMode = 'all' | 'undetailed' | 'returns';
+export type WallFilterMode =
+  | 'all'
+  | 'undetailed'
+  | 'returns'
+  | 'parapets'
+  | 'secondary'
+  | 'wings';
 
 export interface WallFacet {
   id: string;
@@ -605,6 +624,18 @@ export interface WallFacet {
   underlay?: WallElevationUnderlay | null;
   /** Optional link to matching PlanEdge in the roof footprint */
   roofEdgeId?: string;
+  /** Architectural wall role/kind (defaults to 'exterior') */
+  kind?: WallFacetKind;
+  /** Extra parapet upstand height above roof eave (for reporting/presets) */
+  parapetAboveM?: number;
+  /** Whether parapet top receives metal coping flashing (defaults true for parapet kind) */
+  hasCopingFlashing?: boolean;
+  /** Linked secondary zone ID when facet belongs to a recessed patio / wing alcove */
+  secondaryZoneId?: string;
+  /** Open wing/spur wall not part of the closed building perimeter ring */
+  isSpur?: boolean;
+  /** Optional grouping tag for multi-zone or phased wall systems */
+  groupId?: string;
 }
 
 export interface WallPlanEdge {
@@ -613,12 +644,25 @@ export interface WallPlanEdge {
   to: Point2D;
 }
 
+export interface WallSecondaryZone {
+  id: string;
+  name: string;
+  sourceOpeningId?: string;
+  sourceFacetId?: string;
+  depthM: number;
+  heightM?: number;
+  direction?: 'inward' | 'outward';
+  facetIds: string[];
+}
+
 export interface WallPlan {
   points: Point2D[];
   edges: WallPlanEdge[];
   defaultHeightM: number;
   facets: WallFacet[];
   builtAt?: string;
+  spurEdges?: WallPlanEdge[];
+  secondaryZones?: WallSecondaryZone[];
 }
 
 export interface OrderPackSheetLine {
@@ -753,6 +797,11 @@ export interface OrderPack {
     externalCornersCount: number;
     internalCornersCount: number;
     returnFacesCount: number;
+    parapetFacesCount?: number;
+    parapetCopingLm?: number;
+    secondaryFacesCount?: number;
+    secondaryNetAreaM2?: number;
+    wingFacesCount?: number;
     totalNetAreaM2: number;
     totalOpeningsAreaM2: number;
     byCladding: OrderPackWallCladdingLine[];
@@ -792,6 +841,8 @@ export interface ExactRoofModelSnapshot {
 export type TakeoffCompletenessCategory =
   | 'undetailed_wall'
   | 'undetailed_return'
+  | 'undetailed_parapet'
+  | 'undetailed_secondary'
   | 'missing_flashing'
   | 'incomplete_plane'
   | 'incomplete_penetration';

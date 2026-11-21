@@ -9,11 +9,13 @@ import {
   WallCladdingType,
   WallElevationUnderlay,
   WallFacet,
+  WallFacetKind,
   WallOpening,
   WallOpeningType,
   WallPlan,
   WallPlanEdge,
-  WallRoofProfilePoint
+  WallRoofProfilePoint,
+  WallSecondaryZone
 } from '../types/exactRoofing';
 import {
   computeEdgeSetbackLine,
@@ -23,6 +25,34 @@ import {
   isEdgeWallEnabled,
   pointsClose
 } from './exactRoofingEngine';
+
+export interface WallFacetKindMeta {
+  kind: WallFacetKind;
+  label: string;
+  shortLabel: string;
+  hex: string;
+}
+
+export const WALL_FACET_KIND_OPTIONS: WallFacetKindMeta[] = [
+  { kind: 'exterior', label: 'Exterior Wall', shortLabel: 'Exterior', hex: '#38bdf8' },
+  { kind: 'return', label: 'Return / Nib Wall', shortLabel: 'Return', hex: '#f59e0b' },
+  { kind: 'parapet', label: 'Parapet Wall (Coping)', shortLabel: 'Parapet', hex: '#c084fc' },
+  { kind: 'wing', label: 'Wing / Spur Wall', shortLabel: 'Wing', hex: '#2dd4bf' },
+  { kind: 'abutment', label: 'Abutment Wall', shortLabel: 'Abutment', hex: '#fb923c' },
+  { kind: 'secondary', label: 'Secondary / Alcove Wall', shortLabel: 'Secondary', hex: '#a78bfa' },
+  { kind: 'void_edge', label: 'Void Edge Wall', shortLabel: 'Void Edge', hex: '#94a3b8' }
+];
+
+export function getWallFacetKind(facet: Pick<WallFacet, 'kind'>): WallFacetKind {
+  return facet.kind || 'exterior';
+}
+
+export function getWallFacetKindMeta(kind?: WallFacetKind): WallFacetKindMeta {
+  const resolved = kind || 'exterior';
+  return (
+    WALL_FACET_KIND_OPTIONS.find((k) => k.kind === resolved) || WALL_FACET_KIND_OPTIONS[0]
+  );
+}
 
 export interface WallCladdingMeta {
   type: WallCladdingType;
@@ -337,6 +367,7 @@ export function ensureUniqueWallFacetIds(facets: WallFacet[]): WallFacet[] {
 
 /**
  * Ensures an opening sits strictly within facet bounds and meets minimum valid opening sizes.
+ * Updates normalized center ratio (`uRatio`) so subsequent wall length edits keep openings balanced.
  */
 export function clampWallOpeningToFacet(
   facet: Pick<WallFacet, 'lengthM' | 'heightM'>,
@@ -354,14 +385,227 @@ export function clampWallOpeningToFacet(
     Math.max(0, maxH - heightM),
     Math.max(0, opening.sillHeightM || 0)
   ).toFixed(3);
+  const uRatio = +Math.min(1, Math.max(0, (distFromStartM + widthM * 0.5) / maxW)).toFixed(4);
 
   return {
     ...opening,
     widthM,
     heightM,
     distFromStartM,
-    sillHeightM
+    sillHeightM,
+    uRatio
   };
+}
+
+/**
+ * Repositions an opening proportionally when a wall facet changes length, then clamps cleanly.
+ */
+export function scaleOpeningForFacetLength(
+  oldLengthM: number,
+  newLengthM: number,
+  newHeightM: number,
+  opening: WallOpening
+): WallOpening {
+  const safeOldL = Math.max(0.2, oldLengthM || newLengthM);
+  const ratio =
+    typeof opening.uRatio === 'number' && Number.isFinite(opening.uRatio)
+      ? opening.uRatio
+      : (opening.distFromStartM + opening.widthM * 0.5) / safeOldL;
+  const targetCenter = ratio * newLengthM;
+  const candidate: WallOpening = {
+    ...opening,
+    distFromStartM: +(targetCenter - opening.widthM * 0.5).toFixed(3)
+  };
+  return clampWallOpeningToFacet({ lengthM: newLengthM, heightM: newHeightM }, candidate);
+}
+
+/**
+ * Checks whether `candidate` overlaps any other opening on `facet` in 2D (U and V both intersect).
+ * Vertically stacked openings in the same U column do NOT overlap as long as V intervals clear.
+ */
+export function findOpeningOverlaps(
+  facet: Pick<WallFacet, 'lengthM' | 'heightM' | 'openings'>,
+  candidate: WallOpening,
+  ignoreOpeningId?: string
+): { hasOverlap: boolean; overlappingIds: string[] } {
+  const c = clampWallOpeningToFacet(facet, candidate);
+  const cu0 = c.distFromStartM;
+  const cu1 = c.distFromStartM + c.widthM;
+  const cv0 = c.sillHeightM;
+  const cv1 = c.sillHeightM + c.heightM;
+
+  const overlappingIds: string[] = [];
+  for (const op of facet.openings) {
+    if (op.id === (ignoreOpeningId ?? candidate.id)) continue;
+    const o = clampWallOpeningToFacet(facet, op);
+    const uOverlap = Math.min(cu1, o.distFromStartM + o.widthM) - Math.max(cu0, o.distFromStartM);
+    const vOverlap = Math.min(cv1, o.sillHeightM + o.heightM) - Math.max(cv0, o.sillHeightM);
+    if (uOverlap > 0.01 && vOverlap > 0.01) {
+      overlappingIds.push(op.id);
+    }
+  }
+  return {
+    hasOverlap: overlappingIds.length > 0,
+    overlappingIds
+  };
+}
+
+/**
+ * Switches opening type (`window` <-> `door` <-> `garage` <-> `void`) while preserving horizontal position.
+ */
+export function switchWallOpeningType(
+  facet: Pick<WallFacet, 'lengthM' | 'heightM'>,
+  opening: WallOpening,
+  nextType: WallOpeningType
+): WallOpening {
+  let nextSill = opening.sillHeightM;
+  if (nextType === 'door' || nextType === 'garage') {
+    nextSill = 0;
+  } else if (nextType === 'window' && opening.sillHeightM < 0.05) {
+    nextSill = Math.min(0.9, Math.max(0, facet.heightM - opening.heightM));
+  }
+  const nextHeight =
+    nextType === 'door' || nextType === 'garage'
+      ? Math.min(facet.heightM, Math.max(opening.heightM, 2.05))
+      : opening.heightM;
+
+  const autoDefaultPattern = /^(Window|Entry Door|Garage Door|Door|Garage|Void)\s*\d*$/i;
+  const typeLabelMap: Record<WallOpeningType, string> = {
+    window: 'Window',
+    door: 'Entry Door',
+    garage: 'Garage Door',
+    void: 'Void'
+  };
+  const nextLabel =
+    !opening.label || autoDefaultPattern.test(opening.label.trim())
+      ? typeLabelMap[nextType]
+      : opening.label;
+
+  return clampWallOpeningToFacet(facet, {
+    ...opening,
+    type: nextType,
+    sillHeightM: +nextSill.toFixed(3),
+    heightM: +nextHeight.toFixed(3),
+    label: nextLabel
+  });
+}
+
+/**
+ * Duplicates an existing opening into the nearest clear spot beside (or above) the original.
+ */
+export function duplicateWallOpening(
+  facet: WallFacet,
+  openingId: string
+): { openings: WallOpening[]; created: WallOpening } | null {
+  const src = facet.openings.find((o) => o.id === openingId);
+  if (!src) return null;
+
+  const baseId = `op-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const candidates: WallOpening[] = [
+    { ...src, id: baseId, distFromStartM: +(src.distFromStartM + src.widthM + 0.25).toFixed(3) },
+    { ...src, id: baseId, distFromStartM: +(src.distFromStartM - src.widthM - 0.25).toFixed(3) },
+    { ...src, id: baseId, sillHeightM: +(src.sillHeightM + src.heightM + 0.2).toFixed(3) },
+    { ...src, id: baseId, distFromStartM: +(src.distFromStartM + 0.25).toFixed(3) }
+  ];
+
+  let chosen = clampWallOpeningToFacet(facet, candidates[0]);
+  for (const cand of candidates) {
+    const clamped = clampWallOpeningToFacet(facet, cand);
+    if (!findOpeningOverlaps(facet, clamped).hasOverlap) {
+      chosen = clamped;
+      break;
+    }
+  }
+
+  chosen = {
+    ...chosen,
+    label: src.label ? `${src.label} Copy` : `Opening ${facet.openings.length + 1}`,
+    linkedSecondaryZoneId: undefined
+  };
+
+  return {
+    openings: [...facet.openings, chosen],
+    created: chosen
+  };
+}
+
+/**
+ * Shifts an overlapping opening to the nearest non-overlapping U position along the facet.
+ */
+export function resolveOpeningOverlap(facet: WallFacet, openingId: string): WallOpening[] {
+  const target = facet.openings.find((o) => o.id === openingId);
+  if (!target) return facet.openings;
+  if (!findOpeningOverlaps(facet, target, openingId).hasOverlap) return facet.openings;
+
+  const step = 0.1;
+  const maxU = Math.max(0, facet.lengthM - target.widthM);
+  let best = target;
+  let bestDist = Infinity;
+
+  for (let u = 0; u <= maxU + 1e-4; u += step) {
+    const cand = clampWallOpeningToFacet(facet, { ...target, distFromStartM: +u.toFixed(3) });
+    if (!findOpeningOverlaps(facet, cand, openingId).hasOverlap) {
+      const d = Math.abs(cand.distFromStartM - target.distFromStartM);
+      if (d < bestDist) {
+        bestDist = d;
+        best = cand;
+      }
+    }
+  }
+
+  return facet.openings.map((o) => (o.id === openingId ? best : o));
+}
+
+export interface SanitizedExtrusionOpening extends WallOpening {
+  u0: number;
+  u1: number;
+  v0: number;
+  v1: number;
+}
+
+/**
+ * Central defensive sanitizer for facet openings before 2D/3D hole punching.
+ * Clamps inside valid piers, rejects degenerate (<50mm) shapes, and keeps stacked
+ * openings (separated vertically) intact while preventing self-intersecting 2D holes.
+ */
+export function sanitizeWallOpeningsForExtrusion(
+  facet: Pick<WallFacet, 'lengthM' | 'heightM' | 'openings'>
+): SanitizedExtrusionOpening[] {
+  const L = Math.max(0, facet.lengthM);
+  const H = Math.max(0, facet.heightM);
+  if (L < 0.08 || H < 0.08) return [];
+
+  const minSideMargin = Math.min(0.015, L * 0.04);
+  const minHeadMargin = Math.min(0.015, H * 0.03);
+  const accepted: SanitizedExtrusionOpening[] = [];
+
+  for (const op of facet.openings || []) {
+    const clamped = clampWallOpeningToFacet({ lengthM: L, heightM: H }, op);
+    const u0 = +Math.max(minSideMargin, clamped.distFromStartM).toFixed(4);
+    const u1 = +Math.min(L - minSideMargin, clamped.distFromStartM + clamped.widthM).toFixed(4);
+    const v0 = +Math.max(0, clamped.sillHeightM).toFixed(4);
+    const v1 = +Math.min(H - minHeadMargin, clamped.sillHeightM + clamped.heightM).toFixed(4);
+    if (u1 - u0 < 0.06 || v1 - v0 < 0.06) continue;
+
+    // Require >= 10mm separation ONLY when both horizontal AND vertical intervals intersect,
+    // so vertically stacked openings (e.g., highlight window over door) always render both holes!
+    const collides = accepted.some((other) => {
+      const uGap = Math.max(u0 - other.u1, other.u0 - u1);
+      const vGap = Math.max(v0 - other.v1, other.v0 - v1);
+      return uGap < 0.01 && vGap < 0.01;
+    });
+    if (!collides) {
+      accepted.push({
+        ...clamped,
+        u0,
+        u1,
+        v0,
+        v1
+      });
+    }
+  }
+
+  return accepted;
 }
 
 /**
@@ -475,10 +719,17 @@ export function buildWallFacetsFromPlan(
       lengthM,
       heightM
     };
-    const openings = (prev?.openings || []).map((op) => clampWallOpeningToFacet(facetBase, op));
+    const prevLen = prev?.lengthM ?? lengthM;
+    const openings = (prev?.openings || []).map((op) =>
+      Math.abs(prevLen - lengthM) > 0.02
+        ? scaleOpeningForFacetLength(prevLen, lengthM, heightM, op)
+        : clampWallOpeningToFacet(facetBase, op)
+    );
     const regions = prev?.regions
       ? prev.regions.map((r) => clampWallRegionToFacet(facetBase, r))
       : undefined;
+    const resolvedKind = prev?.kind;
+    const isParapet = resolvedKind === 'parapet';
 
     return {
       id,
@@ -490,13 +741,19 @@ export function buildWallFacetsFromPlan(
       heightM,
       bottomZ,
       topZ,
-      heightSource: prev?.heightSource ?? defaultHeightSource,
-      roofProfile: prev?.roofProfile,
+      heightSource: isParapet ? 'manual' : prev?.heightSource ?? defaultHeightSource,
+      roofProfile: isParapet || resolvedKind === 'wing' || resolvedKind === 'secondary' ? undefined : prev?.roofProfile,
       claddingType: prev?.claddingType ?? defaultCladding,
       openings,
       regions,
       underlay: prev?.underlay ?? null,
-      roofEdgeId: prev?.roofEdgeId ?? findMatchingRoofEdgeId(seg.from, seg.to, options?.roofLevels)
+      roofEdgeId: prev?.roofEdgeId ?? findMatchingRoofEdgeId(seg.from, seg.to, options?.roofLevels),
+      ...(resolvedKind ? { kind: resolvedKind } : {}),
+      ...(prev?.parapetAboveM !== undefined ? { parapetAboveM: prev.parapetAboveM } : {}),
+      ...(prev?.hasCopingFlashing !== undefined ? { hasCopingFlashing: prev.hasCopingFlashing } : {}),
+      ...(prev?.secondaryZoneId ? { secondaryZoneId: prev.secondaryZoneId } : {}),
+      ...(prev?.isSpur ? { isSpur: prev.isSpur } : {}),
+      ...(prev?.groupId ? { groupId: prev.groupId } : {})
     };
   });
 }
@@ -553,22 +810,31 @@ export function deriveWallPlanFromRoofLevels(
     wallPoints = outline.points.map((p) => ({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) }));
   }
 
+  const ringOnlyExisting = (existingFacets || []).filter(
+    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
+  );
+  const preservedNonRing = (existingFacets || []).filter(
+    (f) => f.isSpur || f.kind === 'wing' || f.kind === 'secondary'
+  );
+
   const wallEdges = buildWallEdgesFromPoints(wallPoints, 'wall-edge');
-  const rawFacets = buildWallFacetsFromPlan(
+  const rawRingFacets = buildWallFacetsFromPlan(
     { points: wallPoints, edges: wallEdges },
     {
       defaultHeightM: hM,
       defaultHeightSource: 'roof',
-      existingFacets,
+      existingFacets: ringOnlyExisting,
       roofLevels: levels
     }
   );
+
+  const combinedFacets = ensureUniqueWallFacetIds([...rawRingFacets, ...preservedNonRing]);
 
   const plan: WallPlan = {
     points: wallPoints,
     edges: wallEdges,
     defaultHeightM: hM,
-    facets: rawFacets,
+    facets: combinedFacets,
     builtAt: new Date().toISOString()
   };
 
@@ -576,17 +842,85 @@ export function deriveWallPlanFromRoofLevels(
 }
 
 /**
- * Updates one wall plan edge length (shifting target vertex + subsequent vertices proportionally or directly along edge ray)
- * and preserves facet details.
+ * Re-attaches preserved wing/spur walls and secondary zone walls after rebuilding the primary ring,
+ * and keeps linked secondary zone geometry synchronized if the host edge moved.
+ */
+function mergePreservedExtraFacets(
+  plan: WallPlan,
+  ringFacets: WallFacet[]
+): WallFacet[] {
+  const extras = plan.facets.filter(
+    (f) => f.isSpur || f.kind === 'wing' || f.kind === 'secondary'
+  );
+  return ensureUniqueWallFacetIds([...ringFacets, ...extras]);
+}
+
+/**
+ * Updates one wall plan edge length (or spur/secondary wall length) cleanly while preserving
+ * openings proportionally via uRatio, cladding, regions, and extras.
  */
 export function updateWallPlanEdgeLength(
   plan: WallPlan,
-  edgeId: string,
+  edgeIdOrFacetId: string,
   newLengthM: number,
   roofLevels?: RoofLevel[]
 ): WallPlan {
-  if (!Number.isFinite(newLengthM) || newLengthM < 0.1 || plan.edges.length < 3) return plan;
-  const edgeIdx = plan.edges.findIndex((e) => e.id === edgeId);
+  if (!Number.isFinite(newLengthM) || newLengthM < 0.1) return plan;
+
+  // Check if targeting a wing/spur or secondary facet directly
+  const directExtra = plan.facets.find(
+    (f) =>
+      f.id === edgeIdOrFacetId &&
+      (f.isSpur || f.kind === 'wing' || f.kind === 'secondary')
+  );
+  if (directExtra) {
+    const curLen = dist(directExtra.from, directExtra.to);
+    if (curLen < 0.02) return plan;
+    const ux = (directExtra.to.x - directExtra.from.x) / curLen;
+    const uy = (directExtra.to.y - directExtra.from.y) / curLen;
+    const nextTo = {
+      x: +(directExtra.from.x + ux * newLengthM).toFixed(3),
+      y: +(directExtra.from.y + uy * newLengthM).toFixed(3)
+    };
+    const nextLen = +dist(directExtra.from, nextTo).toFixed(3);
+    const updatedFacets = plan.facets.map((f) => {
+      if (f.id !== directExtra.id) return f;
+      return {
+        ...f,
+        to: nextTo,
+        lengthM: nextLen,
+        openings: f.openings.map((op) =>
+          scaleOpeningForFacetLength(f.lengthM, nextLen, f.heightM, op)
+        ),
+        regions: f.regions
+          ? f.regions.map((r) => clampWallRegionToFacet({ lengthM: nextLen, heightM: f.heightM }, r))
+          : undefined
+      };
+    });
+    return {
+      ...plan,
+      facets: updatedFacets,
+      spurEdges: plan.spurEdges?.map((se) =>
+        pointsClose(se.from, directExtra.from, 0.05) && pointsClose(se.to, directExtra.to, 0.05)
+          ? { ...se, to: nextTo }
+          : se
+      ),
+      builtAt: new Date().toISOString()
+    };
+  }
+
+  if (plan.edges.length < 3) return plan;
+  let edgeIdx = plan.edges.findIndex((e) => e.id === edgeIdOrFacetId);
+  if (edgeIdx < 0) {
+    const matchingFacet = plan.facets.find((f) => f.id === edgeIdOrFacetId);
+    if (matchingFacet) {
+      edgeIdx = plan.edges.findIndex(
+        (e) =>
+          pointsClose(e.from, matchingFacet.from, 0.05) &&
+          pointsClose(e.to, matchingFacet.to, 0.05)
+      );
+    }
+  }
   if (edgeIdx < 0) return plan;
 
   const targetEdge = plan.edges[edgeIdx];
@@ -606,13 +940,17 @@ export function updateWallPlanEdgeLength(
       : { ...pt }
   );
 
+  const ringExisting = plan.facets.filter(
+    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
+  );
   const updatedEdges = buildWallEdgesFromPoints(updatedPoints, 'wall-edge');
-  const updatedFacets = buildWallFacetsFromPlan(
+  const updatedRingFacets = buildWallFacetsFromPlan(
     { points: updatedPoints, edges: updatedEdges },
     {
       defaultHeightM: plan.defaultHeightM,
-      existingFacets: plan.facets,
-      roofLevels
+      existingFacets: ringExisting,
+      roofLevels,
+      mergeCollinear: false
     }
   );
 
@@ -620,7 +958,7 @@ export function updateWallPlanEdgeLength(
     ...plan,
     points: updatedPoints,
     edges: updatedEdges,
-    facets: updatedFacets,
+    facets: mergePreservedExtraFacets(plan, updatedRingFacets),
     builtAt: new Date().toISOString()
   };
 }
@@ -638,20 +976,24 @@ export function moveWallPlanVertex(
   const updatedPoints = plan.points.map((pt, idx) =>
     idx === vertexIdx ? { x: +newPt.x.toFixed(3), y: +newPt.y.toFixed(3) } : { ...pt }
   );
+  const ringExisting = plan.facets.filter(
+    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
+  );
   const updatedEdges = buildWallEdgesFromPoints(updatedPoints, 'wall-edge');
-  const updatedFacets = buildWallFacetsFromPlan(
+  const updatedRingFacets = buildWallFacetsFromPlan(
     { points: updatedPoints, edges: updatedEdges },
     {
       defaultHeightM: plan.defaultHeightM,
-      existingFacets: plan.facets,
-      roofLevels
+      existingFacets: ringExisting,
+      roofLevels,
+      mergeCollinear: false
     }
   );
   return {
     ...plan,
     points: updatedPoints,
     edges: updatedEdges,
-    facets: updatedFacets,
+    facets: mergePreservedExtraFacets(plan, updatedRingFacets),
     builtAt: new Date().toISOString()
   };
 }
@@ -1049,6 +1391,9 @@ export function fitWallFacetTopToRoof(
   roofLevels: RoofLevel[],
   roofPlanes: RoofPlane[] = []
 ): WallFacet {
+  if (facet.kind === 'parapet' || facet.kind === 'wing' || facet.kind === 'secondary') {
+    return facet;
+  }
   const resolved = resolveRoofTopForWallFacet(facet, roofLevels, roofPlanes);
   if (!resolved) return facet;
   const nextBase = { lengthM: facet.lengthM, heightM: resolved.heightM };
@@ -1075,6 +1420,10 @@ export function syncWallPlanWithRoof(
   if (!wallPlan || !roofLevels || roofLevels.length === 0) return wallPlan;
   let changed = false;
   const nextFacets = wallPlan.facets.map((facet) => {
+    // Parapet, wing, and secondary walls retain explicit flat heights
+    if (facet.kind === 'parapet' || facet.kind === 'wing' || facet.kind === 'secondary') {
+      return facet;
+    }
     const matchedId =
       facet.roofEdgeId ?? findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
     const shouldSync =
@@ -1166,20 +1515,25 @@ export interface WallPlanTopology {
 }
 
 export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
-  if (!facets || facets.length < 3) {
+  const ringFacets = (facets || []).filter(
+    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary' && f.kind !== 'void_edge'
+  );
+  const explicitReturns = (facets || []).filter((f) => f.kind === 'return');
+
+  if (ringFacets.length < 3) {
     return {
       externalCornersCount: 0,
       internalCornersCount: 0,
-      returnFacesCount: 0,
+      returnFacesCount: explicitReturns.length,
       cornerDetails: [],
-      returnFacetIds: []
+      returnFacetIds: explicitReturns.map((f) => f.id)
     };
   }
 
   // Signed area in screen-down 2D coordinates (x right, y down)
   let signedArea2 = 0;
-  for (let i = 0; i < facets.length; i++) {
-    const f = facets[i];
+  for (let i = 0; i < ringFacets.length; i++) {
+    const f = ringFacets[i];
     signedArea2 += f.from.x * f.to.y - f.to.x * f.from.y;
   }
   const orientationSign = signedArea2 >= 0 ? 1 : -1;
@@ -1188,9 +1542,9 @@ export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
   let externalCornersCount = 0;
   let internalCornersCount = 0;
 
-  for (let i = 0; i < facets.length; i++) {
-    const prev = facets[(i - 1 + facets.length) % facets.length];
-    const curr = facets[i];
+  for (let i = 0; i < ringFacets.length; i++) {
+    const prev = ringFacets[(i - 1 + ringFacets.length) % ringFacets.length];
+    const curr = ringFacets[i];
     const lenA = dist(prev.from, prev.to) || 1;
     const lenB = dist(curr.from, curr.to) || 1;
     const ax = (prev.to.x - prev.from.x) / lenA;
@@ -1218,13 +1572,13 @@ export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
     });
   }
 
-  const returnFacetIdSet = new Set<string>();
-  for (let i = 0; i < facets.length; i++) {
+  const returnFacetIdSet = new Set<string>(explicitReturns.map((f) => f.id));
+  for (let i = 0; i < ringFacets.length; i++) {
     const startCorner = cornerDetails[i];
-    const endCorner = cornerDetails[(i + 1) % facets.length];
-    const isShortNib = facets[i].lengthM <= 2.2 && facets.length >= 6;
+    const endCorner = cornerDetails[(i + 1) % ringFacets.length];
+    const isShortNib = ringFacets[i].lengthM <= 2.2 && ringFacets.length >= 6;
     if (startCorner?.kind === 'internal' || endCorner?.kind === 'internal' || isShortNib) {
-      returnFacetIdSet.add(facets[i].id);
+      returnFacetIdSet.add(ringFacets[i].id);
     }
   }
 
@@ -1325,10 +1679,26 @@ export interface WallTakeoffSummary {
   internalCornersCount: number;
   returnFacesCount: number;
   returnFacetIds: string[];
+  parapetFacesCount: number;
+  parapetCopingLm: number;
+  parapetAreaM2: number;
+  secondaryFacesCount: number;
+  secondaryNetAreaM2: number;
+  wingFacesCount: number;
   byCladding: WallCladdingGroupSummary[];
 }
 
-export function computeWallTakeoffSummary(facets: WallFacet[]): WallTakeoffSummary {
+export function computeWallTakeoffSummary(
+  facets: WallFacet[],
+  scope: 'all' | 'primary' | 'secondary' = 'all'
+): WallTakeoffSummary {
+  const scopedFacets =
+    scope === 'primary'
+      ? facets.filter((f) => f.kind !== 'secondary')
+      : scope === 'secondary'
+      ? facets.filter((f) => f.kind === 'secondary')
+      : facets;
+
   const groupMap = new Map<
     WallCladdingType,
     WallCladdingGroupSummary & { facetIdSet: Set<string>; spanByFacet: Map<string, number> }
@@ -1338,15 +1708,35 @@ export function computeWallTakeoffSummary(facets: WallFacet[]): WallTakeoffSumma
   let totalOpeningsAreaM2 = 0;
   let totalNetAreaM2 = 0;
   let totalOpeningsCount = 0;
+  let parapetFacesCount = 0;
+  let parapetCopingLm = 0;
+  let parapetAreaM2 = 0;
+  let secondaryFacesCount = 0;
+  let secondaryNetAreaM2 = 0;
+  let wingFacesCount = 0;
   const undetailedFacetIds: string[] = [];
 
-  facets.forEach((f) => {
+  scopedFacets.forEach((f) => {
     const m = computeWallFacetMetrics(f);
     totalLinealM += f.lengthM;
     totalGrossAreaM2 += m.grossAreaM2;
     totalOpeningsAreaM2 += m.openingsAreaM2;
     totalNetAreaM2 += m.netCladdingAreaM2;
     totalOpeningsCount += m.openingsCount;
+    if (f.kind === 'parapet') {
+      parapetFacesCount += 1;
+      if (f.hasCopingFlashing !== false) {
+        parapetCopingLm += f.lengthM;
+      }
+      parapetAreaM2 += m.netCladdingAreaM2;
+    }
+    if (f.kind === 'secondary') {
+      secondaryFacesCount += 1;
+      secondaryNetAreaM2 += m.netCladdingAreaM2;
+    }
+    if (f.kind === 'wing' || f.isSpur) {
+      wingFacesCount += 1;
+    }
     if (isWallFacetUndetailed(f)) {
       undetailedFacetIds.push(f.id);
     }
@@ -1403,8 +1793,8 @@ export function computeWallTakeoffSummary(facets: WallFacet[]): WallTakeoffSumma
   const topology = analyzeWallPlanTopology(facets);
 
   return {
-    totalFaces: facets.length,
-    detailedFacesCount: facets.length - undetailedFacetIds.length,
+    totalFaces: scopedFacets.length,
+    detailedFacesCount: scopedFacets.length - undetailedFacetIds.length,
     undetailedCount: undetailedFacetIds.length,
     undetailedFacetIds,
     totalLinealM: +totalLinealM.toFixed(2),
@@ -1416,6 +1806,12 @@ export function computeWallTakeoffSummary(facets: WallFacet[]): WallTakeoffSumma
     internalCornersCount: topology.internalCornersCount,
     returnFacesCount: topology.returnFacesCount,
     returnFacetIds: topology.returnFacetIds,
+    parapetFacesCount,
+    parapetCopingLm: +parapetCopingLm.toFixed(2),
+    parapetAreaM2: +parapetAreaM2.toFixed(2),
+    secondaryFacesCount,
+    secondaryNetAreaM2: +secondaryNetAreaM2.toFixed(2),
+    wingFacesCount,
     byCladding
   };
 }
@@ -1426,6 +1822,7 @@ export interface WallTakeoffExportPayload {
   faces: {
     code: string;
     name: string;
+    kind: WallFacetKind;
     lengthM: number;
     heightM: number;
     bottomZ: number;
@@ -1458,6 +1855,7 @@ export function buildWallTakeoffExportData(wallPlan: WallPlan | null): WallTakeo
     return {
       code: f.code,
       name: f.name || `Wall ${f.code}`,
+      kind: getWallFacetKind(f),
       lengthM: f.lengthM,
       heightM: f.heightM,
       bottomZ: f.bottomZ,
@@ -1482,16 +1880,21 @@ export function buildWallTakeoffExportData(wallPlan: WallPlan | null): WallTakeo
     ),
     '',
     'PER-FACE WALL SCHEDULE',
-    'Code,Length (m),Height (m),Height Source,Return Face,Cladding,Openings,Gross (m2),Openings (m2),Net (m2),Status',
+    'Code,Kind,Length (m),Height (m),Height Source,Return Face,Cladding,Openings,Gross (m2),Openings (m2),Net (m2),Status',
     ...faces.map(
       (r) =>
-        `${r.code},${r.lengthM.toFixed(2)},${r.heightM.toFixed(2)},${r.heightSource},${r.isReturnFace ? 'Yes' : 'No'},"${r.claddingSummary}",${r.openingsCount},${r.grossAreaM2.toFixed(2)},${r.openingsAreaM2.toFixed(2)},${r.netAreaM2.toFixed(2)},${r.needsDetail ? 'Needs Detail' : 'Detailed'}`
+        `${r.code},${r.kind},${r.lengthM.toFixed(2)},${r.heightM.toFixed(2)},${r.heightSource},${r.isReturnFace ? 'Yes' : 'No'},"${r.claddingSummary}",${r.openingsCount},${r.grossAreaM2.toFixed(2)},${r.openingsAreaM2.toFixed(2)},${r.netAreaM2.toFixed(2)},${r.needsDetail ? 'Needs Detail' : 'Detailed'}`
     ),
     '',
-    'CORNERS & RETURNS',
+    'CORNERS, RETURNS, PARAPETS & SECONDARY ZONES',
     `External Corners,${summary.externalCornersCount}`,
     `Internal (Notch) Corners,${summary.internalCornersCount}`,
     `Return / Short Faces,${summary.returnFacesCount}`,
+    `Parapet Faces,${summary.parapetFacesCount}`,
+    `Parapet Coping Flashing (lm),${summary.parapetCopingLm.toFixed(2)}`,
+    `Wing / Spur Faces,${summary.wingFacesCount}`,
+    `Secondary Alcove Faces,${summary.secondaryFacesCount}`,
+    `Secondary Net Area (m2),${summary.secondaryNetAreaM2.toFixed(2)}`,
     '',
     'OPENINGS SCHEDULE',
     'Wall Code,Type,Label,Width (m),Height (m),Sill (m),Offset X (m),Area (m2)',
@@ -1541,9 +1944,16 @@ export function deriveRoofOutlineFromWallPlan(
 ): { outline: RoofOutline; linkedWallPlan: WallPlan } | null {
   if (!wallPlan) return null;
 
+  const ringCandidates = wallPlan.facets.filter(
+    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
+  );
+  const nonRingExtras = wallPlan.facets.filter(
+    (f) => f.isSpur || f.kind === 'wing' || f.kind === 'secondary'
+  );
+
   const baseFacets: WallFacet[] =
-    wallPlan.facets.length >= 3
-      ? wallPlan.facets
+    ringCandidates.length >= 3
+      ? ringCandidates
       : wallPlan.points.length >= 3
       ? buildWallFacetsFromPlan(
           { points: wallPlan.points, edges: wallPlan.edges },
@@ -1614,14 +2024,14 @@ export function deriveRoofOutlineFromWallPlan(
     levelId
   };
 
-  const linkedFacets = baseFacets.map((facet, idx) => ({
+  const linkedRingFacets = baseFacets.map((facet, idx) => ({
     ...facet,
     roofEdgeId: edges[idx].id
   }));
 
   const linkedWallPlan: WallPlan = {
     ...wallPlan,
-    facets: linkedFacets,
+    facets: ensureUniqueWallFacetIds([...linkedRingFacets, ...nonRingExtras]),
     builtAt: new Date().toISOString()
   };
 
@@ -1638,6 +2048,7 @@ export function linkWallFacetsToRoofLevels(
 ): WallPlan {
   if (!wallPlan || wallPlan.facets.length === 0 || roofLevels.length === 0) return wallPlan;
   const linkedFacets = wallPlan.facets.map((facet) => {
+    if (facet.isSpur || facet.kind === 'wing' || facet.kind === 'secondary') return facet;
     const matched =
       facet.roofEdgeId &&
       roofLevels.some((lvl) => lvl.outline.edges.some((e) => e.id === facet.roofEdgeId))
@@ -1652,5 +2063,511 @@ export function linkWallFacetsToRoofLevels(
     facets: linkedFacets
   };
 }
+
+/**
+ * Adds an open polyline of wing/spur wall segments (`kind: 'wing', isSpur: true`) to a WallPlan
+ * without altering the closed exterior building ring points.
+ */
+export function addWingWallToPlan(
+  plan: WallPlan | null,
+  polylinePoints: Point2D[],
+  options?: {
+    heightM?: number;
+    bottomZ?: number;
+    claddingType?: WallCladdingType;
+    namePrefix?: string;
+  }
+): WallPlan {
+  const basePlan: WallPlan = plan || {
+    points: [],
+    edges: [],
+    defaultHeightM: options?.heightM ?? 2.7,
+    facets: [],
+    builtAt: new Date().toISOString()
+  };
+
+  if (polylinePoints.length < 2) return basePlan;
+  const heightM = +(options?.heightM ?? basePlan.defaultHeightM ?? 2.7).toFixed(3);
+  const bottomZ = +(options?.bottomZ ?? 0).toFixed(3);
+  const topZ = +(bottomZ + heightM).toFixed(3);
+  const claddingType = options?.claddingType ?? 'none';
+
+  const existingWings = basePlan.facets.filter((f) => f.kind === 'wing' || f.isSpur).length;
+  const newWingFacets: WallFacet[] = [];
+  const newSpurEdges: WallPlanEdge[] = [...(basePlan.spurEdges || [])];
+
+  let wingCount = existingWings;
+  for (let i = 0; i < polylinePoints.length - 1; i++) {
+    const from = {
+      x: +polylinePoints[i].x.toFixed(3),
+      y: +polylinePoints[i].y.toFixed(3)
+    };
+    const to = {
+      x: +polylinePoints[i + 1].x.toFixed(3),
+      y: +polylinePoints[i + 1].y.toFixed(3)
+    };
+    const len = +dist(from, to).toFixed(3);
+    if (len < 0.08) continue;
+
+    wingCount += 1;
+    const code = `W${wingCount}`;
+    const edgeId = `spur-edge-${Date.now().toString(36)}-${wingCount}`;
+    const facetId = `wall-wing-${Date.now().toString(36)}-${wingCount}`;
+    newSpurEdges.push({ id: edgeId, from, to });
+    newWingFacets.push({
+      id: facetId,
+      code,
+      name: `${options?.namePrefix || 'Wing'} ${wingCount}`,
+      from,
+      to,
+      lengthM: len,
+      heightM,
+      bottomZ,
+      topZ,
+      heightSource: 'manual',
+      claddingType,
+      openings: [],
+      kind: 'wing',
+      isSpur: true
+    });
+  }
+
+  return {
+    ...basePlan,
+    spurEdges: newSpurEdges,
+    facets: ensureUniqueWallFacetIds([...basePlan.facets, ...newWingFacets]),
+    builtAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Splits a single wall facet into two sequential facets cleanly, preserving cladding, kind,
+ * regions, and partitioning any existing openings across the split point.
+ */
+export function splitWallFacetInPlan(
+  plan: WallPlan,
+  facetId: string,
+  splitDistM?: number,
+  roofLevels?: RoofLevel[]
+): WallPlan {
+  const idx = plan.facets.findIndex((f) => f.id === facetId);
+  if (idx < 0) return plan;
+  const target = plan.facets[idx];
+  if (target.lengthM < 0.4) return plan;
+
+  const splitU = +Math.max(0.2, Math.min(target.lengthM - 0.2, splitDistM ?? target.lengthM * 0.5)).toFixed(3);
+  const t = splitU / target.lengthM;
+  const midPt: Point2D = {
+    x: +(target.from.x + (target.to.x - target.from.x) * t).toFixed(3),
+    y: +(target.from.y + (target.to.y - target.from.y) * t).toFixed(3)
+  };
+
+  const leftOps: WallOpening[] = [];
+  const rightOps: WallOpening[] = [];
+  for (const op of target.openings) {
+    const centerU = op.distFromStartM + op.widthM * 0.5;
+    if (centerU <= splitU) {
+      leftOps.push(
+        clampWallOpeningToFacet(
+          { lengthM: splitU, heightM: target.heightM },
+          op
+        )
+      );
+    } else {
+      rightOps.push(
+        clampWallOpeningToFacet(
+          { lengthM: target.lengthM - splitU, heightM: target.heightM },
+          { ...op, distFromStartM: +(op.distFromStartM - splitU).toFixed(3) }
+        )
+      );
+    }
+  }
+
+  const lenA = +dist(target.from, midPt).toFixed(3);
+  const lenB = +dist(midPt, target.to).toFixed(3);
+
+  const childA: WallFacet = {
+    ...target,
+    to: midPt,
+    lengthM: lenA,
+    openings: leftOps,
+    roofProfile: undefined,
+    regions: undefined
+  };
+  const childB: WallFacet = {
+    ...target,
+    id: `${target.id}-b-${Date.now().toString(36).slice(-4)}`,
+    code: `${target.code}2`,
+    name: `${target.name || `Wall ${target.code}`} (Part 2)`,
+    from: midPt,
+    lengthM: lenB,
+    openings: rightOps,
+    underlay: null,
+    roofProfile: undefined,
+    regions: undefined
+  };
+
+  // If part of the primary closed ring, also insert the split vertex into plan.points/edges
+  let nextPoints = plan.points;
+  let nextEdges = plan.edges;
+  if (!target.isSpur && target.kind !== 'wing' && target.kind !== 'secondary' && plan.points.length >= 3) {
+    const segIdx = plan.edges.findIndex(
+      (e) => pointsClose(e.from, target.from, 0.05) && pointsClose(e.to, target.to, 0.05)
+    );
+    if (segIdx >= 0) {
+      const ptsCopy = [...plan.points];
+      ptsCopy.splice(segIdx + 1, 0, midPt);
+      nextPoints = ptsCopy;
+      nextEdges = buildWallEdgesFromPoints(nextPoints, 'wall-edge');
+    }
+  }
+
+  const nextFacetsRaw = [...plan.facets];
+  nextFacetsRaw.splice(idx, 1, childA, childB);
+
+  // Re-label closed ring codes cleanly while preserving spur/secondary codes
+  let ringIdx = 0;
+  const relabeled = nextFacetsRaw.map((f) => {
+    if (f.isSpur || f.kind === 'wing' || f.kind === 'secondary') return f;
+    const code = indexToWallCode(ringIdx++);
+    return {
+      ...f,
+      code,
+      name: f.name && !/^Wall [A-Z]+$/.test(f.name) ? f.name : `Wall ${code}`,
+      roofEdgeId: f.roofEdgeId ?? findMatchingRoofEdgeId(f.from, f.to, roofLevels)
+    };
+  });
+
+  return {
+    ...plan,
+    points: nextPoints,
+    edges: nextEdges,
+    facets: ensureUniqueWallFacetIds(relabeled),
+    builtAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Sets wall kind (exterior/return/parapet/wing/abutment/secondary), configuring parapet defaults safely.
+ */
+export function updateWallFacetKind(
+  facet: WallFacet,
+  kind: WallFacetKind,
+  options?: { parapetAboveM?: number; parapetHeightM?: number; hasCopingFlashing?: boolean }
+): WallFacet {
+  if (kind === 'parapet') {
+    const above = options?.parapetAboveM ?? facet.parapetAboveM ?? 0.45;
+    const targetH =
+      options?.parapetHeightM ??
+      (facet.kind === 'parapet' ? facet.heightM : +(facet.heightM + above).toFixed(3));
+    const safeH = +Math.max(0.4, targetH).toFixed(3);
+    return {
+      ...facet,
+      kind: 'parapet',
+      heightSource: 'manual',
+      roofProfile: undefined,
+      heightM: safeH,
+      topZ: +(facet.bottomZ + safeH).toFixed(3),
+      parapetAboveM: +above.toFixed(3),
+      hasCopingFlashing: options?.hasCopingFlashing ?? facet.hasCopingFlashing ?? true,
+      openings: facet.openings.map((o) => clampWallOpeningToFacet({ lengthM: facet.lengthM, heightM: safeH }, o))
+    };
+  }
+  if (kind === 'wing') {
+    return {
+      ...facet,
+      kind: 'wing',
+      isSpur: true,
+      heightSource: 'manual',
+      roofProfile: undefined
+    };
+  }
+  return {
+    ...facet,
+    kind,
+    ...(kind !== 'secondary' && facet.kind === 'wing' ? { isSpur: false } : {})
+  };
+}
+
+/**
+ * Batch updates cladding, height, or kind across multiple selected wall facets.
+ */
+export function batchUpdateWallFacetsInPlan(
+  plan: WallPlan,
+  facetIds: string[],
+  patch: { claddingType?: WallCladdingType; heightM?: number; kind?: WallFacetKind }
+): WallPlan {
+  const idSet = new Set(facetIds);
+  if (idSet.size === 0) return plan;
+
+  const nextFacets = plan.facets.map((f) => {
+    if (!idSet.has(f.id)) return f;
+    let updated = { ...f };
+    if (patch.kind) {
+      updated = updateWallFacetKind(updated, patch.kind);
+    }
+    if (patch.claddingType) {
+      updated.claddingType = patch.claddingType;
+      updated.regions = undefined;
+    }
+    if (typeof patch.heightM === 'number' && Number.isFinite(patch.heightM) && patch.heightM >= 0.4) {
+      const hM = +patch.heightM.toFixed(3);
+      updated.heightM = hM;
+      updated.topZ = +(updated.bottomZ + hM).toFixed(3);
+      updated.heightSource = 'manual';
+      updated.roofProfile = undefined;
+      updated.openings = updated.openings.map((op) =>
+        clampWallOpeningToFacet({ lengthM: updated.lengthM, heightM: hM }, op)
+      );
+      if (updated.regions) {
+        updated.regions = updated.regions.map((r) =>
+          clampWallRegionToFacet({ lengthM: updated.lengthM, heightM: hM }, r)
+        );
+      }
+    }
+    return updated;
+  });
+
+  return {
+    ...plan,
+    facets: nextFacets,
+    builtAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Computes the 3 secondary enclosure walls (Left Return, Back Wall, Right Return) projecting
+ * inward (or outward) from a void opening on `sourceFacet`.
+ */
+function buildSecondaryZoneSegments(
+  planPoints: Point2D[],
+  sourceFacet: WallFacet,
+  opening: WallOpening,
+  depthM: number,
+  direction: 'inward' | 'outward'
+): Array<{ role: string; from: Point2D; to: Point2D }> {
+  const len = Math.max(0.2, dist(sourceFacet.from, sourceFacet.to));
+  const ux = (sourceFacet.to.x - sourceFacet.from.x) / len;
+  const uy = (sourceFacet.to.y - sourceFacet.from.y) / len;
+
+  const signedA = planPoints.length >= 3 ? wallSignedArea2(planPoints) : 1;
+  const sign = signedA >= 0 ? 1 : -1;
+  // In deriveRoofOutlineFromWallPlan, outward normal is (+sign*uy, -sign*ux).
+  // Therefore inward into the primary building envelope is (-sign*uy, +sign*ux).
+  const dirMul = direction === 'outward' ? -1 : 1;
+  const nx = -sign * uy * dirMul;
+  const ny = sign * ux * dirMul;
+
+  const u0 = Math.max(0, opening.distFromStartM);
+  const u1 = Math.min(sourceFacet.lengthM, opening.distFromStartM + opening.widthM);
+  const d = Math.max(0.3, depthM);
+
+  const pStart: Point2D = {
+    x: +(sourceFacet.from.x + ux * u0).toFixed(3),
+    y: +(sourceFacet.from.y + uy * u0).toFixed(3)
+  };
+  const pEnd: Point2D = {
+    x: +(sourceFacet.from.x + ux * u1).toFixed(3),
+    y: +(sourceFacet.from.y + uy * u1).toFixed(3)
+  };
+  const pBackStart: Point2D = {
+    x: +(pStart.x + nx * d).toFixed(3),
+    y: +(pStart.y + ny * d).toFixed(3)
+  };
+  const pBackEnd: Point2D = {
+    x: +(pEnd.x + nx * d).toFixed(3),
+    y: +(pEnd.y + ny * d).toFixed(3)
+  };
+
+  return [
+    { role: 'Left Return', from: pStart, to: pBackStart },
+    { role: 'Back Wall', from: pBackStart, to: pBackEnd },
+    { role: 'Right Return', from: pBackEnd, to: pEnd }
+  ];
+}
+
+/**
+ * Promotes a void opening into a linked 3-wall Secondary Wall Section (e.g. patio enclosure,
+ * entry court, plant alcove) with editable depth, cladding, heights, and independent openings.
+ */
+export function createSecondaryZoneFromVoid(
+  plan: WallPlan,
+  sourceFacetId: string,
+  openingId: string,
+  options?: {
+    depthM?: number;
+    name?: string;
+    direction?: 'inward' | 'outward';
+    claddingType?: WallCladdingType;
+  }
+): { wallPlan: WallPlan; zone: WallSecondaryZone; createdFacets: WallFacet[] } | null {
+  const sourceFacet = plan.facets.find((f) => f.id === sourceFacetId);
+  if (!sourceFacet) return null;
+  const opening = sourceFacet.openings.find((o) => o.id === openingId);
+  if (!opening) return null;
+
+  // Avoid creating a duplicate zone if already linked
+  if (opening.linkedSecondaryZoneId) {
+    const existingZone = plan.secondaryZones?.find((z) => z.id === opening.linkedSecondaryZoneId);
+    if (existingZone) {
+      const existingFacets = plan.facets.filter((f) => existingZone.facetIds.includes(f.id));
+      return { wallPlan: plan, zone: existingZone, createdFacets: existingFacets };
+    }
+  }
+
+  const depthM = +Math.max(0.4, Math.min(12, options?.depthM ?? 2.4)).toFixed(3);
+  const direction = options?.direction ?? 'inward';
+  const heightM = +Math.max(0.6, sourceFacet.heightM).toFixed(3);
+  const bottomZ = sourceFacet.bottomZ;
+  const topZ = +(bottomZ + heightM).toFixed(3);
+  const claddingType =
+    options?.claddingType ??
+    (sourceFacet.claddingType !== 'none' ? sourceFacet.claddingType : 'none');
+
+  const zoneIndex = (plan.secondaryZones?.length || 0) + 1;
+  const zoneId = `sec-zone-${Date.now().toString(36)}-${zoneIndex}`;
+  const zoneName = options?.name || `Recess / Alcove ${zoneIndex}`;
+
+  const segs = buildSecondaryZoneSegments(plan.points, sourceFacet, opening, depthM, direction);
+  const existingSecCount = plan.facets.filter((f) => f.kind === 'secondary').length;
+
+  const createdFacets: WallFacet[] = segs.map((seg, i) => {
+    const code = `S${existingSecCount + i + 1}`;
+    const len = +dist(seg.from, seg.to).toFixed(3);
+    return {
+      id: `wall-sec-${zoneId}-${i + 1}`,
+      code,
+      name: `${zoneName} · ${seg.role}`,
+      from: seg.from,
+      to: seg.to,
+      lengthM: len,
+      heightM,
+      bottomZ,
+      topZ,
+      heightSource: 'manual',
+      claddingType,
+      openings: [],
+      kind: 'secondary',
+      secondaryZoneId: zoneId,
+      groupId: zoneId
+    };
+  });
+
+  const zone: WallSecondaryZone = {
+    id: zoneId,
+    name: zoneName,
+    sourceOpeningId: opening.id,
+    sourceFacetId: sourceFacet.id,
+    depthM,
+    heightM,
+    direction,
+    facetIds: createdFacets.map((f) => f.id)
+  };
+
+  const updatedFacets = plan.facets.map((f) =>
+    f.id === sourceFacet.id
+      ? {
+          ...f,
+          openings: f.openings.map((o) =>
+            o.id === opening.id ? { ...o, type: 'void' as const, linkedSecondaryZoneId: zoneId } : o
+          )
+        }
+      : f
+  );
+
+  const nextPlan: WallPlan = {
+    ...plan,
+    secondaryZones: [...(plan.secondaryZones || []), zone],
+    facets: ensureUniqueWallFacetIds([...updatedFacets, ...createdFacets]),
+    builtAt: new Date().toISOString()
+  };
+
+  return {
+    wallPlan: nextPlan,
+    zone,
+    createdFacets
+  };
+}
+
+/**
+ * Updates the recess/projection depth (or direction) of a linked Secondary Wall Section,
+ * preserving each secondary wall's cladding, regions, height, and openings!
+ */
+export function updateSecondaryZoneDepth(
+  plan: WallPlan,
+  zoneId: string,
+  newDepthM: number,
+  direction?: 'inward' | 'outward'
+): WallPlan {
+  const zone = plan.secondaryZones?.find((z) => z.id === zoneId);
+  if (!zone || !zone.sourceFacetId || !zone.sourceOpeningId) return plan;
+  const sourceFacet = plan.facets.find((f) => f.id === zone.sourceFacetId);
+  const opening = sourceFacet?.openings.find((o) => o.id === zone.sourceOpeningId);
+  if (!sourceFacet || !opening) return plan;
+
+  const safeDepth = +Math.max(0.3, Math.min(12, newDepthM)).toFixed(3);
+  const resolvedDir = direction ?? zone.direction ?? 'inward';
+  const segs = buildSecondaryZoneSegments(plan.points, sourceFacet, opening, safeDepth, resolvedDir);
+
+  const updatedFacets = plan.facets.map((f) => {
+    const slotIdx = zone.facetIds.indexOf(f.id);
+    if (slotIdx < 0 || slotIdx >= segs.length) return f;
+    const seg = segs[slotIdx];
+    const nextLen = +dist(seg.from, seg.to).toFixed(3);
+    return {
+      ...f,
+      from: seg.from,
+      to: seg.to,
+      lengthM: nextLen,
+      openings: f.openings.map((op) =>
+        scaleOpeningForFacetLength(f.lengthM, nextLen, f.heightM, op)
+      ),
+      regions: f.regions
+        ? f.regions.map((r) => clampWallRegionToFacet({ lengthM: nextLen, heightM: f.heightM }, r))
+        : undefined
+    };
+  });
+
+  return {
+    ...plan,
+    secondaryZones: (plan.secondaryZones || []).map((z) =>
+      z.id === zoneId ? { ...z, depthM: safeDepth, direction: resolvedDir } : z
+    ),
+    facets: updatedFacets,
+    builtAt: new Date().toISOString()
+  };
+}
+
+/**
+ * Removes a secondary wall zone and its linked secondary facets cleanly.
+ */
+export function removeSecondaryZone(plan: WallPlan, zoneId: string): WallPlan {
+  const zone = plan.secondaryZones?.find((z) => z.id === zoneId);
+  if (!zone) return plan;
+  const removeIds = new Set(zone.facetIds);
+
+  const nextFacets = plan.facets
+    .filter((f) => !removeIds.has(f.id) && f.secondaryZoneId !== zoneId)
+    .map((f) =>
+      f.id === zone.sourceFacetId
+        ? {
+            ...f,
+            openings: f.openings.map((o) =>
+              o.linkedSecondaryZoneId === zoneId
+                ? { ...o, linkedSecondaryZoneId: undefined }
+                : o
+            )
+          }
+        : f
+    );
+
+  return {
+    ...plan,
+    secondaryZones: (plan.secondaryZones || []).filter((z) => z.id !== zoneId),
+    facets: nextFacets,
+    builtAt: new Date().toISOString()
+  };
+}
+
 
 

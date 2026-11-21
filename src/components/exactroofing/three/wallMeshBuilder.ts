@@ -7,11 +7,11 @@ import {
   WallPlan
 } from '../../../types/exactRoofing';
 import {
-  clampWallOpeningToFacet,
   clampWallRegionToFacet,
   computeWallTakeoffSummary,
   getWallCladdingMeta,
-  isWallFacetUndetailed
+  isWallFacetUndetailed,
+  sanitizeWallOpeningsForExtrusion
 } from '../../../utils/wallCladdingEngine';
 import {
   Roof3DShadingMode,
@@ -31,46 +31,30 @@ interface SanitizedOpening {
 /**
  * Produces non-overlapping, manifold-safe opening rectangles clamped cleanly
  * inside the exterior wall pier boundaries so ExtrudeGeometry never self-intersects.
+ * Supports vertically stacked openings (e.g. highlight window over door/window).
  */
-function sanitizeOpeningsForExtrusion(facet: WallFacet): SanitizedOpening[] {
+function buildExtrusionOpenings(facet: WallFacet): SanitizedOpening[] {
   const L = facet.lengthM;
   const maxProfileH =
-    facet.roofProfile && facet.roofProfile.length > 0
+    facet.roofProfile && facet.roofProfile.length > 0 && facet.kind !== 'parapet'
       ? Math.max(facet.heightM, ...facet.roofProfile.map((p) => p.topZ - facet.bottomZ))
       : facet.heightM;
   const H = facet.heightM;
-  if (L < 0.25 || maxProfileH < 0.25) return [];
+  if (L < 0.2 || maxProfileH < 0.2) return [];
 
-  const minCornerJamb = Math.min(0.04, L * 0.05);
-  const minHeadJamb = Math.min(0.04, H * 0.05);
+  const minCornerJamb = Math.min(0.035, L * 0.05);
+  const minHeadJamb = Math.min(0.035, H * 0.04);
 
-  const clamped = facet.openings
-    .map((raw) => {
-      const c = clampWallOpeningToFacet(facet, raw);
-      const u0 = Math.max(minCornerJamb, c.distFromStartM);
-      const u1 = Math.min(L - minCornerJamb, c.distFromStartM + c.widthM);
-      const isThreshold = c.sillHeightM <= 0.035;
-      const v0 = isThreshold ? 0 : Math.max(0.04, c.sillHeightM);
-      const v1 = Math.min(H - minHeadJamb, c.sillHeightM + c.heightM);
-      return { raw: c, u0, u1, v0, v1, isThreshold };
+  return sanitizeWallOpeningsForExtrusion(facet)
+    .map((o) => {
+      const u0 = Math.max(minCornerJamb, o.u0);
+      const u1 = Math.min(L - minCornerJamb, o.u1);
+      const isThreshold = o.v0 <= 0.035;
+      const v0 = isThreshold ? 0 : Math.max(0.03, o.v0);
+      const v1 = Math.min(H - minHeadJamb, o.v1);
+      return { raw: o, u0, u1, v0, v1, isThreshold };
     })
-    .filter((o) => o.u1 - o.u0 >= 0.14 && o.v1 - o.v0 >= 0.14)
-    .sort((a, b) => a.u0 - b.u0);
-
-  // Prevent horizontal or 2D overlap between extruded holes/notches
-  const accepted: SanitizedOpening[] = [];
-  for (const cand of clamped) {
-    const overlapsExisting = accepted.some((prev) => {
-      const uOverlap = Math.min(cand.u1, prev.u1) - Math.max(cand.u0, prev.u0) > -0.025;
-      const vOverlap = Math.min(cand.v1, prev.v1) - Math.max(cand.v0, prev.v0) > -0.025;
-      return uOverlap && vOverlap;
-    });
-    if (!overlapsExisting) {
-      accepted.push(cand);
-    }
-  }
-
-  return accepted;
+    .filter((o) => o.u1 - o.u0 >= 0.08 && o.v1 - o.v0 >= 0.08);
 }
 
 /**
@@ -86,7 +70,7 @@ function buildWallRegionShapes(params: {
   roofProfilePts?: { u: number; v: number }[];
 }): THREE.Shape[] {
   const { u0, u1, v0, v1, openings, roofProfilePts } = params;
-  if (u1 - u0 < 0.06 || v1 - v0 < 0.06) return [];
+  if (u1 - u0 < 0.05 || v1 - v0 < 0.05) return [];
 
   const eps = 0.02;
   const overlapping = openings.filter(
@@ -103,17 +87,18 @@ function buildWallRegionShapes(params: {
   fullCutters.forEach((op) => {
     const cutStart = Math.max(u0, op.u0);
     const cutEnd = Math.min(u1, op.u1);
-    if (cutStart - cursorU >= 0.06) {
+    if (cutStart - cursorU >= 0.05) {
       subSpans.push([cursorU, cutStart]);
     }
     cursorU = Math.max(cursorU, cutEnd);
   });
-  if (u1 - cursorU >= 0.06) {
+  if (u1 - cursorU >= 0.05) {
     subSpans.push([cursorU, u1]);
   }
 
   const shapes: THREE.Shape[] = [];
   subSpans.forEach(([su0, su1]) => {
+    if (su1 - su0 < 0.05) return;
     const spanOps = overlapping.filter((op) => op.u1 > su0 + eps && op.u0 < su1 - eps);
     const bottomNotches = spanOps
       .filter((op) => op.v0 <= v0 + eps && op.v1 < v1 - eps)
@@ -127,14 +112,16 @@ function buildWallRegionShapes(params: {
 
     const shape = new THREE.Shape();
     shape.moveTo(su0, v0);
+    let lastBottomU = su0;
     bottomNotches.forEach((op) => {
-      const nu0 = Math.max(su0 + 0.015, op.u0);
-      const nu1 = Math.min(su1 - 0.015, op.u1);
+      const nu0 = Math.max(lastBottomU + 0.012, op.u0);
+      const nu1 = Math.min(su1 - 0.012, op.u1);
       if (nu1 - nu0 < 0.05) return;
       shape.lineTo(nu0, v0);
-      shape.lineTo(nu0, op.v1);
-      shape.lineTo(nu1, op.v1);
+      shape.lineTo(nu0, Math.min(v1 - 0.025, op.v1));
+      shape.lineTo(nu1, Math.min(v1 - 0.025, op.v1));
       shape.lineTo(nu1, v0);
+      lastBottomU = nu1;
     });
     shape.lineTo(su1, v0);
 
@@ -143,44 +130,63 @@ function buildWallRegionShapes(params: {
         .filter((p) => p.u >= su0 - 0.02 && p.u <= su1 + 0.02)
         .map((p) => ({
           u: Math.max(su0, Math.min(su1, p.u)),
-          v: Math.max(v0 + 0.15, p.v)
+          v: Math.max(v0 + 0.12, p.v)
         }))
         .sort((a, b) => b.u - a.u);
 
       const firstRightV =
         clippedTop[0]?.v ??
-        Math.max(v0 + 0.15, roofProfilePts[roofProfilePts.length - 1].v);
+        Math.max(v0 + 0.12, roofProfilePts[roofProfilePts.length - 1].v);
       shape.lineTo(su1, firstRightV);
       clippedTop.forEach((pt) => {
         shape.lineTo(pt.u, pt.v);
       });
       const lastLeftV =
-        clippedTop[clippedTop.length - 1]?.v ?? Math.max(v0 + 0.15, roofProfilePts[0].v);
+        clippedTop[clippedTop.length - 1]?.v ?? Math.max(v0 + 0.12, roofProfilePts[0].v);
       shape.lineTo(su0, lastLeftV);
     } else {
       shape.lineTo(su1, v1);
+      let lastTopU = su1;
       topNotches.forEach((op) => {
-        const nu0 = Math.max(su0 + 0.015, op.u0);
-        const nu1 = Math.min(su1 - 0.015, op.u1);
+        const nu1 = Math.min(lastTopU - 0.012, op.u1);
+        const nu0 = Math.max(su0 + 0.012, op.u0);
         if (nu1 - nu0 < 0.05) return;
         shape.lineTo(nu1, v1);
-        shape.lineTo(nu1, op.v0);
-        shape.lineTo(nu0, op.v0);
+        shape.lineTo(nu1, Math.max(v0 + 0.025, op.v0));
+        shape.lineTo(nu0, Math.max(v0 + 0.025, op.v0));
         shape.lineTo(nu0, v1);
+        lastTopU = nu0;
       });
       shape.lineTo(su0, v1);
     }
     shape.closePath();
 
+    // Ensure polygon has positive non-degenerate area before pushing holes
+    if (Math.abs(THREE.ShapeUtils.area(shape.getPoints())) < 0.002) {
+      return;
+    }
+
     interiorHoles.forEach((op) => {
-      const hu0 = Math.max(su0 + 0.02, op.u0);
-      const hu1 = Math.min(su1 - 0.02, op.u1);
-      if (hu1 - hu0 < 0.08) return;
+      const hu0 = Math.max(su0 + 0.015, op.u0);
+      const hu1 = Math.min(su1 - 0.015, op.u1);
+      const hv0 = Math.max(v0 + 0.015, op.v0);
+      const hv1 = Math.min(v1 - 0.015, op.v1);
+      if (hu1 - hu0 < 0.06 || hv1 - hv0 < 0.06) return;
+
+      // Skip hole if it intersects a bottom/top notch vertically (safety guard)
+      const hitsBottomNotch = bottomNotches.some(
+        (bn) => hu0 < bn.u1 + 0.01 && hu1 > bn.u0 - 0.01 && hv0 <= bn.v1 + 0.01
+      );
+      const hitsTopNotch = topNotches.some(
+        (tn) => hu0 < tn.u1 + 0.01 && hu1 > tn.u0 - 0.01 && hv1 >= tn.v0 - 0.01
+      );
+      if (hitsBottomNotch || hitsTopNotch) return;
+
       const hole = new THREE.Path();
-      hole.moveTo(hu0, op.v0);
-      hole.lineTo(hu0, op.v1);
-      hole.lineTo(hu1, op.v1);
-      hole.lineTo(hu1, op.v0);
+      hole.moveTo(hu0, hv0);
+      hole.lineTo(hu0, hv1);
+      hole.lineTo(hu1, hv1);
+      hole.lineTo(hu1, hv0);
       hole.closePath();
       shape.holes.push(hole);
     });
@@ -279,12 +285,21 @@ export function buildWallPlan3DGroup(params: {
   const takeoffSummary = computeWallTakeoffSummary(wallPlan.facets);
   const returnFacetIdSet = new Set(takeoffSummary.returnFacetIds);
 
-  // Shared opening joinery & leaf materials
+  // Shared opening joinery, coping & leaf materials
   const frameMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#1e293b',
       metalness: 0.58,
       roughness: 0.34,
+      wireframe: isWireframe
+    })
+  );
+
+  const parapetCopingMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: '#334155',
+      metalness: 0.68,
+      roughness: 0.28,
       wireframe: isWireframe
     })
   );
@@ -314,7 +329,7 @@ export function buildWallPlan3DGroup(params: {
     const dy = facet.to.y - facet.from.y;
     const L = Math.hypot(dx, dy);
     const H = facet.heightM;
-    if (L < 0.05 || H < 0.1) return;
+    if (!Number.isFinite(L) || !Number.isFinite(H) || L < 0.05 || H < 0.1) return;
 
     const dirX = dx / L;
     const dirY = dy / L;
@@ -330,17 +345,34 @@ export function buildWallPlan3DGroup(params: {
 
     const isSelected = Boolean(selectedWallFacetId && selectedWallFacetId === facet.id);
     const isUndetailed = isWallFacetUndetailed(facet);
-    const isReturn = returnFacetIdSet.has(facet.id);
+    const isReturn = returnFacetIdSet.has(facet.id) || facet.kind === 'return';
+    const isParapet = facet.kind === 'parapet';
+    const isSecondary = facet.kind === 'secondary' || Boolean(facet.secondaryZoneId);
+    const isWing = facet.kind === 'wing' || Boolean(facet.isSpur);
+
     const isDimmedByFilter =
       (wallFilterMode === 'undetailed' && !isUndetailed) ||
-      (wallFilterMode === 'returns' && !isReturn);
+      (wallFilterMode === 'returns' && !isReturn) ||
+      (wallFilterMode === 'parapets' && !isParapet) ||
+      (wallFilterMode === 'secondary' && !isSecondary) ||
+      (wallFilterMode === 'wings' && !isWing);
+
     const isHighlightedByFilter =
       (wallFilterMode === 'undetailed' && isUndetailed) ||
-      (wallFilterMode === 'returns' && isReturn);
+      (wallFilterMode === 'returns' && isReturn) ||
+      (wallFilterMode === 'parapets' && isParapet) ||
+      (wallFilterMode === 'secondary' && isSecondary) ||
+      (wallFilterMode === 'wings' && isWing);
 
-    const sanitizedOpenings = sanitizeOpeningsForExtrusion(facet);
+    const sanitizedOpenings = buildExtrusionOpenings(facet);
+    const allowRoofProfile =
+      facet.heightSource === 'roof' &&
+      facet.kind !== 'parapet' &&
+      facet.kind !== 'wing' &&
+      facet.kind !== 'secondary';
+
     const roofProfileLocal =
-      facet.heightSource === 'roof' && facet.roofProfile && facet.roofProfile.length >= 2
+      allowRoofProfile && facet.roofProfile && facet.roofProfile.length >= 2
         ? facet.roofProfile.map((p) => ({
             u: Math.max(0, Math.min(L, p.distM)),
             v: Math.max(0.25, p.topZ - facet.bottomZ)
@@ -381,6 +413,12 @@ export function buildWallPlan3DGroup(params: {
         : isHighlightedByFilter
         ? wallFilterMode === 'undetailed'
           ? '#d97706'
+          : wallFilterMode === 'parapets'
+          ? '#a855f7'
+          : wallFilterMode === 'secondary'
+          ? '#8b5cf6'
+          : wallFilterMode === 'wings'
+          ? '#14b8a6'
           : '#0ea5e9'
         : '#000000';
       const baseEmissiveIntensity = isSelected ? 0.34 : isHighlightedByFilter ? 0.28 : 0;
@@ -396,7 +434,7 @@ export function buildWallPlan3DGroup(params: {
           emissive: new THREE.Color(baseEmissiveHex),
           emissiveIntensity: baseEmissiveIntensity,
           transparent: isDimmedByFilter,
-          opacity: isDimmedByFilter ? 0.24 : 1,
+          opacity: isDimmedByFilter ? 0.22 : 1,
           wireframe: isWireframe
         })
       );
@@ -440,12 +478,39 @@ export function buildWallPlan3DGroup(params: {
       });
     });
 
+    // Architectural metal coping cap on parapet walls
+    if (isParapet && facet.hasCopingFlashing !== false) {
+      const copingGeo = trackGeo(new THREE.BoxGeometry(L + 0.04, 0.042, wallThickness + 0.055));
+      const copingMesh = new THREE.Mesh(copingGeo, parapetCopingMat);
+      copingMesh.position.set(L / 2, H + 0.018, 0);
+      copingMesh.castShadow = !isDimmedByFilter;
+      copingMesh.receiveShadow = true;
+      copingMesh.userData = { wallFacetId: facet.id };
+      facetGroup.add(copingMesh);
+    }
+
     // Crisp Opening Joinery Frames, Architectural Glazing & Recessed Door/Garage Leaves
     sanitizedOpenings.forEach((op) => {
       const w = op.u1 - op.u0;
       const h = op.v1 - op.v0;
       const uMid = (op.u0 + op.u1) / 2;
       const vMid = (op.v0 + op.v1) / 2;
+
+      // Voids linked to secondary enclosure zones act as clean open portals; unlinked voids show slim reveal
+      if (op.raw.type === 'void') {
+        if (!op.raw.linkedSecondaryZoneId) {
+          const revealW = 0.025;
+          const revealDepth = wallThickness + 0.012;
+          const headMesh = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(w, revealW, revealDepth)),
+            frameMat
+          );
+          headMesh.position.set(uMid, op.v1 - revealW / 2, 0);
+          facetGroup.add(headMesh);
+        }
+        return;
+      }
+
       const jambW = 0.045;
       const frameDepth = wallThickness + 0.032;
 
@@ -533,27 +598,30 @@ export function buildWallPlan3DGroup(params: {
     rootGroup.add(facetGroup);
   });
 
-  // Grounded concrete floor slab plinth matching WallPlan footprint
-  if (wallPlan.points.length >= 3) {
+  // Grounded concrete floor slab plinth matching closed WallPlan footprint (guarded against degenerate shapes)
+  if (wallPlan.points && wallPlan.points.length >= 3) {
     const shapePts = wallPlan.points.map(
       (pt) => new THREE.Vector2(pt.x - bounds.midX, pt.y - bounds.midY)
     );
-    const floorShape = new THREE.Shape(shapePts);
-    const padGeo = trackGeo(
-      new THREE.ExtrudeGeometry(floorShape, { depth: 0.12, bevelEnabled: false })
-    );
-    padGeo.rotateX(Math.PI / 2);
-    const padMat = trackMat(
-      new THREE.MeshStandardMaterial({
-        color: '#283244',
-        roughness: 0.92,
-        metalness: 0.05,
-        wireframe: isWireframe
-      })
-    );
-    const padMesh = new THREE.Mesh(padGeo, padMat);
-    padMesh.position.y = 0.06;
-    padMesh.receiveShadow = true;
-    rootGroup.add(padMesh);
+    if (Math.abs(THREE.ShapeUtils.area(shapePts)) > 0.05) {
+      const floorShape = new THREE.Shape(shapePts);
+      const padGeo = trackGeo(
+        new THREE.ExtrudeGeometry(floorShape, { depth: 0.12, bevelEnabled: false })
+      );
+      padGeo.rotateX(Math.PI / 2);
+      const padMat = trackMat(
+        new THREE.MeshStandardMaterial({
+          color: '#283244',
+          roughness: 0.92,
+          metalness: 0.05,
+          wireframe: isWireframe
+        })
+      );
+      const padMesh = new THREE.Mesh(padGeo, padMat);
+      padMesh.position.y = 0.06;
+      padMesh.receiveShadow = true;
+      rootGroup.add(padMesh);
+    }
   }
 }
+

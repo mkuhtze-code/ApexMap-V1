@@ -5,16 +5,19 @@ import {
   Check,
   Compass,
   Download,
+  GitBranch,
   Layers,
   Link2,
   Maximize2,
   PenTool,
   Plus,
   Ruler,
+  Scissors,
   Sparkles,
   Square,
   Trash2,
   Undo2,
+  X,
   ZoomIn,
   ZoomOut
 } from 'lucide-react';
@@ -25,7 +28,9 @@ import {
   RoofOutline,
   RoofPlane,
   RoofPlanUnderlay,
+  WallCladdingType,
   WallFacet,
+  WallFacetKind,
   WallFilterMode,
   WallPlan
 } from '../../types/exactRoofing';
@@ -40,20 +45,30 @@ import {
   squarePolygonCorner
 } from '../../utils/exactRoofingEngine';
 import {
+  addWingWallToPlan,
   analyzeWallPlanTopology,
+  batchUpdateWallFacetsInPlan,
   buildWallEdgesFromPoints,
   buildWallFacetsFromPlan,
   buildWallOpeningsSchedule,
   buildWallTakeoffExportData,
   computeWallFacetMetrics,
   computeWallTakeoffSummary,
+  createSecondaryZoneFromVoid,
   deriveWallPlanFromRoofLevels,
   getFacetPrimaryDisplayCladding,
   getWallCladdingMeta,
+  getWallFacetKind,
+  getWallFacetKindMeta,
   isWallFacetUndetailed,
   moveWallPlanVertex,
+  removeSecondaryZone,
+  splitWallFacetInPlan,
   syncWallPlanWithRoof,
-  updateWallPlanEdgeLength
+  updateSecondaryZoneDepth,
+  updateWallPlanEdgeLength,
+  WALL_CLADDING_OPTIONS,
+  WALL_FACET_KIND_OPTIONS
 } from '../../utils/wallCladdingEngine';
 import {
   computeDynamicScaleBar,
@@ -101,6 +116,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   const viewportRef = useRef<HTMLDivElement>(null);
   const [subView, setSubView] = useState<'plan' | 'elevation'>(initialSubView);
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
+  const [drawMode, setDrawMode] = useState<'ring' | 'wing'>('ring');
   const [draftPoints, setDraftPoints] = useState<Point2D[]>([]);
   const [hoverPt, setHoverPt] = useState<Point2D | null>(null);
   const [typedLengthBuffer, setTypedLengthBuffer] = useState<string>('');
@@ -113,6 +129,11 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   const [editLengthVal, setEditLengthVal] = useState<string>('');
   const [localFilterMode, setLocalFilterMode] = useState<WallFilterMode>('all');
   const [scheduleTab, setScheduleTab] = useState<ScheduleTab>('summary');
+  const [takeoffScope, setTakeoffScope] = useState<'all' | 'primary' | 'secondary'>('all');
+  const [multiSelectedFacetIds, setMultiSelectedFacetIds] = useState<string[]>([]);
+  const [batchCladding, setBatchCladding] = useState<WallCladdingType>('weatherboard');
+  const [batchKind, setBatchKind] = useState<WallFacetKind | ''>('');
+  const [batchHeightM, setBatchHeightM] = useState<string>('');
 
   // Zoom & Pan state for the wall floor plan CAD viewport
   const [zoom, setZoom] = useState<number>(1);
@@ -151,9 +172,19 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     setEditLengthVal(target ? target.lengthM.toFixed(2) : '');
   }, [selectedWallFacetId, facets]);
 
-  const takeoffSummary = useMemo(
-    () => computeWallTakeoffSummary(facets),
+  React.useEffect(() => {
+    setMultiSelectedFacetIds((prev) =>
+      prev.filter((id) => facets.some((f) => f.id === id))
+    );
+  }, [facets]);
+
+  const fullSummary = useMemo(
+    () => computeWallTakeoffSummary(facets, 'all'),
     [facets]
+  );
+  const takeoffSummary = useMemo(
+    () => computeWallTakeoffSummary(facets, takeoffScope),
+    [facets, takeoffScope]
   );
   const topology = useMemo(
     () => analyzeWallPlanTopology(facets),
@@ -176,6 +207,15 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     if (filterMode === 'returns') {
       return facets.filter((f) => returnFacetIdSet.has(f.id));
     }
+    if (filterMode === 'parapets') {
+      return facets.filter((f) => getWallFacetKind(f) === 'parapet');
+    }
+    if (filterMode === 'secondary') {
+      return facets.filter((f) => getWallFacetKind(f) === 'secondary');
+    }
+    if (filterMode === 'wings') {
+      return facets.filter((f) => getWallFacetKind(f) === 'wing' || Boolean(f.isSpur));
+    }
     return facets;
   }, [facets, filterMode, returnFacetIdSet]);
 
@@ -184,11 +224,12 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     [facets]
   );
 
-  // Unified world viewport framing roof + wall plan + draft points
+  // Unified world viewport framing roof + wall plan + wing/secondary facets + draft points
   const viewBounds = useMemo(() => {
     const pts: Point2D[] = [
       ...levels.flatMap((l) => l.outline.points),
       ...(wallPlan?.points || []),
+      ...facets.flatMap((f) => [f.from, f.to]),
       ...draftPoints
     ];
     if (planUnderlay && planUnderlay.visible !== false && planUnderlay.isCalibrated) {
@@ -241,8 +282,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   const scaleBar = useMemo(() => computeDynamicScaleBar(pxPerM), [pxPerM]);
 
   const squareClosedPoints = useMemo(
-    () => (isDrawing ? buildCompleteSquarePoints(draftPoints, true) : null),
-    [isDrawing, draftPoints]
+    () => (isDrawing && drawMode === 'ring' ? buildCompleteSquarePoints(draftPoints, true) : null),
+    [isDrawing, drawMode, draftPoints]
   );
 
   const selectedCornerAngleDeg = useMemo(() => {
@@ -323,10 +364,23 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     const candidates: Point2D[] = [
       ...levels.flatMap((l) => l.outline.points),
       ...(wallPlan?.points || []),
+      ...facets.flatMap((f) => [f.from, f.to]),
       ...draftPoints
     ];
     for (const c of candidates) {
       if (dist(pt, c) < 0.25) return { ...c };
+    }
+    // Also snap onto any existing wall line segment when branching a wing/spur wall
+    if (drawMode === 'wing') {
+      for (const f of facets) {
+        const vx = f.to.x - f.from.x;
+        const vy = f.to.y - f.from.y;
+        const l2 = vx * vx + vy * vy;
+        if (l2 < 1e-4) continue;
+        const t = Math.max(0, Math.min(1, ((pt.x - f.from.x) * vx + (pt.y - f.from.y) * vy) / l2));
+        const proj = { x: +(f.from.x + vx * t).toFixed(3), y: +(f.from.y + vy * t).toFixed(3) };
+        if (dist(pt, proj) < 0.22) return proj;
+      }
     }
     return applyDraftPointSnap(pt, anchor, { orthoSnap: true, angleToleranceDeg: 7 });
   };
@@ -342,15 +396,21 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         roofLevels: levels
       }
     );
+    const preservedExtras = (wallPlan?.facets || []).filter(
+      (f) => f.kind === 'wing' || f.kind === 'secondary' || f.isSpur
+    );
     const nextPlan: WallPlan = {
       points: pts,
       edges,
       defaultHeightM,
-      facets: builtFacets,
+      spurEdges: wallPlan?.spurEdges,
+      secondaryZones: wallPlan?.secondaryZones,
+      facets: [...builtFacets, ...preservedExtras],
       builtAt: new Date().toISOString()
     };
     onUpdateWallPlan(nextPlan);
     setIsDrawing(false);
+    setDrawMode('ring');
     setDraftPoints([]);
     setHoverPt(null);
     setTypedLengthBuffer('');
@@ -358,6 +418,22 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     setSelectedVertexIdx(null);
     if (builtFacets[0]) {
       onSelectWallFacet(builtFacets[0].id);
+    }
+  };
+
+  const commitWingPolyline = (pts: Point2D[]) => {
+    if (pts.length < 2) return;
+    const nextPlan = addWingWallToPlan(wallPlan, pts, { heightM: defaultHeightM });
+    onUpdateWallPlan(nextPlan);
+    setIsDrawing(false);
+    setDrawMode('ring');
+    setDraftPoints([]);
+    setHoverPt(null);
+    setTypedLengthBuffer('');
+    lastAimPtRef.current = null;
+    const lastCreated = nextPlan.facets[nextPlan.facets.length - 1];
+    if (lastCreated) {
+      onSelectWallFacet(lastCreated.id);
     }
   };
 
@@ -374,7 +450,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     );
     if (!nextPt || dist(lastPt, nextPt) < 0.05) return false;
     setTypedLengthBuffer('');
-    if (draftPoints.length >= 3 && pointsClose(nextPt, draftPoints[0], 0.25)) {
+    if (drawMode === 'ring' && draftPoints.length >= 3 && pointsClose(nextPt, draftPoints[0], 0.25)) {
       commitDraftLoop(draftPoints);
       return true;
     }
@@ -383,7 +459,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     return true;
   };
 
-  // SketchUp-style type-to-length & Close Square shortcuts while drawing floor plan
+  // SketchUp-style type-to-length & Close Square shortcuts while drawing floor plan or wing walls
   useEffect(() => {
     if (!isDrawing || readOnly) return;
     const isTypingTarget = (target: EventTarget | null) => {
@@ -404,6 +480,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
           setDraftPoints((p) => p.slice(0, -1));
         } else {
           setIsDrawing(false);
+          setDrawMode('ring');
         }
         return;
       }
@@ -428,12 +505,14 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         e.preventDefault();
         if (typedLengthBuffer.trim().length > 0) {
           commitTypedWallLength(typedLengthBuffer);
-        } else if (draftPoints.length >= 3) {
+        } else if (drawMode === 'wing' && draftPoints.length >= 2) {
+          commitWingPolyline(draftPoints);
+        } else if (drawMode === 'ring' && draftPoints.length >= 3) {
           commitDraftLoop(draftPoints);
         }
         return;
       }
-      if (e.key.toLowerCase() === 'r' && squareClosedPoints) {
+      if (e.key.toLowerCase() === 'r' && drawMode === 'ring' && squareClosedPoints) {
         e.preventDefault();
         commitDraftLoop(squareClosedPoints);
       }
@@ -441,7 +520,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isDrawing, readOnly, draftPoints, typedLengthBuffer, hoverPt, squareClosedPoints]);
+  }, [isDrawing, drawMode, readOnly, draftPoints, typedLengthBuffer, hoverPt, squareClosedPoints]);
 
   const handleBuildFacesFromPlan = () => {
     if (readOnly) return;
@@ -523,7 +602,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     const raw = getWorldFromClient(e.clientX, e.clientY);
     if (!raw) return;
 
-    if (draftPoints.length >= 3 && pointsClose(raw, draftPoints[0], 0.45)) {
+    if (drawMode === 'ring' && draftPoints.length >= 3 && pointsClose(raw, draftPoints[0], 0.45)) {
       commitDraftLoop(draftPoints);
       return;
     }
@@ -658,16 +737,37 @@ export const WallPlanWorkspace: React.FC<Props> = ({
       (ed) =>
         pointsClose(ed.from, facet.from, 0.08) && pointsClose(ed.to, facet.to, 0.08)
     );
-    if (!edgeMatch) return;
-    const updated = updateWallPlanEdgeLength(wallPlan, edgeMatch.id, val, levels);
+    const updated = updateWallPlanEdgeLength(wallPlan, edgeMatch?.id || facet.id, val, levels);
     onUpdateWallPlan(updated);
   };
 
+  const handleSplitFacet = (facetId: string) => {
+    if (!wallPlan || readOnly) return;
+    const updated = splitWallFacetInPlan(wallPlan, facetId, undefined, levels);
+    onUpdateWallPlan(updated);
+  };
+
+  const handlePromoteVoidToSecondary = (facetId: string, openingId: string, depthM: number) => {
+    if (!wallPlan || readOnly) return;
+    const res = createSecondaryZoneFromVoid(wallPlan, facetId, openingId, { depthM });
+    if (!res) return;
+    onUpdateWallPlan(res.wallPlan);
+    if (res.createdFacets[0]) {
+      onSelectWallFacet(res.createdFacets[0].id);
+    }
+  };
+
+  const toggleMultiSelectFacet = (facetId: string) => {
+    setMultiSelectedFacetIds((prev) =>
+      prev.includes(facetId) ? prev.filter((id) => id !== facetId) : [...prev, facetId]
+    );
+  };
+
   const wallAsOutline: RoofOutline | null = useMemo(() => {
-    if (!wallPlan || wallPlan.points.length < 3) return null;
+    if (!wallPlan || (wallPlan.points.length < 3 && wallPlan.facets.length === 0)) return null;
     return {
       id: 'wall-plan-outline',
-      points: wallPlan.points,
+      points: wallPlan.points.length >= 3 ? wallPlan.points : wallPlan.facets.flatMap((f) => [f.from, f.to]),
       edges: wallPlan.facets.map((f) => ({
         id: f.id,
         from: f.from,
@@ -688,6 +788,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         onSelectFacet={(id) => onSelectWallFacet(id)}
         onUpdateFacet={onUpdateWallFacet}
         onBackToPlan={() => setSubView('plan')}
+        onPromoteVoidToSecondary={handlePromoteVoidToSecondary}
+        secondaryZones={wallPlan?.secondaryZones || []}
         readOnly={readOnly}
       />
     );
@@ -733,7 +835,12 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               <button
                 type="button"
                 onClick={() => {
-                  setIsDrawing((v) => !v);
+                  if (isDrawing && drawMode === 'ring') {
+                    setIsDrawing(false);
+                  } else {
+                    setDrawMode('ring');
+                    setIsDrawing(true);
+                  }
                   setDraftPoints([]);
                   setHoverPt(null);
                   setTypedLengthBuffer('');
@@ -741,13 +848,40 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                   setSelectedVertexIdx(null);
                 }}
                 className={`px-2.5 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer ${
-                  isDrawing
+                  isDrawing && drawMode === 'ring'
                     ? 'bg-amber-500 border-amber-400 text-slate-950'
                     : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-200'
                 }`}
               >
                 <PenTool className="w-3.5 h-3.5" />
-                <span>{isDrawing ? 'Cancel Draw' : 'Draw Plan'}</span>
+                <span>{isDrawing && drawMode === 'ring' ? 'Cancel Draw' : 'Draw Plan'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (isDrawing && drawMode === 'wing') {
+                    setIsDrawing(false);
+                    setDrawMode('ring');
+                  } else {
+                    setDrawMode('wing');
+                    setIsDrawing(true);
+                  }
+                  setDraftPoints([]);
+                  setHoverPt(null);
+                  setTypedLengthBuffer('');
+                  lastAimPtRef.current = null;
+                  setSelectedVertexIdx(null);
+                }}
+                className={`px-2.5 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer ${
+                  isDrawing && drawMode === 'wing'
+                    ? 'bg-teal-500 border-teal-400 text-slate-950'
+                    : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-teal-300'
+                }`}
+                title="Draw open wing, privacy screen, or freestanding courtyard wall polyline"
+              >
+                <GitBranch className="w-3.5 h-3.5" />
+                <span>{isDrawing && drawMode === 'wing' ? 'Cancel Wing' : '+ Wing Wall'}</span>
               </button>
 
               <button
@@ -799,12 +933,15 @@ export const WallPlanWorkspace: React.FC<Props> = ({
 
         <div className="flex items-center gap-2 text-xs flex-wrap">
           {facets.length > 0 && (
-            <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
+            <div className="flex flex-wrap items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800 gap-0.5">
               {(
                 [
                   { id: 'all', label: `All (${facets.length})` },
-                  { id: 'undetailed', label: `Needs Detail (${takeoffSummary.undetailedCount})` },
-                  { id: 'returns', label: `Returns (${topology.returnFacesCount})` }
+                  { id: 'undetailed', label: `Needs Detail (${fullSummary.undetailedCount})` },
+                  { id: 'returns', label: `Returns (${topology.returnFacesCount})` },
+                  { id: 'parapets', label: `Parapets (${fullSummary.parapetFacesCount})` },
+                  { id: 'secondary', label: `Secondary (${fullSummary.secondaryFacesCount})` },
+                  { id: 'wings', label: `Wings (${fullSummary.wingFacesCount})` }
                 ] as const
               ).map((flt) => (
                 <button
@@ -859,11 +996,19 @@ export const WallPlanWorkspace: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* Interactive Drawing Banner (with SketchUp Type-to-Length & Close Square) */}
+      {/* Interactive Drawing Banner (with SketchUp Type-to-Length, Close Square & Open Wing Polyline) */}
       {isDrawing && (
-        <div className="bg-amber-950/60 border border-amber-500/40 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-          <span className="font-bold text-amber-200">
-            Tap corners ({draftPoints.length} pts) · aim &amp; type length (m or mm) + Enter
+        <div
+          className={`rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs border ${
+            drawMode === 'wing'
+              ? 'bg-teal-950/60 border-teal-500/45'
+              : 'bg-amber-950/60 border-amber-500/40'
+          }`}
+        >
+          <span className={`font-bold ${drawMode === 'wing' ? 'text-teal-200' : 'text-amber-200'}`}>
+            {drawMode === 'wing'
+              ? `Wing Wall (${draftPoints.length} pts) · snap to wall/corner, type length + Enter`
+              : `Tap corners (${draftPoints.length} pts) · aim & type length (m or mm) + Enter`}
           </span>
           <div className="flex flex-wrap items-center gap-1.5">
             {draftPoints.length >= 1 && (
@@ -905,7 +1050,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               <Undo2 className="w-3.5 h-3.5" />
               <span>Undo</span>
             </button>
-            {squareClosedPoints && (
+            {drawMode === 'ring' && squareClosedPoints && (
               <button
                 type="button"
                 onClick={() => commitDraftLoop(squareClosedPoints)}
@@ -916,15 +1061,27 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 <span>Close Square</span>
               </button>
             )}
-            <button
-              type="button"
-              disabled={draftPoints.length < 3}
-              onClick={() => commitDraftLoop(draftPoints)}
-              className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold flex items-center gap-1 cursor-pointer disabled:opacity-40"
-            >
-              <Check className="w-3.5 h-3.5" />
-              <span>Close &amp; Build</span>
-            </button>
+            {drawMode === 'wing' ? (
+              <button
+                type="button"
+                disabled={draftPoints.length < 2}
+                onClick={() => commitWingPolyline(draftPoints)}
+                className="px-2.5 py-1 rounded-lg bg-teal-500 hover:bg-teal-400 text-slate-950 font-extrabold flex items-center gap-1 cursor-pointer disabled:opacity-40"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Finish Wing</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={draftPoints.length < 3}
+                onClick={() => commitDraftLoop(draftPoints)}
+                className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold flex items-center gap-1 cursor-pointer disabled:opacity-40"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Close &amp; Build</span>
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -1120,12 +1277,21 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 const x2 = toSvgX(facet.to.x);
                 const y2 = toSvgY(facet.to.y);
                 const isSel = facet.id === selectedWallFacetId;
+                const isMultiSel = multiSelectedFacetIds.includes(facet.id);
                 const isUndetailed = isWallFacetUndetailed(facet);
                 const isReturn = returnFacetIdSet.has(facet.id);
+                const facetKind = getWallFacetKind(facet);
+                const kindMeta = getWallFacetKindMeta(facetKind);
+                const isWing = facetKind === 'wing' || Boolean(facet.isSpur);
+                const isParapet = facetKind === 'parapet';
+                const isSecondary = facetKind === 'secondary';
                 const matchesFilter =
                   filterMode === 'all' ||
                   (filterMode === 'undetailed' && isUndetailed) ||
-                  (filterMode === 'returns' && isReturn);
+                  (filterMode === 'returns' && isReturn) ||
+                  (filterMode === 'parapets' && isParapet) ||
+                  (filterMode === 'secondary' && isSecondary) ||
+                  (filterMode === 'wings' && isWing);
 
                 const primary = getFacetPrimaryDisplayCladding(facet);
                 const meta = getWallCladdingMeta(primary);
@@ -1152,6 +1318,10 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                     onClick={(e) => {
                       if (isDrawing) return;
                       e.stopPropagation();
+                      if (e.shiftKey && !readOnly) {
+                        toggleMultiSelectFacet(facet.id);
+                        return;
+                      }
                       onSelectWallFacet(facet.id);
                     }}
                     onDoubleClick={(e) => {
@@ -1169,13 +1339,36 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       stroke="transparent"
                       strokeWidth="18"
                     />
+                    {(isMultiSel || isParapet) && (
+                      <line
+                        x1={x1}
+                        y1={y1}
+                        x2={x2}
+                        y2={y2}
+                        stroke={isMultiSel ? '#10b981' : '#c084fc'}
+                        strokeWidth={isMultiSel ? 10 : 8}
+                        strokeOpacity={isMultiSel ? 0.55 : 0.4}
+                        strokeLinecap="round"
+                      />
+                    )}
                     <line
                       x1={x1}
                       y1={y1}
                       x2={x2}
                       y2={y2}
-                      stroke={isSel ? '#38bdf8' : isUndetailed ? '#f59e0b' : meta.hex}
+                      stroke={
+                        isSel
+                          ? '#38bdf8'
+                          : isUndetailed
+                          ? '#f59e0b'
+                          : isWing
+                          ? '#2dd4bf'
+                          : isSecondary
+                          ? '#a78bfa'
+                          : meta.hex
+                      }
                       strokeWidth={isSel ? 5.5 : isReturn ? 4.2 : 3.5}
+                      strokeDasharray={isWing ? '7 4' : isSecondary ? '5 3' : undefined}
                       strokeLinecap="round"
                     />
 
@@ -1184,14 +1377,28 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       <circle
                         r="11"
                         fill={isSel ? '#0284c7' : '#0b101d'}
-                        stroke={isSel ? '#ffffff' : isUndetailed ? '#f59e0b' : meta.hex}
+                        stroke={
+                          isMultiSel
+                            ? '#10b981'
+                            : isSel
+                            ? '#ffffff'
+                            : isParapet
+                            ? '#c084fc'
+                            : isWing
+                            ? '#2dd4bf'
+                            : isSecondary
+                            ? '#a78bfa'
+                            : isUndetailed
+                            ? '#f59e0b'
+                            : meta.hex
+                        }
                         strokeWidth="2"
                       />
                       <text
                         y="3.8"
                         textAnchor="middle"
                         fill="#f8fafc"
-                        fontSize="10.5"
+                        fontSize="10"
                         fontWeight="900"
                         fontFamily="monospace"
                       >
@@ -1199,18 +1406,19 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       </text>
                     </g>
 
-                    {/* Outward True-Length + Opening Readout */}
+                    {/* Outward True-Length + Kind + Opening Readout */}
                     <text
                       x={labelX}
                       y={labelY}
                       textAnchor="middle"
-                      fill={isSel ? '#7dd3fc' : '#cbd5e1'}
+                      fill={isSel ? '#7dd3fc' : isParapet ? '#d8b4fe' : isWing ? '#5eead4' : isSecondary ? '#c4b5fd' : '#cbd5e1'}
                       fontSize="10.5"
                       fontWeight="bold"
                       fontFamily="monospace"
                       pointerEvents="none"
                     >
                       {facet.lengthM.toFixed(2)}m
+                      {facetKind !== 'exterior' ? ` · ${kindMeta.shortLabel}` : ''}
                       {facet.openings.length > 0 ? ` (${facet.openings.length})` : ''}
                     </text>
                   </g>
@@ -1483,12 +1691,19 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 {selectedFacet.code}
               </span>
               <div className="min-w-0">
-                <div className="font-bold text-white truncate">
-                  Wall {selectedFacet.code} ·{' '}
-                  {selectedFacet.regions && selectedFacet.regions.length > 1
-                    ? `${selectedFacet.regions.length} Mixed Regions`
-                    : getWallCladdingMeta(selectedFacet.claddingType).label}
-                  {selectedFacet.heightSource === 'roof' ? ' · From Roof' : ''}
+                <div className="font-bold text-white truncate flex items-center gap-1.5 flex-wrap">
+                  <span>
+                    Wall {selectedFacet.code} ·{' '}
+                    {selectedFacet.regions && selectedFacet.regions.length > 1
+                      ? `${selectedFacet.regions.length} Mixed Regions`
+                      : getWallCladdingMeta(selectedFacet.claddingType).label}
+                    {selectedFacet.heightSource === 'roof' ? ' · From Roof' : ''}
+                  </span>
+                  {getWallFacetKind(selectedFacet) !== 'exterior' && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300">
+                      {getWallFacetKindMeta(getWallFacetKind(selectedFacet)).shortLabel}
+                    </span>
+                  )}
                 </div>
                 <div className="text-[11px] font-mono text-slate-400 tabular-nums">
                   {selectedFacet.lengthM.toFixed(2)}m × {selectedFacet.heightM.toFixed(2)}m ·{' '}
@@ -1498,25 +1713,37 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {!readOnly && (
-                <div className="flex items-center gap-1">
-                  <Ruler className="w-3.5 h-3.5 text-slate-500" />
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0.2"
-                    value={editLengthVal}
-                    onChange={(e) => setEditLengthVal(e.target.value)}
-                    onBlur={handleApplyEdgeLength}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleApplyEdgeLength();
-                    }}
-                    className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums"
-                    title="Edit wall length (m)"
-                  />
-                  <span className="text-[11px] text-slate-500">m</span>
-                </div>
+                <>
+                  <div className="flex items-center gap-1">
+                    <Ruler className="w-3.5 h-3.5 text-slate-500" />
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0.2"
+                      value={editLengthVal}
+                      onChange={(e) => setEditLengthVal(e.target.value)}
+                      onBlur={handleApplyEdgeLength}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleApplyEdgeLength();
+                      }}
+                      className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums"
+                      title="Edit wall length (m)"
+                    />
+                    <span className="text-[11px] text-slate-500">m</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={selectedFacet.lengthM < 0.4}
+                    onClick={() => handleSplitFacet(selectedFacet.id)}
+                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold flex items-center gap-1 cursor-pointer disabled:opacity-40"
+                    title="Split selected wall face cleanly at midpoint (Shift+Click faces to batch edit)"
+                  >
+                    <Scissors className="w-3 h-3 text-amber-400" />
+                    <span>Split</span>
+                  </button>
+                </>
               )}
               <button
                 type="button"
@@ -1525,6 +1752,104 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               >
                 <Building2 className="w-3.5 h-3.5" />
                 <span>Detail Elevation</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Multi-Select Batch Apply Bar (Shift+Click on Plan or Tick Checkboxes in Faces Table) */}
+        {!readOnly && wallPlan && multiSelectedFacetIds.length >= 1 && (
+          <div className="bg-emerald-950/35 border border-emerald-500/40 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span className="font-extrabold text-emerald-300">
+              {multiSelectedFacetIds.length} wall {multiSelectedFacetIds.length === 1 ? 'face' : 'faces'} selected (Shift+Click to add/remove)
+            </span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <select
+                value={batchCladding}
+                onChange={(e) => setBatchCladding(e.target.value as WallCladdingType)}
+                className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-bold"
+              >
+                {WALL_CLADDING_OPTIONS.map((opt) => (
+                  <option key={opt.type} value={opt.type}>
+                    {opt.shortLabel}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateWallPlan(
+                    batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
+                      claddingType: batchCladding
+                    })
+                  )
+                }
+                className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer"
+              >
+                Apply Cladding
+              </button>
+
+              <select
+                value={batchKind}
+                onChange={(e) => setBatchKind(e.target.value as WallFacetKind | '')}
+                className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-bold"
+              >
+                <option value="">Role...</option>
+                {WALL_FACET_KIND_OPTIONS.map((opt) => (
+                  <option key={opt.kind} value={opt.kind}>
+                    {opt.shortLabel}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={!batchKind}
+                onClick={() =>
+                  batchKind &&
+                  onUpdateWallPlan(
+                    batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
+                      kind: batchKind
+                    })
+                  )
+                }
+                className="px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+              >
+                Set Role
+              </button>
+
+              <input
+                type="number"
+                step="0.1"
+                min="0.4"
+                max="8"
+                placeholder="H (m)"
+                value={batchHeightM}
+                onChange={(e) => setBatchHeightM(e.target.value)}
+                className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-mono tabular-nums"
+              />
+              <button
+                type="button"
+                disabled={!Number.isFinite(parseFloat(batchHeightM)) || parseFloat(batchHeightM) < 0.4}
+                onClick={() => {
+                  const h = parseFloat(batchHeightM);
+                  if (Number.isFinite(h) && h >= 0.4) {
+                    onUpdateWallPlan(
+                      batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, { heightM: h })
+                    );
+                  }
+                }}
+                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+              >
+                Set H
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setMultiSelectedFacetIds([])}
+                className="p-1 rounded-lg text-slate-400 hover:text-white cursor-pointer"
+                title="Clear Selection"
+              >
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
@@ -1559,9 +1884,37 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 ))}
               </div>
 
+              {(fullSummary.secondaryFacesCount > 0 || takeoffScope !== 'all') && (
+                <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
+                  {(
+                    [
+                      { id: 'all', label: 'All Scope' },
+                      { id: 'primary', label: 'Primary' },
+                      { id: 'secondary', label: 'Secondary' }
+                    ] as const
+                  ).map((sc) => (
+                    <button
+                      key={sc.id}
+                      type="button"
+                      onClick={() => setTakeoffScope(sc.id)}
+                      className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                        takeoffScope === sc.id
+                          ? 'bg-violet-600 text-white'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {sc.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <span className="text-[11px] font-mono text-slate-400 tabular-nums">
                 {topology.externalCornersCount} ext · {topology.internalCornersCount} int notch ·{' '}
                 {topology.returnFacesCount} returns
+                {takeoffSummary.parapetCopingLm > 0
+                  ? ` · ${takeoffSummary.parapetCopingLm.toFixed(1)} lm coping`
+                  : ''}
               </span>
             </div>
 
@@ -1586,6 +1939,98 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               </button>
             </div>
           </div>
+
+          {/* Linked Secondary Wall Sections Manager */}
+          {wallPlan?.secondaryZones && wallPlan.secondaryZones.length > 0 && (
+            <div className="bg-violet-950/25 border border-violet-500/35 rounded-xl p-2.5 space-y-1.5">
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="font-extrabold text-violet-200">
+                  Secondary Wall Sections ({wallPlan.secondaryZones.length})
+                </span>
+                <span className="font-mono text-violet-300 tabular-nums">
+                  {fullSummary.secondaryNetAreaM2.toFixed(2)} m² net
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {wallPlan.secondaryZones.map((zone) => (
+                  <div
+                    key={zone.id}
+                    className="flex flex-wrap items-center gap-2 bg-slate-950/90 border border-violet-500/30 rounded-lg px-2.5 py-1.5 text-[11px]"
+                  >
+                    <span className="font-bold text-white">{zone.name}</span>
+                    {!readOnly && (
+                      <>
+                        <label className="flex items-center gap-1 text-slate-400">
+                          <span>Depth</span>
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0.3"
+                            max="12"
+                            value={+zone.depthM.toFixed(2)}
+                            onChange={(e) => {
+                              const d = parseFloat(e.target.value);
+                              if (Number.isFinite(d) && d >= 0.3) {
+                                onUpdateWallPlan(updateSecondaryZoneDepth(wallPlan, zone.id, d));
+                              }
+                            }}
+                            className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono font-bold text-right tabular-nums"
+                          />
+                          <span>m</span>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateWallPlan(
+                              updateSecondaryZoneDepth(
+                                wallPlan,
+                                zone.id,
+                                zone.depthM,
+                                zone.direction === 'outward' ? 'inward' : 'outward'
+                              )
+                            )
+                          }
+                          className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-violet-200 font-bold cursor-pointer"
+                          title="Flip Inward vs Outward enclosure direction"
+                        >
+                          {zone.direction === 'outward' ? 'Outward' : 'Inward'}
+                        </button>
+                      </>
+                    )}
+                    <div className="flex items-center gap-1">
+                      {zone.facetIds.map((fid, i) => {
+                        const cf = facets.find((f) => f.id === fid);
+                        if (!cf) return null;
+                        return (
+                          <button
+                            key={fid}
+                            type="button"
+                            onClick={() => {
+                              onSelectWallFacet(fid);
+                              setSubView('elevation');
+                            }}
+                            className="px-1.5 py-0.5 rounded bg-violet-600/25 hover:bg-violet-600/45 border border-violet-500/40 text-violet-200 font-mono font-bold cursor-pointer"
+                          >
+                            {cf.code || `S${i + 1}`}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        onClick={() => onUpdateWallPlan(removeSecondaryZone(wallPlan, zone.id))}
+                        className="p-0.5 text-slate-400 hover:text-rose-400 cursor-pointer"
+                        title="Remove Secondary Section"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {scheduleTab === 'summary' && (
             <div className="overflow-x-auto">
@@ -1635,7 +2080,9 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               <table className="w-full text-left text-xs tabular-nums">
                 <thead>
                   <tr className="border-b border-slate-800 text-[10px] uppercase text-slate-500">
+                    {!readOnly && <th className="py-1.5 pr-1 font-bold w-6">Sel</th>}
                     <th className="py-1.5 pr-2 font-bold">Face</th>
+                    <th className="py-1.5 px-2 font-bold">Role</th>
                     <th className="py-1.5 px-2 font-bold">Cladding</th>
                     <th className="py-1.5 px-2 font-bold text-right">L × H</th>
                     <th className="py-1.5 px-2 font-bold">Height Source</th>
@@ -1650,15 +2097,39 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                     const undetailed = isWallFacetUndetailed(f);
                     const isRet = returnFacetIdSet.has(f.id);
                     const prim = getFacetPrimaryDisplayCladding(f);
+                    const fk = getWallFacetKind(f);
+                    const km = getWallFacetKindMeta(fk);
+                    const isMulti = multiSelectedFacetIds.includes(f.id);
                     return (
                       <tr
                         key={f.id}
                         onClick={() => onSelectWallFacet(f.id)}
                         className="text-slate-200 hover:bg-slate-900/60 cursor-pointer"
                       >
+                        {!readOnly && (
+                          <td
+                            className="py-1.5 pr-1"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              toggleMultiSelectFacet(f.id);
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isMulti}
+                              onChange={() => {}}
+                              className="accent-emerald-500 cursor-pointer"
+                            />
+                          </td>
+                        )}
                         <td className="py-1.5 pr-2 font-mono font-bold">
                           {f.code}
                           {isRet ? ' (Return)' : ''}
+                        </td>
+                        <td className="py-1.5 px-2">
+                          <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] font-bold text-slate-300">
+                            {km.shortLabel}
+                          </span>
                         </td>
                         <td className="py-1.5 px-2">
                           {f.regions && f.regions.length > 1
@@ -1681,7 +2152,19 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                         >
                           {m.netCladdingAreaM2.toFixed(2)}
                         </td>
-                        <td className="py-1.5 pl-2 text-right">
+                        <td className="py-1.5 pl-2 text-right space-x-2">
+                          {!readOnly && f.lengthM >= 0.4 && (
+                            <button
+                              type="button"
+                              onClick={(ev) => {
+                                ev.stopPropagation();
+                                handleSplitFacet(f.id);
+                              }}
+                              className="text-amber-400 hover:text-amber-300 font-bold cursor-pointer"
+                            >
+                              Split
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={(ev) => {

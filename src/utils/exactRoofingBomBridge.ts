@@ -1290,6 +1290,11 @@ export function buildOrderPack(params: {
       externalCornersCount: topology.externalCornersCount,
       internalCornersCount: topology.internalCornersCount,
       returnFacesCount: topology.returnFacesCount,
+      parapetFacesCount: wallSum.parapetFacesCount,
+      parapetCopingLm: wallSum.parapetCopingLm,
+      secondaryFacesCount: wallSum.secondaryFacesCount,
+      secondaryNetAreaM2: wallSum.secondaryNetAreaM2,
+      wingFacesCount: wallSum.wingFacesCount,
       totalNetAreaM2: wallSum.totalNetAreaM2,
       totalOpeningsAreaM2: wallSum.totalOpeningsAreaM2,
       byCladding: wallSum.byCladding
@@ -1506,6 +1511,24 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
         esc(wl.notes)
       ].join(','));
     });
+
+    if ((orderPack.walls.parapetCopingLm ?? 0) > 0) {
+      lines.push([
+        'WALL_PARAPET_COPING',
+        esc('WALL-COPING-PARAPET'),
+        esc(`Parapet Metal Coping Capping (${orderPack.walls.parapetFacesCount || 0} walls)`),
+        (orderPack.walls.parapetCopingLm ?? 0).toFixed(2),
+        'lm',
+        '',
+        '',
+        'NO',
+        (orderPack.walls.parapetCopingLm ?? 0).toFixed(2),
+        '',
+        '',
+        '',
+        esc('Includes parapet upstand coping flashing allowance')
+      ].join(','));
+    }
 
     orderPack.walls.openingsSchedule.forEach((op) => {
       lines.push([

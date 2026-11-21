@@ -1246,12 +1246,15 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
                   Seams
                 </button>
                 {wallPlan && wallPlan.facets.length > 0 && showWalls && (
-                  <div className="flex items-center p-0.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <div className="flex flex-wrap items-center p-0.5 rounded-lg bg-slate-900 border border-slate-800 gap-0.5">
                     {(
                       [
                         { id: 'all', label: 'All Walls' },
                         { id: 'undetailed', label: 'Needs Detail' },
-                        { id: 'returns', label: 'Returns' }
+                        { id: 'returns', label: 'Returns' },
+                        { id: 'parapets', label: 'Parapets' },
+                        { id: 'secondary', label: 'Secondary' },
+                        { id: 'wings', label: 'Wings' }
                       ] as const
                     ).map((fOpt) => (
                       <button

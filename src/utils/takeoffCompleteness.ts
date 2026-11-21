@@ -40,7 +40,7 @@ export function evaluateTakeoffCompleteness(
     wallPlan.facets.forEach((facet) => {
       if (!isWallFacetUndetailed(facet)) return;
       undetailedWallsCount += 1;
-      const isReturn = returnIds.has(facet.id);
+      const isReturn = returnIds.has(facet.id) || facet.kind === 'return';
       if (isReturn) {
         undetailedReturnsCount += 1;
         issues.push({
@@ -49,6 +49,26 @@ export function evaluateTakeoffCompleteness(
           severity: 'blocker',
           title: `Return Wall ${facet.code} (${facet.lengthM.toFixed(2)}m) needs detail`,
           detail: 'Internal notch / return face has no cladding assigned and can be missed.',
+          targetId: facet.id,
+          targetCode: facet.code
+        });
+      } else if (facet.kind === 'parapet') {
+        issues.push({
+          id: `issue-parapet-${facet.id}`,
+          category: 'undetailed_parapet',
+          severity: 'warning',
+          title: `Parapet Wall ${facet.code} (${facet.lengthM.toFixed(2)}m) needs cladding`,
+          detail: 'Assign parapet wall cladding and verify coping flashing allowance.',
+          targetId: facet.id,
+          targetCode: facet.code
+        });
+      } else if (facet.kind === 'secondary') {
+        issues.push({
+          id: `issue-secondary-${facet.id}`,
+          category: 'undetailed_secondary',
+          severity: 'warning',
+          title: `Secondary Wall ${facet.code} (${facet.lengthM.toFixed(2)}m) needs cladding`,
+          detail: 'Assign cladding to secondary/patio enclosure wall face.',
           targetId: facet.id,
           targetCode: facet.code
         });

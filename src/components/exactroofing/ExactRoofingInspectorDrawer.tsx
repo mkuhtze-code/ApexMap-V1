@@ -13,6 +13,7 @@ import {
   TakeoffCompletenessReport,
   WallCladdingType,
   WallFacet,
+  WallFacetKind,
   WallFilterMode,
   WallPlan
 } from '../../types/exactRoofing';
@@ -49,9 +50,13 @@ import {
   fitWallFacetTopToRoof,
   getFacetPrimaryDisplayCladding,
   getWallCladdingMeta,
+  getWallFacetKind,
+  getWallFacetKindMeta,
   isWallFacetUndetailed,
   resolveRoofTopForWallFacet,
-  WALL_CLADDING_OPTIONS
+  updateWallFacetKind,
+  WALL_CLADDING_OPTIONS,
+  WALL_FACET_KIND_OPTIONS
 } from '../../utils/wallCladdingEngine';
 import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBridge';
 
@@ -198,6 +203,15 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
     }
     if (wallFilterMode === 'returns') {
       return wallFacets.filter((f) => returnFacetIdSet.has(f.id));
+    }
+    if (wallFilterMode === 'parapets') {
+      return wallFacets.filter((f) => getWallFacetKind(f) === 'parapet');
+    }
+    if (wallFilterMode === 'secondary') {
+      return wallFacets.filter((f) => getWallFacetKind(f) === 'secondary');
+    }
+    if (wallFilterMode === 'wings') {
+      return wallFacets.filter((f) => getWallFacetKind(f) === 'wing' || Boolean(f.isSpur));
     }
     return wallFacets;
   }, [wallFacets, wallFilterMode, returnFacetIdSet]);
@@ -1081,7 +1095,74 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   </span>
                 )}
               </div>
-              {!isLockedView && selRoofMatch && onUpdateWallFacet && (
+              {!isLockedView && onUpdateWallFacet && (() => {
+                const curKind = getWallFacetKind(selectedWallFacet);
+                return (
+                  <div className="pt-1.5 border-t border-slate-800/80 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                        Wall Role
+                      </span>
+                      <select
+                        value={curKind}
+                        onChange={(e) =>
+                          onUpdateWallFacet(
+                            updateWallFacetKind(selectedWallFacet, e.target.value as WallFacetKind)
+                          )
+                        }
+                        className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] font-bold text-slate-100 focus:outline-hidden focus:border-sky-400"
+                      >
+                        {WALL_FACET_KIND_OPTIONS.map((opt) => (
+                          <option key={opt.kind} value={opt.kind}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    {curKind === 'parapet' && (
+                      <div className="flex items-center justify-between gap-2 bg-purple-950/35 border border-purple-500/30 rounded-xl px-2.5 py-1.5 text-[11px]">
+                        <label className="flex items-center gap-1.5 text-purple-200 font-bold cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={selectedWallFacet.hasCopingFlashing !== false}
+                            onChange={(e) =>
+                              onUpdateWallFacet({
+                                ...selectedWallFacet,
+                                hasCopingFlashing: e.target.checked
+                              })
+                            }
+                            className="accent-purple-400"
+                          />
+                          <span>Parapet Coping Cap</span>
+                        </label>
+                        <div className="flex items-center gap-1">
+                          <span className="text-[10px] text-purple-300">H</span>
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0.4"
+                            max="8"
+                            value={+selectedWallFacet.heightM.toFixed(2)}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              if (Number.isFinite(val) && val >= 0.4) {
+                                onUpdateWallFacet(
+                                  updateWallFacetKind(selectedWallFacet, 'parapet', {
+                                    parapetHeightM: val
+                                  })
+                                );
+                              }
+                            }}
+                            className="w-14 bg-slate-900 border border-purple-500/40 rounded px-1.5 py-0.5 text-right font-mono font-bold text-white text-[11px] tabular-nums"
+                          />
+                          <span className="text-[10px] text-purple-300">m</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+              {!isLockedView && selRoofMatch && onUpdateWallFacet && getWallFacetKind(selectedWallFacet) !== 'parapet' && getWallFacetKind(selectedWallFacet) !== 'wing' && getWallFacetKind(selectedWallFacet) !== 'secondary' && (
                 <button
                   type="button"
                   onClick={() =>
@@ -1713,19 +1794,22 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-1 p-0.5 bg-slate-950 rounded-xl border border-slate-800 text-[10px] font-bold">
+                  <div className="flex flex-wrap gap-1 p-0.5 bg-slate-950 rounded-xl border border-slate-800 text-[10px] font-bold">
                     {(
                       [
                         { id: 'all', label: `All (${wallFacets.length})` },
                         { id: 'undetailed', label: `Need (${wallSummary.undetailedCount})` },
-                        { id: 'returns', label: `Ret (${wallSummary.returnFacesCount})` }
+                        { id: 'returns', label: `Ret (${wallSummary.returnFacesCount})` },
+                        { id: 'parapets', label: `Par (${wallSummary.parapetFacesCount})` },
+                        { id: 'secondary', label: `Sec (${wallSummary.secondaryFacesCount})` },
+                        { id: 'wings', label: `Wing (${wallSummary.wingFacesCount})` }
                       ] as const
                     ).map((fOpt) => (
                       <button
                         key={fOpt.id}
                         type="button"
                         onClick={() => setWallFilterMode(fOpt.id)}
-                        className={`py-1 rounded-lg cursor-pointer transition-colors ${
+                        className={`px-2 py-1 rounded-lg cursor-pointer transition-colors ${
                           wallFilterMode === fOpt.id
                             ? 'bg-amber-500 text-slate-950'
                             : 'text-slate-400 hover:text-white'
@@ -1770,6 +1854,9 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                                   ? `${wf.regions.length} zones`
                                   : meta.shortLabel}
                                 {isRet ? ' · Ret' : ''}
+                                {getWallFacetKind(wf) !== 'exterior' && !isRet
+                                  ? ` · ${getWallFacetKindMeta(getWallFacetKind(wf)).shortLabel}`
+                                  : ''}
                               </div>
                               <div className="text-[10px] text-slate-400 font-mono tabular-nums">
                                 {wf.openings.length} openings · {m.netCladdingAreaM2.toFixed(1)} m²

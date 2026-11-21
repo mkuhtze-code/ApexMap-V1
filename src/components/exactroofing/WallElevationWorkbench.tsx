@@ -1,8 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
+  ArrowDown,
   ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ChevronLeft,
   ChevronRight,
+  Copy,
   DoorOpen,
   Eye,
   EyeOff,
@@ -14,6 +19,7 @@ import {
   Maximize2,
   Plus,
   Ruler,
+  Sparkles,
   Square,
   Trash2,
   Upload,
@@ -29,8 +35,10 @@ import {
   WallCladdingType,
   WallElevationUnderlay,
   WallFacet,
+  WallFacetKind,
   WallOpening,
-  WallOpeningType
+  WallOpeningType,
+  WallSecondaryZone
 } from '../../types/exactRoofing';
 import {
   calibrateUnderlayFromTwoPoints,
@@ -40,11 +48,19 @@ import {
   createDefaultWallOpening,
   createHorizontalDadoSplit,
   createVerticalBaySplit,
+  duplicateWallOpening,
+  findOpeningOverlaps,
   fitWallFacetTopToRoof,
   getFacetPrimaryDisplayCladding,
   getWallCladdingMeta,
+  getWallFacetKind,
+  getWallFacetKindMeta,
+  resolveOpeningOverlap,
   resolveRoofTopForWallFacet,
-  WALL_CLADDING_OPTIONS
+  switchWallOpeningType,
+  updateWallFacetKind,
+  WALL_CLADDING_OPTIONS,
+  WALL_FACET_KIND_OPTIONS
 } from '../../utils/wallCladdingEngine';
 import { SAMPLE_PROJECT_PLANS } from '../../data/sampleArchitecturalPlans';
 
@@ -57,6 +73,8 @@ interface Props {
   onSelectFacet: (facetId: string) => void;
   onUpdateFacet: (updatedFacet: WallFacet) => void;
   onBackToPlan?: () => void;
+  onPromoteVoidToSecondary?: (facetId: string, openingId: string, depthM: number) => void;
+  secondaryZones?: WallSecondaryZone[];
   readOnly?: boolean;
 }
 
@@ -79,6 +97,8 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   onSelectFacet,
   onUpdateFacet,
   onBackToPlan,
+  onPromoteVoidToSecondary,
+  secondaryZones = [],
   readOnly = false
 }) => {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -93,11 +113,13 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   const [calPtsNorm, setCalPtsNorm] = useState<Point2D[]>([]);
   const [calDistM, setCalDistM] = useState<string>('2.10');
   const [imageAspect, setImageAspect] = useState<number>(1.45);
+  const [promoteDepthM, setPromoteDepthM] = useState<string>('2.4');
 
   // Zoom & Pan state for inspecting underlay scans & parametric openings
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isPanDragging, setIsPanDragging] = useState<boolean>(false);
+  const [isOpeningDragging, setIsOpeningDragging] = useState<boolean>(false);
   const zoomRef = useRef<number>(1);
   const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   zoomRef.current = zoom;
@@ -112,6 +134,18 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     originPanY: number;
     moved: boolean;
   } | null>(null);
+  const openingDragRef = useRef<{
+    pointerId: number;
+    openingId: string;
+    mode: 'move' | 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se';
+    startU: number;
+    startV: number;
+    startW: number;
+    startH: number;
+    startSvgX: number;
+    startSvgY: number;
+    moved: boolean;
+  } | null>(null);
   const suppressNextClickRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -120,6 +154,8 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     setSelectedOpeningId(facet.openings[0]?.id || null);
     setCalibratingTwoPt(false);
     setCalPtsNorm([]);
+    openingDragRef.current = null;
+    setIsOpeningDragging(false);
   }, [facet.id]);
 
   const metrics = useMemo(() => computeWallFacetMetrics(facet), [facet]);
@@ -330,6 +366,37 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     onUpdateFacet({ ...facet, openings: updated });
   };
 
+  const handleSwitchOpeningType = (opId: string, nextType: WallOpeningType) => {
+    if (readOnly) return;
+    const updated = facet.openings.map((op) =>
+      op.id === opId ? switchWallOpeningType(facet, op, nextType) : op
+    );
+    onUpdateFacet({ ...facet, openings: updated });
+  };
+
+  const handleNudgeOpening = (opId: string, duM: number, dvM: number) => {
+    if (readOnly) return;
+    const target = facet.openings.find((o) => o.id === opId);
+    if (!target) return;
+    handleUpdateOpening(opId, {
+      distFromStartM: +(target.distFromStartM + duM).toFixed(3),
+      sillHeightM: +(target.sillHeightM + dvM).toFixed(3)
+    });
+  };
+
+  const handleDuplicateOpening = (opId: string) => {
+    if (readOnly) return;
+    const res = duplicateWallOpening(facet, opId);
+    if (!res) return;
+    onUpdateFacet({ ...facet, openings: res.openings });
+    setSelectedOpeningId(res.created.id);
+  };
+
+  const handleResolveOverlap = (opId: string) => {
+    if (readOnly) return;
+    onUpdateFacet({ ...facet, openings: resolveOpeningOverlap(facet, opId) });
+  };
+
   const handleDeleteOpening = (opId: string) => {
     if (readOnly) return;
     const remaining = facet.openings.filter((o) => o.id !== opId);
@@ -339,10 +406,51 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     }
   };
 
+  const facetRef = useRef(facet);
+  facetRef.current = facet;
+  const selectedOpeningOverlap = useMemo(() => {
+    if (!selectedOpening) return { hasOverlap: false, overlappingIds: [] };
+    return findOpeningOverlaps(facet, selectedOpening, selectedOpening.id);
+  }, [facet, selectedOpening]);
+
+  useEffect(() => {
+    if (readOnly || !selectedOpeningId) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      const curFacet = facetRef.current;
+      const curOp = curFacet.openings.find((o) => o.id === selectedOpeningId);
+      if (!curOp) return;
+
+      const step = e.shiftKey ? 0.1 : 0.01;
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        handleNudgeOpening(curOp.id, -step, 0);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        handleNudgeOpening(curOp.id, step, 0);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        handleNudgeOpening(curOp.id, 0, step);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        handleNudgeOpening(curOp.id, 0, -step);
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        handleDeleteOpening(curOp.id);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [readOnly, selectedOpeningId]);
+
   // True-scale SVG elevation layout (1 unit = 100 px per metre)
   const pxPerM = 100;
   const maxProfileHeight =
-    facet.heightSource === 'roof' && facet.roofProfile && facet.roofProfile.length > 0
+    facet.heightSource === 'roof' &&
+    facet.kind !== 'parapet' &&
+    facet.roofProfile &&
+    facet.roofProfile.length > 0
       ? Math.max(facet.heightM, ...facet.roofProfile.map((p) => p.topZ - facet.bottomZ))
       : facet.heightM;
   const padL = 78;
@@ -421,12 +529,56 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     return () => viewport.removeEventListener('wheel', handleWheel);
   }, [svgW, svgH]);
 
+  const clientToSvgPoint = (clientX: number, clientY: number): Point2D | null => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const fitScale = Math.min(rect.width / vbW, rect.height / vbH) || 1;
+    const renderedW = vbW * fitScale;
+    const renderedH = vbH * fitScale;
+    const padLeftPx = (rect.width - renderedW) / 2;
+    const padTopPx = (rect.height - renderedH) / 2;
+    return {
+      x: vbX + (clientX - rect.left - padLeftPx) / Math.max(0.01, fitScale),
+      y: vbY + (clientY - rect.top - padTopPx) / Math.max(0.01, fitScale)
+    };
+  };
+
+  const startOpeningDrag = (
+    e: React.PointerEvent<SVGElement>,
+    op: WallOpening,
+    mode: 'move' | 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se'
+  ) => {
+    if (readOnly || calibratingTwoPt) return;
+    e.stopPropagation();
+    const svgPt = clientToSvgPoint(e.clientX, e.clientY);
+    if (!svgPt) return;
+    const c = clampWallOpeningToFacet(facet, op);
+    setSelectedOpeningId(c.id);
+    openingDragRef.current = {
+      pointerId: e.pointerId,
+      openingId: c.id,
+      mode,
+      startU: c.distFromStartM,
+      startV: c.sillHeightM,
+      startW: c.widthM,
+      startH: c.heightM,
+      startSvgX: svgPt.x,
+      startSvgY: svgPt.y,
+      moved: false
+    };
+    setIsOpeningDragging(true);
+  };
+
   const handleSvgPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
     activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (activePointersRef.current.size === 2) {
       const pts = Array.from(activePointersRef.current.values());
       lastPinchDistRef.current = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
       panDragRef.current = null;
+      openingDragRef.current = null;
+      setIsOpeningDragging(false);
       setIsPanDragging(false);
       return;
     }
@@ -448,6 +600,53 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
     const fitScale = Math.min(rect.width / vbW, rect.height / vbH) || 1;
+
+    if (openingDragRef.current && openingDragRef.current.pointerId === e.pointerId) {
+      const drag = openingDragRef.current;
+      const svgPt = clientToSvgPoint(e.clientX, e.clientY);
+      if (!svgPt) return;
+      const duM = (svgPt.x - drag.startSvgX) / pxPerM;
+      const dvM = -(svgPt.y - drag.startSvgY) / pxPerM;
+      if (Math.hypot(duM, dvM) > 0.005) {
+        drag.moved = true;
+      }
+
+      const snap = (v: number) => Math.round(v * 100) / 100; // 10mm precision
+      let u0 = drag.startU;
+      let u1 = drag.startU + drag.startW;
+      let v0 = drag.startV;
+      let v1 = drag.startV + drag.startH;
+
+      if (drag.mode === 'move') {
+        const nextU = Math.max(0, Math.min(facet.lengthM - drag.startW, snap(drag.startU + duM)));
+        const nextV = Math.max(0, Math.min(facet.heightM - drag.startH, snap(drag.startV + dvM)));
+        u0 = nextU;
+        u1 = nextU + drag.startW;
+        v0 = nextV;
+        v1 = nextV + drag.startH;
+      } else {
+        if (drag.mode.includes('w')) {
+          u0 = Math.max(0, Math.min(u1 - 0.2, snap(drag.startU + duM)));
+        }
+        if (drag.mode.includes('e')) {
+          u1 = Math.min(facet.lengthM, Math.max(u0 + 0.2, snap(drag.startU + drag.startW + duM)));
+        }
+        if (drag.mode.includes('s')) {
+          v0 = Math.max(0, Math.min(v1 - 0.2, snap(drag.startV + dvM)));
+        }
+        if (drag.mode.includes('n')) {
+          v1 = Math.min(facet.heightM, Math.max(v0 + 0.2, snap(drag.startV + drag.startH + dvM)));
+        }
+      }
+
+      handleUpdateOpening(drag.openingId, {
+        distFromStartM: +u0.toFixed(3),
+        sillHeightM: +v0.toFixed(3),
+        widthM: +(u1 - u0).toFixed(3),
+        heightM: +(v1 - v0).toFixed(3)
+      });
+      return;
+    }
 
     if (activePointersRef.current.has(e.pointerId)) {
       const prev = activePointersRef.current.get(e.pointerId)!;
@@ -485,6 +684,13 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   };
 
   const handleSvgPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (openingDragRef.current && openingDragRef.current.pointerId === e.pointerId) {
+      if (openingDragRef.current.moved) {
+        suppressNextClickRef.current = true;
+      }
+      openingDragRef.current = null;
+      setIsOpeningDragging(false);
+    }
     if (panDragRef.current && panDragRef.current.pointerId === e.pointerId) {
       if (panDragRef.current.moved) {
         suppressNextClickRef.current = true;
@@ -1136,15 +1342,34 @@ export const WallElevationWorkbench: React.FC<Props> = ({
               />
 
               {/* Layer 2B: Roof-Linked Top Rake/Eave Profile Overlay */}
-              {facet.heightSource === 'roof' && facet.roofProfile && facet.roofProfile.length >= 2 && (
-                <polyline
-                  points={facet.roofProfile
-                    .map((p) => `${toSvgX(p.distM)},${toSvgY(Math.max(0.2, p.topZ - facet.bottomZ))}`)
-                    .join(' ')}
-                  fill="none"
-                  stroke="#38bdf8"
-                  strokeWidth="3"
-                  strokeDasharray="8 4"
+              {facet.heightSource === 'roof' &&
+                facet.kind !== 'parapet' &&
+                facet.roofProfile &&
+                facet.roofProfile.length >= 2 && (
+                  <polyline
+                    points={facet.roofProfile
+                      .map((p) => `${toSvgX(p.distM)},${toSvgY(Math.max(0.2, p.topZ - facet.bottomZ))}`)
+                      .join(' ')}
+                    fill="none"
+                    stroke="#38bdf8"
+                    strokeWidth="3"
+                    strokeDasharray="8 4"
+                    pointerEvents="none"
+                  />
+                )}
+
+              {/* Layer 2C: Parapet Metal Coping Flashing Cap */}
+              {facet.kind === 'parapet' && facet.hasCopingFlashing !== false && (
+                <rect
+                  x={padL - 3}
+                  y={toSvgY(facet.heightM) - 7}
+                  width={wallW + 6}
+                  height={7}
+                  rx={1.5}
+                  fill="#c084fc"
+                  fillOpacity="0.88"
+                  stroke="#f3e8ff"
+                  strokeWidth="1.2"
                   pointerEvents="none"
                 />
               )}
@@ -1226,7 +1451,7 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                 </text>
               </g>
 
-              {/* Layer 3: Parametric Openings Cutouts */}
+              {/* Layer 3: Interactive Parametric Openings Cutouts + 8-Handle Resize Gizmo */}
               {facet.openings.map((op) => {
                 const c = clampWallOpeningToFacet(facet, op);
                 const ox = toSvgX(c.distFromStartM);
@@ -1235,11 +1460,46 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                 const oh = Math.max(8, c.heightM * pxPerM);
                 const style = OPENING_STYLE[c.type];
                 const isSel = c.id === selectedOpeningId;
+                const opOverlap = findOpeningOverlaps(facet, c, c.id).hasOverlap;
+                const handleR = Math.max(4.5, Math.min(7, 6 / Math.sqrt(Math.max(1, zoom))));
+
+                const resizeHandles: Array<{
+                  mode: 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+                  hx: number;
+                  hy: number;
+                  cursor: string;
+                }> = [
+                  { mode: 'nw', hx: ox, hy: oy, cursor: 'nwse-resize' },
+                  { mode: 'n', hx: ox + ow / 2, hy: oy, cursor: 'ns-resize' },
+                  { mode: 'ne', hx: ox + ow, hy: oy, cursor: 'nesw-resize' },
+                  { mode: 'e', hx: ox + ow, hy: oy + oh / 2, cursor: 'ew-resize' },
+                  { mode: 'se', hx: ox + ow, hy: oy + oh, cursor: 'nwse-resize' },
+                  { mode: 's', hx: ox + ow / 2, hy: oy + oh, cursor: 'ns-resize' },
+                  { mode: 'sw', hx: ox, hy: oy + oh, cursor: 'nesw-resize' },
+                  { mode: 'w', hx: ox, hy: oy + oh / 2, cursor: 'ew-resize' }
+                ];
 
                 return (
                   <g
                     key={c.id}
-                    className={calibratingTwoPt ? 'pointer-events-none' : 'cursor-pointer'}
+                    className={
+                      calibratingTwoPt
+                        ? 'pointer-events-none'
+                        : readOnly
+                        ? 'cursor-pointer'
+                        : isOpeningDragging
+                        ? 'cursor-grabbing'
+                        : 'cursor-move'
+                    }
+                    onPointerDown={(ev) => {
+                      if (calibratingTwoPt) return;
+                      if (readOnly) {
+                        ev.stopPropagation();
+                        setSelectedOpeningId(c.id);
+                        return;
+                      }
+                      startOpeningDrag(ev, c, 'move');
+                    }}
                     onClick={(ev) => {
                       if (calibratingTwoPt || suppressNextClickRef.current) return;
                       ev.stopPropagation();
@@ -1251,9 +1511,10 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       y={oy}
                       width={ow}
                       height={oh}
-                      fill={style.fill}
-                      stroke={isSel ? '#ffffff' : style.stroke}
+                      fill={opOverlap ? 'rgba(244, 63, 94, 0.36)' : style.fill}
+                      stroke={opOverlap ? '#fb7185' : isSel ? '#ffffff' : style.stroke}
                       strokeWidth={isSel ? 3.5 : 2}
+                      strokeDasharray={c.type === 'void' ? '6 4' : undefined}
                     />
                     {c.type === 'window' && (
                       <line
@@ -1264,12 +1525,13 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                         stroke={style.stroke}
                         strokeWidth="1.2"
                         opacity="0.7"
+                        pointerEvents="none"
                       />
                     )}
                     {c.type === 'garage' && (
                       <>
-                        <line x1={ox} y1={oy + oh * 0.33} x2={ox + ow} y2={oy + oh * 0.33} stroke={style.stroke} strokeWidth="1" opacity="0.65" />
-                        <line x1={ox} y1={oy + oh * 0.66} x2={ox + ow} y2={oy + oh * 0.66} stroke={style.stroke} strokeWidth="1" opacity="0.65" />
+                        <line x1={ox} y1={oy + oh * 0.33} x2={ox + ow} y2={oy + oh * 0.33} stroke={style.stroke} strokeWidth="1" opacity="0.65" pointerEvents="none" />
+                        <line x1={ox} y1={oy + oh * 0.66} x2={ox + ow} y2={oy + oh * 0.66} stroke={style.stroke} strokeWidth="1" opacity="0.65" pointerEvents="none" />
                       </>
                     )}
                     <text
@@ -1280,6 +1542,7 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       fontSize="14"
                       fontWeight="bold"
                       fontFamily="sans-serif"
+                      pointerEvents="none"
                     >
                       {c.label || style.label}
                     </text>
@@ -1290,9 +1553,27 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       fill="#e2e8f0"
                       fontSize="13"
                       fontFamily="monospace"
+                      pointerEvents="none"
                     >
                       {c.widthM.toFixed(2)}×{c.heightM.toFixed(2)}m
                     </text>
+                    {isSel && !readOnly && !calibratingTwoPt &&
+                      resizeHandles.map((h) => (
+                        <rect
+                          key={`${c.id}-${h.mode}`}
+                          x={h.hx - handleR}
+                          y={h.hy - handleR}
+                          width={handleR * 2}
+                          height={handleR * 2}
+                          rx={1.5}
+                          fill="#ffffff"
+                          stroke="#0284c7"
+                          strokeWidth="2"
+                          style={{ cursor: h.cursor }}
+                          onPointerDown={(ev) => startOpeningDrag(ev, c, h.mode)}
+                          onClick={(ev) => ev.stopPropagation()}
+                        />
+                      ))}
                   </g>
                 );
               })}
@@ -1388,11 +1669,11 @@ export const WallElevationWorkbench: React.FC<Props> = ({
 
         {/* Right/Bottom: Wall Cladding, Roof Link & Opening Parameters */}
         <div className="lg:col-span-4 flex flex-col gap-3">
-          {/* Wall Dimensions, Roof Link & Cladding Regions */}
+          {/* Wall Dimensions, Kind / Parapet, Roof Link & Cladding Regions */}
           <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-3 space-y-3">
             <div className="flex items-center justify-between gap-2">
               <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-300">
-                Face {facet.code} Height &amp; Finish
+                Face {facet.code} Role, Height &amp; Finish
               </span>
               <span
                 className={`text-[10px] font-bold ${
@@ -1403,7 +1684,52 @@ export const WallElevationWorkbench: React.FC<Props> = ({
               </span>
             </div>
 
-            {!readOnly && roofMatchInfo && (
+            {/* Wall Role / Kind selector */}
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="text-[10px] font-bold uppercase text-slate-400">Wall Kind</span>
+              <select
+                disabled={readOnly}
+                value={getWallFacetKind(facet)}
+                onChange={(e) => {
+                  const nextKind = e.target.value as WallFacetKind;
+                  onUpdateFacet(updateWallFacetKind(facet, nextKind));
+                }}
+                className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white cursor-pointer disabled:opacity-60"
+              >
+                {WALL_FACET_KIND_OPTIONS.map((kOpt) => (
+                  <option key={kOpt.kind} value={kOpt.kind}>
+                    {kOpt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {facet.kind === 'parapet' && (
+              <div className="bg-purple-950/35 border border-purple-500/40 rounded-xl p-2.5 space-y-2 text-[11px]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-extrabold text-purple-200">
+                    Parapet Coping Flashing
+                  </span>
+                  <span className="font-mono font-bold text-purple-300 tabular-nums">
+                    {facet.hasCopingFlashing !== false ? `${facet.lengthM.toFixed(2)} lm` : '0.00 lm'}
+                  </span>
+                </div>
+                <label className="flex items-center gap-2 text-slate-300 font-bold cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={readOnly}
+                    checked={facet.hasCopingFlashing !== false}
+                    onChange={(e) =>
+                      onUpdateFacet({ ...facet, hasCopingFlashing: e.target.checked })
+                    }
+                    className="accent-purple-400 cursor-pointer"
+                  />
+                  <span>Include metal parapet coping capping on takeoff</span>
+                </label>
+              </div>
+            )}
+
+            {!readOnly && roofMatchInfo && facet.kind !== 'parapet' && facet.kind !== 'wing' && facet.kind !== 'secondary' && (
               <button
                 type="button"
                 onClick={handleFitTopToRoof}
@@ -1587,7 +1913,7 @@ export const WallElevationWorkbench: React.FC<Props> = ({
             </div>
           </div>
 
-          {/* Openings List & Selected Opening Parameter Editor */}
+          {/* Openings List & Interactive Selected Opening Editor */}
           <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-3 space-y-2.5 flex-1">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-300">
@@ -1607,42 +1933,61 @@ export const WallElevationWorkbench: React.FC<Props> = ({
 
             {facet.openings.length === 0 ? (
               <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-3 text-[11px] text-slate-400">
-                No windows or doors on Wall {facet.code}. Attach an elevation scan or use the toolbar above to place cutouts.
+                No windows or doors on Wall {facet.code}. Attach an elevation scan or click + Window/Door/Garage/Void above to place, then drag edges directly on the wall.
               </div>
             ) : (
               <div className="space-y-1 max-h-32 overflow-y-auto pr-0.5">
                 {facet.openings.map((op) => {
                   const isSel = op.id === selectedOpeningId;
+                  const opHasOverlap = findOpeningOverlaps(facet, op, op.id).hasOverlap;
                   return (
                     <div
                       key={op.id}
                       onClick={() => setSelectedOpeningId(op.id)}
                       className={`p-2 rounded-xl border flex items-center justify-between gap-2 text-xs cursor-pointer transition-colors ${
-                        isSel
+                        opHasOverlap
+                          ? 'bg-rose-950/35 border-rose-500/60 text-white'
+                          : isSel
                           ? 'bg-sky-950/45 border-sky-500/60 text-white'
                           : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
                       }`}
                     >
                       <div className="min-w-0">
-                        <div className="font-bold text-[11px] truncate">
-                          {op.label || OPENING_STYLE[op.type].label}
+                        <div className="font-bold text-[11px] truncate flex items-center gap-1.5">
+                          <span>{op.label || OPENING_STYLE[op.type].label}</span>
+                          {opHasOverlap && (
+                            <AlertTriangle className="w-3 h-3 text-rose-400 shrink-0" />
+                          )}
                         </div>
                         <div className="text-[10px] font-mono text-slate-400 tabular-nums">
                           {op.widthM.toFixed(2)}×{op.heightM.toFixed(2)}m @ {op.distFromStartM.toFixed(2)}m
                         </div>
                       </div>
                       {!readOnly && (
-                        <button
-                          type="button"
-                          onClick={(ev) => {
-                            ev.stopPropagation();
-                            handleDeleteOpening(op.id);
-                          }}
-                          className="p-1 text-slate-500 hover:text-rose-400 cursor-pointer"
-                          title="Delete opening"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex items-center gap-0.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              handleDuplicateOpening(op.id);
+                            }}
+                            className="p-1 text-slate-500 hover:text-sky-400 cursor-pointer"
+                            title="Duplicate opening"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              handleDeleteOpening(op.id);
+                            }}
+                            className="p-1 text-slate-500 hover:text-rose-400 cursor-pointer"
+                            title="Delete opening"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       )}
                     </div>
                   );
@@ -1652,7 +1997,25 @@ export const WallElevationWorkbench: React.FC<Props> = ({
 
             {selectedOpening && (
               <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5 space-y-2">
-                <div className="flex items-center justify-between gap-2">
+                {selectedOpeningOverlap.hasOverlap && (
+                  <div className="bg-rose-950/50 border border-rose-500/50 rounded-lg px-2 py-1.5 flex items-center justify-between gap-2 text-[11px]">
+                    <span className="text-rose-200 font-bold flex items-center gap-1">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                      <span>Overlaps another opening</span>
+                    </span>
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        onClick={() => handleResolveOverlap(selectedOpening.id)}
+                        className="px-2 py-0.5 rounded bg-rose-500 hover:bg-rose-400 text-slate-950 font-extrabold text-[10px] cursor-pointer"
+                      >
+                        Resolve
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between gap-1.5">
                   <input
                     type="text"
                     disabled={readOnly}
@@ -1661,23 +2024,17 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                     onChange={(e) =>
                       handleUpdateOpening(selectedOpening.id, { label: e.target.value })
                     }
-                    className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white focus:outline-hidden focus:border-sky-400"
+                    className="flex-1 min-w-0 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-white focus:outline-hidden focus:border-sky-400"
                   />
                   <select
                     disabled={readOnly}
                     value={selectedOpening.type}
-                    onChange={(e) => {
-                      const nextType = e.target.value as WallOpeningType;
-                      handleUpdateOpening(selectedOpening.id, {
-                        type: nextType,
-                        sillHeightM:
-                          nextType === 'door' || nextType === 'garage'
-                            ? 0
-                            : selectedOpening.sillHeightM === 0
-                            ? 0.9
-                            : selectedOpening.sillHeightM
-                      });
-                    }}
+                    onChange={(e) =>
+                      handleSwitchOpeningType(
+                        selectedOpening.id,
+                        e.target.value as WallOpeningType
+                      )
+                    }
                     className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs font-bold text-slate-200 cursor-pointer"
                   >
                     <option value="window">Window</option>
@@ -1686,6 +2043,64 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                     <option value="void">Void</option>
                   </select>
                 </div>
+
+                {/* 10mm Nudge + Duplicate + Delete Quick Bar */}
+                {!readOnly && (
+                  <div className="flex items-center justify-between gap-1 pt-0.5">
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px] font-bold text-slate-500 mr-0.5">10mm:</span>
+                      <button
+                        type="button"
+                        onClick={() => handleNudgeOpening(selectedOpening.id, -0.01, 0)}
+                        className="p-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 cursor-pointer"
+                        title="Nudge Left 10mm (Left Arrow)"
+                      >
+                        <ArrowLeft className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleNudgeOpening(selectedOpening.id, 0.01, 0)}
+                        className="p-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 cursor-pointer"
+                        title="Nudge Right 10mm (Right Arrow)"
+                      >
+                        <ArrowRight className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleNudgeOpening(selectedOpening.id, 0, 0.01)}
+                        className="p-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 cursor-pointer"
+                        title="Nudge Up 10mm (Up Arrow)"
+                      >
+                        <ArrowUp className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleNudgeOpening(selectedOpening.id, 0, -0.01)}
+                        className="p-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 cursor-pointer"
+                        title="Nudge Down 10mm (Down Arrow)"
+                      >
+                        <ArrowDown className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => handleDuplicateOpening(selectedOpening.id)}
+                        className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 flex items-center gap-1 cursor-pointer"
+                      >
+                        <Copy className="w-3 h-3" />
+                        <span>Dup</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteOpening(selectedOpening.id)}
+                        className="px-2 py-1 rounded bg-slate-900 hover:bg-rose-950/60 border border-slate-700 hover:border-rose-500/50 text-[10px] font-bold text-rose-300 cursor-pointer"
+                      >
+                        Del
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 <div className="grid grid-cols-2 gap-1.5 text-[11px] tabular-nums">
                   <label className="space-y-0.5">
@@ -1757,6 +2172,73 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                     />
                   </label>
                 </div>
+
+                {/* Void Promotion -> Secondary Wall Section (e.g. Patio Alcove / Entry Court) */}
+                {selectedOpening.type === 'void' && onPromoteVoidToSecondary && (
+                  <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                    {selectedOpening.linkedSecondaryZoneId ? (
+                      <div className="flex items-center justify-between gap-2 bg-violet-950/40 border border-violet-500/40 rounded-lg px-2.5 py-1.5 text-[11px]">
+                        <span className="font-bold text-violet-200 truncate">
+                          Linked:{' '}
+                          {secondaryZones.find((z) => z.id === selectedOpening.linkedSecondaryZoneId)
+                            ?.name || 'Secondary Alcove'}
+                        </span>
+                        {(() => {
+                          const z = secondaryZones.find(
+                            (zn) => zn.id === selectedOpening.linkedSecondaryZoneId
+                          );
+                          const firstChildId = z?.facetIds[0];
+                          return firstChildId ? (
+                            <button
+                              type="button"
+                              onClick={() => onSelectFacet(firstChildId)}
+                              className="px-2 py-0.5 rounded bg-violet-500 hover:bg-violet-400 text-slate-950 font-extrabold text-[10px] cursor-pointer shrink-0"
+                            >
+                              Open Walls
+                            </button>
+                          ) : null;
+                        })()}
+                      </div>
+                    ) : (
+                      !readOnly && (
+                        <div className="bg-violet-950/35 border border-violet-500/35 rounded-lg p-2 space-y-1.5">
+                          <div className="text-[10px] font-extrabold text-violet-200 flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-violet-400" />
+                            <span>Promote Void to Secondary Wall Section</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <label className="flex items-center gap-1 text-[10px] text-slate-300 font-bold">
+                              <span>Depth (m)</span>
+                              <input
+                                type="number"
+                                step="0.2"
+                                min="0.4"
+                                max="12"
+                                value={promoteDepthM}
+                                onChange={(e) => setPromoteDepthM(e.target.value)}
+                                className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono font-bold text-[11px]"
+                              />
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const d = parseFloat(promoteDepthM);
+                                onPromoteVoidToSecondary(
+                                  facet.id,
+                                  selectedOpening.id,
+                                  Number.isFinite(d) && d >= 0.4 ? d : 2.4
+                                );
+                              }}
+                              className="flex-1 py-1 px-2 rounded-lg bg-violet-500 hover:bg-violet-400 text-slate-950 font-extrabold text-[11px] cursor-pointer"
+                            >
+                              Create Secondary Section
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>

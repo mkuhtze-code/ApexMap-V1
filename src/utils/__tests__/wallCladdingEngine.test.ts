@@ -24,6 +24,7 @@ import {
   fitWallFacetTopToRoof,
   isWallFacetUndetailed,
   linkWallFacetsToRoofLevels,
+  mergePreservedExtraFacets,
   removeSecondaryZone,
   resolveOpeningOverlap,
   sanitizeWallOpeningsForExtrusion,
@@ -816,5 +817,34 @@ geos.forEach((g) => g.dispose());
 mats.forEach((m) => m.dispose());
 testGlassMat.dispose();
 console.log('✓ Test 18 Passed: Headless 3D wall extrusion succeeds across stacked openings, short nibs, dado, parapet, wings & secondary');
+
+// 19. Preserving wing & secondary walls when rebuilding primary ring facets
+const extraPlan = addWingWallToPlan(
+  batched,
+  [
+    { x: 10, y: 8 },
+    { x: 12.5, y: 8 }
+  ],
+  { heightM: 2.2, claddingType: 'weatherboard' }
+);
+const rebuiltRingOnly = buildWallFacetsFromPlan(
+  { points: extraPlan.points, edges: extraPlan.edges },
+  { defaultHeightM: 2.7, existingFacets: extraPlan.facets }
+);
+const mergedRebuild = mergePreservedExtraFacets(extraPlan, rebuiltRingOnly);
+assert.ok(
+  mergedRebuild.some((f) => f.kind === 'wing'),
+  'mergePreservedExtraFacets must keep open wing facets on rebuild'
+);
+assert.ok(
+  mergedRebuild.some((f) => f.kind === 'secondary'),
+  'mergePreservedExtraFacets must keep secondary alcove facets on rebuild'
+);
+assert.equal(
+  new Set(mergedRebuild.map((f) => f.id)).size,
+  mergedRebuild.length,
+  'Merged rebuilt facets maintain strictly unique IDs'
+);
+console.log('✓ Test 19 Passed: Perimeter rebuild preserves wing & secondary facets with unique IDs');
 
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

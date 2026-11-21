@@ -1,15 +1,21 @@
 import { FlashingProfile } from '../types/crm';
 import {
   AssignableRoofLine,
+  FaceRoofingPack,
   LayoutResult,
+  OrderPack,
   PlanEdge,
   Point2D,
   RoofAsset,
   RoofFlashingAssignment,
   RoofLevel,
+  RoofLifecycleStage,
   RoofOutline,
   RoofPlane,
-  SheetSpec
+  SheetSpec,
+  TakeoffCompletenessIssue,
+  TakeoffCompletenessReport,
+  WallPlan
 } from '../types/exactRoofing';
 import {
   buildOutlineFromPoints,
@@ -621,4 +627,241 @@ export function buildAutoFlashingAssignments(params: {
   });
 
   return added;
+}
+
+export interface CalmStageActionItem {
+  id: string;
+  label: string;
+  detail: string;
+  kind: 'fix_issue' | 'apply_patch' | 'open_flashings' | 'open_wall_plan' | 'open_order_pack' | 'select_plane';
+  severity: 'blocker' | 'warning' | 'ready';
+  issue?: TakeoffCompletenessIssue;
+  patch?: DeterministicRoofPatch;
+  targetPlaneId?: string;
+}
+
+export interface CalmStageGuidance {
+  stage: RoofLifecycleStage;
+  headline: string;
+  summary: string;
+  statusTone: 'ready' | 'attention' | 'blocked';
+  metricsLine: string;
+  actions: CalmStageActionItem[];
+}
+
+/**
+ * Calm systems-level guidance derived strictly from existing Order Pack, completeness report,
+ * wall plan, and install packs. Never invents quantities or pricing.
+ */
+export function buildCalmStageGuidance(params: {
+  stage: RoofLifecycleStage;
+  measureLocked?: boolean;
+  planes: RoofPlane[];
+  layout: LayoutResult | null;
+  orderPack?: OrderPack | null;
+  completenessReport?: TakeoffCompletenessReport | null;
+  wallPlan?: WallPlan | null;
+  roofingPacks?: FaceRoofingPack[];
+  completedPlaneIds?: string[];
+  selectedPlane?: RoofPlane | null;
+  auditReport?: DeterministicRoofAuditReport | null;
+}): CalmStageGuidance {
+  const {
+    stage,
+    measureLocked = false,
+    planes,
+    layout,
+    orderPack,
+    completenessReport,
+    wallPlan,
+    roofingPacks = [],
+    completedPlaneIds = [],
+    selectedPlane = null,
+    auditReport = null
+  } = params;
+
+  const blockers = completenessReport?.issues.filter((i) => i.severity === 'blocker') || [];
+  const warnings = completenessReport?.issues.filter((i) => i.severity === 'warning') || [];
+  const totalSheets = orderPack?.totals.totalSheets ?? layout?.parents.length ?? 0;
+  const totalOrderedLm = orderPack?.totals.totalOrderedLm ?? 0;
+  const wallNetAreaM2 = orderPack?.walls?.totalNetAreaM2 ?? orderPack?.totals.wallNetAreaM2 ?? 0;
+  const roofAreaM2 = orderPack?.totals.roofAreaM2 ?? layout?.totalRoofArea ?? 0;
+  const flashingRunsCount = orderPack?.flashings.length ?? 0;
+
+  if (stage === 'installing') {
+    const completedSet = new Set(completedPlaneIds);
+    const nextPack = roofingPacks.find((p) => !completedSet.has(p.planeId)) || null;
+    const activePack =
+      (selectedPlane ? roofingPacks.find((p) => p.planeId === selectedPlane.id) : null) ||
+      nextPack ||
+      roofingPacks[0] ||
+      null;
+
+    const actions: CalmStageActionItem[] = [];
+    if (nextPack) {
+      const targetPlane = planes.find((p) => p.id === nextPack.planeId);
+      actions.push({
+        id: `guide-next-pack-${nextPack.planeId}`,
+        label: `Focus Pack #${nextPack.sequenceNumber}: Face ${nextPack.code}`,
+        detail: `${nextPack.packLabel}${targetPlane ? ` · ${targetPlane.underlapSide === 'left' ? 'Lay Left → Right' : 'Lay Right → Left'}` : ''}`,
+        kind: 'select_plane',
+        severity: 'ready',
+        targetPlaneId: nextPack.planeId
+      });
+    }
+    if (orderPack) {
+      actions.push({
+        id: 'guide-view-order-pack',
+        label: 'Open Locked Order Pack',
+        detail: `${totalSheets} ordered sheets · ${flashingRunsCount} flashing runs (quantities only)`,
+        kind: 'open_order_pack',
+        severity: 'ready'
+      });
+    }
+
+    return {
+      stage,
+      headline: nextPack
+        ? `Next Up: Pack #${nextPack.sequenceNumber} · Face ${nextPack.code}`
+        : roofingPacks.length > 0
+        ? 'All Roof Packs Completed'
+        : 'Install Spec Reference',
+      summary: nextPack
+        ? `${nextPack.packLabel}. Keep laps locked on ${
+            activePack?.outOfOrderOffcutWarning
+              ? 'pack order to preserve repress offcuts.'
+              : 'sheet sequence shown on Plan.'
+          }`
+        : roofingPacks.length > 0
+        ? `All ${roofingPacks.length} roof packs marked complete. Check flashing laps and penetrations for sign-off.`
+        : 'Lock a roof measure to generate sequenced site packs.',
+      statusTone: nextPack?.outOfOrderOffcutWarning ? 'attention' : 'ready',
+      metricsLine: `${completedSet.size}/${roofingPacks.length} packs done · ${totalSheets} sheets · ${flashingRunsCount} flashings`,
+      actions: actions.slice(0, 2)
+    };
+  }
+
+  if (stage === 'measuring') {
+    const actions: CalmStageActionItem[] = [];
+
+    blockers.slice(0, 3).forEach((issue) => {
+      actions.push({
+        id: `guide-blocker-${issue.id}`,
+        label: `Fix: ${issue.title}`,
+        detail: issue.detail,
+        kind: 'fix_issue',
+        severity: 'blocker',
+        issue
+      });
+    });
+
+    if (actions.length < 3 && auditReport?.recommendedPatches.length) {
+      const topPatch = auditReport.recommendedPatches[0];
+      actions.push({
+        id: `guide-patch-${topPatch.id}`,
+        label: topPatch.label,
+        detail: topPatch.reason,
+        kind: 'apply_patch',
+        severity: topPatch.severity === 'critical' ? 'blocker' : 'warning',
+        patch: topPatch
+      });
+    }
+
+    if (actions.length < 3 && warnings.length > 0) {
+      const firstWarn = warnings[0];
+      actions.push({
+        id: `guide-warn-${firstWarn.id}`,
+        label: firstWarn.title,
+        detail: firstWarn.detail,
+        kind: 'fix_issue',
+        severity: 'warning',
+        issue: firstWarn
+      });
+    }
+
+    const readyToLock = blockers.length === 0 && planes.length > 0;
+    return {
+      stage,
+      headline: measureLocked
+        ? 'Measure Locked · Order Pack Emitted'
+        : readyToLock
+        ? warnings.length > 0
+          ? `Ready to Lock (${warnings.length} optional warning${warnings.length > 1 ? 's' : ''})`
+          : 'Measure Verified · Ready to Lock'
+        : `${blockers.length} Blocker${blockers.length === 1 ? '' : 's'} Before Lock`,
+      summary: measureLocked
+        ? 'Geometry and ordered sheet lengths are frozen for yard & site packs.'
+        : blockers.length > 0
+        ? `Resolve ${blockers.length} item${blockers.length === 1 ? '' : 's'} below (returns, structural flashings, face pitch, or penetrations) before locking measure.`
+        : 'Confirm any site-measured sheet length overrides and lock measure to emit the final Order Pack.',
+      statusTone: blockers.length > 0 ? 'blocked' : warnings.length > 0 ? 'attention' : 'ready',
+      metricsLine: `${planes.length} faces · ${totalSheets} sheets (${totalOrderedLm.toFixed(1)} lm)${
+        wallNetAreaM2 > 0 ? ` · ${wallNetAreaM2.toFixed(1)} m² walls` : ''
+      }`,
+      actions: actions.slice(0, 3)
+    };
+  }
+
+  // Quoting stage
+  const actions: CalmStageActionItem[] = [];
+  if (blockers.length > 0) {
+    actions.push({
+      id: `guide-quote-gap-${blockers[0].id}`,
+      label: blockers[0].title,
+      detail: blockers[0].detail,
+      kind: 'fix_issue',
+      severity: 'blocker',
+      issue: blockers[0]
+    });
+  }
+  if (auditReport?.recommendedPatches.length) {
+    const topPatch = auditReport.recommendedPatches[0];
+    actions.push({
+      id: `guide-quote-patch-${topPatch.id}`,
+      label: topPatch.label,
+      detail: topPatch.reason,
+      kind: 'apply_patch',
+      severity: 'warning',
+      patch: topPatch
+    });
+  }
+  if (wallPlan && wallPlan.facets.length > 0 && warnings.some((w) => w.category.startsWith('undetailed'))) {
+    actions.push({
+      id: 'guide-quote-walls',
+      label: 'Review Undetailed Wall Faces',
+      detail: `${completenessReport?.undetailedWallsCount || 0} wall faces need cladding selected for complete takeoff.`,
+      kind: 'open_wall_plan',
+      severity: 'warning'
+    });
+  }
+  if (actions.length === 0 && planes.length > 0) {
+    actions.push({
+      id: 'guide-quote-order',
+      label: 'Review Draft Order Pack',
+      detail: `${totalSheets} sheets (${totalOrderedLm.toFixed(1)} lm) · ${flashingRunsCount} flashing runs ready`,
+      kind: 'open_order_pack',
+      severity: 'ready'
+    });
+  }
+
+  return {
+    stage,
+    headline:
+      planes.length === 0
+        ? 'Draw Roof or Walls to Start'
+        : blockers.length === 0
+        ? 'Draft Takeoff Balanced'
+        : `${blockers.length} Takeoff Gap${blockers.length === 1 ? '' : 's'} to Tidy`,
+    summary:
+      planes.length === 0
+        ? 'Trace a roof footprint on Plan or draw exterior walls first, then generate a draft order.'
+        : blockers.length > 0
+        ? 'Close flashing or return gaps before moving to site measure, or open Draft Order now.'
+        : `Draft scope covers ${roofAreaM2.toFixed(1)} m² roof${wallNetAreaM2 > 0 ? ` + ${wallNetAreaM2.toFixed(1)} m² wall cladding` : ''}. Generate draft order when ready.`,
+    statusTone: blockers.length > 0 ? 'attention' : 'ready',
+    metricsLine: `${planes.length} faces · ${totalSheets} sheets · ${totalOrderedLm.toFixed(1)} lm · ${
+      wallPlan?.facets.length || 0
+    } walls`,
+    actions: actions.slice(0, 3)
+  };
 }

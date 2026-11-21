@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   buildAutoFlashingAssignments,
+  buildCalmStageGuidance,
   computeIdealUnderlapSideForPlane,
   getMinimumPitchForProfile,
   normalizeAndVerifyAiRoofOutline,
@@ -13,6 +14,8 @@ import {
   getPresetOutline,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
+import { buildOrderPack, computeRoofingPacks } from '../exactRoofingBomBridge';
+import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
 import { RoofLevel, SheetSpec } from '../../types/exactRoofing';
 import { DEFAULT_ARCHITECTURAL_PROFILES } from '../sheetMetalGeometry';
 
@@ -124,6 +127,70 @@ const sheetSpec: SheetSpec = {
     computeIdealUnderlapSideForPlane(northSlope, 'W'),
     'Opposing North vs South slopes mirror their leeward side-lap direction against West wind'
   );
+}
+
+// 5. Test Calm Stage Guidance across Quote, Measure, and Install modes
+{
+  const outline = getPresetOutline('rectangle_14x10');
+  const skeleton = generateSkeletonLines(outline);
+  const levels: RoofLevel[] = [
+    { id: 'level-1', code: 'L1', name: 'Main Roof', eaveHeightM: 2.7, outline, skeleton }
+  ];
+  const planes = syncMultiLevelPlanes(levels, [], 22.5);
+  const layout = generateCuttingLayout(planes, sheetSpec);
+  const assignableLines = getAssignableRoofLinesMultiLevel(levels, planes, [], []);
+  const packs = computeRoofingPacks({ planes, layout });
+  const completenessBlocked = evaluateTakeoffCompleteness({
+    levels,
+    planes,
+    assignableLines,
+    flashingAssignments: [],
+    wallPlan: null,
+    assets: []
+  });
+  const pack = buildOrderPack({
+    planes,
+    levels,
+    layout,
+    assignableLines,
+    assignments: [],
+    completenessReport: completenessBlocked
+  });
+
+  const quoteGuide = buildCalmStageGuidance({
+    stage: 'quoting',
+    planes,
+    layout,
+    orderPack: pack,
+    completenessReport: completenessBlocked
+  });
+  assert.equal(quoteGuide.stage, 'quoting');
+  assert.ok(quoteGuide.actions.length >= 1 && quoteGuide.actions.length <= 3);
+
+  const measureGuide = buildCalmStageGuidance({
+    stage: 'measuring',
+    planes,
+    layout,
+    orderPack: pack,
+    completenessReport: completenessBlocked
+  });
+  assert.equal(measureGuide.statusTone, 'blocked');
+  assert.ok(measureGuide.actions.some((a) => a.kind === 'fix_issue'));
+
+  const installGuide = buildCalmStageGuidance({
+    stage: 'installing',
+    measureLocked: true,
+    planes,
+    layout,
+    orderPack: pack,
+    roofingPacks: packs,
+    completedPlaneIds: packs[0] ? [packs[0].planeId] : []
+  });
+  assert.equal(installGuide.stage, 'installing');
+  assert.ok(!installGuide.headline.includes('$') && !installGuide.summary.includes('$'));
+  if (packs.length > 1) {
+    assert.ok(installGuide.headline.includes(packs[1].code), 'Advances next pack when Pack #1 is completed');
+  }
 }
 
 console.log('✓ All exactRoofingAiBridge deterministic + AI verification tests passed!');

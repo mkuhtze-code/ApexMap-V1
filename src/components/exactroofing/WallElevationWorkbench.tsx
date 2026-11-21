@@ -158,6 +158,12 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     setIsOpeningDragging(false);
   }, [facet.id]);
 
+  useEffect(() => {
+    if (selectedOpeningId && !facet.openings.some((o) => o.id === selectedOpeningId)) {
+      setSelectedOpeningId(facet.openings[0]?.id || null);
+    }
+  }, [facet.openings, selectedOpeningId]);
+
   const metrics = useMemo(() => computeWallFacetMetrics(facet), [facet]);
   const primaryCladding = useMemo(() => getFacetPrimaryDisplayCladding(facet), [facet]);
   const claddingMeta = useMemo(() => getWallCladdingMeta(primaryCladding), [primaryCladding]);
@@ -556,6 +562,7 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     if (!svgPt) return;
     const c = clampWallOpeningToFacet(facet, op);
     setSelectedOpeningId(c.id);
+    svgRef.current?.setPointerCapture?.(e.pointerId);
     openingDragRef.current = {
       pointerId: e.pointerId,
       openingId: c.id,
@@ -684,6 +691,9 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   };
 
   const handleSvgPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (svgRef.current?.hasPointerCapture?.(e.pointerId)) {
+      svgRef.current.releasePointerCapture(e.pointerId);
+    }
     if (openingDragRef.current && openingDragRef.current.pointerId === e.pointerId) {
       if (openingDragRef.current.moved) {
         suppressNextClickRef.current = true;
@@ -1750,7 +1760,10 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                   max="12"
                   disabled={readOnly}
                   value={+facet.heightM.toFixed(2)}
-                  onChange={(e) => handleSetHeight(parseFloat(e.target.value))}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (Number.isFinite(v)) handleSetHeight(v);
+                  }}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-sky-400 disabled:opacity-60"
                 />
               </label>
@@ -1764,7 +1777,10 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                   max="12"
                   disabled={readOnly}
                   value={+facet.bottomZ.toFixed(2)}
-                  onChange={(e) => handleSetBottomZ(parseFloat(e.target.value))}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (Number.isFinite(v)) handleSetBottomZ(v);
+                  }}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-sky-400 disabled:opacity-60"
                 />
               </label>
@@ -2112,11 +2128,10 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       max={facet.lengthM}
                       disabled={readOnly}
                       value={+selectedOpening.widthM.toFixed(2)}
-                      onChange={(e) =>
-                        handleUpdateOpening(selectedOpening.id, {
-                          widthM: parseFloat(e.target.value)
-                        })
-                      }
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (Number.isFinite(v)) handleUpdateOpening(selectedOpening.id, { widthM: v });
+                      }}
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
                     />
                   </label>
@@ -2129,11 +2144,10 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       max={facet.heightM}
                       disabled={readOnly}
                       value={+selectedOpening.heightM.toFixed(2)}
-                      onChange={(e) =>
-                        handleUpdateOpening(selectedOpening.id, {
-                          heightM: parseFloat(e.target.value)
-                        })
-                      }
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (Number.isFinite(v)) handleUpdateOpening(selectedOpening.id, { heightM: v });
+                      }}
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
                     />
                   </label>
@@ -2146,11 +2160,12 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       max={facet.lengthM}
                       disabled={readOnly}
                       value={+selectedOpening.distFromStartM.toFixed(2)}
-                      onChange={(e) =>
-                        handleUpdateOpening(selectedOpening.id, {
-                          distFromStartM: parseFloat(e.target.value)
-                        })
-                      }
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (Number.isFinite(v)) {
+                          handleUpdateOpening(selectedOpening.id, { distFromStartM: v });
+                        }
+                      }}
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
                     />
                   </label>
@@ -2163,11 +2178,12 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       max={facet.heightM}
                       disabled={readOnly}
                       value={+selectedOpening.sillHeightM.toFixed(2)}
-                      onChange={(e) =>
-                        handleUpdateOpening(selectedOpening.id, {
-                          sillHeightM: parseFloat(e.target.value)
-                        })
-                      }
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (Number.isFinite(v)) {
+                          handleUpdateOpening(selectedOpening.id, { sillHeightM: v });
+                        }
+                      }}
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
                     />
                   </label>

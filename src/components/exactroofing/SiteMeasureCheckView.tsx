@@ -155,10 +155,10 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
           <button
             type="button"
             onClick={onOpenOrderModal}
-            className="min-h-[44px] px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap"
+            className="min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-bold flex items-center gap-2 cursor-pointer whitespace-nowrap"
           >
-            <ShoppingCart className="w-4 h-4" />
-            <span>{measureLocked ? 'View Order Pack' : 'Open BOM & Order Pack'}</span>
+            <ShoppingCart className="w-4 h-4 text-sky-400" />
+            <span>{measureLocked ? 'Order Pack' : 'Review Order Pack'}</span>
           </button>
 
           {!measureLocked && (
@@ -170,22 +170,82 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
                   ? `Resolve ${completenessReport.blockersCount} blocker(s) before locking`
                   : 'Confirm & lock final site measure to emit Order Pack'
               }
-              className={`min-h-[44px] px-4 py-2 rounded-xl text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap ${
+              className={`min-h-[42px] px-4 py-2 rounded-xl text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap ${
                 completenessReport && !completenessReport.canLockMeasure
-                  ? 'bg-rose-700/80 hover:bg-rose-600 border border-rose-400/50'
-                  : 'bg-amber-600 hover:bg-amber-500'
+                  ? 'bg-rose-700 hover:bg-rose-600 border border-rose-400/50'
+                  : 'bg-emerald-600 hover:bg-emerald-500'
               }`}
             >
               <Lock className="w-4 h-4" />
               <span>
                 {completenessReport && !completenessReport.canLockMeasure
-                  ? `Review ${completenessReport.blockersCount} Blockers`
-                  : 'Confirm Measure & Lock'}
+                  ? `Resolve ${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'}`
+                  : 'Confirm & Lock'}
               </span>
             </button>
           )}
         </div>
       </div>
+
+      {/* 1B. LINEAR MEASURE CHECKLIST (Blockers & Actionable Items) */}
+      {!measureLocked && completenessReport && completenessReport.issues.length > 0 && (
+        <div
+          className={`rounded-2xl border p-3.5 space-y-2 ${
+            completenessReport.blockersCount > 0
+              ? 'bg-[#0b101d] border-rose-500/45'
+              : 'bg-[#0b101d] border-amber-500/40'
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs font-extrabold text-white">
+              <AlertTriangle
+                className={`w-4 h-4 shrink-0 ${
+                  completenessReport.blockersCount > 0 ? 'text-rose-400' : 'text-amber-400'
+                }`}
+              />
+              <span>
+                {completenessReport.blockersCount > 0
+                  ? `${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'} Must Be Resolved Before Lock`
+                  : `${completenessReport.warningsCount} Optional Warning${completenessReport.warningsCount === 1 ? '' : 's'}`}
+              </span>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+              {completenessReport.blockersCount} blockers · {completenessReport.warningsCount} warnings
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5">
+            {completenessReport.issues.slice(0, 6).map((issue) => (
+              <div
+                key={`top-${issue.id}`}
+                className="px-3 py-2 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2 text-xs"
+              >
+                <div className="min-w-0">
+                  <div className="font-bold text-slate-100 truncate">
+                    <span
+                      className={
+                        issue.severity === 'blocker' ? 'text-rose-400 mr-1.5' : 'text-amber-300 mr-1.5'
+                      }
+                    >
+                      [{issue.severity === 'blocker' ? 'Blocker' : 'Warn'}]
+                    </span>
+                    {issue.title}
+                  </div>
+                  <div className="text-[11px] text-slate-400 truncate">{issue.detail}</div>
+                </div>
+                {onJumpToCompletenessIssue && (
+                  <button
+                    type="button"
+                    onClick={() => onJumpToCompletenessIssue(issue)}
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold cursor-pointer shrink-0 whitespace-nowrap"
+                  >
+                    Fix
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* 2. 4-STEP VERIFICATION STATUS STRIP */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">

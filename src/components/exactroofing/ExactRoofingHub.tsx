@@ -114,7 +114,6 @@ import {
   Minimize2,
   Lock,
   Unlock,
-  FileSpreadsheet,
   FileImage,
   Package
 } from 'lucide-react';
@@ -574,6 +573,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
     const synced = syncMultiLevelPlanes(nextLevels, prevPlanes, defaultPitchDeg);
     setPlanes(synced);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, nextLevels, synced) : prev));
     return synced;
   };
 
@@ -1975,6 +1975,24 @@ export const ExactRoofingHub: React.FC<Props> = ({
       }
       return;
     }
+    if (issue.category === 'undetailed_parapet') {
+      setWallFilterMode('parapets');
+      if (issue.targetId) {
+        handleOpenWallElevation(issue.targetId);
+      } else {
+        setActiveTab('wall_plan');
+      }
+      return;
+    }
+    if (issue.category === 'undetailed_secondary') {
+      setWallFilterMode('secondary');
+      if (issue.targetId) {
+        handleOpenWallElevation(issue.targetId);
+      } else {
+        setActiveTab('wall_plan');
+      }
+      return;
+    }
     if (issue.category === 'undetailed_wall') {
       setWallFilterMode('undetailed');
       if (issue.targetId) {
@@ -2021,6 +2039,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setFrozenOrderPack(null);
     setMeasureLocked(false);
     setLifecycleStage('measuring');
+    setActiveTab('measure_check');
     persistSnapshotToProject(nextSnap);
     triggerNotice('Measure unlocked for variations & re-measure');
   };
@@ -2030,10 +2049,56 @@ export const ExactRoofingHub: React.FC<Props> = ({
     if (nextStage === 'installing') {
       setActiveTab('layout_results');
       if (isMobile) setIsInspectorOpen(false);
+    } else if (nextStage === 'measuring') {
+      setActiveTab('measure_check');
     } else if (nextStage === 'quoting') {
-      if (activeTab === 'measure_check') {
+      if (
+        activeTab === 'measure_check' ||
+        activeTab === 'layout_results' ||
+        activeTab === 'flashing_workshop'
+      ) {
         setActiveTab('canvas_plan');
       }
+    }
+  };
+
+  const nextIncompletePack = useMemo(
+    () =>
+      roofingPacks.find(
+        (pk) => !installProgress.completedPlaneIds.includes(pk.planeId)
+      ) || null,
+    [roofingPacks, installProgress.completedPlaneIds]
+  );
+
+  const handleAdvanceNextInstallPack = () => {
+    if (!nextIncompletePack) {
+      setOrderModalTab('order_pack');
+      setIsOrderModalOpen(true);
+      return;
+    }
+    if (activeTab !== 'layout_results') {
+      setActiveTab('layout_results');
+      handleSelectPlane(nextIncompletePack.planeId);
+      return;
+    }
+    const nextCompleted = [
+      ...installProgress.completedPlaneIds,
+      nextIncompletePack.planeId
+    ];
+    const nextProgress: RoofInstallProgress = {
+      ...installProgress,
+      completedPlaneIds: nextCompleted,
+      lastUpdatedAt: new Date().toISOString()
+    };
+    handleUpdateInstallProgress(nextProgress);
+    const upcoming = roofingPacks.find(
+      (pk) => !nextCompleted.includes(pk.planeId)
+    );
+    if (upcoming) {
+      handleSelectPlane(upcoming.planeId);
+      triggerNotice(`✓ Face ${nextIncompletePack.code} complete · Next: Face ${upcoming.code}`);
+    } else {
+      triggerNotice(`✓ All ${roofingPacks.length} packs completed`);
     }
   };
 
@@ -2147,62 +2212,103 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const templateDropdownMenu = isTemplateDropdownOpen && (
     <div className="absolute top-full left-0 mt-1.5 w-64 bg-[#0e1526] border border-slate-750 rounded-2xl p-1.5 shadow-2xl z-50 animate-in fade-in slide-in-from-top-1 space-y-0.5">
       <div className="px-2 py-1 text-[10px] font-mono uppercase text-slate-400 font-bold">
-        Single &amp; Multi-Height Roofs
+        Engineering Views
       </div>
-      {[
-        { key: 'rectangle_14x10' as const, label: '14m × 10m Hip & Ridge' },
-        { key: 'l_shape_standard' as const, label: 'L-Shape Valley & Hips' },
-        { key: 'straight_gable' as const, label: 'Classic Duo-Pitch Gable' },
-        { key: 't_shape' as const, label: 'T-Shape Villa' },
-        { key: 'two_storey_split' as const, label: '2-Storey Upper + Lower' },
-        { key: 'cascading_terrace' as const, label: 'Cascading Terraced Roof' }
-      ].map((item) => (
-        <button
-          key={item.key}
-          onClick={() => handleSelectPreset(item.key)}
-          className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between transition-colors cursor-pointer ${
-            selectedPreset === item.key
-              ? 'bg-blue-600 text-white'
-              : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-          }`}
-        >
-          <span>{item.label}</span>
-          {selectedPreset === item.key && <span className="text-[10px]">✓</span>}
-        </button>
-      ))}
-
-      <div className="my-1 border-t border-slate-800" />
-
       <button
+        type="button"
         onClick={() => {
           setIsTemplateDropdownOpen(false);
-          setIsImportModalOpen(true);
+          handleGenerateLayoutClick();
         }}
-        className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-blue-400 hover:bg-blue-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+        className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+          activeTab === 'layout_results'
+            ? 'bg-sky-600 text-white'
+            : 'text-slate-200 hover:bg-slate-800'
+        }`}
       >
-        <Upload className="w-3.5 h-3.5" />
-        <span>Import (SVG / DXF / JSON)</span>
+        <Scissors className="w-3.5 h-3.5 text-sky-400" />
+        <span>Sheet Cuts &amp; Offcuts</span>
       </button>
 
       <button
+        type="button"
         onClick={() => {
           setIsTemplateDropdownOpen(false);
-          setActiveTab('canvas_plan');
-          setOpenPlanModalSignal((s) => s + 1);
+          setActiveTab('flashing_workshop');
         }}
-        className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-amber-300 hover:bg-amber-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+        className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+          activeTab === 'flashing_workshop'
+            ? 'bg-sky-600 text-white'
+            : 'text-slate-200 hover:bg-slate-800'
+        }`}
       >
-        <FileImage className="w-3.5 h-3.5" />
-        <span>Architectural Plan (2-Pt Scale)</span>
+        <Ruler className="w-3.5 h-3.5 text-sky-400" />
+        <span>Flashings Workshop</span>
       </button>
 
-      <button
-        onClick={handleStartBlank}
-        className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-emerald-400 hover:bg-emerald-600/20 flex items-center gap-2 transition-colors cursor-pointer"
-      >
-        <Plus className="w-3.5 h-3.5" />
-        <span>Draw From Scratch (Blank)</span>
-      </button>
+      {!isReadOnlyGeometry && (
+        <>
+          <div className="my-1 border-t border-slate-800" />
+
+          <div className="px-2 py-1 text-[10px] font-mono uppercase text-slate-400 font-bold">
+            Roof Presets
+          </div>
+          {[
+            { key: 'rectangle_14x10' as const, label: '14m × 10m Hip & Ridge' },
+            { key: 'l_shape_standard' as const, label: 'L-Shape Valley & Hips' },
+            { key: 'straight_gable' as const, label: 'Classic Duo-Pitch Gable' },
+            { key: 't_shape' as const, label: 'T-Shape Villa' },
+            { key: 'two_storey_split' as const, label: '2-Storey Upper + Lower' },
+            { key: 'cascading_terrace' as const, label: 'Cascading Terraced Roof' }
+          ].map((item) => (
+            <button
+              key={item.key}
+              onClick={() => handleSelectPreset(item.key)}
+              className={`w-full text-left px-2.5 py-1.5 rounded-xl text-xs font-bold flex items-center justify-between transition-colors cursor-pointer ${
+                selectedPreset === item.key
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+              }`}
+            >
+              <span>{item.label}</span>
+              {selectedPreset === item.key && <span className="text-[10px]">✓</span>}
+            </button>
+          ))}
+
+          <div className="my-1 border-t border-slate-800" />
+
+          <button
+            onClick={() => {
+              setIsTemplateDropdownOpen(false);
+              setActiveTab('canvas_plan');
+              setOpenPlanModalSignal((s) => s + 1);
+            }}
+            className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-amber-300 hover:bg-amber-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+          >
+            <FileImage className="w-3.5 h-3.5" />
+            <span>Architectural Plan (2-Pt Scale)</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setIsTemplateDropdownOpen(false);
+              setIsImportModalOpen(true);
+            }}
+            className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-blue-400 hover:bg-blue-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+          >
+            <Upload className="w-3.5 h-3.5" />
+            <span>Import (SVG / DXF / JSON)</span>
+          </button>
+
+          <button
+            onClick={handleStartBlank}
+            className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-emerald-400 hover:bg-emerald-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>Draw From Scratch (Blank)</span>
+          </button>
+        </>
+      )}
     </div>
   );
 
@@ -2498,18 +2604,24 @@ export const ExactRoofingHub: React.FC<Props> = ({
               </div>
             </div>
 
-            {/* Right Cluster: Stage-Focused Controls (Zero Quote/BOM Clutter in Installing) */}
+            {/* Right Cluster: 1 Primary CTA Per Stage + Calm Utility */}
             <div className="flex items-center gap-1.5 shrink-0">
               {lifecycleStage === 'installing' ? (
                 <>
-                  <span className="h-9 px-2.5 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[11px] font-extrabold flex items-center gap-1">
-                    <Lock className="w-3 h-3" />
-                    <span>Site Locked</span>
-                  </span>
+                  <button
+                    type="button"
+                    onClick={handleAdvanceNextInstallPack}
+                    className="h-9 px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                  >
+                    <Package className="w-3.5 h-3.5" />
+                    <span>
+                      {nextIncompletePack ? `Next · ${nextIncompletePack.code}` : 'Order Pack'}
+                    </span>
+                  </button>
                   {isFullscreen && embedded ? (
                     <button
                       onClick={() => setIsFullscreen(false)}
-                      className="h-10 w-10 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-700 cursor-pointer"
+                      className="h-9 w-9 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-700 cursor-pointer"
                       aria-label="Exit Fullscreen"
                     >
                       <Minimize2 className="w-4 h-4" />
@@ -2517,8 +2629,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   ) : (
                     <button
                       onClick={handleSaveToProject}
-                      className="h-10 w-10 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-emerald-400 border border-slate-800 cursor-pointer"
-                      aria-label="Save Lay Order"
+                      className="h-9 w-9 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-emerald-400 border border-slate-800 cursor-pointer"
+                      aria-label="Save Progress"
                     >
                       <Save className="w-4 h-4" />
                     </button>
@@ -2529,38 +2641,56 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   <button
                     type="button"
                     onClick={() => setIsAiDrawerOpen(true)}
-                    className="h-10 px-2.5 rounded-xl bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white text-xs font-extrabold flex items-center gap-1 cursor-pointer shadow-md border border-sky-400/30"
-                    aria-label="Open Roof Field AI"
+                    className="h-9 w-9 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-sky-300 flex items-center justify-center cursor-pointer"
+                    aria-label="Open Assistant"
                   >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>AI</span>
+                    <Sparkles className="w-4 h-4" />
                   </button>
 
-                  <button
-                    onClick={() => {
-                      setOrderModalTab(lifecycleStage === 'quoting' && onPushBomToQuote ? 'quote' : 'orders');
-                      setIsOrderModalOpen(true);
-                    }}
-                    className="h-10 px-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-300 border border-emerald-500/40 text-xs font-extrabold flex items-center gap-1 cursor-pointer tabular-nums"
-                    aria-label="Simple Material List and Orders"
-                  >
-                    <ShoppingCart className="w-3.5 h-3.5" />
-                    <span className="text-[11px]">BOM</span>
-                  </button>
-
-                  {lifecycleStage === 'measuring' && !measureLocked ? (
+                  {lifecycleStage === 'quoting' ? (
+                    <button
+                      onClick={() => {
+                        setOrderModalTab('order_pack');
+                        setIsOrderModalOpen(true);
+                      }}
+                      className="h-9 px-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                      aria-label="Generate draft order"
+                    >
+                      <ShoppingCart className="w-3.5 h-3.5" />
+                      <span>Draft Order</span>
+                    </button>
+                  ) : !measureLocked ? (
                     <button
                       onClick={handleRequestLockMeasure}
-                      className="h-10 px-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer"
-                      aria-label="Lock Measure"
+                      className={`h-9 px-2.5 rounded-xl text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                        completenessReport.blockersCount > 0
+                          ? 'bg-rose-700 hover:bg-rose-600'
+                          : 'bg-emerald-600 hover:bg-emerald-500'
+                      }`}
+                      aria-label="Confirm and Lock Measure"
                     >
                       <Lock className="w-3.5 h-3.5" />
-                      <span>Lock</span>
+                      <span>
+                        {completenessReport.blockersCount > 0
+                          ? `Fix (${completenessReport.blockersCount})`
+                          : 'Confirm & Lock'}
+                      </span>
                     </button>
-                  ) : isFullscreen && embedded ? (
+                  ) : (
+                    <button
+                      onClick={handleUnlockMeasure}
+                      className="h-9 px-2.5 rounded-xl bg-amber-950/70 border border-amber-500/40 text-amber-300 text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                      aria-label="Unlock Measure"
+                    >
+                      <Unlock className="w-3.5 h-3.5" />
+                      <span>Unlock</span>
+                    </button>
+                  )}
+
+                  {isFullscreen && embedded ? (
                     <button
                       onClick={() => setIsFullscreen(false)}
-                      className="h-10 w-10 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-700 cursor-pointer"
+                      className="h-9 w-9 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-700 cursor-pointer"
                       aria-label="Exit Fullscreen"
                     >
                       <Minimize2 className="w-4 h-4" />
@@ -2568,7 +2698,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   ) : (
                     <button
                       onClick={handleSaveToProject}
-                      className="h-10 w-10 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-emerald-400 border border-slate-800 cursor-pointer"
+                      className="h-9 w-9 flex items-center justify-center rounded-xl bg-slate-900 hover:bg-slate-800 text-emerald-400 border border-slate-800 cursor-pointer"
                       aria-label="Save Progress"
                     >
                       <Save className="w-4 h-4" />
@@ -2795,12 +2925,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
           )}
         </main>
 
-        {/* Stage-Tailored Bottom Thumb Navigation Bar */}
+        {/* Stage-Tailored Bottom Thumb Navigation Bar (Max 5 Clean Views) */}
         <nav
           aria-label="ApexMap Studio Views"
-          className={`shrink-0 bg-[#0b101d]/95 backdrop-blur-md border-t border-slate-800 px-1.5 pt-1.5 pb-[calc(0.4rem+env(safe-area-inset-bottom))] grid gap-1 z-30 ${
-            lifecycleStage === 'installing' ? 'grid-cols-5' : 'grid-cols-6'
-          }`}
+          className="shrink-0 bg-[#0b101d]/95 backdrop-blur-md border-t border-slate-800 px-1.5 pt-1.5 pb-[calc(0.4rem+env(safe-area-inset-bottom))] grid grid-cols-5 gap-1 z-30"
         >
           {lifecycleStage === 'installing' ? (
             <>
@@ -2862,12 +2990,38 @@ export const ExactRoofingHub: React.FC<Props> = ({
               >
                 <Sliders className="w-4 h-4 mb-0.5" />
                 <span className="truncate max-w-[54px]">
-                  {selectedPlane ? `Face ${selectedPlane.code}` : 'Job Spec'}
+                  {selectedPlane ? `Face ${selectedPlane.code}` : 'Spec'}
                 </span>
               </button>
             </>
           ) : (
             <>
+              {lifecycleStage === 'measuring' ? (
+                <button
+                  onClick={() => setActiveTab('measure_check')}
+                  className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
+                    activeTab === 'measure_check'
+                      ? 'bg-emerald-600/25 text-emerald-300 border border-emerald-500/40'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <ClipboardCheck className="w-4 h-4 mb-0.5" />
+                  <span>Checklist</span>
+                </button>
+              ) : (
+                <button
+                  onClick={handleGenerateLayoutClick}
+                  className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
+                    activeTab === 'layout_results'
+                      ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <Scissors className="w-4 h-4 mb-0.5" />
+                  <span>Cuts</span>
+                </button>
+              )}
+
               <button
                 onClick={() => setActiveTab('canvas_plan')}
                 className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
@@ -2907,57 +3061,6 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 <span>3D</span>
               </button>
 
-              {lifecycleStage === 'measuring' ? (
-                <button
-                  onClick={() => setActiveTab('measure_check')}
-                  className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
-                    activeTab === 'measure_check'
-                      ? 'bg-emerald-600/25 text-emerald-300 border border-emerald-500/40'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <ClipboardCheck className="w-4 h-4 mb-0.5" />
-                  <span>Verify</span>
-                </button>
-              ) : (
-                <button
-                  onClick={handleGenerateLayoutClick}
-                  className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
-                    activeTab === 'layout_results'
-                      ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Scissors className="w-4 h-4 mb-0.5" />
-                  <span>Offcuts</span>
-                </button>
-              )}
-
-              <button
-                onClick={() =>
-                  lifecycleStage === 'measuring'
-                    ? handleGenerateLayoutClick()
-                    : setActiveTab('flashing_workshop')
-                }
-                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer relative ${
-                  (lifecycleStage === 'measuring' ? activeTab === 'layout_results' : activeTab === 'flashing_workshop')
-                    ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                {lifecycleStage === 'measuring' ? (
-                  <>
-                    <Scissors className="w-4 h-4 mb-0.5" />
-                    <span>Offcuts</span>
-                  </>
-                ) : (
-                  <>
-                    <Ruler className="w-4 h-4 mb-0.5" />
-                    <span>Flashings</span>
-                  </>
-                )}
-              </button>
-
               <button
                 onClick={() => setIsInspectorOpen(!isInspectorOpen)}
                 className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer relative ${
@@ -2968,7 +3071,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               >
                 <Sliders className="w-4 h-4 mb-0.5" />
                 <span className="truncate max-w-[54px]">
-                  {selectedPlane ? `Area ${selectedPlane.code}` : 'Inspect'}
+                  {selectedPlane ? `Face ${selectedPlane.code}` : 'Inspect'}
                 </span>
               </button>
             </>
@@ -3083,6 +3186,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
           isOpen={isAiDrawerOpen}
           onClose={() => setIsAiDrawerOpen(false)}
           lifecycleStage={lifecycleStage}
+          measureLocked={measureLocked}
           projectTitle={project?.title || 'Profiled Metal Roof'}
           profileName={project?.profile}
           windZone={project?.windZone}
@@ -3099,8 +3203,16 @@ export const ExactRoofingHub: React.FC<Props> = ({
           layout={layoutResult}
           roofingPacks={roofingPacks}
           completedPlaneIds={installProgress.completedPlaneIds}
+          wallPlan={wallPlan}
+          completenessReport={completenessReport}
+          orderPack={liveOrderPack}
           onApplyScannedRoof={handleApplyAiRoof}
           onApplyDeterministicPatches={handleApplyDeterministicPatches}
+          onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
+          onOpenWallPlan={() => {
+            setWallSubView('plan');
+            setActiveTab('wall_plan');
+          }}
           onExecuteAction={handleExecuteAiAction}
           onOpenFullCopilot={() => setIsAiCopilotOpen(true)}
         />
@@ -3144,6 +3256,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
           layout={layoutResult}
           bom={roofBom}
           packs={roofingPacks}
+          planes={planes}
+          levels={levels}
+          assets={assets}
+          wallPlan={wallPlan}
+          completenessReport={completenessReport}
+          orderPack={liveOrderPack}
+          sheetOrderMode={sheetOrderMode}
+          onChangeSheetOrderMode={handleChangeSheetOrderMode}
+          sheetOrderComparison={sheetOrderComparison}
           initialModalTab={orderModalTab}
           onSelectLineToAssign={(line) => setActiveFlashingLineId(line.lineId)}
           onRemoveAssignment={handleRemoveFlashingAssignment}
@@ -3238,10 +3359,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
         </div>
       )}
 
-      {/* 1. UNIFIED STAGE-TAILORED WORKSPACE BAR */}
-      <div className="bg-[#0b101d] border border-slate-800 rounded-2xl px-3.5 py-2.5 text-white shadow-xl space-y-2 shrink-0">
+      {/* 1. CALM 3-ZONE SYSTEMS WORKSPACE BAR */}
+      <div className="bg-[#0b101d] border border-slate-800 rounded-2xl px-3.5 py-2.5 text-white shadow-xl shrink-0">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          {/* Left: Stage Segmented Switcher, Active Project & Templates */}
+          {/* Zone 1: Active Job & 3 Primary Modes (Quote | Measure | Install) */}
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
               {(['quoting', 'measuring', 'installing'] as const).map((st) => (
@@ -3249,7 +3370,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   key={st}
                   type="button"
                   onClick={() => handleSelectStage(st)}
-                  className={`px-2.5 py-1.5 rounded-lg text-xs font-extrabold transition-all cursor-pointer flex items-center gap-1 whitespace-nowrap ${
+                  className={`px-3 py-1.5 rounded-lg text-xs font-extrabold transition-all cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0 ${
                     lifecycleStage === st
                       ? st === 'quoting'
                         ? 'bg-blue-600 text-white shadow-xs'
@@ -3262,10 +3383,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   {st === 'measuring' && measureLocked && <Lock className="w-3 h-3" />}
                   <span>
                     {st === 'quoting'
-                      ? '1. Quoting'
+                      ? 'Quote'
                       : st === 'measuring'
-                      ? '2. Measuring'
-                      : '3. Installing'}
+                      ? 'Measure'
+                      : 'Install'}
                   </span>
                 </button>
               ))}
@@ -3275,7 +3396,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               <select
                 value={project?.id || ''}
                 onChange={(e) => onSelectProject(e.target.value)}
-                className="bg-slate-900 border border-slate-750 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-200 max-w-[190px] truncate outline-none cursor-pointer"
+                className="bg-slate-900 border border-slate-800 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-200 max-w-[190px] truncate outline-none cursor-pointer"
                 aria-label="Active Project"
               >
                 {projects.map((p) => (
@@ -3285,15 +3406,136 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 ))}
               </select>
             )}
+          </div>
 
-            {!isReadOnlyGeometry && (
+          {/* Zone 2: Single Unified Viewport Switch + Contextual Tools Popover */}
+          <div className="flex items-center gap-1.5">
+            <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
+              {lifecycleStage === 'installing' ? (
+                <>
+                  <button
+                    onClick={() => setActiveTab('layout_results')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'layout_results'
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Package className="w-3.5 h-3.5" />
+                    <span>Packs</span>
+                  </button>
+
+                  <button
+                    onClick={() => setActiveTab('canvas_plan')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'canvas_plan'
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Compass className="w-3.5 h-3.5" />
+                    <span>Plan</span>
+                  </button>
+
+                  <button
+                    onClick={() => setActiveTab('view_3d')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'view_3d'
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Box className="w-3.5 h-3.5" />
+                    <span>3D</span>
+                  </button>
+
+                  <button
+                    onClick={() => setActiveTab('flashing_workshop')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'flashing_workshop'
+                        ? 'bg-sky-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Ruler className="w-3.5 h-3.5" />
+                    <span>Flashing Guide</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  {lifecycleStage === 'measuring' && (
+                    <button
+                      onClick={() => setActiveTab('measure_check')}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                        activeTab === 'measure_check'
+                          ? 'bg-emerald-600 text-white shadow-xs'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <ClipboardCheck className="w-3.5 h-3.5" />
+                      <span>Checklist</span>
+                      {completenessReport.blockersCount > 0 && (
+                        <span className="font-mono text-[10px] px-1.5 py-0.2 rounded bg-rose-600 text-white tabular-nums">
+                          {completenessReport.blockersCount}
+                        </span>
+                      )}
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => setActiveTab('canvas_plan')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'canvas_plan'
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Compass className="w-3.5 h-3.5" />
+                    <span>Plan</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setWallSubView('plan');
+                      setActiveTab('wall_plan');
+                    }}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'wall_plan'
+                        ? 'bg-amber-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Building2 className="w-3.5 h-3.5" />
+                    <span>Walls</span>
+                  </button>
+
+                  <button
+                    onClick={() => setActiveTab('view_3d')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'view_3d'
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Box className="w-3.5 h-3.5" />
+                    <span>3D</span>
+                  </button>
+                </>
+              )}
+            </div>
+
+            {lifecycleStage !== 'installing' && (
               <div className="relative" ref={templateDropdownRef}>
                 <button
                   onClick={() => setIsTemplateDropdownOpen(!isTemplateDropdownOpen)}
-                  className="px-2.5 py-1.5 rounded-xl bg-slate-850 hover:bg-slate-800 text-slate-200 hover:text-white border border-slate-750 text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
+                  className={`px-2.5 py-1.5 rounded-xl border text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                    activeTab === 'layout_results' || activeTab === 'flashing_workshop'
+                      ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
+                      : 'bg-slate-900 hover:bg-slate-800 text-slate-200 border-slate-800'
+                  }`}
                 >
-                  <LayoutTemplate className="w-3.5 h-3.5 text-blue-400" />
-                  <span>Templates</span>
+                  <LayoutTemplate className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Tools</span>
                   <ChevronDown
                     className={`w-3.5 h-3.5 text-slate-400 transition-transform ${
                       isTemplateDropdownOpen ? 'rotate-180' : ''
@@ -3305,200 +3547,59 @@ export const ExactRoofingHub: React.FC<Props> = ({
             )}
           </div>
 
-          {/* Center: Clean Stage-Tailored View Switcher */}
-          <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800/80">
-            {lifecycleStage === 'installing' ? (
-              <>
-                <button
-                  onClick={() => setActiveTab('layout_results')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'layout_results'
-                      ? 'bg-emerald-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Package className="w-3.5 h-3.5" />
-                  <span>Packs &amp; Sequence</span>
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('canvas_plan')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'canvas_plan'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Compass className="w-3.5 h-3.5" />
-                  <span>Roof Plan</span>
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('view_3d')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'view_3d'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Box className="w-3.5 h-3.5" />
-                  <span>3D View</span>
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('flashing_workshop')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'flashing_workshop'
-                      ? 'bg-sky-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Ruler className="w-3.5 h-3.5" />
-                  <span>Flashing Guide</span>
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  onClick={() => setActiveTab('canvas_plan')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'canvas_plan'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Compass className="w-3.5 h-3.5" />
-                  <span>Plan</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    setWallSubView('plan');
-                    setActiveTab('wall_plan');
-                  }}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'wall_plan'
-                      ? 'bg-amber-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Building2 className="w-3.5 h-3.5" />
-                  <span>Walls</span>
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('view_3d')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'view_3d'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Box className="w-3.5 h-3.5" />
-                  <span>3D</span>
-                </button>
-
-                {lifecycleStage === 'measuring' && (
-                  <button
-                    onClick={() => setActiveTab('measure_check')}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                      activeTab === 'measure_check'
-                        ? 'bg-emerald-600 text-white shadow-xs'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <ClipboardCheck className="w-3.5 h-3.5" />
-                    <span>Site Check</span>
-                  </button>
-                )}
-
-                <button
-                  onClick={() => setActiveTab('layout_results')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'layout_results'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Scissors className="w-3.5 h-3.5" />
-                  <span>Offcuts</span>
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('flashing_workshop')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                    activeTab === 'flashing_workshop'
-                      ? 'bg-sky-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Ruler className="w-3.5 h-3.5" />
-                  <span>Flashings</span>
-                </button>
-              </>
-            )}
-          </div>
-
-          {/* Right: 1 Clear Primary CTA Per Stage + Utility Buttons */}
+          {/* Zone 3: 1 Clear Primary CTA Per Mode + Quiet Utilities */}
           <div className="flex items-center gap-1.5">
             {lifecycleStage === 'quoting' && (
-              <>
-                {onPushBomToQuote ? (
-                  <button
-                    onClick={() => {
-                      setOrderModalTab('quote');
-                      setIsOrderModalOpen(true);
-                    }}
-                    className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5"
-                  >
-                    <FileSpreadsheet className="w-3.5 h-3.5" />
-                    <span>BOM ➔ Quote</span>
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => {
-                      setOrderModalTab('orders');
-                      setIsOrderModalOpen(true);
-                    }}
-                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5"
-                  >
-                    <ShoppingCart className="w-3.5 h-3.5" />
-                    <span>Simple BOM</span>
-                  </button>
-                )}
-              </>
+              <button
+                onClick={() => {
+                  setOrderModalTab('order_pack');
+                  setIsOrderModalOpen(true);
+                }}
+                className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              >
+                <ShoppingCart className="w-3.5 h-3.5" />
+                <span>Generate draft order</span>
+              </button>
             )}
 
             {lifecycleStage === 'measuring' && (
               <>
                 <button
                   onClick={() => {
-                    setOrderModalTab('orders');
+                    setOrderModalTab('order_pack');
                     setIsOrderModalOpen(true);
                   }}
-                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700 font-bold text-xs transition-all cursor-pointer flex items-center gap-1.5"
+                  className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 font-bold text-xs transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
-                  <ShoppingCart className="w-3.5 h-3.5" />
-                  <span>Simple BOM</span>
+                  <ShoppingCart className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Order Pack</span>
                 </button>
 
                 {!measureLocked ? (
                   <button
                     onClick={handleRequestLockMeasure}
-                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5"
-                    title="Lock Roof Dimensions & Offcuts for Site Installation"
+                    className={`px-3.5 py-1.5 rounded-xl text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                      completenessReport.blockersCount > 0
+                        ? 'bg-rose-700 hover:bg-rose-600'
+                        : 'bg-emerald-600 hover:bg-emerald-500'
+                    }`}
+                    title="Confirm & lock site measure to emit Order Pack"
                   >
                     <Lock className="w-3.5 h-3.5" />
-                    <span>Confirm &amp; Lock Measure</span>
+                    <span>
+                      {completenessReport.blockersCount > 0
+                        ? `Confirm & lock (${completenessReport.blockersCount} blocker${completenessReport.blockersCount === 1 ? '' : 's'})`
+                        : 'Confirm & lock'}
+                    </span>
                   </button>
                 ) : (
                   <button
                     type="button"
                     onClick={handleUnlockMeasure}
-                    className="px-3 py-1.5 rounded-xl bg-amber-950/70 hover:bg-amber-900/80 border border-amber-500/40 text-amber-300 text-xs font-extrabold cursor-pointer flex items-center gap-1.5"
+                    className="px-3 py-1.5 rounded-xl bg-amber-950/70 hover:bg-amber-900/80 border border-amber-500/40 text-amber-300 text-xs font-extrabold cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0"
                   >
                     <Unlock className="w-3.5 h-3.5" />
-                    <span>Unlock Measure</span>
+                    <span>Unlock measure</span>
                   </button>
                 )}
               </>
@@ -3506,15 +3607,25 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
             {lifecycleStage === 'installing' && (
               <div className="flex items-center gap-1.5">
-                <span className="px-2.5 py-1.5 rounded-xl bg-emerald-950/50 border border-emerald-500/40 text-emerald-300 text-xs font-extrabold flex items-center gap-1.5">
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>Install Spec Locked</span>
-                </span>
+                <button
+                  type="button"
+                  onClick={handleAdvanceNextInstallPack}
+                  className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer flex items-center gap-1.5 shadow-md whitespace-nowrap shrink-0"
+                >
+                  <Package className="w-3.5 h-3.5" />
+                  <span>
+                    {nextIncompletePack
+                      ? activeTab === 'layout_results'
+                        ? `Complete Face ${nextIncompletePack.code}`
+                        : `Next pack · Face ${nextIncompletePack.code}`
+                      : `All ${roofingPacks.length} packs done`}
+                  </span>
+                </button>
                 {measureLocked && (
                   <button
                     type="button"
                     onClick={handleUnlockMeasure}
-                    className="px-2 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-amber-300 text-[11px] font-bold cursor-pointer flex items-center gap-1"
+                    className="px-2 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-amber-300 text-[11px] font-bold cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
                     title="Unlock for variation"
                   >
                     <Unlock className="w-3 h-3" />
@@ -3524,23 +3635,21 @@ export const ExactRoofingHub: React.FC<Props> = ({
               </div>
             )}
 
-            {lifecycleStage !== 'installing' && (
-              <button
-                onClick={() => setIsAiDrawerOpen(true)}
-                className="px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white font-extrabold text-xs shadow-md transition-all cursor-pointer border border-sky-400/30 flex items-center gap-1"
-                title="Field AI Assistant & Plan Scanner"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-sky-100" />
-                <span>AI</span>
-              </button>
-            )}
+            <button
+              onClick={() => setIsAiDrawerOpen(true)}
+              className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-sky-300 border border-slate-800 font-bold text-xs transition-all cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
+              title="Stage Assistant"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Assistant</span>
+            </button>
 
             <button
               onClick={() => setIsInspectorOpen(!isInspectorOpen)}
-              className={`p-2 rounded-xl text-xs font-bold transition-all cursor-pointer border flex items-center gap-1.5 ${
+              className={`p-2 rounded-xl text-xs font-bold transition-all cursor-pointer border flex items-center gap-1.5 shrink-0 ${
                 isInspectorOpen
-                  ? 'bg-slate-800 text-sky-400 border-sky-500/50 shadow-inner'
-                  : 'bg-slate-850 hover:bg-slate-800 text-slate-400 border-slate-750 hover:text-white'
+                  ? 'bg-slate-800 text-sky-400 border-sky-500/50'
+                  : 'bg-slate-900 hover:bg-slate-800 text-slate-400 border-slate-800 hover:text-white'
               }`}
               title={lifecycleStage === 'installing' ? 'Toggle Job Spec Panel' : 'Toggle Inspector Drawer'}
             >
@@ -3550,7 +3659,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
             {embedded && (
               <button
                 onClick={() => setIsFullscreen(!isFullscreen)}
-                className="p-2 rounded-xl bg-slate-850 hover:bg-slate-800 text-sky-400 border border-slate-750 text-xs font-bold transition-all cursor-pointer"
+                className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-sky-400 border border-slate-800 text-xs font-bold transition-all cursor-pointer shrink-0"
                 title={isFullscreen ? 'Exit Fullscreen Studio' : 'Expand Fullscreen Studio'}
               >
                 {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
@@ -3559,7 +3668,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
             <button
               onClick={handleSaveToProject}
-              className="p-2 rounded-xl bg-slate-850 hover:bg-slate-800 text-emerald-400 border border-slate-750 text-xs font-bold transition-all cursor-pointer"
+              className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-emerald-400 border border-slate-800 text-xs font-bold transition-all cursor-pointer shrink-0"
               title="Save Roof Model & Stage"
             >
               <Save className="w-4 h-4" />
@@ -3906,11 +4015,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
         projectTitle={project?.title || 'Profiled Metal Roof'}
       />
 
-      {/* Quick Field AI Drawer (Hybrid Deterministic Auto-Fix, Stage Guidance & Plan Vision Scan) */}
+      {/* Stage Assistant Drawer */}
       <ExactRoofingAiDrawer
         isOpen={isAiDrawerOpen}
         onClose={() => setIsAiDrawerOpen(false)}
         lifecycleStage={lifecycleStage}
+        measureLocked={measureLocked}
         projectTitle={project?.title || 'Profiled Metal Roof'}
         profileName={project?.profile}
         windZone={project?.windZone}
@@ -3927,8 +4037,16 @@ export const ExactRoofingHub: React.FC<Props> = ({
         layout={layoutResult}
         roofingPacks={roofingPacks}
         completedPlaneIds={installProgress.completedPlaneIds}
+        wallPlan={wallPlan}
+        completenessReport={completenessReport}
+        orderPack={liveOrderPack}
         onApplyScannedRoof={handleApplyAiRoof}
         onApplyDeterministicPatches={handleApplyDeterministicPatches}
+        onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
+        onOpenWallPlan={() => {
+          setWallSubView('plan');
+          setActiveTab('wall_plan');
+        }}
         onExecuteAction={handleExecuteAiAction}
         onOpenFullCopilot={() => setIsAiCopilotOpen(true)}
       />

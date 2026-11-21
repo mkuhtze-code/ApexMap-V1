@@ -845,7 +845,7 @@ export function deriveWallPlanFromRoofLevels(
  * Re-attaches preserved wing/spur walls and secondary zone walls after rebuilding the primary ring,
  * and keeps linked secondary zone geometry synchronized if the host edge moved.
  */
-function mergePreservedExtraFacets(
+export function mergePreservedExtraFacets(
   plan: WallPlan,
   ringFacets: WallFacet[]
 ): WallFacet[] {

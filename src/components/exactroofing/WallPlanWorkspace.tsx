@@ -61,6 +61,7 @@ import {
   getWallFacetKind,
   getWallFacetKindMeta,
   isWallFacetUndetailed,
+  mergePreservedExtraFacets,
   moveWallPlanVertex,
   removeSecondaryZone,
   splitWallFacetInPlan,
@@ -95,6 +96,8 @@ interface Props {
 }
 
 type ScheduleTab = 'summary' | 'faces' | 'openings';
+
+const EMPTY_FACETS: WallFacet[] = [];
 
 export const WallPlanWorkspace: React.FC<Props> = ({
   wallPlan,
@@ -161,7 +164,10 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     onChangeWallFilterMode?.(mode);
   };
 
-  const facets = wallPlan?.facets || [];
+  const facets = useMemo(
+    () => wallPlan?.facets ?? EMPTY_FACETS,
+    [wallPlan?.facets]
+  );
   const selectedFacet = useMemo(
     () => facets.find((f) => f.id === selectedWallFacetId) || facets[0] || null,
     [facets, selectedWallFacetId]
@@ -173,9 +179,11 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   }, [selectedWallFacetId, facets]);
 
   React.useEffect(() => {
-    setMultiSelectedFacetIds((prev) =>
-      prev.filter((id) => facets.some((f) => f.id === id))
-    );
+    setMultiSelectedFacetIds((prev) => {
+      if (prev.length === 0) return prev;
+      const filtered = prev.filter((id) => facets.some((f) => f.id === id));
+      return filtered.length === prev.length ? prev : filtered;
+    });
   }, [facets]);
 
   const fullSummary = useMemo(
@@ -537,15 +545,16 @@ export const WallPlanWorkspace: React.FC<Props> = ({
           roofLevels: levels
         }
       );
+      const mergedFacets = mergePreservedExtraFacets(wallPlan, built);
       onUpdateWallPlan({
         ...wallPlan,
         defaultHeightM,
         edges,
-        facets: built,
+        facets: mergedFacets,
         builtAt: new Date().toISOString()
       });
-      if (built[0] && !built.some((f) => f.id === selectedWallFacetId)) {
-        onSelectWallFacet(built[0].id);
+      if (mergedFacets[0] && !mergedFacets.some((f) => f.id === selectedWallFacetId)) {
+        onSelectWallFacet(mergedFacets[0].id);
       }
     } else {
       handleSeedFromRoof();

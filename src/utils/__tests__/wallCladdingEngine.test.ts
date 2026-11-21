@@ -3,6 +3,9 @@ import * as THREE from 'three';
 import {
   addWingWallToPlan,
   analyzeWallPlanTopology,
+  applyCladdingToFacets,
+  applyHeightToFacets,
+  applyKindToFacets,
   batchUpdateWallFacetsInPlan,
   buildWallEdgesFromPoints,
   buildWallFacetsFromPlan,
@@ -38,6 +41,7 @@ import {
 import {
   applyRoofStylePreset,
   createRoofLevel,
+  generateCuttingLayout,
   generateSkeletonLines,
   getPresetOutline,
   syncMultiLevelPlanes
@@ -846,5 +850,95 @@ assert.equal(
   'Merged rebuilt facets maintain strictly unique IDs'
 );
 console.log('✓ Test 19 Passed: Perimeter rebuild preserves wing & secondary facets with unique IDs');
+
+// 20. Batch Multi-Apply Helpers (applyCladdingToFacets, applyKindToFacets, applyHeightToFacets) & Zero-Pricing Order Pack
+{
+  const baseOutline20 = getPresetOutline('rectangle_14x10');
+  const lvl20 = createRoofLevel(1, 'Main Roof', 2.7, baseOutline20.points);
+  const planes20 = syncMultiLevelPlanes([lvl20], [], 22.5);
+  const derivedPlan20 = deriveWallPlanFromRoofLevels([lvl20], 2.7, undefined, planes20);
+  assert.ok(derivedPlan20, 'deriveWallPlanFromRoofLevels returns a non-null WallPlan');
+  let wallPlan20 = derivedPlan20;
+
+  const targetIds20 = wallPlan20.facets.slice(0, 2).map((f) => f.id);
+  const opening20 = createDefaultWallOpening(wallPlan20.facets[0], 'window');
+  wallPlan20 = {
+    ...wallPlan20,
+    facets: wallPlan20.facets.map((f, idx) => (idx === 0 ? { ...f, openings: [opening20] } : f))
+  };
+
+  wallPlan20 = applyCladdingToFacets(wallPlan20, targetIds20, 'weatherboard');
+  targetIds20.forEach((id) => {
+    const f = wallPlan20.facets.find((item) => item.id === id);
+    assert.equal(f?.claddingType, 'weatherboard', 'applyCladdingToFacets updates selected wall cladding');
+  });
+
+  wallPlan20 = applyKindToFacets(wallPlan20, targetIds20, 'parapet');
+  targetIds20.forEach((id) => {
+    const f = wallPlan20.facets.find((item) => item.id === id);
+    assert.equal(f?.kind, 'parapet', 'applyKindToFacets updates selected wall facet kind');
+  });
+
+  wallPlan20 = applyHeightToFacets(wallPlan20, targetIds20, 3.45, {
+    heightSource: 'manual'
+  });
+  targetIds20.forEach((id) => {
+    const f = wallPlan20.facets.find((item) => item.id === id);
+    assert.equal(f?.heightSource, 'manual');
+    assert.equal(f?.heightM, 3.45);
+  });
+
+  const raisedLvl20 = createRoofLevel(1, 'Main Roof', 3.8, baseOutline20.points);
+  const raisedPlanes20 = syncMultiLevelPlanes([raisedLvl20], [], 22.5);
+  // Parapet facets protect their manual upstand height when syncing roof heights
+  wallPlan20 = applyHeightToFacets(wallPlan20, targetIds20, 3.8, {
+    heightSource: 'roof',
+    levels: [raisedLvl20],
+    planes: raisedPlanes20
+  });
+  targetIds20.forEach((id) => {
+    const f = wallPlan20.facets.find((item) => item.id === id);
+    assert.equal(f?.heightM, 3.45, 'Parapet kind preserves manual height during roof height sync');
+  });
+
+  // Switching back to exterior allows heightSource: 'roof' to snap cleanly to raised roof eave (3.8m)
+  wallPlan20 = applyKindToFacets(wallPlan20, targetIds20, 'exterior');
+  wallPlan20 = applyHeightToFacets(wallPlan20, targetIds20, 3.8, {
+    heightSource: 'roof',
+    levels: [raisedLvl20],
+    planes: raisedPlanes20
+  });
+  targetIds20.forEach((id) => {
+    const f = wallPlan20.facets.find((item) => item.id === id);
+    assert.equal(f?.heightSource, 'roof');
+    assert.ok(f && Math.abs(f.heightM - 3.8) < 0.05, `Expected synced roof height ~3.8m, got ${f?.heightM}`);
+  });
+
+  assert.equal(wallPlan20.facets[0].openings.length, 1, 'Batch wall helpers preserve facet openings');
+  assert.equal(new Set(wallPlan20.facets.map((f) => f.id)).size, wallPlan20.facets.length, 'Unique wall facet IDs preserved');
+
+  const spec20 = { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 };
+  const layout20 = generateCuttingLayout(raisedPlanes20, spec20);
+  const comp20 = evaluateTakeoffCompleteness({
+    levels: [raisedLvl20],
+    planes: raisedPlanes20,
+    assignableLines: [],
+    flashingAssignments: [],
+    wallPlan: wallPlan20,
+    assets: []
+  });
+  const pack20 = buildOrderPack({
+    planes: raisedPlanes20,
+    levels: [raisedLvl20],
+    layout: layout20,
+    assignableLines: [],
+    assignments: [],
+    wallPlan: wallPlan20,
+    completenessReport: comp20
+  });
+  const csv20 = exportOrderPackToCsv(pack20);
+  assert.ok(!csv20.includes('$'), 'Wall-inclusive Order Pack CSV must stay strictly commercial-neutral (no $)');
+}
+console.log('✓ Test 20 Passed: Multi-facet wall batch apply helpers preserve openings, roof sync & zero-pricing Order Pack');
 
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

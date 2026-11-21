@@ -10,6 +10,7 @@ import {
   WallElevationUnderlay,
   WallFacet,
   WallFacetKind,
+  WallHeightSource,
   WallOpening,
   WallOpeningType,
   WallPlan,
@@ -106,8 +107,8 @@ export const WALL_CLADDING_OPTIONS: WallCladdingMeta[] = [
   },
   {
     type: 'other',
-    label: 'Other / Custom Cladding',
-    shortLabel: 'Other',
+    label: 'Stone / Other Cladding',
+    shortLabel: 'Stone / Other',
     hex: '#78716c',
     roughness: 0.76,
     metalness: 0.08
@@ -2295,7 +2296,14 @@ export function updateWallFacetKind(
 export function batchUpdateWallFacetsInPlan(
   plan: WallPlan,
   facetIds: string[],
-  patch: { claddingType?: WallCladdingType; heightM?: number; kind?: WallFacetKind }
+  patch: {
+    claddingType?: WallCladdingType;
+    heightM?: number;
+    kind?: WallFacetKind;
+    heightSource?: WallHeightSource;
+    roofLevels?: RoofLevel[];
+    roofPlanes?: RoofPlane[];
+  }
 ): WallPlan {
   const idSet = new Set(facetIds);
   if (idSet.size === 0) return plan;
@@ -2310,12 +2318,20 @@ export function batchUpdateWallFacetsInPlan(
       updated.claddingType = patch.claddingType;
       updated.regions = undefined;
     }
-    if (typeof patch.heightM === 'number' && Number.isFinite(patch.heightM) && patch.heightM >= 0.4) {
+    if (patch.heightSource === 'roof' && patch.roofLevels && patch.roofPlanes) {
+      updated = fitWallFacetTopToRoof(updated, patch.roofLevels, patch.roofPlanes);
+    } else if (
+      typeof patch.heightM === 'number' &&
+      Number.isFinite(patch.heightM) &&
+      patch.heightM >= 0.4
+    ) {
       const hM = +patch.heightM.toFixed(3);
       updated.heightM = hM;
       updated.topZ = +(updated.bottomZ + hM).toFixed(3);
-      updated.heightSource = 'manual';
-      updated.roofProfile = undefined;
+      updated.heightSource = patch.heightSource ?? 'manual';
+      if (updated.heightSource === 'manual') {
+        updated.roofProfile = undefined;
+      }
       updated.openings = updated.openings.map((op) =>
         clampWallOpeningToFacet({ lengthM: updated.lengthM, heightM: hM }, op)
       );
@@ -2324,6 +2340,8 @@ export function batchUpdateWallFacetsInPlan(
           clampWallRegionToFacet({ lengthM: updated.lengthM, heightM: hM }, r)
         );
       }
+    } else if (patch.heightSource) {
+      updated.heightSource = patch.heightSource;
     }
     return updated;
   });
@@ -2333,6 +2351,40 @@ export function batchUpdateWallFacetsInPlan(
     facets: nextFacets,
     builtAt: new Date().toISOString()
   };
+}
+
+export function applyCladdingToFacets(
+  wallPlan: WallPlan,
+  facetIds: string[],
+  claddingType: WallCladdingType
+): WallPlan {
+  return batchUpdateWallFacetsInPlan(wallPlan, facetIds, { claddingType });
+}
+
+export function applyKindToFacets(
+  wallPlan: WallPlan,
+  facetIds: string[],
+  kind: WallFacetKind
+): WallPlan {
+  return batchUpdateWallFacetsInPlan(wallPlan, facetIds, { kind });
+}
+
+export function applyHeightToFacets(
+  wallPlan: WallPlan,
+  facetIds: string[],
+  heightM: number,
+  options?: {
+    heightSource?: WallHeightSource;
+    levels?: RoofLevel[];
+    planes?: RoofPlane[];
+  }
+): WallPlan {
+  return batchUpdateWallFacetsInPlan(wallPlan, facetIds, {
+    heightM,
+    heightSource: options?.heightSource ?? 'manual',
+    roofLevels: options?.levels,
+    roofPlanes: options?.planes
+  });
 }
 
 /**

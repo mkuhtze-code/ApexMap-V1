@@ -12,12 +12,26 @@ export interface Point3D {
 export type EdgeType =
   | 'unclassified'
   | 'outline'
+  | 'ridge'
   | 'hip'
   | 'valley'
-  | 'ridge'
-  | 'change-of-pitch'
   | 'verge'
-  | 'wall';
+  | 'wall'
+  | 'rake'
+  | 'apron'
+  | 'change-of-pitch';
+
+export type SkeletonLineType =
+  | 'ridge'
+  | 'hip'
+  | 'valley'
+  | 'eave'
+  | 'barge'
+  | 'wall'
+  | 'rake'
+  | 'apron'
+  | 'change-of-pitch'
+  | 'unclassified';
 
 export interface PlanEdge {
   id: string;
@@ -47,7 +61,7 @@ export interface SkeletonLine {
   id: string;
   from: Point2D;
   to: Point2D;
-  suggestedType: 'hip' | 'valley' | 'ridge';
+  suggestedType: SkeletonLineType;
   levelId?: string;
 }
 
@@ -845,6 +859,7 @@ export type TakeoffCompletenessCategory =
   | 'undetailed_secondary'
   | 'missing_flashing'
   | 'incomplete_plane'
+  | 'mixed_pitch'
   | 'incomplete_penetration';
 
 export interface TakeoffCompletenessIssue {

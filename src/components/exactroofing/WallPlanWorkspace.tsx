@@ -32,6 +32,7 @@ import {
   WallFacet,
   WallFacetKind,
   WallFilterMode,
+  WallHeightSource,
   WallPlan
 } from '../../types/exactRoofing';
 import {
@@ -90,6 +91,8 @@ interface Props {
   onUpdateWallFacet: (updatedFacet: WallFacet) => void;
   wallFilterMode?: WallFilterMode;
   onChangeWallFilterMode?: (mode: WallFilterMode) => void;
+  multiSelectedFacetIds?: string[];
+  onChangeMultiSelectedFacetIds?: (ids: string[]) => void;
   onBuildRoofFromWalls?: (plan: WallPlan) => void;
   initialSubView?: 'plan' | 'elevation';
   readOnly?: boolean;
@@ -111,6 +114,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   onUpdateWallFacet,
   wallFilterMode: propWallFilterMode,
   onChangeWallFilterMode,
+  multiSelectedFacetIds: propMultiSelectedFacetIds,
+  onChangeMultiSelectedFacetIds,
   onBuildRoofFromWalls,
   initialSubView = 'plan',
   readOnly = false
@@ -133,10 +138,12 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   const [localFilterMode, setLocalFilterMode] = useState<WallFilterMode>('all');
   const [scheduleTab, setScheduleTab] = useState<ScheduleTab>('summary');
   const [takeoffScope, setTakeoffScope] = useState<'all' | 'primary' | 'secondary'>('all');
-  const [multiSelectedFacetIds, setMultiSelectedFacetIds] = useState<string[]>([]);
+  const [localMultiSelectedFacetIds, setLocalMultiSelectedFacetIds] = useState<string[]>([]);
+  const [wallMultiMode, setWallMultiMode] = useState<boolean>(false);
   const [batchCladding, setBatchCladding] = useState<WallCladdingType>('weatherboard');
   const [batchKind, setBatchKind] = useState<WallFacetKind | ''>('');
   const [batchHeightM, setBatchHeightM] = useState<string>('');
+  const [batchHeightSource, setBatchHeightSource] = useState<WallHeightSource | ''>('');
 
   // Zoom & Pan state for the wall floor plan CAD viewport
   const [zoom, setZoom] = useState<number>(1);
@@ -173,18 +180,26 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     [facets, selectedWallFacetId]
   );
 
+  const multiSelectedFacetIds = propMultiSelectedFacetIds ?? localMultiSelectedFacetIds;
+  const setMultiSelectedFacetIds = (ids: string[]) => {
+    setLocalMultiSelectedFacetIds(ids);
+    onChangeMultiSelectedFacetIds?.(ids);
+  };
+
   React.useEffect(() => {
     const target = facets.find((f) => f.id === selectedWallFacetId);
     setEditLengthVal(target ? target.lengthM.toFixed(2) : '');
   }, [selectedWallFacetId, facets]);
 
   React.useEffect(() => {
-    setMultiSelectedFacetIds((prev) => {
-      if (prev.length === 0) return prev;
-      const filtered = prev.filter((id) => facets.some((f) => f.id === id));
-      return filtered.length === prev.length ? prev : filtered;
-    });
-  }, [facets]);
+    if (multiSelectedFacetIds.length === 0) return;
+    const validSet = new Set(facets.map((f) => f.id));
+    const filtered = multiSelectedFacetIds.filter((id) => validSet.has(id));
+    if (filtered.length !== multiSelectedFacetIds.length) {
+      setLocalMultiSelectedFacetIds(filtered);
+      onChangeMultiSelectedFacetIds?.(filtered);
+    }
+  }, [facets, multiSelectedFacetIds]);
 
   const fullSummary = useMemo(
     () => computeWallTakeoffSummary(facets, 'all'),
@@ -767,9 +782,10 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   };
 
   const toggleMultiSelectFacet = (facetId: string) => {
-    setMultiSelectedFacetIds((prev) =>
-      prev.includes(facetId) ? prev.filter((id) => id !== facetId) : [...prev, facetId]
-    );
+    const next = multiSelectedFacetIds.includes(facetId)
+      ? multiSelectedFacetIds.filter((id) => id !== facetId)
+      : [...multiSelectedFacetIds, facetId];
+    setMultiSelectedFacetIds(next);
   };
 
   const wallAsOutline: RoofOutline | null = useMemo(() => {
@@ -934,6 +950,26 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 >
                   <Compass className="w-3.5 h-3.5" />
                   <span>Build Roof</span>
+                </button>
+              )}
+
+              {facets.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setWallMultiMode((v) => !v)}
+                  className={`px-2.5 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer ${
+                    wallMultiMode || multiSelectedFacetIds.length >= 2
+                      ? 'bg-emerald-600/30 border-emerald-500/50 text-emerald-200'
+                      : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300'
+                  }`}
+                  title="Tap multiple wall faces to batch edit (or Shift+Click)"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>
+                    {multiSelectedFacetIds.length >= 2
+                      ? `Multi (${multiSelectedFacetIds.length})`
+                      : 'Multi'}
+                  </span>
                 </button>
               )}
             </>
@@ -1327,7 +1363,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                     onClick={(e) => {
                       if (isDrawing) return;
                       e.stopPropagation();
-                      if (e.shiftKey && !readOnly) {
+                      if ((e.shiftKey || wallMultiMode) && !readOnly) {
                         toggleMultiSelectFacet(facet.id);
                         return;
                       }
@@ -1766,12 +1802,25 @@ export const WallPlanWorkspace: React.FC<Props> = ({
           </div>
         )}
 
-        {/* Multi-Select Batch Apply Bar (Shift+Click on Plan or Tick Checkboxes in Faces Table) */}
-        {!readOnly && wallPlan && multiSelectedFacetIds.length >= 1 && (
+        {/* Multi-Select Batch Apply Bar (Multi mode, Shift+Click on Plan, or Checkboxes in Faces Table) */}
+        {!readOnly && wallPlan && (multiSelectedFacetIds.length >= 1 || wallMultiMode) && (
           <div className="bg-emerald-950/35 border border-emerald-500/40 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-            <span className="font-extrabold text-emerald-300">
-              {multiSelectedFacetIds.length} wall {multiSelectedFacetIds.length === 1 ? 'face' : 'faces'} selected (Shift+Click to add/remove)
-            </span>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-extrabold text-emerald-300">
+                {multiSelectedFacetIds.length === 0
+                  ? 'Multi-Select Active (tap faces or select filtered)'
+                  : `${multiSelectedFacetIds.length} wall ${multiSelectedFacetIds.length === 1 ? 'face' : 'faces'} selected`}
+              </span>
+              {filteredFacets.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setMultiSelectedFacetIds(filteredFacets.map((f) => f.id))}
+                  className="px-2 py-0.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-200 cursor-pointer"
+                >
+                  Select Shown ({filteredFacets.length})
+                </button>
+              )}
+            </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <select
                 value={batchCladding}
@@ -1786,6 +1835,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               </select>
               <button
                 type="button"
+                disabled={multiSelectedFacetIds.length === 0}
                 onClick={() =>
                   onUpdateWallPlan(
                     batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
@@ -1793,7 +1843,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                     })
                   )
                 }
-                className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer"
+                className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
               >
                 Apply Cladding
               </button>
@@ -1812,7 +1862,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               </select>
               <button
                 type="button"
-                disabled={!batchKind}
+                disabled={!batchKind || multiSelectedFacetIds.length === 0}
                 onClick={() =>
                   batchKind &&
                   onUpdateWallPlan(
@@ -1838,12 +1888,19 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               />
               <button
                 type="button"
-                disabled={!Number.isFinite(parseFloat(batchHeightM)) || parseFloat(batchHeightM) < 0.4}
+                disabled={
+                  multiSelectedFacetIds.length === 0 ||
+                  !Number.isFinite(parseFloat(batchHeightM)) ||
+                  parseFloat(batchHeightM) < 0.4
+                }
                 onClick={() => {
                   const h = parseFloat(batchHeightM);
                   if (Number.isFinite(h) && h >= 0.4) {
                     onUpdateWallPlan(
-                      batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, { heightM: h })
+                      batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
+                        heightM: h,
+                        heightSource: 'manual'
+                      })
                     );
                   }
                 }}
@@ -1852,9 +1909,39 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 Set H
               </button>
 
+              <select
+                value={batchHeightSource}
+                onChange={(e) => setBatchHeightSource(e.target.value as WallHeightSource | '')}
+                className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white font-bold"
+              >
+                <option value="">Height Source...</option>
+                <option value="manual">Manual</option>
+                <option value="roof">From Roof Eave</option>
+              </select>
               <button
                 type="button"
-                onClick={() => setMultiSelectedFacetIds([])}
+                disabled={!batchHeightSource || multiSelectedFacetIds.length === 0}
+                onClick={() =>
+                  batchHeightSource &&
+                  onUpdateWallPlan(
+                    batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
+                      heightSource: batchHeightSource,
+                      roofLevels: levels,
+                      roofPlanes
+                    })
+                  )
+                }
+                className="px-2 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+              >
+                Set Source
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setMultiSelectedFacetIds([]);
+                  setWallMultiMode(false);
+                }}
                 className="p-1 rounded-lg text-slate-400 hover:text-white cursor-pointer"
                 title="Clear Selection"
               >

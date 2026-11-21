@@ -142,6 +142,32 @@ export function evaluateTakeoffCompleteness(
           targetCode: lvl.code
         });
       }
+
+      const mainLevelPlanes = levelPlanes.filter((p) => !p.isVirtualAssetPlane && Number.isFinite(p.pitchDeg) && p.pitchDeg > 0);
+      if (mainLevelPlanes.length >= 2) {
+        const distinctPitches = Array.from(
+          new Set(mainLevelPlanes.map((p) => +p.pitchDeg.toFixed(1)))
+        ).sort((a, b) => a - b);
+        if (distinctPitches.length > 1) {
+          const pitchCounts = new Map<number, number>();
+          mainLevelPlanes.forEach((p) => {
+            const key = +p.pitchDeg.toFixed(1);
+            pitchCounts.set(key, (pitchCounts.get(key) || 0) + 1);
+          });
+          const majorityPitch = Array.from(pitchCounts.entries()).sort(
+            (a, b) => b[1] - a[1] || b[0] - a[0]
+          )[0][0];
+          issues.push({
+            id: `issue-mixed-pitch-${lvl.id}`,
+            category: 'mixed_pitch',
+            severity: 'warning',
+            title: `${lvl.code}: Mixed pitches (${distinctPitches.map((p) => `${p}°`).join(' vs ')})`,
+            detail: 'Confirm deliberate dual-pitch faces or multi-select & unify roof faces before lock.',
+            targetId: lvl.id,
+            targetCode: String(majorityPitch)
+          });
+        }
+      }
     });
   }
 

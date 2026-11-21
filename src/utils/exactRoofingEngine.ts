@@ -2,6 +2,7 @@ import {
   Point2D,
   Point3D,
   EdgeType,
+  SkeletonLineType,
   PlanEdge,
   RoofOutline,
   SkeletonLine,
@@ -285,6 +286,141 @@ export function buildAttachedOutlineFromEdge(
   };
 }
 
+export interface RoofLineTypeCatalogItem {
+  edgeType: EdgeType;
+  lineType: SkeletonLineType;
+  code: string;
+  label: string;
+  shortLabel: string;
+  colorHex: string;
+  flashingKind: RoofLineFlashingKind;
+  dashArray?: string;
+}
+
+export const ROOF_LINE_TYPE_CATALOG: readonly RoofLineTypeCatalogItem[] = [
+  {
+    edgeType: 'outline',
+    lineType: 'eave',
+    code: 'E',
+    label: 'Eave / Gutter',
+    shortLabel: 'Eave',
+    colorHex: '#22c55e',
+    flashingKind: 'eave'
+  },
+  {
+    edgeType: 'ridge',
+    lineType: 'ridge',
+    code: 'R',
+    label: 'Ridge',
+    shortLabel: 'Ridge',
+    colorHex: '#c084fc',
+    flashingKind: 'ridge'
+  },
+  {
+    edgeType: 'hip',
+    lineType: 'hip',
+    code: 'H',
+    label: 'Hip',
+    shortLabel: 'Hip',
+    colorHex: '#38bdf8',
+    flashingKind: 'hip'
+  },
+  {
+    edgeType: 'valley',
+    lineType: 'valley',
+    code: 'V',
+    label: 'Valley',
+    shortLabel: 'Valley',
+    colorHex: '#fbbf24',
+    flashingKind: 'valley',
+    dashArray: '6 3'
+  },
+  {
+    edgeType: 'verge',
+    lineType: 'barge',
+    code: 'B',
+    label: 'Barge / Verge',
+    shortLabel: 'Barge',
+    colorHex: '#818cf8',
+    flashingKind: 'barge',
+    dashArray: '6 4'
+  },
+  {
+    edgeType: 'wall',
+    lineType: 'wall',
+    code: 'W',
+    label: 'Wall / Abutment',
+    shortLabel: 'Wall',
+    colorHex: '#f59e0b',
+    flashingKind: 'apron',
+    dashArray: '5 3'
+  },
+  {
+    edgeType: 'rake',
+    lineType: 'rake',
+    code: 'RK',
+    label: 'Rake',
+    shortLabel: 'Rake',
+    colorHex: '#6366f1',
+    flashingKind: 'barge',
+    dashArray: '6 4'
+  },
+  {
+    edgeType: 'apron',
+    lineType: 'apron',
+    code: 'A',
+    label: 'Apron / Step',
+    shortLabel: 'Apron',
+    colorHex: '#fb923c',
+    flashingKind: 'apron',
+    dashArray: '5 3'
+  },
+  {
+    edgeType: 'change-of-pitch',
+    lineType: 'change-of-pitch',
+    code: 'PB',
+    label: 'Pitch Break',
+    shortLabel: 'Break',
+    colorHex: '#f97316',
+    flashingKind: 'apron',
+    dashArray: '4 4'
+  },
+  {
+    edgeType: 'unclassified',
+    lineType: 'unclassified',
+    code: '?',
+    label: 'Unclassified',
+    shortLabel: 'Unclass',
+    colorHex: '#94a3b8',
+    flashingKind: 'eave',
+    dashArray: '3 4'
+  }
+];
+
+export function getRoofEdgeTypeMeta(edgeType: EdgeType): RoofLineTypeCatalogItem {
+  return (
+    ROOF_LINE_TYPE_CATALOG.find((item) => item.edgeType === edgeType) ||
+    ROOF_LINE_TYPE_CATALOG[ROOF_LINE_TYPE_CATALOG.length - 1]
+  );
+}
+
+export function getSkeletonLineTypeMeta(lineType: SkeletonLineType): RoofLineTypeCatalogItem {
+  return (
+    ROOF_LINE_TYPE_CATALOG.find((item) => item.lineType === lineType) ||
+    ROOF_LINE_TYPE_CATALOG[1]
+  );
+}
+
+export function mapEdgeTypeToFlashingKind(edgeType: EdgeType): RoofLineFlashingKind {
+  return getRoofEdgeTypeMeta(edgeType).flashingKind;
+}
+
+export function mapSkeletonLineTypeToFlashingKind(
+  lineType: SkeletonLineType
+): RoofLineFlashingKind {
+  return getSkeletonLineTypeMeta(lineType).flashingKind;
+}
+
 /**
  * Classifies a single boundary edge without altering skeleton geometry or fall direction of other edges.
  */
@@ -293,10 +429,23 @@ export function classifyOutlineEdge(
   edgeId: string,
   edgeType: EdgeType
 ): RoofOutline {
+  return applyEdgeType(outline, [edgeId], edgeType);
+}
+
+/**
+ * Batch-classify one or more boundary edges cleanly without altering manual skeletons or unrelated faces.
+ */
+export function applyEdgeType(
+  outline: RoofOutline,
+  edgeIds: string[],
+  edgeType: EdgeType
+): RoofOutline {
+  if (!edgeIds || edgeIds.length === 0) return outline;
+  const targetSet = new Set(edgeIds);
   return {
     ...outline,
     edges: outline.edges.map((e) =>
-      e.id === edgeId
+      targetSet.has(e.id)
         ? {
             ...e,
             type: edgeType,
@@ -305,6 +454,154 @@ export function classifyOutlineEdge(
         : e
     )
   };
+}
+
+/**
+ * Batch-update skeleton / internal polyline types cleanly.
+ */
+export function applySkeletonLineType(
+  skeleton: SkeletonLine[],
+  lineIds: string[],
+  lineType: SkeletonLineType
+): SkeletonLine[] {
+  if (!lineIds || lineIds.length === 0) return skeleton;
+  const targetSet = new Set(lineIds);
+  return skeleton.map((s) =>
+    targetSet.has(s.id) ? { ...s, suggestedType: lineType } : s
+  );
+}
+
+/**
+ * Batch-update eave setback & wall presence across one or more perimeter edges.
+ */
+export function applyEaveSetback(
+  outline: RoofOutline,
+  edgeIds: string[],
+  setbackM: number,
+  hasWall?: boolean
+): RoofOutline {
+  if (!edgeIds || edgeIds.length === 0) return outline;
+  const targetSet = new Set(edgeIds);
+  const clampedSetback = +Math.max(0, Math.min(3.0, setbackM)).toFixed(2);
+  return {
+    ...outline,
+    edges: outline.edges.map((e) =>
+      targetSet.has(e.id)
+        ? {
+            ...e,
+            eaveSetbackM: clampedSetback,
+            ...(hasWall !== undefined ? { hasWall } : {})
+          }
+        : e
+    )
+  };
+}
+
+/**
+ * Batch-update eave wall height (Z) across one or more perimeter edges.
+ */
+export function applyEaveHeightToEdges(
+  outline: RoofOutline,
+  edgeIds: string[],
+  heightM: number
+): RoofOutline {
+  if (!edgeIds || edgeIds.length === 0) return outline;
+  const targetSet = new Set(edgeIds);
+  const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
+  return {
+    ...outline,
+    edges: outline.edges.map((e) =>
+      targetSet.has(e.id) ? { ...e, eaveHeightM: clampedZ } : e
+    )
+  };
+}
+
+/**
+ * Batch-apply pitch (deg) to selected roof planes while preserving IDs, codes, colors, and overrides.
+ */
+export function applyPitchToPlanes(
+  planes: RoofPlane[],
+  planeIds: string[],
+  pitchDeg: number,
+  levels: RoofLevel[] = []
+): RoofPlane[] {
+  if (!planeIds || planeIds.length === 0) return planes;
+  const targetSet = new Set(planeIds);
+  const clampedPitch = +Math.max(1, Math.min(65, pitchDeg)).toFixed(1);
+
+  return planes.map((plane) => {
+    if (!targetSet.has(plane.id)) return plane;
+    const owningLvl =
+      levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
+      levels.find((l) => l.outline.edges.some((e) => e.id === plane.eaveEdgeId));
+    const edge = owningLvl?.outline.edges.find((e) => e.id === plane.eaveEdgeId);
+    if (!owningLvl || !edge) {
+      return { ...plane, pitchDeg: clampedPitch };
+    }
+    const rebuilt = createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
+      pitchDeg: clampedPitch,
+      underlapSide: plane.underlapSide,
+      eaveHeightM: plane.eaveHeightM,
+      sheetRunEdgeId: plane.sheetRunEdgeId,
+      orderedSheetLengthM: plane.orderedSheetLengthM,
+      name: plane.name,
+      existingId: plane.id,
+      isStartEdge: plane.isStartEdge,
+      levelId: plane.levelId || owningLvl.id,
+      levelCode: plane.levelCode || owningLvl.code,
+      levelName: plane.levelName || owningLvl.name
+    });
+    return {
+      ...rebuilt,
+      id: plane.id,
+      code: plane.code,
+      label: plane.label,
+      color: plane.color
+    };
+  });
+}
+
+/**
+ * Batch-apply sheet lay / underlap direction across selected roof planes.
+ */
+export function applyDirectionToPlanes(
+  planes: RoofPlane[],
+  planeIds: string[],
+  underlapSide: 'left' | 'right'
+): RoofPlane[] {
+  if (!planeIds || planeIds.length === 0) return planes;
+  const targetSet = new Set(planeIds);
+  return planes.map((plane) =>
+    targetSet.has(plane.id) ? { ...plane, underlapSide } : plane
+  );
+}
+
+/**
+ * Batch-apply BOM-only site-measured ordered sheet length override across selected planes.
+ * Never alters planPolygon, developedPolygon, or modeled slopeLength.
+ */
+export function applyOrderedSheetLengthToPlanes(
+  planes: RoofPlane[],
+  planeIds: string[],
+  orderedSheetLengthM: number | undefined
+): RoofPlane[] {
+  if (!planeIds || planeIds.length === 0) return planes;
+  const targetSet = new Set(planeIds);
+  const cleanLen =
+    orderedSheetLengthM !== undefined &&
+    Number.isFinite(orderedSheetLengthM) &&
+    orderedSheetLengthM > 0.2
+      ? +orderedSheetLengthM.toFixed(3)
+      : undefined;
+  return planes.map((plane) => {
+    if (!targetSet.has(plane.id)) return plane;
+    if (cleanLen === undefined) {
+      const next = { ...plane };
+      delete next.orderedSheetLengthM;
+      return next;
+    }
+    return { ...plane, orderedSheetLengthM: cleanLen };
+  });
 }
 
 function getLevelIdPrefixFromOutline(outline: RoofOutline): string | undefined {
@@ -2558,11 +2855,15 @@ function classifyFaceEdges(
           distToSegment(p2, oe.from, oe.to) < 0.15
       );
       if (matchedOutline) {
-        if (matchedOutline.type === 'wall') {
+        if (
+          matchedOutline.type === 'wall' ||
+          matchedOutline.type === 'apron' ||
+          matchedOutline.type === 'change-of-pitch'
+        ) {
           result.push({ edgeId, type: 'wall' });
           continue;
         }
-        if (matchedOutline.type === 'verge') {
+        if (matchedOutline.type === 'verge' || matchedOutline.type === 'rake') {
           result.push({ edgeId, type: 'verge' });
           continue;
         }
@@ -2590,7 +2891,18 @@ function classifyFaceEdges(
       );
 
     if (skelMatch) {
-      result.push({ edgeId, type: skelMatch.suggestedType });
+      const mappedType: 'eave' | 'ridge' | 'hip' | 'valley' | 'verge' | 'wall' =
+        skelMatch.suggestedType === 'ridge' ||
+        skelMatch.suggestedType === 'hip' ||
+        skelMatch.suggestedType === 'valley' ||
+        skelMatch.suggestedType === 'eave'
+          ? skelMatch.suggestedType
+          : skelMatch.suggestedType === 'wall' ||
+            skelMatch.suggestedType === 'apron' ||
+            skelMatch.suggestedType === 'change-of-pitch'
+          ? 'wall'
+          : 'verge';
+      result.push({ edgeId, type: mappedType });
     } else {
       result.push({ edgeId, type: 'verge' });
     }
@@ -5668,20 +5980,28 @@ export function getAssignableRoofLines(
 ): AssignableRoofLine[] {
   const lines: AssignableRoofLine[] = [];
 
-  // 1. Perimeter edges: Gable Verges -> 'barge', Abutment Walls -> 'apron', Eaves -> 'eave'
+  // 1. Perimeter edges across full 10-type catalog
   outline.edges.forEach((edge, idx) => {
-    const isBarge = edge.type === 'verge';
-    const isWall = edge.type === 'wall';
-    const flashingKind: RoofLineFlashingKind = isWall ? 'apron' : isBarge ? 'barge' : 'eave';
+    const meta = getRoofEdgeTypeMeta(edge.type);
+    const flashingKind: RoofLineFlashingKind = meta.flashingKind;
     const matchedPlane = planes.find((p) => p.eaveEdgeId === edge.id);
     const levelPrefix = matchedPlane?.levelCode ? `[${matchedPlane.levelCode}] ` : '';
-    const baseName = isWall
-      ? `${levelPrefix}Abutment Wall Apron #${idx + 1}`
-      : isBarge
-      ? `${levelPrefix}Gable Barge #${idx + 1}`
-      : matchedPlane
-      ? `${matchedPlane.code} Eave (${matchedPlane.name})`
-      : getEdgeCompassLabel(edge.from, edge.to, idx);
+    const baseName =
+      edge.type === 'wall'
+        ? `${levelPrefix}Abutment Wall Apron #${idx + 1}`
+        : edge.type === 'apron'
+        ? `${levelPrefix}Apron / Step #${idx + 1}`
+        : edge.type === 'change-of-pitch'
+        ? `${levelPrefix}Pitch Break Apron #${idx + 1}`
+        : edge.type === 'verge'
+        ? `${levelPrefix}Gable Barge #${idx + 1}`
+        : edge.type === 'rake'
+        ? `${levelPrefix}Rake Edge #${idx + 1}`
+        : edge.type === 'ridge' || edge.type === 'hip' || edge.type === 'valley'
+        ? `${levelPrefix}Perimeter ${meta.label} #${idx + 1}`
+        : matchedPlane
+        ? `${matchedPlane.code} Eave (${matchedPlane.name})`
+        : getEdgeCompassLabel(edge.from, edge.to, idx);
 
     const slopeInfo = computeRoofLineTrueLengthM(
       flashingKind,
@@ -5692,6 +6012,14 @@ export function getAssignableRoofLines(
       skeleton
     );
     const pieceInfo = computeFlashingPieceBreakdown(slopeInfo.trueSlopeLengthM, flashingKind);
+    const suggestedCategory: AssignableRoofLine['suggestedCategory'] =
+      flashingKind === 'apron'
+        ? 'Apron & Abutment'
+        : flashingKind === 'valley'
+        ? 'Valley & Gutter'
+        : flashingKind === 'ridge' || flashingKind === 'hip'
+        ? 'Ridge & Hip'
+        : 'Barge & Edge';
 
     lines.push({
       lineId: edge.id,
@@ -5720,21 +6048,17 @@ export function getAssignableRoofLines(
           : slopeInfo.pitchesDeg,
       eaveHeightM: edge.eaveHeightM ?? matchedPlane?.eaveHeightM,
       levelId: edge.levelId ?? matchedPlane?.levelId ?? outline.levelId,
-      suggestedCategory: isWall ? 'Apron & Abutment' : 'Barge & Edge'
+      suggestedCategory
     });
   });
 
-  // 2. Internal Skeleton Lines: Ridges, Hips, Valleys
-  const counts = { ridge: 0, hip: 0, valley: 0 };
+  // 2. Internal Skeleton / Polylines across full 10-type catalog
+  const counts: Record<string, number> = {};
   skeleton.forEach((skel) => {
-    counts[skel.suggestedType] += 1;
-    const flashingKind: RoofLineFlashingKind = skel.suggestedType;
-    const typeLabel =
-      skel.suggestedType === 'ridge'
-        ? `Ridge #${counts.ridge}`
-        : skel.suggestedType === 'valley'
-        ? `Valley #${counts.valley}`
-        : `Hip #${counts.hip}`;
+    counts[skel.suggestedType] = (counts[skel.suggestedType] || 0) + 1;
+    const meta = getSkeletonLineTypeMeta(skel.suggestedType);
+    const flashingKind: RoofLineFlashingKind = meta.flashingKind;
+    const typeLabel = `${meta.label} #${counts[skel.suggestedType]}`;
 
     const slopeInfo = computeRoofLineTrueLengthM(
       flashingKind,
@@ -5745,6 +6069,14 @@ export function getAssignableRoofLines(
       skeleton
     );
     const pieceInfo = computeFlashingPieceBreakdown(slopeInfo.trueSlopeLengthM, flashingKind);
+    const suggestedCategory: AssignableRoofLine['suggestedCategory'] =
+      flashingKind === 'valley'
+        ? 'Valley & Gutter'
+        : flashingKind === 'apron'
+        ? 'Apron & Abutment'
+        : flashingKind === 'barge' || flashingKind === 'eave'
+        ? 'Barge & Edge'
+        : 'Ridge & Hip';
 
     lines.push({
       lineId: skel.id,
@@ -5765,7 +6097,7 @@ export function getAssignableRoofLines(
       recommendedQuantity: pieceInfo.recommendedQuantity,
       associatedPlaneIds: slopeInfo.associatedPlaneIds,
       pitchesDeg: slopeInfo.pitchesDeg,
-      suggestedCategory: skel.suggestedType === 'valley' ? 'Valley & Gutter' : 'Ridge & Hip'
+      suggestedCategory
     });
   });
 

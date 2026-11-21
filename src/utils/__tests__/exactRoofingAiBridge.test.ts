@@ -193,4 +193,56 @@ const sheetSpec: SheetSpec = {
   }
 }
 
+// 6. Test Deterministic Batch Multi-Apply Audit Patches (Mixed Pitch + Unclassified Edges) & Zero Pricing
+{
+  const outline = getPresetOutline('rectangle_14x10');
+  const mixedEdgesOutline = {
+    ...outline,
+    edges: outline.edges.map((e, idx) => (idx >= 2 ? { ...e, type: 'unclassified' as const } : e))
+  };
+  const skeleton = generateSkeletonLines(mixedEdgesOutline);
+  const levels: RoofLevel[] = [
+    { id: 'level-batch', code: 'L1', name: 'Main Roof', eaveHeightM: 2.7, outline: mixedEdgesOutline, skeleton }
+  ];
+  const basePlanes = syncMultiLevelPlanes(levels, [], 22.5);
+  const mixedPlanes = basePlanes.map((p, idx) => (idx === 0 ? { ...p, pitchDeg: 15 } : p));
+  const layout = generateCuttingLayout(mixedPlanes, sheetSpec);
+  const assignableLines = getAssignableRoofLinesMultiLevel(levels, mixedPlanes, [], []);
+
+  const report = runDeterministicRoofAudit({
+    planes: mixedPlanes,
+    levels,
+    layout,
+    sheetSpec,
+    assignableLines,
+    flashingAssignments: [],
+    profileName: 'TRS Plumbdeck Trapezoidal 0.55mm',
+    windZone: 'Very High',
+    prevailingWind: 'SW'
+  });
+
+  const batchPitchPatch = report.recommendedPatches.find((p) => p.op === 'batch_plane_pitch');
+  const batchEdgePatch = report.recommendedPatches.find((p) => p.op === 'batch_classify_edges');
+
+  assert.ok(batchPitchPatch, 'Detects mixed pitch on level and emits batch_plane_pitch patch');
+  assert.ok((batchPitchPatch?.targetIds?.length || 0) >= 2, 'batch_plane_pitch targets all main level faces');
+  assert.ok(batchEdgePatch, 'Detects unclassified perimeter edges alongside classified eaves and emits batch_classify_edges');
+  assert.equal(batchEdgePatch?.targetIds?.length, 2, 'batch_classify_edges targets exactly the 2 unclassified edges');
+
+  report.recommendedPatches.forEach((patch) => {
+    assert.ok(!patch.label.includes('$') && !patch.reason.includes('$'), 'Recommended patches must never include $ pricing');
+  });
+  report.findings.forEach((f) => {
+    assert.ok(!f.title.includes('$') && !f.detail.includes('$'), 'Audit findings must never include $ pricing');
+  });
+
+  const guide = buildCalmStageGuidance({
+    stage: 'quoting',
+    planes: mixedPlanes,
+    layout,
+    auditReport: report
+  });
+  assert.ok(!guide.headline.includes('$') && !guide.summary.includes('$') && !guide.metricsLine.includes('$'));
+}
+
 console.log('✓ All exactRoofingAiBridge deterministic + AI verification tests passed!');

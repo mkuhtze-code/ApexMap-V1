@@ -4,6 +4,7 @@ import {
   RoofOutline,
   RoofLevel,
   SkeletonLine,
+  SkeletonLineType,
   PlanEdge,
   RoofPlane,
   Point2D,
@@ -45,6 +46,9 @@ import {
   scaleOutlineUniformly,
   worldToPlanUnderlayNorm,
   planUnderlayNormToWorld,
+  ROOF_LINE_TYPE_CATALOG,
+  getRoofEdgeTypeMeta,
+  getSkeletonLineTypeMeta,
   PlanViewportBounds,
   dist
 } from '../../utils/exactRoofingEngine';
@@ -160,6 +164,17 @@ interface Props {
   projectPlans?: ArchitecturalPlan[];
   onUpdatePlanUnderlay?: (underlay: RoofPlanUnderlay | null) => void;
   openPlanModalSignal?: number;
+  selectedPlaneIds?: string[];
+  onChangeSelectedPlaneIds?: (ids: string[]) => void;
+  selectedEdgeIds?: string[];
+  onChangeSelectedEdgeIds?: (ids: string[]) => void;
+  selectedSkeletonLineIds?: string[];
+  onChangeSelectedSkeletonLineIds?: (ids: string[]) => void;
+  onBatchUpdatePlanePitch?: (planeIds: string[], pitchDeg: number) => void;
+  onBatchClassifyEdges?: (edgeIds: string[], edgeType: EdgeType) => void;
+  onBatchUpdateSkeletonType?: (lineIds: string[], lineType: SkeletonLineType) => void;
+  onUndo?: () => void;
+  canUndo?: boolean;
 }
 
 export const ExactRoofingCanvas: React.FC<Props> = ({
@@ -209,7 +224,18 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   planUnderlay = null,
   projectPlans = [],
   onUpdatePlanUnderlay,
-  openPlanModalSignal
+  openPlanModalSignal,
+  selectedPlaneIds: propSelectedPlaneIds,
+  onChangeSelectedPlaneIds,
+  selectedEdgeIds: propSelectedEdgeIds,
+  onChangeSelectedEdgeIds,
+  selectedSkeletonLineIds: propSelectedSkeletonLineIds,
+  onChangeSelectedSkeletonLineIds,
+  onBatchUpdatePlanePitch,
+  onBatchClassifyEdges,
+  onBatchUpdateSkeletonType,
+  onUndo,
+  canUndo = false
 }) => {
   const { isMobile, isTouchDevice } = useDeviceDetection();
 
@@ -219,6 +245,35 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const [isMobileToolsOpen, setIsMobileToolsOpen] = useState<boolean>(false);
   const [showAllDims, setShowAllDims] = useState<boolean>(false);
   const [inspectedLine, setInspectedLine] = useState<{ kind: 'edge' | 'skeleton'; id: string } | null>(null);
+  const [multiSelectMode, setMultiSelectMode] = useState<boolean>(false);
+  const [moreLineTypesOpen, setMoreLineTypesOpen] = useState<boolean>(false);
+  const [localSelectedPlaneIds, setLocalSelectedPlaneIds] = useState<string[]>([]);
+  const [localSelectedEdgeIds, setLocalSelectedEdgeIds] = useState<string[]>([]);
+  const [localSelectedSkeletonLineIds, setLocalSelectedSkeletonLineIds] = useState<string[]>([]);
+
+  const selectedPlaneIds = propSelectedPlaneIds ?? localSelectedPlaneIds;
+  const setSelectedPlaneIds = (ids: string[]) => {
+    setLocalSelectedPlaneIds(ids);
+    onChangeSelectedPlaneIds?.(ids);
+  };
+  const selectedEdgeIds = propSelectedEdgeIds ?? localSelectedEdgeIds;
+  const setSelectedEdgeIds = (ids: string[]) => {
+    setLocalSelectedEdgeIds(ids);
+    onChangeSelectedEdgeIds?.(ids);
+  };
+  const selectedSkeletonLineIds = propSelectedSkeletonLineIds ?? localSelectedSkeletonLineIds;
+  const setSelectedSkeletonLineIds = (ids: string[]) => {
+    setLocalSelectedSkeletonLineIds(ids);
+    onChangeSelectedSkeletonLineIds?.(ids);
+  };
+  const toggleMultiId = (list: string[], id: string) =>
+    list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
+  const totalMultiSelectedCount =
+    selectedPlaneIds.length + selectedEdgeIds.length + selectedSkeletonLineIds.length;
+  const hasMultiSelectionBar =
+    !readOnlyGeometry &&
+    activeTool === 'set_pitch' &&
+    (multiSelectMode || totalMultiSelectedCount >= 2);
 
   // Freehand drawing, attach-to-edge & scaling state
   const [draftPoints, setDraftPoints] = useState<Point2D[]>([]);
@@ -311,8 +366,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     }
   }, [openPlanModalSignal]);
 
-  // Add internal roof line state (polyline chain + 3-pt angle bisector)
-  const [newLineType, setNewLineType] = useState<'ridge' | 'hip' | 'valley'>('hip');
+  // Add internal roof line state (all 10 line types, polyline chain + 3-pt angle bisector)
+  const [newLineType, setNewLineType] = useState<SkeletonLineType>('hip');
   const [lineStartPt, setLineStartPt] = useState<Point2D | null>(null);
   const [chainLineMode, setChainLineMode] = useState<boolean>(true);
   const [bisectMode, setBisectMode] = useState<boolean>(false);
@@ -1443,9 +1498,21 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       if (attached) onDeletePlane(attached.id);
       return;
     }
+    if (!readOnlyGeometry && activeTool === 'set_pitch' && (e.shiftKey || multiSelectMode)) {
+      setEditingMeasurement(null);
+      const nextIds = toggleMultiId(selectedEdgeIds, edge.id);
+      setSelectedEdgeIds(nextIds);
+      if (nextIds.length <= 1) {
+        setInspectedLine(nextIds.length === 1 ? { kind: 'edge', id: nextIds[0] } : null);
+      } else {
+        setInspectedLine(null);
+      }
+      return;
+    }
     // Select / Inspect mode -> display line info card with length, flashing, pitch & hip/gable actions
     setEditingMeasurement(null);
     onSelectPlane(null);
+    setSelectedEdgeIds([edge.id]);
     setInspectedLine({ kind: 'edge', id: edge.id });
   };
 
@@ -1842,26 +1909,74 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               activeTool === 'adjust_shape') && (
               <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1.5 w-[calc(100%-16px)] max-w-sm pointer-events-none">
                 {activeTool === 'add_line' && (
-                  <div className="pointer-events-auto bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex flex-wrap justify-center items-center gap-1 animate-in fade-in slide-in-from-bottom-2">
-                    {[
-                      { type: 'ridge' as const, label: 'Ridge', color: 'bg-purple-400', activeBg: 'bg-purple-600' },
-                      { type: 'hip' as const, label: 'Hip', color: 'bg-sky-400', activeBg: 'bg-sky-600' },
-                      { type: 'valley' as const, label: 'Valley', color: 'bg-amber-400', activeBg: 'bg-amber-600' }
-                    ].map((item) => (
+                  <div className="pointer-events-auto relative bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex flex-wrap justify-center items-center gap-1 animate-in fade-in slide-in-from-bottom-2">
+                    {(['ridge', 'hip', 'valley'] as const).map((lineType) => {
+                      const meta = getSkeletonLineTypeMeta(lineType);
+                      return (
+                        <button
+                          key={lineType}
+                          type="button"
+                          onClick={() => {
+                            setNewLineType(lineType);
+                            setMoreLineTypesOpen(false);
+                          }}
+                          className={`min-h-[34px] px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                            newLineType === lineType
+                              ? 'bg-purple-600 text-white shadow-xs'
+                              : 'text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: meta.colorHex }} />
+                          <span>{meta.shortLabel}</span>
+                        </button>
+                      );
+                    })}
+                    <div className="relative">
                       <button
-                        key={item.type}
                         type="button"
-                        onClick={() => setNewLineType(item.type)}
-                        className={`min-h-[34px] px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
-                          newLineType === item.type
-                            ? `${item.activeBg} text-white shadow-xs`
+                        onClick={() => setMoreLineTypesOpen((v) => !v)}
+                        className={`min-h-[34px] px-2 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1 ${
+                          !['ridge', 'hip', 'valley'].includes(newLineType) || moreLineTypesOpen
+                            ? 'bg-sky-600 text-white'
                             : 'text-slate-300 hover:bg-slate-800'
                         }`}
                       >
-                        <span className={`w-2 h-2 rounded-full ${item.color}`} />
-                        <span>{item.label}</span>
+                        <span>
+                          {!['ridge', 'hip', 'valley'].includes(newLineType)
+                            ? getSkeletonLineTypeMeta(newLineType).shortLabel
+                            : 'More'}
+                        </span>
+                        <ChevronDown className="w-3 h-3" />
                       </button>
-                    ))}
+                      {moreLineTypesOpen && (
+                        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 bg-[#0b101d]/98 border border-slate-700 rounded-xl p-1.5 shadow-2xl grid grid-cols-1 gap-0.5 z-40">
+                          {ROOF_LINE_TYPE_CATALOG.map((item) => (
+                            <button
+                              key={item.lineType}
+                              type="button"
+                              onClick={() => {
+                                setNewLineType(item.lineType);
+                                setMoreLineTypesOpen(false);
+                              }}
+                              className={`w-full px-2 py-1.5 rounded-lg text-left text-[11px] font-bold flex items-center justify-between cursor-pointer ${
+                                newLineType === item.lineType
+                                  ? 'bg-sky-600 text-white'
+                                  : 'text-slate-200 hover:bg-slate-800'
+                              }`}
+                            >
+                              <span className="flex items-center gap-1.5">
+                                <span
+                                  className="w-2 h-2 rounded-full shrink-0"
+                                  style={{ backgroundColor: item.colorHex }}
+                                />
+                                <span>{item.label}</span>
+                              </span>
+                              <span className="font-mono text-[10px] opacity-75">{item.code}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                     <div className="w-px h-5 bg-slate-700 mx-0.5" />
                     <button
                       type="button"
@@ -2251,25 +2366,73 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   {buttonEl}
                   {activeTool === 'add_line' && (
                     <div className="absolute left-full ml-2 top-0 bg-[#090d16]/95 backdrop-blur-md border border-purple-500/40 p-1 rounded-xl shadow-2xl flex items-center gap-1 z-30 animate-in fade-in slide-in-from-left-2 whitespace-nowrap">
-                      {[
-                        { type: 'ridge' as const, label: 'Ridge', color: 'bg-purple-400', activeBg: 'bg-purple-600' },
-                        { type: 'hip' as const, label: 'Hip', color: 'bg-sky-400', activeBg: 'bg-sky-600' },
-                        { type: 'valley' as const, label: 'Valley', color: 'bg-amber-400', activeBg: 'bg-amber-600' }
-                      ].map((item) => (
+                      {(['ridge', 'hip', 'valley'] as const).map((lineType) => {
+                        const meta = getSkeletonLineTypeMeta(lineType);
+                        return (
+                          <button
+                            key={lineType}
+                            type="button"
+                            onClick={() => {
+                              setNewLineType(lineType);
+                              setMoreLineTypesOpen(false);
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                              newLineType === lineType
+                                ? 'bg-purple-600 text-white shadow-xs'
+                                : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                            }`}
+                          >
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: meta.colorHex }} />
+                            <span>{meta.shortLabel}</span>
+                          </button>
+                        );
+                      })}
+                      <div className="relative">
                         <button
-                          key={item.type}
                           type="button"
-                          onClick={() => setNewLineType(item.type)}
-                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
-                            newLineType === item.type
-                              ? `${item.activeBg} text-white shadow-xs`
+                          onClick={() => setMoreLineTypesOpen((v) => !v)}
+                          className={`px-2 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1 ${
+                            !['ridge', 'hip', 'valley'].includes(newLineType) || moreLineTypesOpen
+                              ? 'bg-sky-600 text-white'
                               : 'text-slate-300 hover:bg-slate-800 hover:text-white'
                           }`}
                         >
-                          <span className={`w-2 h-2 rounded-full ${item.color}`} />
-                          <span>{item.label}</span>
+                          <span>
+                            {!['ridge', 'hip', 'valley'].includes(newLineType)
+                              ? getSkeletonLineTypeMeta(newLineType).shortLabel
+                              : 'All 10 Types'}
+                          </span>
+                          <ChevronDown className="w-3 h-3" />
                         </button>
-                      ))}
+                        {moreLineTypesOpen && (
+                          <div className="absolute top-full left-0 mt-1.5 w-48 bg-[#0b101d]/98 border border-slate-700 rounded-xl p-1.5 shadow-2xl grid grid-cols-1 gap-0.5 z-40">
+                            {ROOF_LINE_TYPE_CATALOG.map((item) => (
+                              <button
+                                key={item.lineType}
+                                type="button"
+                                onClick={() => {
+                                  setNewLineType(item.lineType);
+                                  setMoreLineTypesOpen(false);
+                                }}
+                                className={`w-full px-2 py-1.5 rounded-lg text-left text-[11px] font-bold flex items-center justify-between cursor-pointer ${
+                                  newLineType === item.lineType
+                                    ? 'bg-sky-600 text-white'
+                                    : 'text-slate-200 hover:bg-slate-800'
+                                }`}
+                              >
+                                <span className="flex items-center gap-1.5">
+                                  <span
+                                    className="w-2 h-2 rounded-full shrink-0"
+                                    style={{ backgroundColor: item.colorHex }}
+                                  />
+                                  <span>{item.label}</span>
+                                </span>
+                                <span className="font-mono text-[10px] opacity-75">{item.code}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <div className="w-px h-5 bg-slate-700 mx-0.5" />
                       <button
                         type="button"
@@ -2556,6 +2719,25 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             </>
           )}
 
+          {!readOnlyGeometry && activeTool === 'set_pitch' && (
+            <button
+              type="button"
+              onClick={() => setMultiSelectMode((v) => !v)}
+              className={`min-h-[36px] px-2 flex items-center justify-center gap-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                multiSelectMode || totalMultiSelectedCount >= 2
+                  ? 'bg-cyan-600/35 text-cyan-200 border border-cyan-500/50'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+              title="Multi-Select faces, edges & lines (or Shift+Click)"
+            >
+              <Check className="w-3.5 h-3.5" />
+              {!isMobile && (
+                <span>
+                  {totalMultiSelectedCount >= 2 ? `Multi (${totalMultiSelectedCount})` : 'Multi'}
+                </span>
+              )}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setShowAllDims((v) => !v)}
@@ -2919,8 +3101,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             if (inspectedLine) {
               setInspectedLine(null);
             }
-            if (selectedPlaneId && activeTool === 'set_pitch') {
-              onSelectPlane(null);
+            if (!e.shiftKey && !multiSelectMode && activeTool === 'set_pitch') {
+              if (selectedPlaneId) onSelectPlane(null);
+              if (selectedPlaneIds.length > 0) setSelectedPlaneIds([]);
+              if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
+              if (selectedSkeletonLineIds.length > 0) setSelectedSkeletonLineIds([]);
             }
             handleCanvasClick(e);
           }}
@@ -3156,6 +3341,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               Boolean(levels && levels.length > 1 && activeLevelId && activeLevelId !== 'all') &&
               (plane.levelId || 'level-1') !== activeLevelId;
             const isSelected = selectedPlaneId === plane.id;
+            const isMultiSelected = selectedPlaneIds.includes(plane.id);
             const isStart =
               plane.id === (startPlaneId || layout?.startPlaneId) ||
               layout?.startPlaneId === `${plane.id}__lower` ||
@@ -3192,6 +3378,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   e.stopPropagation();
                   setInspectedLine(null);
                   setEditingMeasurement(null);
+                  if (!readOnlyGeometry && activeTool === 'set_pitch' && (e.shiftKey || multiSelectMode)) {
+                    setSelectedPlaneIds(toggleMultiId(selectedPlaneIds, plane.id));
+                    onSelectPlane(plane.id);
+                    return;
+                  }
+                  setSelectedPlaneIds([plane.id]);
                   onSelectPlane(plane.id);
                   if (readOnlyGeometry) {
                     onInstallSelectPlane?.(plane.id);
@@ -3211,15 +3403,24 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   fillOpacity={
                     isDimmedByLevel
                       ? 0.12
-                      : isSelected
+                      : isSelected || isMultiSelected
                       ? 0.56
                       : isInstalled
                       ? 0.48
                       : 0.34
                   }
-                  stroke={isStart ? '#10b981' : isSelected ? '#ffffff' : plane.color || '#3b82f6'}
+                  stroke={
+                    isMultiSelected
+                      ? '#38bdf8'
+                      : isStart
+                      ? '#10b981'
+                      : isSelected
+                      ? '#ffffff'
+                      : plane.color || '#3b82f6'
+                  }
                   strokeOpacity={isDimmedByLevel ? 0.35 : 0.95}
-                  strokeWidth={isStart ? '3.8' : isSelected ? '3' : '1.8'}
+                  strokeWidth={isMultiSelected ? '4.2' : isStart ? '3.8' : isSelected ? '3' : '1.8'}
+                  strokeDasharray={isMultiSelected ? '7 3' : undefined}
                   className="transition-all group-hover:fill-opacity-50"
                 />
 
@@ -3833,7 +4034,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             />
           )}
 
-          {/* ROOF LINES (Ridges, Hips, Valleys) WITH MINIMAL CLICKABLE CODE BADGES */}
+          {/* ROOF LINES (All 10 Types) WITH MINIMAL CLICKABLE CODE BADGES */}
           {displaySkeleton.map((s) => {
             const x1 = toSvgX(s.from.x);
             const y1 = toSvgY(s.from.y);
@@ -3842,19 +4043,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const midX = (x1 + x2) / 2;
             const midY = (y1 + y2) / 2;
             const lineLenM = +dist(s.from, s.to).toFixed(2);
-
-            const strokeColor =
-              s.suggestedType === 'ridge'
-                ? '#c084fc'
-                : s.suggestedType === 'valley'
-                ? '#fbbf24'
-                : '#38bdf8';
-
-            const lineCode =
-              s.suggestedType === 'ridge' ? 'R' : s.suggestedType === 'valley' ? 'V' : 'H';
+            const lineMeta = getSkeletonLineTypeMeta(s.suggestedType);
+            const strokeColor = lineMeta.colorHex;
+            const lineCode = lineMeta.code;
 
             const assignedFlashing = assignmentByLineId.get(s.id);
             const isInspected = inspectedLine?.kind === 'skeleton' && inspectedLine.id === s.id;
+            const isMultiLine = selectedSkeletonLineIds.includes(s.id);
 
             const isLineNonSelectable = isCanvasTapTool || activeTool === 'adjust_shape';
             const handleSkeletonLineSelect = (ev: React.MouseEvent) => {
@@ -3870,6 +4065,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               }
               setEditingMeasurement(null);
               onSelectPlane(null);
+              if (!readOnlyGeometry && activeTool === 'set_pitch' && (ev.shiftKey || multiSelectMode)) {
+                const nextIds = toggleMultiId(selectedSkeletonLineIds, s.id);
+                setSelectedSkeletonLineIds(nextIds);
+                setInspectedLine(nextIds.length === 1 ? { kind: 'skeleton', id: nextIds[0] } : null);
+                return;
+              }
+              setSelectedSkeletonLineIds([s.id]);
               setInspectedLine({ kind: 'skeleton', id: s.id });
             };
 
@@ -3888,15 +4090,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   stroke="transparent"
                   strokeWidth={isTouchDevice ? '28' : '20'}
                 />
-                {(assignedFlashing || isInspected) && (
+                {(assignedFlashing || isInspected || isMultiLine) && (
                   <line
                     x1={x1}
                     y1={y1}
                     x2={x2}
                     y2={y2}
-                    stroke={isInspected ? '#ffffff' : '#10b981'}
-                    strokeOpacity={isInspected ? '0.65' : '0.45'}
-                    strokeWidth="8.5"
+                    stroke={isMultiLine ? '#38bdf8' : isInspected ? '#ffffff' : '#10b981'}
+                    strokeOpacity={isMultiLine ? '0.68' : isInspected ? '0.65' : '0.45'}
+                    strokeWidth={isMultiLine ? '9.5' : '8.5'}
                     strokeLinecap="round"
                   />
                 )}
@@ -3907,7 +4109,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   y2={y2}
                   stroke={strokeColor}
                   strokeWidth={s.suggestedType === 'hip' ? '3' : '3.5'}
-                  strokeDasharray={s.suggestedType === 'valley' ? '6 3' : undefined}
+                  strokeDasharray={lineMeta.dashArray}
                   strokeLinecap="round"
                   className="transition-all group-hover:stroke-white group-hover:stroke-[4px]"
                 />
@@ -3920,9 +4122,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       width="44"
                       height="19"
                       rx="9.5"
-                      fill={isInspected ? '#0369a1' : assignedFlashing ? '#064e3b' : '#090d16'}
+                      fill={isInspected || isMultiLine ? '#0369a1' : assignedFlashing ? '#064e3b' : '#090d16'}
                       fillOpacity="0.92"
-                      stroke={isInspected ? '#ffffff' : assignedFlashing ? '#10b981' : strokeColor}
+                      stroke={isMultiLine ? '#38bdf8' : isInspected ? '#ffffff' : assignedFlashing ? '#10b981' : strokeColor}
                       strokeWidth="1.2"
                     />
                     <text
@@ -3942,10 +4144,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     <circle r={isTouchDevice ? 16 : 12} fill="transparent" />
                     <circle
                       r="8.5"
-                      fill={isInspected ? '#0284c7' : assignedFlashing ? '#064e3b' : '#090d16'}
+                      fill={isInspected || isMultiLine ? '#0284c7' : assignedFlashing ? '#064e3b' : '#090d16'}
                       fillOpacity="0.94"
-                      stroke={isInspected ? '#ffffff' : assignedFlashing ? '#10b981' : strokeColor}
-                      strokeWidth={isInspected ? '2' : '1.4'}
+                      stroke={isMultiLine ? '#38bdf8' : isInspected ? '#ffffff' : assignedFlashing ? '#10b981' : strokeColor}
+                      strokeWidth={isInspected || isMultiLine ? '2' : '1.4'}
                       className="transition-transform group-hover/badge:scale-125"
                     />
                     <text
@@ -3966,7 +4168,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             );
           })}
 
-          {/* OUTLINE EDGES (UNCLASSIFIED, EAVES, GABLE VERGES, ABUTMENT WALLS & RIDGE/HIP/VALLEY BOUNDARIES) */}
+          {/* OUTLINE EDGES (ALL 10 CLASSIFICATIONS) */}
           {(() => {
             const displayEdges =
               activeLevelId === 'all' && levels && levels.length > 1
@@ -3981,43 +4183,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const midX = (x1 + x2) / 2;
             const midY = (y1 + y2) / 2;
             const edgeLenM = +dist(e.from, e.to).toFixed(2);
+            const edgeMeta = getRoofEdgeTypeMeta(e.type);
             const isGableVerge = e.type === 'verge';
             const isWall = e.type === 'wall';
-            const isUnclassified = e.type === 'unclassified';
-            const isPerimRidge = e.type === 'ridge';
-            const isPerimHip = e.type === 'hip';
-            const isPerimValley = e.type === 'valley';
             const isDefined = planes.some((p) => p.eaveEdgeId === e.id);
             const assignedFlashing = assignmentByLineId.get(e.id);
             const isInspected = inspectedLine?.kind === 'edge' && inspectedLine.id === e.id;
-            const edgeCode = isWall
-              ? 'W'
-              : isGableVerge
-              ? 'B'
-              : isPerimRidge
-              ? 'R'
-              : isPerimHip
-              ? 'H'
-              : isPerimValley
-              ? 'V'
-              : isUnclassified
-              ? '?'
-              : 'E';
-            const edgeStroke = isWall
-              ? '#f59e0b'
-              : isGableVerge
-              ? '#818cf8'
-              : isPerimRidge
-              ? '#c084fc'
-              : isPerimHip
-              ? '#38bdf8'
-              : isPerimValley
-              ? '#fbbf24'
-              : isUnclassified
-              ? '#94a3b8'
-              : isDefined
-              ? '#22c55e'
-              : '#ffffff';
+            const isMultiEdge = selectedEdgeIds.includes(e.id);
+            const edgeCode = edgeMeta.code;
+            const edgeStroke = e.type === 'outline' && isDefined ? '#22c55e' : edgeMeta.colorHex;
 
             const owningOutline =
               (levels && e.levelId ? levels.find((l) => l.id === e.levelId)?.outline : undefined) ||
@@ -4047,15 +4221,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   stroke="transparent"
                   strokeWidth={isTouchDevice ? '30' : '22'}
                 />
-                {(assignedFlashing || isInspected) && (
+                {(assignedFlashing || isInspected || isMultiEdge) && (
                   <line
                     x1={x1}
                     y1={y1}
                     x2={x2}
                     y2={y2}
-                    stroke={isInspected ? '#ffffff' : '#10b981'}
-                    strokeOpacity={isInspected ? '0.65' : '0.45'}
-                    strokeWidth="9"
+                    stroke={isMultiEdge ? '#38bdf8' : isInspected ? '#ffffff' : '#10b981'}
+                    strokeOpacity={isMultiEdge ? '0.68' : isInspected ? '0.65' : '0.45'}
+                    strokeWidth={isMultiEdge ? '10' : '9'}
                     strokeLinecap="round"
                   />
                 )}
@@ -4084,17 +4258,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   y2={y2}
                   stroke={edgeStroke}
                   strokeWidth={isWall ? '4.5' : isGableVerge ? '3.8' : isDefined ? '4' : '3.2'}
-                  strokeDasharray={
-                    isWall
-                      ? '10 3'
-                      : isGableVerge
-                      ? '8 5'
-                      : isUnclassified
-                      ? '5 4'
-                      : isPerimValley
-                      ? '6 3'
-                      : undefined
-                  }
+                  strokeDasharray={edgeMeta.dashArray}
                   strokeLinecap="round"
                   className="transition-all group-hover:stroke-sky-400"
                 />
@@ -4109,18 +4273,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     const dy2 = toSvgY(dimGeom.dimEnd.y);
                     const lx = toSvgX(dimGeom.labelPos.x);
                     const ly = toSvgY(dimGeom.labelPos.y);
-                    const dimColor = isInspected
+                    const dimColor = isMultiEdge || isInspected
                       ? '#38bdf8'
                       : assignedFlashing
                       ? '#10b981'
-                      : isWall
-                      ? '#f59e0b'
-                      : isGableVerge
-                      ? '#818cf8'
-                      : '#22c55e';
+                      : edgeStroke;
                     return (
                       <g className="cursor-pointer">
-                        {/* Extension witness lines */}
                         <line
                           x1={toSvgX(dimGeom.extStart1.x)}
                           y1={toSvgY(dimGeom.extStart1.y)}
@@ -4141,7 +4300,6 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           strokeWidth="0.9"
                           pointerEvents="none"
                         />
-                        {/* Architectural dimension spine */}
                         <line
                           x1={dx1}
                           y1={dy1}
@@ -4152,10 +4310,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           strokeWidth="1.15"
                           pointerEvents="none"
                         />
-                        {/* End tick dots */}
                         <circle cx={dx1} cy={dy1} r="2.2" fill={dimColor} pointerEvents="none" />
                         <circle cx={dx2} cy={dy2} r="2.2" fill={dimColor} pointerEvents="none" />
-                        {/* Dimension callout pill */}
                         <g transform={`translate(${lx}, ${ly})`}>
                           <rect
                             x="-26"
@@ -4164,7 +4320,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                             height="19"
                             rx="9.5"
                             fill={
-                              isInspected
+                              isInspected || isMultiEdge
                                 ? '#0369a1'
                                 : assignedFlashing
                                 ? '#064e3b'
@@ -4195,7 +4351,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     <circle
                       r="9.5"
                       fill={
-                        isInspected
+                        isInspected || isMultiEdge
                           ? '#0284c7'
                           : assignedFlashing
                           ? '#064e3b'
@@ -4208,19 +4364,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           : '#1e293b'
                       }
                       stroke={
-                        isInspected
+                        isMultiEdge
+                          ? '#38bdf8'
+                          : isInspected
                           ? '#ffffff'
                           : assignedFlashing
                           ? '#10b981'
-                          : isWall
-                          ? '#f59e0b'
-                          : isGableVerge
-                          ? '#818cf8'
-                          : isDefined
-                          ? '#22c55e'
-                          : '#94a3b8'
+                          : edgeStroke
                       }
-                      strokeWidth={isInspected ? '2.2' : '1.4'}
+                      strokeWidth={isInspected || isMultiEdge ? '2.2' : '1.4'}
                       className="transition-transform group-hover/badge:scale-125"
                     />
                     <text
@@ -4228,7 +4380,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       y="3.3"
                       textAnchor="middle"
                       fill={assignedFlashing ? '#6ee7b7' : isWall ? '#fde68a' : '#ffffff'}
-                      fontSize="9"
+                      fontSize="8.5"
                       fontWeight="900"
                       fontFamily="monospace"
                       pointerEvents="none"
@@ -4866,8 +5018,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           </div>
         )}
 
-        {/* 5. CLICK-TO-INSPECT LINE INFO CARD (Shows Length, Wall Z, Flashing & Quick Edits) */}
+        {/* 5. CLICK-TO-INSPECT LINE INFO CARD (Shows Length, All-10 Type Switcher, Wall Z & Flashing) */}
         {inspectedLine &&
+          !hasMultiSelectionBar &&
           !editingMeasurement &&
           (() => {
             const isEdge = inspectedLine.kind === 'edge';
@@ -4893,66 +5046,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
             const isVerge = edgeObj?.type === 'verge';
             const isWall = edgeObj?.type === 'wall';
-            const isUnclassified = edgeObj?.type === 'unclassified';
-            const badgeCode = edgeObj
-              ? isWall
-                ? 'W'
-                : isVerge
-                ? 'B'
-                : edgeObj.type === 'ridge'
-                ? 'R'
-                : edgeObj.type === 'hip'
-                ? 'H'
-                : edgeObj.type === 'valley'
-                ? 'V'
-                : isUnclassified
-                ? '?'
-                : 'E'
-              : skelObj!.suggestedType === 'ridge'
-              ? 'R'
-              : skelObj!.suggestedType === 'valley'
-              ? 'V'
-              : 'H';
-            const badgeTitle =
-              assignable?.label ||
-              (edgeObj
-                ? isWall
-                  ? 'Abutment / Riser Wall'
-                  : isVerge
-                  ? 'Gable / Barge'
-                  : edgeObj.type === 'ridge'
-                  ? 'Perimeter Ridge Edge'
-                  : edgeObj.type === 'hip'
-                  ? 'Perimeter Hip Edge'
-                  : edgeObj.type === 'valley'
-                  ? 'Perimeter Valley Edge'
-                  : isUnclassified
-                  ? 'Unclassified Boundary Edge'
-                  : 'Eave Wall Edge'
-                : skelObj!.suggestedType === 'ridge'
-                ? 'Ridge Line'
-                : skelObj!.suggestedType === 'valley'
-                ? 'Valley'
-                : 'Hip Line');
-            const badgeColor = edgeObj
-              ? isWall
-                ? '#f59e0b'
-                : isVerge
-                ? '#818cf8'
-                : edgeObj.type === 'ridge'
-                ? '#c084fc'
-                : edgeObj.type === 'hip'
-                ? '#38bdf8'
-                : edgeObj.type === 'valley'
-                ? '#fbbf24'
-                : isUnclassified
-                ? '#94a3b8'
-                : '#22c55e'
-              : skelObj!.suggestedType === 'ridge'
-              ? '#c084fc'
-              : skelObj!.suggestedType === 'valley'
-              ? '#fbbf24'
-              : '#38bdf8';
+            const meta = edgeObj
+              ? getRoofEdgeTypeMeta(edgeObj.type)
+              : getSkeletonLineTypeMeta(skelObj!.suggestedType);
+            const badgeCode = meta.code;
+            const badgeTitle = assignable?.label || meta.label;
+            const badgeColor = meta.colorHex;
 
             const midSvg = {
               x: (toSvgX(fromPt.x) + toSvgX(toPt.x)) / 2,
@@ -5000,6 +5099,34 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     <X className="w-4 h-4" />
                   </button>
                 </div>
+
+                {/* Inline All-10 Type Switcher */}
+                {!readOnlyGeometry && (edgeObj ? onBatchClassifyEdges : onBatchUpdateSkeletonType) && (
+                  <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-[11px]">
+                    <span className="text-slate-400 font-bold shrink-0">Line Type:</span>
+                    <select
+                      value={edgeObj ? edgeObj.type : skelObj!.suggestedType}
+                      onChange={(ev) => {
+                        const val = ev.target.value;
+                        if (edgeObj && onBatchClassifyEdges) {
+                          onBatchClassifyEdges([edgeObj.id], val as EdgeType);
+                        } else if (skelObj && onBatchUpdateSkeletonType) {
+                          onBatchUpdateSkeletonType([skelObj.id], val as SkeletonLineType);
+                        }
+                      }}
+                      className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-white font-bold text-[11px] focus:outline-hidden focus:border-sky-400"
+                    >
+                      {ROOF_LINE_TYPE_CATALOG.map((item) => {
+                        const optVal = edgeObj ? item.edgeType : item.lineType;
+                        return (
+                          <option key={`${item.code}-${item.lineType}`} value={optVal}>
+                            {item.code} · {item.label}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                )}
 
                 {/* Compact Wall Height (Z) Editor for Perimeter Eaves & Abutment Walls */}
                 {edgeObj && !readOnlyGeometry && onUpdateEdgeEaveHeight && (
@@ -5198,9 +5325,173 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             );
           })()}
 
+        {/* 5A. MULTI-SELECT FLOATING ACTION BAR */}
+        {hasMultiSelectionBar && !editingMeasurement && (
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            className={`absolute left-1/2 -translate-x-1/2 z-30 w-[calc(100%-20px)] max-w-xl bg-[#0b101d]/96 backdrop-blur-md border border-cyan-500/45 text-white rounded-2xl p-2.5 shadow-2xl space-y-2 animate-in fade-in slide-in-from-bottom-2 ${
+              isMobile ? 'bottom-2.5' : 'bottom-4'
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="font-extrabold text-cyan-300">
+                  {totalMultiSelectedCount === 0
+                    ? 'Multi-Select Active (tap items or use preset)'
+                    : [
+                        selectedPlaneIds.length > 0 ? `${selectedPlaneIds.length} faces` : null,
+                        selectedEdgeIds.length > 0 ? `${selectedEdgeIds.length} edges` : null,
+                        selectedSkeletonLineIds.length > 0 ? `${selectedSkeletonLineIds.length} lines` : null
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                </span>
+              </div>
+              <div className="flex items-center gap-1 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSelectedPlaneIds(
+                      planes
+                        .filter(
+                          (p) =>
+                            activeLevelId === 'all' ||
+                            !activeLevelId ||
+                            (p.levelId || 'level-1') === activeLevelId
+                        )
+                        .map((p) => p.id)
+                    )
+                  }
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-200 cursor-pointer"
+                >
+                  This Level Faces
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSelectedEdgeIds(
+                      allDisplayEdges.filter((ed) => ed.type === 'outline').map((ed) => ed.id)
+                    )
+                  }
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-emerald-300 cursor-pointer"
+                >
+                  All Eaves
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSelectedEdgeIds(
+                      allDisplayEdges.filter((ed) => ed.type === 'unclassified').map((ed) => ed.id)
+                    )
+                  }
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-amber-300 cursor-pointer"
+                >
+                  Unclassified
+                </button>
+                {canUndo && onUndo && (
+                  <button
+                    type="button"
+                    onClick={onUndo}
+                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 flex items-center gap-1 cursor-pointer"
+                  >
+                    <Undo2 className="w-3 h-3" />
+                    <span>Undo</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedPlaneIds([]);
+                    setSelectedEdgeIds([]);
+                    setSelectedSkeletonLineIds([]);
+                    setMultiSelectMode(false);
+                  }}
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer"
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+              {selectedPlaneIds.length >= 1 && onBatchUpdatePlanePitch && (
+                <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-xl p-1">
+                  <span className="px-1.5 text-[10px] font-bold text-sky-300">Pitch:</span>
+                  {[5, 12, 15, 22.5, 30].map((deg) => (
+                    <button
+                      key={deg}
+                      type="button"
+                      onClick={() => onBatchUpdatePlanePitch(selectedPlaneIds, deg)}
+                      className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-blue-600 text-white font-mono font-bold text-[10px] cursor-pointer"
+                    >
+                      {deg}°
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {selectedEdgeIds.length >= 1 && onBatchClassifyEdges && (
+                <select
+                  defaultValue=""
+                  onChange={(ev) => {
+                    if (ev.target.value) {
+                      onBatchClassifyEdges(selectedEdgeIds, ev.target.value as EdgeType);
+                      ev.target.value = '';
+                    }
+                  }}
+                  className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1 text-[11px] font-bold text-white cursor-pointer"
+                >
+                  <option value="">Set {selectedEdgeIds.length} Edges Type...</option>
+                  {ROOF_LINE_TYPE_CATALOG.map((item) => (
+                    <option key={`be-${item.code}-${item.edgeType}`} value={item.edgeType}>
+                      {item.code} · {item.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              {selectedSkeletonLineIds.length >= 1 && onBatchUpdateSkeletonType && (
+                <select
+                  defaultValue=""
+                  onChange={(ev) => {
+                    if (ev.target.value) {
+                      onBatchUpdateSkeletonType(
+                        selectedSkeletonLineIds,
+                        ev.target.value as SkeletonLineType
+                      );
+                      ev.target.value = '';
+                    }
+                  }}
+                  className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1 text-[11px] font-bold text-white cursor-pointer"
+                >
+                  <option value="">Set {selectedSkeletonLineIds.length} Lines Type...</option>
+                  {ROOF_LINE_TYPE_CATALOG.map((item) => (
+                    <option key={`bs-${item.code}-${item.lineType}`} value={item.lineType}>
+                      {item.code} · {item.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              {onOpenInspector && totalMultiSelectedCount >= 2 && (
+                <button
+                  type="button"
+                  onClick={onOpenInspector}
+                  className="ml-auto px-3 py-1 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-extrabold text-[11px] flex items-center gap-1 cursor-pointer"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  <span>Batch Edit in Inspector</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* 5B. CLICK-TO-INSPECT ROOF AREA QUICK CARD (Plan View Face Click -> Actual Sheet Length + Details) */}
         {selectedPlaneObj &&
           !inspectedLine &&
+          !hasMultiSelectionBar &&
           !editingMeasurement &&
           (isMobile || (!readOnlyGeometry && Boolean(onUpdatePlaneOrderedSheetLength))) && (
           <div

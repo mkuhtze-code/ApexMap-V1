@@ -1304,11 +1304,24 @@ export function buildRoofSceneGroup(params: {
       lvl.skeleton.forEach((sk) => {
         const zA = getPtZ(sk.from);
         const zB = getPtZ(sk.to);
-        const offset = sk.suggestedType === 'valley' ? -0.008 : 0.028;
+        const offset = sk.suggestedType === 'valley' ? -0.008 : sk.suggestedType === 'eave' ? -0.012 : 0.028;
         const pA = toThreeVec(sk.from.x, sk.from.y, zA + offset, bounds);
         const pB = toThreeVec(sk.to.x, sk.to.y, zB + offset, bounds);
-        const mat = sk.suggestedType === 'valley' ? valleyMaterial : flashingMaterial;
-        const strip = buildFlashingStripMesh(pA, pB, sk.suggestedType, mat);
+        const stripKind: 'ridge' | 'hip' | 'valley' | 'barge' | 'gutter' | 'apron' =
+          sk.suggestedType === 'ridge' || sk.suggestedType === 'hip' || sk.suggestedType === 'valley'
+            ? sk.suggestedType
+            : sk.suggestedType === 'barge' || sk.suggestedType === 'rake'
+            ? 'barge'
+            : sk.suggestedType === 'eave' || sk.suggestedType === 'unclassified'
+            ? 'gutter'
+            : 'apron';
+        const mat =
+          stripKind === 'valley'
+            ? valleyMaterial
+            : stripKind === 'gutter'
+            ? gutterMaterial
+            : flashingMaterial;
+        const strip = buildFlashingStripMesh(pA, pB, stripKind, mat);
         if (strip) {
           trackGeo(strip.geometry);
           rootGroup.add(strip);
@@ -1318,7 +1331,7 @@ export function buildRoofSceneGroup(params: {
       lvl.outline.edges.forEach((edge) => {
         const zA = getPtZ(edge.from);
         const zB = getPtZ(edge.to);
-        if (edge.type === 'verge') {
+        if (edge.type === 'verge' || edge.type === 'rake') {
           const pA = toThreeVec(edge.from.x, edge.from.y, zA + 0.01, bounds);
           const pB = toThreeVec(edge.to.x, edge.to.y, zB + 0.01, bounds);
           const barge = buildFlashingStripMesh(pA, pB, 'barge', flashingMaterial);
@@ -1326,13 +1339,23 @@ export function buildRoofSceneGroup(params: {
             trackGeo(barge.geometry);
             rootGroup.add(barge);
           }
-        } else if (edge.type === 'wall') {
+        } else if (edge.type === 'wall' || edge.type === 'apron' || edge.type === 'change-of-pitch') {
           const pA = toThreeVec(edge.from.x, edge.from.y, zA + 0.025, bounds);
           const pB = toThreeVec(edge.to.x, edge.to.y, zB + 0.025, bounds);
           const apron = buildFlashingStripMesh(pA, pB, 'apron', flashingMaterial);
           if (apron) {
             trackGeo(apron.geometry);
             rootGroup.add(apron);
+          }
+        } else if (edge.type === 'ridge' || edge.type === 'hip' || edge.type === 'valley') {
+          const offset = edge.type === 'valley' ? -0.008 : 0.028;
+          const pA = toThreeVec(edge.from.x, edge.from.y, zA + offset, bounds);
+          const pB = toThreeVec(edge.to.x, edge.to.y, zB + offset, bounds);
+          const mat = edge.type === 'valley' ? valleyMaterial : flashingMaterial;
+          const strip = buildFlashingStripMesh(pA, pB, edge.type, mat);
+          if (strip) {
+            trackGeo(strip.geometry);
+            rootGroup.add(strip);
           }
         } else if (edge.type === 'outline') {
           const pA = toThreeVec(edge.from.x, edge.from.y, zA - 0.012, bounds);

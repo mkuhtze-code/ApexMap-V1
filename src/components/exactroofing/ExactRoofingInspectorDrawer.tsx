@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  EdgeType,
   RoofPlane,
   RoofOutline,
   RoofLevel,
@@ -9,12 +10,14 @@ import {
   AssignableRoofLine,
   RoofFlashingAssignment,
   RoofLifecycleStage,
+  SkeletonLineType,
   TakeoffCompletenessIssue,
   TakeoffCompletenessReport,
   WallCladdingType,
   WallFacet,
   WallFacetKind,
   WallFilterMode,
+  WallHeightSource,
   WallPlan
 } from '../../types/exactRoofing';
 import {
@@ -31,15 +34,19 @@ import {
   Link2,
   Plus,
   Building2,
-  AlertTriangle
+  AlertTriangle,
+  Undo2
 } from 'lucide-react';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
   computeAssetPlacementMetrics,
   computeGableDormerGeometry,
   getDefaultEdgeSetbackM,
+  getRoofEdgeTypeMeta,
+  getSkeletonLineTypeMeta,
   isEdgeWallEnabled,
   repositionAssetToPlane,
+  ROOF_LINE_TYPE_CATALOG,
   updateAssetFromPlacement,
   dist
 } from '../../utils/exactRoofingEngine';
@@ -113,6 +120,33 @@ interface Props {
   onChangeWallFilterMode?: (mode: WallFilterMode) => void;
   completenessReport?: TakeoffCompletenessReport;
   onJumpToCompletenessIssue?: (issue: TakeoffCompletenessIssue) => void;
+  selectedPlaneIds?: string[];
+  onChangeSelectedPlaneIds?: (ids: string[]) => void;
+  selectedEdgeIds?: string[];
+  onChangeSelectedEdgeIds?: (ids: string[]) => void;
+  selectedSkeletonLineIds?: string[];
+  onChangeSelectedSkeletonLineIds?: (ids: string[]) => void;
+  selectedWallFacetIds?: string[];
+  onChangeSelectedWallFacetIds?: (ids: string[]) => void;
+  onBatchPlanePitch?: (ids: string[], pitchDeg: number) => void;
+  onBatchPlaneDirection?: (ids: string[], dir: 'left' | 'right') => void;
+  onBatchPlaneOrderedSheetLength?: (ids: string[], lenM: number | undefined) => void;
+  onBatchPlaneEaveHeight?: (ids: string[], zM: number) => void;
+  onBatchEdgeType?: (ids: string[], edgeType: EdgeType) => void;
+  onBatchEdgeWall?: (ids: string[], updates: { hasWall?: boolean; eaveSetbackM?: number }) => void;
+  onBatchEdgeHeight?: (ids: string[], zM: number) => void;
+  onBatchSkeletonLineType?: (ids: string[], lineType: SkeletonLineType) => void;
+  onBatchWallUpdate?: (
+    facetIds: string[],
+    patch: {
+      claddingType?: WallCladdingType;
+      kind?: WallFacetKind;
+      heightM?: number;
+      heightSource?: WallHeightSource;
+    }
+  ) => void;
+  onUndo?: () => void;
+  canUndo?: boolean;
 }
 
 export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
@@ -167,7 +201,26 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   wallFilterMode: propWallFilterMode,
   onChangeWallFilterMode,
   completenessReport,
-  onJumpToCompletenessIssue
+  onJumpToCompletenessIssue,
+  selectedPlaneIds = [],
+  onChangeSelectedPlaneIds,
+  selectedEdgeIds = [],
+  onChangeSelectedEdgeIds,
+  selectedSkeletonLineIds = [],
+  onChangeSelectedSkeletonLineIds,
+  selectedWallFacetIds = [],
+  onChangeSelectedWallFacetIds,
+  onBatchPlanePitch,
+  onBatchPlaneDirection,
+  onBatchPlaneOrderedSheetLength,
+  onBatchPlaneEaveHeight,
+  onBatchEdgeType,
+  onBatchEdgeWall,
+  onBatchEdgeHeight,
+  onBatchSkeletonLineType,
+  onBatchWallUpdate,
+  onUndo,
+  canUndo = false
 }) => {
   const { isMobile } = useDeviceDetection();
   const isInstalling = lifecycleStage === 'installing';
@@ -257,6 +310,47 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
     setSheetLenDraftMm(String(nextMm));
   };
 
+  const [batchSheetMm, setBatchSheetMm] = React.useState<string>('');
+  const [batchPlaneZ, setBatchPlaneZ] = React.useState<string>('2.7');
+  const [batchEdgeZ, setBatchEdgeZ] = React.useState<string>('2.7');
+  const [batchWallH, setBatchWallH] = React.useState<string>('2.7');
+
+  const selectedPlanesList = React.useMemo(
+    () => planes.filter((p) => selectedPlaneIds.includes(p.id)),
+    [planes, selectedPlaneIds]
+  );
+  const allPlanEdges = React.useMemo(() => {
+    const map = new Map<string, RoofOutline['edges'][number]>();
+    (outline?.edges || []).forEach((e) => map.set(e.id, e));
+    levels.forEach((lvl) => lvl.outline.edges.forEach((e) => map.set(e.id, e)));
+    return Array.from(map.values());
+  }, [outline, levels]);
+  const selectedEdgesList = React.useMemo(
+    () => allPlanEdges.filter((e) => selectedEdgeIds.includes(e.id)),
+    [allPlanEdges, selectedEdgeIds]
+  );
+  const allSkeletonLines = React.useMemo(() => {
+    const map = new Map<string, RoofLevel['skeleton'][number]>();
+    levels.forEach((lvl) => lvl.skeleton.forEach((s) => map.set(s.id, s)));
+    return Array.from(map.values());
+  }, [levels]);
+  const selectedSkeletonList = React.useMemo(
+    () => allSkeletonLines.filter((s) => selectedSkeletonLineIds.includes(s.id)),
+    [allSkeletonLines, selectedSkeletonLineIds]
+  );
+  const selectedWallFacetsList = React.useMemo(
+    () => wallFacets.filter((f) => selectedWallFacetIds.includes(f.id)),
+    [wallFacets, selectedWallFacetIds]
+  );
+
+  const hasMultiRoofOrWallSelection =
+    !selectedAsset &&
+    !selectedPitchBreak &&
+    (selectedPlanesList.length >= 2 ||
+      selectedEdgesList.length >= 2 ||
+      selectedSkeletonList.length >= 2 ||
+      selectedWallFacetsList.length >= 2);
+
   if (!isOpen) return null;
 
   const rxZones = selectedPlane
@@ -270,9 +364,666 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
     selectedPlane?.id === layout?.startPlaneId ||
     selectedPlane?.isStartEdge;
 
+  const clearMultiSelections = () => {
+    onChangeSelectedPlaneIds?.([]);
+    onChangeSelectedEdgeIds?.([]);
+    onChangeSelectedSkeletonLineIds?.([]);
+    onChangeSelectedWallFacetIds?.([]);
+  };
+
+  const focusedLevelPlanes = planes.filter((p) =>
+    activeLevelId === 'all' ? true : (p.levelId || 'level-1') === activeLevelId
+  );
+  const allEaveEdgeIds = allPlanEdges.filter((e) => e.type === 'outline').map((e) => e.id);
+  const allUnclassifiedEdgeIds = allPlanEdges
+    .filter((e) => e.type === 'unclassified')
+    .map((e) => e.id);
+  const allUndetailedWallIds = wallFacets
+    .filter((f) => isWallFacetUndetailed(f))
+    .map((f) => f.id);
+
   const inspectorBody = (
     <div className="flex-1 overflow-y-auto p-4 space-y-3.5 text-xs font-sans">
-      {selectedAsset ? (() => {
+      {hasMultiRoofOrWallSelection ? (() => {
+        const distinctPitches = new Set(selectedPlanesList.map((p) => p.pitchDeg));
+        const commonPitch =
+          selectedPlanesList.length > 0 && distinctPitches.size === 1
+            ? selectedPlanesList[0].pitchDeg
+            : null;
+        const distinctDirs = new Set(selectedPlanesList.map((p) => p.underlapSide));
+        const commonDir =
+          selectedPlanesList.length > 0 && distinctDirs.size === 1
+            ? selectedPlanesList[0].underlapSide
+            : null;
+
+        const distinctEdgeTypes = new Set(selectedEdgesList.map((e) => e.type));
+        const commonEdgeType =
+          selectedEdgesList.length > 0 && distinctEdgeTypes.size === 1
+            ? selectedEdgesList[0].type
+            : null;
+        const distinctEdgeWall = new Set(selectedEdgesList.map((e) => isEdgeWallEnabled(e)));
+        const commonEdgeWall =
+          selectedEdgesList.length > 0 && distinctEdgeWall.size === 1
+            ? isEdgeWallEnabled(selectedEdgesList[0])
+            : null;
+
+        const distinctSkelTypes = new Set(selectedSkeletonList.map((s) => s.suggestedType));
+        const commonSkelType =
+          selectedSkeletonList.length > 0 && distinctSkelTypes.size === 1
+            ? selectedSkeletonList[0].suggestedType
+            : null;
+
+        const distinctWallClad = new Set(selectedWallFacetsList.map((f) => f.claddingType));
+        const commonWallClad =
+          selectedWallFacetsList.length > 0 && distinctWallClad.size === 1
+            ? selectedWallFacetsList[0].claddingType
+            : null;
+        const distinctWallKind = new Set(selectedWallFacetsList.map((f) => getWallFacetKind(f)));
+        const commonWallKind =
+          selectedWallFacetsList.length > 0 && distinctWallKind.size === 1
+            ? getWallFacetKind(selectedWallFacetsList[0])
+            : null;
+        const distinctWallHeightSrc = new Set(
+          selectedWallFacetsList.map((f) => f.heightSource || 'manual')
+        );
+        const commonWallHeightSrc =
+          selectedWallFacetsList.length > 0 && distinctWallHeightSrc.size === 1
+            ? selectedWallFacetsList[0].heightSource || 'manual'
+            : null;
+
+        return (
+          <div className="space-y-3">
+            {/* Multi-select header & quick presets */}
+            <div className="bg-sky-950/35 border border-sky-500/45 p-3.5 rounded-2xl space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-[10px] font-mono uppercase tracking-wider text-sky-300 font-bold">
+                    Multi-Select Batch Edit
+                  </div>
+                  <div className="text-xs font-black text-white mt-0.5 tabular-nums">
+                    {[
+                      selectedPlanesList.length >= 2 ? `${selectedPlanesList.length} Faces` : null,
+                      selectedEdgesList.length >= 2 ? `${selectedEdgesList.length} Edges` : null,
+                      selectedSkeletonList.length >= 2 ? `${selectedSkeletonList.length} Lines` : null,
+                      selectedWallFacetsList.length >= 2 ? `${selectedWallFacetsList.length} Walls` : null
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {!isLockedView && canUndo && onUndo && (
+                    <button
+                      type="button"
+                      onClick={onUndo}
+                      className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 text-[10px] font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <Undo2 className="w-3 h-3" />
+                      <span>Undo</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={clearMultiSelections}
+                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-sky-300 text-[10px] font-bold cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1">
+                {onChangeSelectedPlaneIds && focusedLevelPlanes.length >= 2 && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeSelectedPlaneIds(focusedLevelPlanes.map((p) => p.id))}
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 text-[10px] font-bold cursor-pointer"
+                  >
+                    This Level Faces ({focusedLevelPlanes.length})
+                  </button>
+                )}
+                {onChangeSelectedEdgeIds && allEaveEdgeIds.length >= 2 && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeSelectedEdgeIds(allEaveEdgeIds)}
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 text-[10px] font-bold cursor-pointer"
+                  >
+                    All Eaves ({allEaveEdgeIds.length})
+                  </button>
+                )}
+                {onChangeSelectedEdgeIds && allUnclassifiedEdgeIds.length >= 1 && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeSelectedEdgeIds(allUnclassifiedEdgeIds)}
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer"
+                  >
+                    Unclassified ({allUnclassifiedEdgeIds.length})
+                  </button>
+                )}
+                {onChangeSelectedWallFacetIds && allUndetailedWallIds.length >= 1 && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeSelectedWallFacetIds(allUndetailedWallIds)}
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer"
+                  >
+                    Undetailed Walls ({allUndetailedWallIds.length})
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Batch Roof Faces Card */}
+            {selectedPlanesList.length >= 2 && (
+              <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-slate-200 text-[11px] uppercase tracking-wider">
+                    Batch Apply · {selectedPlanesList.length} Roof Faces
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
+                    {commonPitch !== null ? `${commonPitch}°` : 'Multiple'}
+                  </span>
+                </div>
+
+                {!isLockedView && onBatchPlanePitch && (
+                  <div className="space-y-2">
+                    <input
+                      type="range"
+                      min={3}
+                      max={50}
+                      step={0.5}
+                      value={commonPitch ?? selectedPlanesList[0].pitchDeg}
+                      onChange={(e) =>
+                        onBatchPlanePitch(
+                          selectedPlanesList.map((p) => p.id),
+                          parseFloat(e.target.value)
+                        )
+                      }
+                      className="w-full accent-sky-500 cursor-pointer h-2"
+                    />
+                    <div className="grid grid-cols-5 gap-1.5">
+                      {[5, 12, 15, 22.5, 30].map((deg) => (
+                        <button
+                          key={deg}
+                          type="button"
+                          onClick={() =>
+                            onBatchPlanePitch(
+                              selectedPlanesList.map((p) => p.id),
+                              deg
+                            )
+                          }
+                          className={`py-1.5 rounded-lg text-[10px] font-mono font-bold border cursor-pointer ${
+                            commonPitch !== null && Math.abs(commonPitch - deg) < 0.2
+                              ? 'bg-sky-600 text-white border-sky-400'
+                              : 'bg-slate-950 hover:bg-slate-800 text-slate-300 border-slate-800'
+                          }`}
+                        >
+                          {deg}°
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {!isLockedView && onBatchPlaneDirection && (
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[10px] font-bold text-slate-400">
+                      <span>Lay Direction (Underlap)</span>
+                      <span className="text-slate-300 font-mono">
+                        {commonDir ? (commonDir === 'left' ? 'Left → Right' : 'Right → Left') : 'Multiple'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onBatchPlaneDirection(
+                            selectedPlanesList.map((p) => p.id),
+                            'left'
+                          )
+                        }
+                        className={`py-1.5 rounded-lg text-[11px] font-bold cursor-pointer ${
+                          commonDir === 'left'
+                            ? 'bg-blue-600 text-white'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Left → Right
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onBatchPlaneDirection(
+                            selectedPlanesList.map((p) => p.id),
+                            'right'
+                          )
+                        }
+                        className={`py-1.5 rounded-lg text-[11px] font-bold cursor-pointer ${
+                          commonDir === 'right'
+                            ? 'bg-blue-600 text-white'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        Right → Left
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {!isLockedView && onBatchPlaneEaveHeight && (
+                  <div className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5">
+                    <span className="text-[10px] font-bold text-amber-300">Eave Z (m)</span>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.5"
+                        max="15"
+                        value={batchPlaneZ}
+                        onChange={(e) => setBatchPlaneZ(e.target.value)}
+                        className="w-16 bg-slate-900 border border-amber-500/40 rounded px-2 py-1 text-right font-mono font-bold text-white text-[11px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = parseFloat(batchPlaneZ);
+                          if (Number.isFinite(val) && val >= 0.5) {
+                            onBatchPlaneEaveHeight(
+                              selectedPlanesList.map((p) => p.id),
+                              val
+                            );
+                          }
+                        }}
+                        className="px-2 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-extrabold cursor-pointer"
+                      >
+                        Apply Z
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {!isLockedView && onBatchPlaneOrderedSheetLength && (
+                  <div className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5">
+                    <span className="text-[10px] font-bold text-sky-300">BOM Sheet (mm)</span>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        step="10"
+                        min="300"
+                        max="30000"
+                        placeholder="e.g. 5450"
+                        value={batchSheetMm}
+                        onChange={(e) => setBatchSheetMm(e.target.value)}
+                        className="w-20 bg-slate-900 border border-sky-500/40 rounded px-2 py-1 text-right font-mono font-bold text-white text-[11px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const parsed = parseFloat(batchSheetMm);
+                          if (Number.isFinite(parsed) && parsed >= 300) {
+                            onBatchPlaneOrderedSheetLength(
+                              selectedPlanesList.map((p) => p.id),
+                              +(Math.round(parsed) / 1000).toFixed(3)
+                            );
+                          }
+                        }}
+                        className="px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[10px] font-extrabold cursor-pointer"
+                      >
+                        Set
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onBatchPlaneOrderedSheetLength(
+                            selectedPlanesList.map((p) => p.id),
+                            undefined
+                          )
+                        }
+                        className="px-1.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold cursor-pointer"
+                      >
+                        Auto
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Batch Perimeter Edges Card */}
+            {selectedEdgesList.length >= 2 && (
+              <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-slate-200 text-[11px] uppercase tracking-wider">
+                    Batch Apply · {selectedEdgesList.length} Perimeter Edges
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
+                    {commonEdgeType ? getRoofEdgeTypeMeta(commonEdgeType).shortLabel : 'Multiple'}
+                  </span>
+                </div>
+
+                {!isLockedView && onBatchEdgeType && (
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {ROOF_LINE_TYPE_CATALOG.map((item) => {
+                      const active = commonEdgeType === item.edgeType;
+                      return (
+                        <button
+                          key={item.edgeType}
+                          type="button"
+                          onClick={() =>
+                            onBatchEdgeType(
+                              selectedEdgesList.map((e) => e.id),
+                              item.edgeType
+                            )
+                          }
+                          className={`px-2 py-1.5 rounded-xl border text-left text-[10px] font-bold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                            active
+                              ? 'bg-sky-600/25 border-sky-400 text-white'
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                          }`}
+                        >
+                          <span
+                            className="w-2 h-2 rounded-full shrink-0"
+                            style={{ backgroundColor: item.colorHex }}
+                          />
+                          <span className="truncate">{item.shortLabel}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {!isLockedView && onBatchEdgeHeight && (
+                  <div className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5">
+                    <span className="text-[10px] font-bold text-amber-300">Edge Z (m)</span>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.5"
+                        max="15"
+                        value={batchEdgeZ}
+                        onChange={(e) => setBatchEdgeZ(e.target.value)}
+                        className="w-16 bg-slate-900 border border-amber-500/40 rounded px-2 py-1 text-right font-mono font-bold text-white text-[11px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = parseFloat(batchEdgeZ);
+                          if (Number.isFinite(val) && val >= 0.5) {
+                            onBatchEdgeHeight(
+                              selectedEdgesList.map((e) => e.id),
+                              val
+                            );
+                          }
+                        }}
+                        className="px-2 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-extrabold cursor-pointer"
+                      >
+                        Apply Z
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {!isLockedView && onBatchEdgeWall && (
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-300">
+                        Wall Below Roof ({commonEdgeWall === null ? 'Multiple' : commonEdgeWall ? 'ON' : 'OFF'})
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onBatchEdgeWall(
+                              selectedEdgesList.map((e) => e.id),
+                              { hasWall: true }
+                            )
+                          }
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer ${
+                            commonEdgeWall === true
+                              ? 'bg-amber-500 text-slate-950'
+                              : 'bg-slate-800 text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          Wall ON
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onBatchEdgeWall(
+                              selectedEdgesList.map((e) => e.id),
+                              { hasWall: false }
+                            )
+                          }
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer ${
+                            commonEdgeWall === false
+                              ? 'bg-slate-700 text-white'
+                              : 'bg-slate-800 text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          OFF
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between gap-1.5">
+                      <span className="text-[10px] text-slate-400 font-bold">Eave Setback</span>
+                      <div className="flex items-center gap-1">
+                        {[0, 0.45, 0.6].map((sb) => (
+                          <button
+                            key={sb}
+                            type="button"
+                            onClick={() =>
+                              onBatchEdgeWall(
+                                selectedEdgesList.map((e) => e.id),
+                                { hasWall: true, eaveSetbackM: sb }
+                              )
+                            }
+                            className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-sky-600 text-slate-200 text-[10px] font-mono font-bold cursor-pointer"
+                          >
+                            {sb === 0 ? '0m' : `${sb}m`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Batch Roof Skeleton Lines Card */}
+            {selectedSkeletonList.length >= 2 && (
+              <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-slate-200 text-[11px] uppercase tracking-wider">
+                    Batch Apply · {selectedSkeletonList.length} Roof Lines
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
+                    {commonSkelType ? getSkeletonLineTypeMeta(commonSkelType).shortLabel : 'Multiple'}
+                  </span>
+                </div>
+
+                {!isLockedView && onBatchSkeletonLineType && (
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {ROOF_LINE_TYPE_CATALOG.map((item) => {
+                      const active = commonSkelType === item.lineType;
+                      return (
+                        <button
+                          key={item.lineType}
+                          type="button"
+                          onClick={() =>
+                            onBatchSkeletonLineType(
+                              selectedSkeletonList.map((s) => s.id),
+                              item.lineType
+                            )
+                          }
+                          className={`px-2 py-1.5 rounded-xl border text-left text-[10px] font-bold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                            active
+                              ? 'bg-sky-600/25 border-sky-400 text-white'
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                          }`}
+                        >
+                          <span
+                            className="w-2 h-2 rounded-full shrink-0"
+                            style={{ backgroundColor: item.colorHex }}
+                          />
+                          <span className="truncate">{item.shortLabel}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Batch Wall Facets Card */}
+            {selectedWallFacetsList.length >= 2 && (
+              <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-slate-200 text-[11px] uppercase tracking-wider">
+                    Batch Apply · {selectedWallFacetsList.length} Wall Faces
+                  </span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-amber-300">
+                    {commonWallClad ? getWallCladdingMeta(commonWallClad).shortLabel : 'Multiple'}
+                  </span>
+                </div>
+
+                {!isLockedView && onBatchWallUpdate && (
+                  <>
+                    <div className="space-y-1.5">
+                      <div className="text-[10px] font-bold text-slate-400 uppercase">
+                        Cladding Material
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {WALL_CLADDING_OPTIONS.map((opt) => (
+                          <button
+                            key={opt.type}
+                            type="button"
+                            onClick={() =>
+                              onBatchWallUpdate(
+                                selectedWallFacetsList.map((f) => f.id),
+                                { claddingType: opt.type as WallCladdingType }
+                              )
+                            }
+                            className={`px-2 py-1.5 rounded-xl border text-left text-[10px] font-bold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                              commonWallClad === opt.type
+                                ? 'bg-sky-600/25 border-sky-400 text-white'
+                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                            }`}
+                          >
+                            <span
+                              className="w-2.5 h-2.5 rounded-xs shrink-0 border border-white/20"
+                              style={{ backgroundColor: opt.hex }}
+                            />
+                            <span className="truncate">{opt.shortLabel}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] font-bold text-slate-400 uppercase">
+                        <span>Wall Role / Kind</span>
+                        <span className="font-mono text-slate-300">
+                          {commonWallKind ? getWallFacetKindMeta(commonWallKind).shortLabel : 'Multiple'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {WALL_FACET_KIND_OPTIONS.map((opt) => (
+                          <button
+                            key={opt.kind}
+                            type="button"
+                            onClick={() =>
+                              onBatchWallUpdate(
+                                selectedWallFacetsList.map((f) => f.id),
+                                { kind: opt.kind }
+                              )
+                            }
+                            className={`px-2 py-1.5 rounded-xl border text-left text-[10px] font-bold truncate cursor-pointer transition-colors ${
+                              commonWallKind === opt.kind
+                                ? 'bg-amber-600/25 border-amber-400 text-white'
+                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                            }`}
+                          >
+                            {opt.shortLabel}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="space-y-2 bg-slate-950 border border-slate-800 rounded-xl p-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold text-slate-300">Height Source</span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onBatchWallUpdate(
+                                selectedWallFacetsList.map((f) => f.id),
+                                { heightSource: 'roof' }
+                              )
+                            }
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer ${
+                              commonWallHeightSrc === 'roof'
+                                ? 'bg-sky-600 text-white'
+                                : 'bg-slate-800 text-slate-300 hover:text-white'
+                            }`}
+                          >
+                            From Roof
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onBatchWallUpdate(
+                                selectedWallFacetsList.map((f) => f.id),
+                                { heightSource: 'manual' }
+                              )
+                            }
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold cursor-pointer ${
+                              commonWallHeightSrc === 'manual'
+                                ? 'bg-amber-500 text-slate-950'
+                                : 'bg-slate-800 text-slate-300 hover:text-white'
+                            }`}
+                          >
+                            Manual
+                          </button>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold text-amber-300">Height (m)</span>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0.4"
+                            max="12"
+                            value={batchWallH}
+                            onChange={(e) => setBatchWallH(e.target.value)}
+                            className="w-16 bg-slate-900 border border-amber-500/40 rounded px-2 py-1 text-right font-mono font-bold text-white text-[11px]"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const val = parseFloat(batchWallH);
+                              if (Number.isFinite(val) && val >= 0.4) {
+                                onBatchWallUpdate(
+                                  selectedWallFacetsList.map((f) => f.id),
+                                  { heightM: val }
+                                );
+                              }
+                            }}
+                            className="px-2 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[10px] font-extrabold cursor-pointer"
+                          >
+                            Apply H
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })() : selectedAsset ? (() => {
         const hostPlane = planes.find((p) => p.id === selectedAsset.planeId) || null;
         const metrics = hostPlane
           ? computeAssetPlacementMetrics(hostPlane, selectedAsset)
@@ -1963,7 +2714,13 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               <div className="flex items-center gap-2">
                 <Sliders className="w-4 h-4 text-blue-400" />
                 <h3 className="font-extrabold text-xs uppercase tracking-wider text-slate-200">
-                  {selectedPlane ? 'Area Inspector' : selectedWallFacet ? `Wall ${selectedWallFacet.code} Inspector` : 'Roof & Wall Overview'}
+                  {hasMultiRoofOrWallSelection
+                    ? 'Batch Edit Inspector'
+                    : selectedPlane
+                    ? 'Area Inspector'
+                    : selectedWallFacet
+                    ? `Wall ${selectedWallFacet.code} Inspector`
+                    : 'Roof & Wall Overview'}
                 </h3>
               </div>
               <button
@@ -1989,7 +2746,13 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
         <div className="flex items-center gap-2">
           <Sliders className="w-4 h-4 text-blue-400" />
           <h3 className="font-extrabold text-xs uppercase tracking-wider text-slate-300">
-            {selectedPlane ? 'Roof Area Inspector' : selectedWallFacet ? `Wall ${selectedWallFacet.code} Inspector` : 'Roof & Wall Overview'}
+            {hasMultiRoofOrWallSelection
+              ? 'Batch Edit Inspector'
+              : selectedPlane
+              ? 'Roof Area Inspector'
+              : selectedWallFacet
+              ? `Wall ${selectedWallFacet.code} Inspector`
+              : 'Roof & Wall Overview'}
           </h3>
         </div>
 

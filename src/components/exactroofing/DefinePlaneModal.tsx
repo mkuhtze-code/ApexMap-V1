@@ -1,6 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { EdgeType, PlanEdge, RoofPlane } from '../../types/exactRoofing';
-import { dist } from '../../utils/exactRoofingEngine';
+import {
+  dist,
+  ROOF_LINE_TYPE_CATALOG,
+  getRoofEdgeTypeMeta
+} from '../../utils/exactRoofingEngine';
 import { X, ArrowRight, ArrowLeft, Check, PenTool, Tag, Compass, AlignJustify } from 'lucide-react';
 
 interface Props {
@@ -8,9 +12,22 @@ interface Props {
   outlineEdges?: PlanEdge[];
   existingPlane?: RoofPlane | null;
   existingPlanes?: RoofPlane[];
+  selectedEdgeIds?: string[];
   isOpen: boolean;
   onClose: () => void;
   onClassifyEdge?: (edgeId: string, edgeType: EdgeType) => void;
+  onBatchClassifyEdges?: (edgeIds: string[], edgeType: EdgeType) => void;
+  onBatchUpdateEdges?: (
+    edgeIds: string[],
+    updates: {
+      edgeType?: EdgeType;
+      pitchDeg?: number;
+      eaveHeightM?: number;
+      hasWall?: boolean;
+      eaveSetbackM?: number;
+      underlapSide?: 'left' | 'right';
+    }
+  ) => void;
   onSavePlane: (options: {
     edgeType: EdgeType;
     eaveEdgeId: string;
@@ -38,42 +55,9 @@ const COMMON_SETBACKS = [
   { label: '0.6m Deep', value: 0.6 }
 ];
 
-const EDGE_CLASSIFICATIONS: Array<{
-  type: EdgeType;
-  label: string;
-  code: string;
-  activeClass: string;
-}> = [
-  { type: 'outline', label: 'Eave', code: 'E', activeClass: 'bg-emerald-600 text-white border-emerald-400' },
-  { type: 'ridge', label: 'Ridge', code: 'R', activeClass: 'bg-purple-600 text-white border-purple-400' },
-  { type: 'hip', label: 'Hip', code: 'H', activeClass: 'bg-sky-600 text-white border-sky-400' },
-  { type: 'valley', label: 'Valley', code: 'V', activeClass: 'bg-amber-600 text-white border-amber-400' },
-  { type: 'verge', label: 'Barge / Verge', code: 'B', activeClass: 'bg-indigo-600 text-white border-indigo-400' },
-  { type: 'wall', label: 'Wall', code: 'W', activeClass: 'bg-orange-600 text-white border-orange-400' }
-];
-
-function getEdgeCodeBadge(t: EdgeType): string {
-  switch (t) {
-    case 'outline':
-      return 'E';
-    case 'ridge':
-      return 'R';
-    case 'hip':
-      return 'H';
-    case 'valley':
-      return 'V';
-    case 'verge':
-      return 'B';
-    case 'wall':
-      return 'W';
-    default:
-      return '?';
-  }
-}
-
 function getEdgeShortLabel(e: PlanEdge, index: number): string {
   const len = dist(e.from, e.to).toFixed(2);
-  const code = getEdgeCodeBadge(e.type);
+  const code = getRoofEdgeTypeMeta(e.type).code;
   return `Side ${index + 1} [${code}] · ${len}m`;
 }
 
@@ -82,13 +66,17 @@ export const DefinePlaneModal: React.FC<Props> = ({
   outlineEdges,
   existingPlane,
   existingPlanes = [],
+  selectedEdgeIds = [],
   isOpen,
   onClose,
   onClassifyEdge,
+  onBatchClassifyEdges,
+  onBatchUpdateEdges,
   onSavePlane,
   onAssignFlashing
 }) => {
   const [edgeType, setEdgeType] = useState<EdgeType>('unclassified');
+  const [applyScope, setApplyScope] = useState<'single' | 'selected' | 'level'>('single');
   const [eaveEdgeId, setEaveEdgeId] = useState<string>('');
   const [sheetRunEdgeId, setSheetRunEdgeId] = useState<string>('');
   const [sheetFollowsEave, setSheetFollowsEave] = useState<boolean>(true);
@@ -132,6 +120,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
     const initialSheetEdgeId = activePlaneForEave?.sheetRunEdgeId || initialEaveId;
 
     setEdgeType(initialType);
+    setApplyScope('single');
     setEaveEdgeId(initialEaveId);
     setSheetRunEdgeId(initialSheetEdgeId);
     setSheetFollowsEave(initialSheetEdgeId === initialEaveId);
@@ -195,24 +184,55 @@ export const DefinePlaneModal: React.FC<Props> = ({
     setSheetFollowsEave(nextSheetEdgeId === eaveEdgeId);
   };
 
+  const resolveScopeTargetIds = (): string[] => {
+    if (applyScope === 'selected' && selectedEdgeIds.length >= 2) {
+      return selectedEdgeIds;
+    }
+    if (applyScope === 'level') {
+      return availableEdges.map((ed) => ed.id);
+    }
+    return [edge.id];
+  };
+
   const handleClassifyOnly = () => {
+    const targetIds = resolveScopeTargetIds();
+    if (targetIds.length > 1 && onBatchClassifyEdges) {
+      onBatchClassifyEdges(targetIds, edgeType);
+      onClose();
+      return;
+    }
     if (!onClassifyEdge) return;
     onClassifyEdge(edge.id, edgeType);
     onClose();
   };
 
   const handleSave = () => {
+    const targetIds = resolveScopeTargetIds();
+    const clampedZ = Math.max(0.5, Math.min(20, Number(eaveHeight) || 2.7));
+    const clampedSetback = +Math.max(0, Math.min(3.0, Number(eaveSetbackM) || 0)).toFixed(2);
+    if (targetIds.length > 1 && onBatchUpdateEdges) {
+      onBatchUpdateEdges(targetIds, {
+        edgeType,
+        pitchDeg: pitch,
+        eaveHeightM: clampedZ,
+        hasWall,
+        eaveSetbackM: clampedSetback,
+        underlapSide: underlap
+      });
+      onClose();
+      return;
+    }
     onSavePlane({
       edgeType,
       eaveEdgeId: eaveEdgeId || edge.id,
       sheetRunEdgeId: sheetRunEdgeId || eaveEdgeId || edge.id,
       pitchDeg: pitch,
       underlapSide: underlap,
-      eaveHeightM: Math.max(0.5, Math.min(20, Number(eaveHeight) || 2.7)),
+      eaveHeightM: clampedZ,
       eaveLengthM:
         Math.abs(effectiveLenM - originalEdgeLenM) > 0.02 ? +effectiveLenM.toFixed(2) : undefined,
       hasWall,
-      eaveSetbackM: +Math.max(0, Math.min(3.0, Number(eaveSetbackM) || 0)).toFixed(2),
+      eaveSetbackM: clampedSetback,
       name: name.trim() || `Roof Area [${eaveEdgeId || edge.id}]`
     });
     onClose();
@@ -246,36 +266,85 @@ export const DefinePlaneModal: React.FC<Props> = ({
         {/* Content */}
         <div className="p-4 sm:p-5 space-y-4 text-xs max-h-[75vh] overflow-y-auto">
           {/* STEP 1: CLASSIFY CLICKED BOUNDARY EDGE */}
-          <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-2">
+          <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-2.5">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5 text-[11px] font-bold text-white">
                 <Tag className="w-3.5 h-3.5 text-sky-400" />
-                <span>1. Classify Clicked Boundary Edge (Side {clickedEdgeIndex + 1})</span>
+                <span>1. Line / Boundary Type (Side {clickedEdgeIndex + 1})</span>
               </div>
               <span className="text-[10px] font-mono text-slate-400 tabular-nums">
                 {dist(edge.from, edge.to).toFixed(2)}m
               </span>
             </div>
-            <div className="grid grid-cols-3 gap-1.5">
-              {EDGE_CLASSIFICATIONS.map((cls) => {
-                const isActive = edgeType === cls.type;
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+              {ROOF_LINE_TYPE_CATALOG.map((cls) => {
+                const isActive = edgeType === cls.edgeType;
                 return (
                   <button
-                    key={cls.type}
+                    key={cls.edgeType}
                     type="button"
-                    onClick={() => setEdgeType(cls.type)}
-                    className={`py-2 px-2 rounded-xl border text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                    onClick={() => setEdgeType(cls.edgeType)}
+                    title={cls.label}
+                    className={`py-2 px-1.5 rounded-xl border text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center gap-1 ${
                       isActive
-                        ? `${cls.activeClass} shadow-xs`
+                        ? 'bg-sky-600/25 text-white border-sky-400 shadow-xs'
                         : 'bg-slate-800/80 border-slate-700/60 text-slate-300 hover:bg-slate-800'
                     }`}
                   >
-                    <span className="font-mono font-black">{cls.code}</span>
-                    <span>{cls.label}</span>
+                    <span
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ backgroundColor: cls.colorHex }}
+                    />
+                    <span className="font-mono font-black text-[10px]">{cls.code}</span>
+                    <span className="truncate">{cls.shortLabel}</span>
                   </button>
                 );
               })}
             </div>
+            {(onBatchClassifyEdges || onBatchUpdateEdges) && availableEdges.length > 1 && (
+              <div className="pt-1 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-1.5">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                  Apply Scope
+                </span>
+                <div className="flex items-center gap-1 p-0.5 bg-slate-900 rounded-xl border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setApplyScope('single')}
+                    className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                      applyScope === 'single'
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    This Edge
+                  </button>
+                  {selectedEdgeIds.length >= 2 && (
+                    <button
+                      type="button"
+                      onClick={() => setApplyScope('selected')}
+                      className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                        applyScope === 'selected'
+                          ? 'bg-sky-600 text-white'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {selectedEdgeIds.length} Selected
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setApplyScope('level')}
+                    className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                      applyScope === 'level'
+                        ? 'bg-amber-600 text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    All {availableEdges.length} on Level
+                  </button>
+                </div>
+              </div>
+            )}
             <p className="text-[10px] text-slate-400">
               Classifying a boundary edge labels its CAD type without changing downhill fall until you select the eave below.
             </p>
@@ -558,13 +627,13 @@ export const DefinePlaneModal: React.FC<Props> = ({
                 <span>Flashing</span>
               </button>
             )}
-            {onClassifyEdge && (
+            {(onClassifyEdge || onBatchClassifyEdges) && (
               <button
                 type="button"
                 onClick={handleClassifyOnly}
                 className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 font-bold text-xs transition-colors cursor-pointer"
               >
-                Save Edge Type Only
+                {applyScope === 'single' ? 'Save Edge Type Only' : `Classify (${resolveScopeTargetIds().length})`}
               </button>
             )}
           </div>
@@ -582,7 +651,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
               onClick={handleSave}
               className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 font-extrabold text-white text-xs shadow-md transition-all cursor-pointer"
             >
-              Apply Plane
+              {applyScope === 'single' ? 'Apply Plane' : `Apply to ${resolveScopeTargetIds().length}`}
             </button>
           </div>
         </div>

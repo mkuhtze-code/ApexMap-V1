@@ -33,9 +33,11 @@ import {
 
 export type DeterministicPatchOp =
   | 'set_plane_pitch'
+  | 'batch_plane_pitch'
   | 'set_plane_direction'
   | 'set_start_plane'
   | 'set_edge_mode'
+  | 'batch_classify_edges'
   | 'set_edge_wall'
   | 'auto_assign_flashings';
 
@@ -43,6 +45,7 @@ export interface DeterministicRoofPatch {
   id: string;
   op: DeterministicPatchOp;
   targetId?: string;
+  targetIds?: string[];
   targetCode?: string;
   valueNumber?: number;
   valueString?: string;
@@ -547,6 +550,74 @@ export function runDeterministicRoofAudit(params: {
       detail: `Eave elevations (${levels.map((l) => `${l.code}: ${l.eaveHeightM}m`).join(', ')}) aligned cleanly with non-protruding walls.`
     });
   }
+
+  // 6. Multi-Select Batch Suggestions (Mixed Pitch per Level & Unclassified Perimeter Edges)
+  levels.forEach((lvl) => {
+    const levelMainPlanes = structuralPlanes.filter(
+      (p) => (p.levelId || 'level-1') === lvl.id && Number.isFinite(p.pitchDeg) && p.pitchDeg > 0
+    );
+    if (levelMainPlanes.length >= 2) {
+      const pitchCounts = new Map<number, number>();
+      levelMainPlanes.forEach((p) => {
+        const key = +p.pitchDeg.toFixed(1);
+        pitchCounts.set(key, (pitchCounts.get(key) || 0) + 1);
+      });
+      if (pitchCounts.size > 1) {
+        const sortedPitches = Array.from(pitchCounts.entries()).sort(
+          (a, b) => b[1] - a[1] || b[0] - a[0]
+        );
+        const targetPitch = Math.max(minPitchRequired, sortedPitches[0][0]);
+        const targetIds = levelMainPlanes.map((p) => p.id);
+        const batchPitchPatch: DeterministicRoofPatch = {
+          id: `patch-batch-pitch-${lvl.id}`,
+          op: 'batch_plane_pitch',
+          targetId: lvl.id,
+          targetIds,
+          targetCode: lvl.code,
+          valueNumber: targetPitch,
+          label: `Unify ${lvl.code} pitches to ${targetPitch}° (${targetIds.length} faces)`,
+          reason: `Aligns ${lvl.code} roof slopes (${Array.from(pitchCounts.keys()).map((k) => `${k}°`).join(' vs ')}) so hips, valleys, and ridges intersect cleanly.`,
+          severity: 'optimization',
+          source: 'deterministic'
+        };
+        recommendedPatches.push(batchPitchPatch);
+        findings.push({
+          id: `find-mixed-pitch-${lvl.id}`,
+          category: 'pitch',
+          severity: 'warning',
+          title: `${lvl.code}: Mixed roof pitches across ${levelMainPlanes.length} faces`,
+          detail: `Distinct pitches found (${Array.from(pitchCounts.keys()).map((k) => `${k}°`).join(', ')}). Unify or keep deliberate skillion split.`,
+          suggestedPatch: batchPitchPatch
+        });
+      }
+    }
+
+    const unclassifiedEdges = lvl.outline.edges.filter((e) => e.type === 'unclassified');
+    const hasClassifiedNeighbors = lvl.outline.edges.some((e) => e.type !== 'unclassified');
+    if (unclassifiedEdges.length > 0 && hasClassifiedNeighbors) {
+      const batchEdgePatch: DeterministicRoofPatch = {
+        id: `patch-batch-edges-${lvl.id}`,
+        op: 'batch_classify_edges',
+        targetId: lvl.id,
+        targetIds: unclassifiedEdges.map((e) => e.id),
+        targetCode: lvl.code,
+        valueString: 'verge',
+        label: `Tag ${unclassifiedEdges.length} unclassified ${lvl.code} edge${unclassifiedEdges.length > 1 ? 's' : ''} as Barge / Verge`,
+        reason: 'Clears unclassified perimeter edges so barge/edge flashing schedules reconcile without affecting existing eaves.',
+        severity: 'compliance',
+        source: 'deterministic'
+      };
+      recommendedPatches.push(batchEdgePatch);
+      findings.push({
+        id: `find-unclassified-edges-${lvl.id}`,
+        category: 'geometry',
+        severity: 'warning',
+        title: `${lvl.code}: ${unclassifiedEdges.length} unclassified perimeter edge(s)`,
+        detail: 'Classify remaining edges as Barge/Verge, Eave, Rake, or Wall so flashing takeoffs stay complete.',
+        suggestedPatch: batchEdgePatch
+      });
+    }
+  });
 
   const finalScore = Math.max(25, Math.min(100, score));
   const status: DeterministicRoofAuditReport['status'] =

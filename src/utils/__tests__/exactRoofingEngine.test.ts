@@ -14,7 +14,17 @@ import {
   squarePolygonCorner,
   snapPointToSupportingLine,
   isEdgeColinearWithSegment,
-  syncMultiLevelPlanes
+  syncMultiLevelPlanes,
+  ROOF_LINE_TYPE_CATALOG,
+  getRoofEdgeTypeMeta,
+  getSkeletonLineTypeMeta,
+  applyEdgeType,
+  applySkeletonLineType,
+  applyEaveSetback,
+  applyEaveHeightToEdges,
+  applyPitchToPlanes,
+  applyDirectionToPlanes,
+  applyOrderedSheetLengthToPlanes
 } from '../exactRoofingEngine';
 import type { PlanEdge, RoofLevel, RoofOutline, RoofPlane, SheetSpec } from '../../types/exactRoofing';
 
@@ -2234,5 +2244,103 @@ if (pracOverrideLengths.size > 2) {
 console.log(
   `✓ Test 36 Passed: Practical default uses ${pracHipDistinct.size} length on 4-hip (${pracHipLayout.totalOrderedMetres}m vs Optimized ${optHipLayout.totalOrderedMetres}m across ${optHipDistinct.size} lengths), ${pracSplitDistinct.size} lengths on 2-storey split, and exact 5435mm site override intact.`
 );
+
+// 37. TEST 37: Full 10-Type Roof Line Catalog, Multi-Apply Batch Helpers & Mixed-Pitch Warning
+if (ROOF_LINE_TYPE_CATALOG.length !== 10) {
+  throw new Error(`Expected 10 roof line types in ROOF_LINE_TYPE_CATALOG, got ${ROOF_LINE_TYPE_CATALOG.length}`);
+}
+for (const entry of ROOF_LINE_TYPE_CATALOG) {
+  const edgeMeta = getRoofEdgeTypeMeta(entry.edgeType);
+  const skelMeta = getSkeletonLineTypeMeta(entry.lineType);
+  if (!edgeMeta.label || !skelMeta.label || edgeMeta.edgeType !== entry.edgeType || skelMeta.lineType !== entry.lineType) {
+    throw new Error(`Metadata lookup mismatch for catalog type ${entry.code}`);
+  }
+}
+if (getRoofEdgeTypeMeta('rake').label !== 'Rake' || getRoofEdgeTypeMeta('apron').label !== 'Apron / Step') {
+  throw new Error('Expected Rake and Apron / Step metadata labels to resolve cleanly');
+}
+
+const batchOutline0 = getPresetOutline('rectangle_14x10');
+const batchSkeleton0 = generateSkeletonLines(batchOutline0);
+const multiEdgeIds = [batchOutline0.edges[1].id, batchOutline0.edges[3].id];
+const rakeOutline = applyEdgeType(batchOutline0, [batchOutline0.edges[1].id], 'rake');
+const apronOutline = applyEdgeType(rakeOutline, [batchOutline0.edges[3].id], 'apron');
+if (
+  apronOutline.edges.find((e) => e.id === batchOutline0.edges[1].id)?.type !== 'rake' ||
+  apronOutline.edges.find((e) => e.id === batchOutline0.edges[3].id)?.type !== 'apron'
+) {
+  throw new Error('applyEdgeType failed to batch-apply rake and apron edge types');
+}
+
+const setbackOutline = applyEaveSetback(apronOutline, multiEdgeIds, 0.45, true);
+const heightOutline = applyEaveHeightToEdges(setbackOutline, multiEdgeIds, 3.15);
+multiEdgeIds.forEach((eid) => {
+  const ed = heightOutline.edges.find((e) => e.id === eid);
+  if (!ed || ed.eaveSetbackM !== 0.45 || ed.eaveHeightM !== 3.15) {
+    throw new Error(`Batch setback/height update failed for edge ${eid}`);
+  }
+});
+
+const skelIdsToBatch = batchSkeleton0.slice(0, 2).map((s) => s.id);
+const updatedSkeleton = applySkeletonLineType(batchSkeleton0, skelIdsToBatch, 'barge');
+skelIdsToBatch.forEach((sid) => {
+  if (updatedSkeleton.find((s) => s.id === sid)?.suggestedType !== 'barge') {
+    throw new Error(`applySkeletonLineType failed to update line ${sid}`);
+  }
+});
+
+const batchLvl = createRoofLevel(1, 'Main Roof', 2.7, batchOutline0.points);
+const mixedPitchPlanes0 = syncMultiLevelPlanes([batchLvl], [], 22.5);
+const twoPlaneIds = [mixedPitchPlanes0[0].id, mixedPitchPlanes0[2].id];
+const mixedPitchPlanes = applyPitchToPlanes(mixedPitchPlanes0, [mixedPitchPlanes0[0].id], 15, [batchLvl]);
+if (mixedPitchPlanes[0].pitchDeg !== 15 || mixedPitchPlanes[2].pitchDeg !== 22.5) {
+  throw new Error('applyPitchToPlanes should update targeted plane pitch and leave others untouched');
+}
+
+const mixedReport = evaluateTakeoffCompleteness({
+  levels: [batchLvl],
+  planes: mixedPitchPlanes,
+  assignableLines: [],
+  flashingAssignments: [],
+  wallPlan: null,
+  assets: []
+});
+if (!mixedReport.issues.some((i) => i.category === 'mixed_pitch')) {
+  throw new Error('Expected evaluateTakeoffCompleteness to emit mixed_pitch warning on mixed-pitch level');
+}
+
+const unifiedPlanes = applyPitchToPlanes(mixedPitchPlanes, mixedPitchPlanes.map((p) => p.id), 25, [batchLvl]);
+const unifiedReport = evaluateTakeoffCompleteness({
+  levels: [batchLvl],
+  planes: unifiedPlanes,
+  assignableLines: [],
+  flashingAssignments: [],
+  wallPlan: null,
+  assets: []
+});
+if (unifiedReport.issues.some((i) => i.category === 'mixed_pitch')) {
+  throw new Error('Expected mixed_pitch warning to clear once level planes are unified via applyPitchToPlanes');
+}
+
+const flippedPlanes = applyDirectionToPlanes(unifiedPlanes, twoPlaneIds, 'right');
+twoPlaneIds.forEach((pid) => {
+  if (flippedPlanes.find((p) => p.id === pid)?.underlapSide !== 'right') {
+    throw new Error(`applyDirectionToPlanes failed on ${pid}`);
+  }
+});
+
+const beforeOverride = flippedPlanes[0];
+const overriddenPlanes = applyOrderedSheetLengthToPlanes(flippedPlanes, twoPlaneIds, 5.425);
+const afterOverride = overriddenPlanes[0];
+if (
+  afterOverride.orderedSheetLengthM !== 5.425 ||
+  afterOverride.slopeLength !== beforeOverride.slopeLength ||
+  JSON.stringify(afterOverride.planPolygon) !== JSON.stringify(beforeOverride.planPolygon) ||
+  JSON.stringify(afterOverride.developedPolygon) !== JSON.stringify(beforeOverride.developedPolygon)
+) {
+  throw new Error('applyOrderedSheetLengthToPlanes must set site length while keeping planPolygon, developedPolygon & slopeLength unchanged');
+}
+
+console.log('✓ Test 37 Passed: Full 10-type roof line catalog, batch multi-apply helpers, override geometry lock & mixed_pitch check.');
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

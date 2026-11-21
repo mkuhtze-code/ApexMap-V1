@@ -2723,19 +2723,17 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             <button
               type="button"
               onClick={() => setMultiSelectMode((v) => !v)}
-              className={`min-h-[36px] px-2 flex items-center justify-center gap-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+              className={`min-h-[36px] px-2 flex items-center justify-center gap-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors whitespace-nowrap shrink-0 ${
                 multiSelectMode || totalMultiSelectedCount >= 2
                   ? 'bg-cyan-600/35 text-cyan-200 border border-cyan-500/50'
                   : 'text-slate-400 hover:text-white hover:bg-slate-800'
               }`}
               title="Multi-Select faces, edges & lines (or Shift+Click)"
             >
-              <Check className="w-3.5 h-3.5" />
-              {!isMobile && (
-                <span>
-                  {totalMultiSelectedCount >= 2 ? `Multi (${totalMultiSelectedCount})` : 'Multi'}
-                </span>
-              )}
+              <Check className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                {totalMultiSelectedCount >= 1 ? `Multi (${totalMultiSelectedCount})` : 'Multi'}
+              </span>
             </button>
           )}
           <button
@@ -5363,10 +5361,23 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         .map((p) => p.id)
                     )
                   }
-                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-200 cursor-pointer"
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-200 cursor-pointer whitespace-nowrap"
                 >
                   This Level Faces
                 </button>
+                {activeLevelId && activeLevelId !== 'all' && outline.edges.some((ed) => ed.type === 'outline') && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedEdgeIds(
+                        outline.edges.filter((ed) => ed.type === 'outline').map((ed) => ed.id)
+                      )
+                    }
+                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-emerald-300 cursor-pointer whitespace-nowrap"
+                  >
+                    Level Eaves
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() =>
@@ -5374,7 +5385,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       allDisplayEdges.filter((ed) => ed.type === 'outline').map((ed) => ed.id)
                     )
                   }
-                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-emerald-300 cursor-pointer"
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-emerald-300 cursor-pointer whitespace-nowrap"
                 >
                   All Eaves
                 </button>
@@ -5385,15 +5396,24 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       allDisplayEdges.filter((ed) => ed.type === 'unclassified').map((ed) => ed.id)
                     )
                   }
-                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-amber-300 cursor-pointer"
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-amber-300 cursor-pointer whitespace-nowrap"
                 >
                   Unclassified
                 </button>
+                {totalMultiSelectedCount >= 2 && onOpenInspector && (
+                  <button
+                    type="button"
+                    onClick={onOpenInspector}
+                    className="px-2 py-1 rounded-lg bg-sky-600/30 hover:bg-sky-600/50 border border-sky-500/45 text-[10px] font-bold text-sky-200 cursor-pointer whitespace-nowrap"
+                  >
+                    Batch Inspector
+                  </button>
+                )}
                 {canUndo && onUndo && (
                   <button
                     type="button"
                     onClick={onUndo}
-                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 flex items-center gap-1 cursor-pointer"
+                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 flex items-center gap-1 cursor-pointer whitespace-nowrap"
                   >
                     <Undo2 className="w-3 h-3" />
                     <span>Undo</span>
@@ -5407,7 +5427,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     setSelectedSkeletonLineIds([]);
                     setMultiSelectMode(false);
                   }}
-                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer"
+                  className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer whitespace-nowrap"
                 >
                   Clear
                 </button>

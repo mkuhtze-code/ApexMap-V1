@@ -86,8 +86,10 @@ import {
 } from '../../utils/exactRoofingBomBridge';
 import {
   buildAutoFlashingAssignments,
+  DeterministicRoofAuditReport,
   DeterministicRoofPatch,
-  normalizeAndVerifyAiRoofOutline
+  normalizeAndVerifyAiRoofOutline,
+  runDeterministicRoofAudit
 } from '../../utils/exactRoofingAiBridge';
 import { ExactRoofingCanvas } from './ExactRoofingCanvas';
 import { ExactRoofing3DViewer } from './ExactRoofing3DViewer';
@@ -299,17 +301,29 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
   // 0. Project Lifecycle Stage ('quoting' | 'measuring' | 'installing') & Lock State
-  const [lifecycleStage, setLifecycleStage] = useState<RoofLifecycleStage>(
+  const initialMeasureLockedVal = Boolean(
+    project?.roofPlanModel?.measureLocked ||
+      activeQuote?.roofPlanModel?.measureLocked ||
+      initialState.measureLocked
+  );
+  const resolvedInitialStage: RoofLifecycleStage =
     initialStage ||
-      activeQuote?.roofPlanModel?.stage ||
-      project?.roofPlanModel?.stage ||
-      (project?.roofPlanModel?.measureLocked ? 'installing' : undefined) ||
-      initialState.stage ||
-      'measuring'
-  );
-  const [measureLocked, setMeasureLocked] = useState<boolean>(
-    Boolean(project?.roofPlanModel?.measureLocked || activeQuote?.roofPlanModel?.measureLocked || initialState.measureLocked)
-  );
+    activeQuote?.roofPlanModel?.stage ||
+    project?.roofPlanModel?.stage ||
+    (project?.roofPlanModel?.measureLocked ? 'installing' : undefined) ||
+    initialState.stage ||
+    'measuring';
+  const resolveDefaultTabForStage = (
+    stage: RoofLifecycleStage,
+    locked: boolean
+  ): ExactRoofingHubTab => {
+    if (stage === 'installing' || locked) return 'layout_results';
+    if (stage === 'measuring') return 'measure_check';
+    return 'canvas_plan';
+  };
+
+  const [lifecycleStage, setLifecycleStage] = useState<RoofLifecycleStage>(resolvedInitialStage);
+  const [measureLocked, setMeasureLocked] = useState<boolean>(initialMeasureLockedVal);
   const [installProgress, setInstallProgress] = useState<RoofInstallProgress>(
     project?.roofPlanModel?.installProgress ||
       activeQuote?.roofPlanModel?.installProgress ||
@@ -421,12 +435,20 @@ export const ExactRoofingHub: React.FC<Props> = ({
     overhang: 0.05
   });
 
-  // 5. Active View Mode (Plan View • 3D View • Offcuts • Flashing Workshop)
-  const [activeTab, setActiveTab] = useState<ExactRoofingHubTab>(initialTab);
+  // 5. Active View Mode (Mode-Pure Home: Quote -> Plan · Measure -> Checklist · Install -> Packs)
+  const [activeTab, setActiveTab] = useState<ExactRoofingHubTab>(() =>
+    initialTab !== 'canvas_plan'
+      ? initialTab
+      : resolveDefaultTabForStage(resolvedInitialStage, initialMeasureLockedVal)
+  );
   const [flashingWorkshopView, setFlashingWorkshopView] = useState<'library' | 'orders'>(initialWorkshopView);
 
+  const prevInitialTabPropRef = useRef<ExactRoofingHubTab>(initialTab);
   useEffect(() => {
-    setActiveTab(initialTab);
+    if (prevInitialTabPropRef.current !== initialTab) {
+      prevInitialTabPropRef.current = initialTab;
+      setActiveTab(initialTab);
+    }
   }, [initialTab]);
 
   useEffect(() => {
@@ -507,20 +529,23 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setMeasureLocked(Boolean(snap.measureLocked));
       setSheetOrderMode(snap.sheetOrderMode || 'practical');
       setInstallProgress(snap.installProgress || DEFAULT_INSTALL_PROGRESS);
-      if (initialStage) {
-        setLifecycleStage(initialStage);
-      } else if (snap.stage) {
-        setLifecycleStage(snap.stage);
-      } else if (snap.measureLocked) {
-        setLifecycleStage('installing');
-      }
-      if (snap.measureLocked || initialStage === 'installing') {
+      const hydratedStage: RoofLifecycleStage = initialStage
+        ? initialStage
+        : snap.stage
+        ? snap.stage
+        : snap.measureLocked
+        ? 'installing'
+        : 'measuring';
+      setLifecycleStage(hydratedStage);
+      if (snap.measureLocked || hydratedStage === 'installing') {
         setActiveTab('layout_results');
+      } else if (initialTab === 'canvas_plan') {
+        setActiveTab(resolveDefaultTabForStage(hydratedStage, Boolean(snap.measureLocked)));
       }
     } else if (initialStage) {
       setLifecycleStage(initialStage);
-      if (initialStage === 'installing') {
-        setActiveTab('layout_results');
+      if (initialTab === 'canvas_plan') {
+        setActiveTab(resolveDefaultTabForStage(initialStage, false));
       }
     }
   }, [project?.id, activeQuote?.id, initialStage]);
@@ -841,6 +866,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleAddLevel = () => {
+    if (isReadOnlyGeometry) return;
     const existingNums = levels.map((l) => {
       const m = l.id.match(/level-(\d+)/);
       return m ? parseInt(m[1], 10) : 1;
@@ -868,6 +894,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleUpdateLevelHeight = (levelId: string, heightM: number) => {
+    if (isReadOnlyGeometry) return;
     const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
     const nextLevels = levels.map((lvl) => {
       if (lvl.id !== levelId) return lvl;
@@ -897,6 +924,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     focusedLevel.id === levelId;
 
   const handleDeleteLevel = (levelId: string) => {
+    if (isReadOnlyGeometry) return;
     if (levels.length <= 1) {
       triggerNotice('At least 1 roof level is required');
       return;
@@ -1077,6 +1105,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Toggle Ridge/Hip Junction between Hipped End and Gable End
   const handleToggleJunctionGable = (junctionId: string) => {
+    if (isReadOnlyGeometry) return;
     const targetLvl = focusedLevel;
     const res = toggleJunctionGable(targetLvl.outline, targetLvl.skeleton, junctionId);
     if (!res.toggledTo) return;
@@ -1097,6 +1126,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // Set Edge 3-Way Mode: Hipped Eave ('outline') | Gable Verge ('verge') | Abutment Wall ('wall')
   // Preserves empty / manually-drawn skeletons instead of auto-regenerating lines unexpectedly
   const handleSetEdgeMode = (edgeId: string, mode: 'hipped' | 'gable' | 'wall') => {
+    if (isReadOnlyGeometry) return;
     const owningLvl = findLevelForEdge(edgeId);
     const usesManualOrEmptySkel =
       owningLvl.skeleton.length === 0 || owningLvl.skeleton.some((s) => !s.id.includes('skel-'));
@@ -1154,6 +1184,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Direct Edge Eave Length Resize (establishes exact wall/eave length for related facets)
   const handleUpdateEdgeLength = (edgeId: string, lengthM: number) => {
+    if (isReadOnlyGeometry) return;
     const clampedLen = +Math.max(0.5, Math.min(100, lengthM)).toFixed(2);
     const owningLvl = findLevelForEdge(edgeId);
     const resizedOutline = updateEdgeLength(owningLvl.outline, edgeId, clampedLen);
@@ -1169,6 +1200,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Direct Edge / Plane Eave Height Z Update (establishes Z-axis relationship between tiers)
   const handleUpdateEdgeEaveHeight = (edgeId: string, heightM: number) => {
+    if (isReadOnlyGeometry) return;
     const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
     const owningLvl = findLevelForEdge(edgeId);
     const nextLevels = levels.map((lvl) => {
@@ -1197,6 +1229,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleUpdatePlaneEaveHeight = (planeId: string, heightM: number) => {
+    if (isReadOnlyGeometry) return;
     const targetPlane = planes.find((p) => p.id === planeId);
     if (!targetPlane) return;
     handleUpdateEdgeEaveHeight(targetPlane.eaveEdgeId, heightM);
@@ -1207,6 +1240,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     edgeId: string,
     updates: { hasWall?: boolean; eaveSetbackM?: number }
   ) => {
+    if (isReadOnlyGeometry) return;
     const owningLvl = findLevelForEdge(edgeId);
     const nextOutline = setEdgeWall(owningLvl.outline, edgeId, updates);
     const nextLevels = levels.map((lvl) =>
@@ -1225,6 +1259,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Apply Roof Style Preset (All Hipped or Gable Ends)
   const handleApplyRoofStylePreset = (mode: 'hipped' | 'gable') => {
+    if (isReadOnlyGeometry) return;
     const targetLvl = focusedLevel;
     const res = applyRoofStylePreset(targetLvl.outline, mode);
     const nextLevels = levels.map((l) =>
@@ -1237,6 +1272,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Live Pitch Adjustment
   const handleUpdatePlanePitch = (planeId: string, pitchDeg: number) => {
+    if (isReadOnlyGeometry) return;
     const nextPlanes = planes.map((plane) => {
       if (plane.id !== planeId) return plane;
       const owningLvl =
@@ -1263,6 +1299,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Live Lay Direction Adjustment
   const handleUpdatePlaneDirection = (planeId: string, underlapSide: 'left' | 'right') => {
+    if (isReadOnlyGeometry) return;
     setPlanes((prev) =>
       prev.map((plane) => {
         if (plane.id !== planeId) return plane;
@@ -1292,6 +1329,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     planeId: string,
     orderedSheetLengthM: number | undefined
   ) => {
+    if (isReadOnlyGeometry) return;
     const cleanLen =
       orderedSheetLengthM !== undefined && Number.isFinite(orderedSheetLengthM) && orderedSheetLengthM > 0.2
         ? +orderedSheetLengthM.toFixed(3)
@@ -1342,10 +1380,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleUpdateWallPlan = (nextPlan: WallPlan | null) => {
+    if (isReadOnlyGeometry) return;
     setWallPlan(nextPlan);
   };
 
   const handleUpdateWallFacet = (updatedFacet: WallFacet) => {
+    if (isReadOnlyGeometry) return;
     setWallPlan((prev) => {
       if (!prev) return prev;
       return {
@@ -1357,6 +1397,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleBuildWallFaces = () => {
+    if (isReadOnlyGeometry) return;
     const derived = deriveWallPlanFromRoofLevels(
       levels,
       levels[0]?.eaveHeightM || 2.7,
@@ -1385,6 +1426,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const applyRoofFromWallPlan = (sourcePlan: WallPlan) => {
+    if (isReadOnlyGeometry) return;
     const targetLvl = focusedLevel;
     const idPrefix =
       targetLvl.id !== 'level-1'
@@ -2082,6 +2124,22 @@ export const ExactRoofingHub: React.FC<Props> = ({
     sheetOrderMode,
     sheetOrderComparison
   ]);
+
+  const deterministicAuditReport = useMemo<DeterministicRoofAuditReport>(
+    () =>
+      runDeterministicRoofAudit({
+        planes,
+        levels,
+        layout: layoutResult,
+        sheetSpec,
+        assignableLines,
+        flashingAssignments,
+        profileName: project?.profile || 'TRS Corrugate 0.55mm',
+        windZone: project?.windZone || 'High',
+        prevailingWind: 'SW'
+      }),
+    [planes, levels, layoutResult, sheetSpec, assignableLines, flashingAssignments, project?.profile, project?.windZone]
+  );
 
   const isReadOnlyGeometry =
     lifecycleStage === 'installing' || (lifecycleStage === 'measuring' && measureLocked);
@@ -3146,52 +3204,56 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 setAssets((prev) => [...prev, asset]);
                 triggerNotice(`✓ Added ${asset.label || asset.type}`);
               }}
-              onUpdateAsset={(asset) =>
-                setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)))
-              }
-              onDeleteAsset={(assetId) => {
-                setAssets((prev) => prev.filter((a) => a.id !== assetId));
-                if (selectedAssetId === assetId) setSelectedAssetId(null);
-                triggerNotice('Feature removed');
-              }}
-              onSelectAsset={handleSelectAsset}
-              onAddPitchBreak={(pb) => {
-                setPitchBreaks((prev) => [...prev.filter((x) => x.planeId !== pb.planeId), pb]);
-                triggerNotice(`✓ Pitch break added (${pb.lowerPitchDeg}° apron)`);
-              }}
-              onDeletePitchBreak={(pbId) => {
-                setPitchBreaks((prev) => prev.filter((p) => p.id !== pbId));
-                if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
-                triggerNotice('Pitch break removed');
-              }}
-              onSelectPitchBreak={handleSelectPitchBreak}
-              flashingAssignments={flashingAssignments}
-              assignableLines={assignableLines}
-              onSelectLineForFlashing={
-                isReadOnlyGeometry ? undefined : (lineId) => setActiveFlashingLineId(lineId)
-              }
-              readOnlyGeometry={isReadOnlyGeometry}
-              customSequenceMap={customSequenceMap}
-              completedPlaneIds={installProgress.completedPlaneIds}
-              onInstallSelectPlane={handleInstallSelectPlaneTap}
-              onOpenAiAssistant={() => setIsAiDrawerOpen(true)}
-              onOpenInspector={() => setIsInspectorOpen(true)}
-              planUnderlay={planUnderlay}
-              projectPlans={projectPlans}
-              onUpdatePlanUnderlay={setPlanUnderlay}
-              openPlanModalSignal={openPlanModalSignal}
-              selectedPlaneIds={selectedPlaneIds}
-              onChangeSelectedPlaneIds={setSelectedPlaneIds}
-              selectedEdgeIds={selectedEdgeIds}
-              onChangeSelectedEdgeIds={setSelectedEdgeIds}
-              selectedSkeletonLineIds={selectedSkeletonLineIds}
-              onChangeSelectedSkeletonLineIds={setSelectedSkeletonLineIds}
-              onBatchUpdatePlanePitch={handleBatchPlanePitch}
-              onBatchClassifyEdges={handleBatchEdgeType}
-              onBatchUpdateSkeletonType={handleBatchSkeletonLineType}
-              onUndo={handleUndo}
-              canUndo={canUndo}
-            />
+                onUpdateAsset={(asset) => {
+                  if (isReadOnlyGeometry) return;
+                  setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+                }}
+                onDeleteAsset={(assetId) => {
+                  if (isReadOnlyGeometry) return;
+                  setAssets((prev) => prev.filter((a) => a.id !== assetId));
+                  if (selectedAssetId === assetId) setSelectedAssetId(null);
+                  triggerNotice('Feature removed');
+                }}
+                onSelectAsset={handleSelectAsset}
+                onAddPitchBreak={(pb) => {
+                  if (isReadOnlyGeometry) return;
+                  setPitchBreaks((prev) => [...prev.filter((x) => x.planeId !== pb.planeId), pb]);
+                  triggerNotice(`✓ Pitch break added (${pb.lowerPitchDeg}° apron)`);
+                }}
+                onDeletePitchBreak={(pbId) => {
+                  if (isReadOnlyGeometry) return;
+                  setPitchBreaks((prev) => prev.filter((p) => p.id !== pbId));
+                  if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
+                  triggerNotice('Pitch break removed');
+                }}
+                onSelectPitchBreak={handleSelectPitchBreak}
+                flashingAssignments={flashingAssignments}
+                assignableLines={assignableLines}
+                onSelectLineForFlashing={
+                  isReadOnlyGeometry ? undefined : (lineId) => setActiveFlashingLineId(lineId)
+                }
+                readOnlyGeometry={isReadOnlyGeometry}
+                customSequenceMap={customSequenceMap}
+                completedPlaneIds={installProgress.completedPlaneIds}
+                onInstallSelectPlane={handleInstallSelectPlaneTap}
+                onOpenAiAssistant={() => setIsAiDrawerOpen(true)}
+                onOpenInspector={() => setIsInspectorOpen(true)}
+                planUnderlay={planUnderlay}
+                projectPlans={projectPlans}
+                onUpdatePlanUnderlay={setPlanUnderlay}
+                openPlanModalSignal={openPlanModalSignal}
+                selectedPlaneIds={selectedPlaneIds}
+                onChangeSelectedPlaneIds={setSelectedPlaneIds}
+                selectedEdgeIds={selectedEdgeIds}
+                onChangeSelectedEdgeIds={setSelectedEdgeIds}
+                selectedSkeletonLineIds={selectedSkeletonLineIds}
+                onChangeSelectedSkeletonLineIds={setSelectedSkeletonLineIds}
+                onBatchUpdatePlanePitch={handleBatchPlanePitch}
+                onBatchClassifyEdges={handleBatchEdgeType}
+                onBatchUpdateSkeletonType={handleBatchSkeletonLineType}
+                onUndo={handleUndo}
+                canUndo={canUndo}
+              />
           )}
 
           {activeTab === 'wall_plan' && (
@@ -3207,6 +3269,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 onSelectWallFacet={handleSelectWallFacet}
                 onUpdateWallPlan={handleUpdateWallPlan}
                 onUpdateWallFacet={handleUpdateWallFacet}
+                onBatchUpdateFacets={handleBatchWallUpdate}
                 wallFilterMode={wallFilterMode}
                 onChangeWallFilterMode={setWallFilterMode}
                 multiSelectedFacetIds={selectedWallFacetIds}
@@ -3264,6 +3327,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 roofingPacks={roofingPacks}
                 installProgress={installProgress}
                 onUpdateInstallProgress={handleUpdateInstallProgress}
+                sheetOrderMode={sheetOrderMode}
+                onChangeSheetOrderMode={handleChangeSheetOrderMode}
+                sheetOrderComparison={sheetOrderComparison}
               />
             </div>
           )}
@@ -3280,6 +3346,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 assets={assets}
                 wallPlan={wallPlan}
                 completenessReport={completenessReport}
+                auditReport={deterministicAuditReport}
                 measureLocked={measureLocked}
                 sheetOrderMode={sheetOrderMode}
                 onChangeSheetOrderMode={handleChangeSheetOrderMode}
@@ -3298,6 +3365,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 }}
                 onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
                 onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
+                onApplyDeterministicPatches={handleApplyDeterministicPatches}
                 onOpenOrderModal={() => {
                   setOrderModalTab('orders');
                   setIsOrderModalOpen(true);
@@ -3479,6 +3547,76 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 </span>
               </button>
             </>
+          ) : lifecycleStage === 'measuring' ? (
+            <>
+              <button
+                onClick={() => setActiveTab('measure_check')}
+                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer relative ${
+                  activeTab === 'measure_check'
+                    ? 'bg-emerald-600/25 text-emerald-300 border border-emerald-500/40'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <ClipboardCheck className="w-4 h-4 mb-0.5" />
+                <span>Checklist</span>
+                {completenessReport.blockersCount > 0 && (
+                  <span className="absolute top-1 right-2 w-2 h-2 rounded-full bg-rose-500" />
+                )}
+              </button>
+
+              <button
+                onClick={() => setActiveTab('canvas_plan')}
+                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
+                  activeTab === 'canvas_plan'
+                    ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Compass className="w-4 h-4 mb-0.5" />
+                <span>Plan</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setWallSubView('plan');
+                  setActiveTab('wall_plan');
+                }}
+                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
+                  activeTab === 'wall_plan'
+                    ? 'bg-amber-600/20 text-amber-300 border border-amber-500/40'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Building2 className="w-4 h-4 mb-0.5" />
+                <span>Walls</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('view_3d')}
+                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
+                  activeTab === 'view_3d'
+                    ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Box className="w-4 h-4 mb-0.5" />
+                <span>3D</span>
+              </button>
+
+              <button
+                onClick={() => setIsInspectorOpen(!isInspectorOpen)}
+                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer relative ${
+                  isInspectorOpen
+                    ? 'bg-sky-600/20 text-sky-400 border border-sky-500/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Sliders className="w-4 h-4 mb-0.5" />
+                <span className="truncate max-w-[54px]">
+                  {selectedPlane ? `Face ${selectedPlane.code}` : 'Inspect'}
+                </span>
+              </button>
+            </>
           ) : (
             <>
               <button
@@ -3520,31 +3658,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 <span>3D</span>
               </button>
 
-              {lifecycleStage === 'measuring' ? (
-                <button
-                  onClick={() => setActiveTab('measure_check')}
-                  className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
-                    activeTab === 'measure_check'
-                      ? 'bg-emerald-600/25 text-emerald-300 border border-emerald-500/40'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <ClipboardCheck className="w-4 h-4 mb-0.5" />
-                  <span>Checklist</span>
-                </button>
-              ) : (
-                <button
-                  onClick={() => setIsMobileToolsOpen((v) => !v)}
-                  className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
-                    isMobileToolsOpen || activeTab === 'layout_results' || activeTab === 'flashing_workshop'
-                      ? 'bg-sky-600/20 text-sky-300 border border-sky-500/35'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <LayoutTemplate className="w-4 h-4 mb-0.5" />
-                  <span>Tools</span>
-                </button>
-              )}
+              <button
+                onClick={() => setIsMobileToolsOpen((v) => !v)}
+                className={`min-h-11 flex flex-col items-center justify-center py-1 rounded-xl text-[10px] font-bold transition-all cursor-pointer ${
+                  isMobileToolsOpen || activeTab === 'layout_results' || activeTab === 'flashing_workshop'
+                    ? 'bg-sky-600/20 text-sky-300 border border-sky-500/35'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <LayoutTemplate className="w-4 h-4 mb-0.5" />
+                <span>Tools</span>
+              </button>
 
               <button
                 onClick={() => setIsInspectorOpen(!isInspectorOpen)}
@@ -3596,19 +3720,23 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
           onSelectPlane={handleSelectPlane}
           onSelectAsset={handleSelectAsset}
-          onUpdateAsset={(asset) =>
-            setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)))
-          }
+          onUpdateAsset={(asset) => {
+            if (isReadOnlyGeometry) return;
+            setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+          }}
           onDeleteAsset={(assetId) => {
+            if (isReadOnlyGeometry) return;
             setAssets((prev) => prev.filter((a) => a.id !== assetId));
             if (selectedAssetId === assetId) setSelectedAssetId(null);
             triggerNotice('Feature removed');
           }}
           onSelectPitchBreak={handleSelectPitchBreak}
-          onUpdatePitchBreak={(pb) =>
-            setPitchBreaks((prev) => prev.map((x) => (x.id === pb.id ? pb : x)))
-          }
+          onUpdatePitchBreak={(pb) => {
+            if (isReadOnlyGeometry) return;
+            setPitchBreaks((prev) => prev.map((x) => (x.id === pb.id ? pb : x)));
+          }}
           onDeletePitchBreak={(pbId) => {
+            if (isReadOnlyGeometry) return;
             setPitchBreaks((prev) => prev.filter((x) => x.id !== pbId));
             if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
             triggerNotice('Pitch break removed');
@@ -4218,6 +4346,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onUpdateSkeleton={handleUpdateSkeleton}
               onSelectEdgeToDefine={(edge) => setSelectedEdgeForPlane(edge)}
               onDeletePlane={(planeId) => {
+                if (isReadOnlyGeometry) return;
                 setPlanes((prev) => prev.filter((p) => p.id !== planeId));
                 if (selectedPlaneId === planeId) setSelectedPlaneId(null);
                 triggerNotice('Roof area removed');
@@ -4227,23 +4356,28 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onToggleJunctionGable={handleToggleJunctionGable}
               onToggleEdgeGable={handleToggleEdgeGable}
               onAddAsset={(asset) => {
+                if (isReadOnlyGeometry) return;
                 setAssets((prev) => [...prev, asset]);
                 triggerNotice(`✓ Added ${asset.label || asset.type}`);
               }}
-              onUpdateAsset={(asset) =>
-                setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)))
-              }
+              onUpdateAsset={(asset) => {
+                if (isReadOnlyGeometry) return;
+                setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+              }}
               onDeleteAsset={(assetId) => {
+                if (isReadOnlyGeometry) return;
                 setAssets((prev) => prev.filter((a) => a.id !== assetId));
                 if (selectedAssetId === assetId) setSelectedAssetId(null);
                 triggerNotice('Feature removed');
               }}
               onSelectAsset={handleSelectAsset}
               onAddPitchBreak={(pb) => {
+                if (isReadOnlyGeometry) return;
                 setPitchBreaks((prev) => [...prev.filter((x) => x.planeId !== pb.planeId), pb]);
                 triggerNotice(`✓ Pitch break added (${pb.lowerPitchDeg}° apron)`);
               }}
               onDeletePitchBreak={(pbId) => {
+                if (isReadOnlyGeometry) return;
                 setPitchBreaks((prev) => prev.filter((p) => p.id !== pbId));
                 if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
                 triggerNotice('Pitch break removed');
@@ -4290,6 +4424,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onSelectWallFacet={handleSelectWallFacet}
               onUpdateWallPlan={handleUpdateWallPlan}
               onUpdateWallFacet={handleUpdateWallFacet}
+              onBatchUpdateFacets={handleBatchWallUpdate}
               wallFilterMode={wallFilterMode}
               onChangeWallFilterMode={setWallFilterMode}
               multiSelectedFacetIds={selectedWallFacetIds}
@@ -4375,6 +4510,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               assets={assets}
               wallPlan={wallPlan}
               completenessReport={completenessReport}
+              auditReport={deterministicAuditReport}
               measureLocked={measureLocked}
               sheetOrderMode={sheetOrderMode}
               onChangeSheetOrderMode={handleChangeSheetOrderMode}
@@ -4393,6 +4529,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               }}
               onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
               onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
+              onApplyDeterministicPatches={handleApplyDeterministicPatches}
               onOpenOrderModal={() => {
                 setOrderModalTab('orders');
                 setIsOrderModalOpen(true);
@@ -4461,19 +4598,23 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
           onSelectPlane={handleSelectPlane}
           onSelectAsset={handleSelectAsset}
-          onUpdateAsset={(asset) =>
-            setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)))
-          }
+          onUpdateAsset={(asset) => {
+            if (isReadOnlyGeometry) return;
+            setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+          }}
           onDeleteAsset={(assetId) => {
+            if (isReadOnlyGeometry) return;
             setAssets((prev) => prev.filter((a) => a.id !== assetId));
             if (selectedAssetId === assetId) setSelectedAssetId(null);
             triggerNotice('Feature removed');
           }}
           onSelectPitchBreak={handleSelectPitchBreak}
-          onUpdatePitchBreak={(pb) =>
-            setPitchBreaks((prev) => prev.map((x) => (x.id === pb.id ? pb : x)))
-          }
+          onUpdatePitchBreak={(pb) => {
+            if (isReadOnlyGeometry) return;
+            setPitchBreaks((prev) => prev.map((x) => (x.id === pb.id ? pb : x)));
+          }}
           onDeletePitchBreak={(pbId) => {
+            if (isReadOnlyGeometry) return;
             setPitchBreaks((prev) => prev.filter((x) => x.id !== pbId));
             if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
             triggerNotice('Pitch break removed');

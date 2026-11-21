@@ -89,6 +89,15 @@ interface Props {
   onSelectWallFacet: (facetId: string | null) => void;
   onUpdateWallPlan: (nextPlan: WallPlan | null) => void;
   onUpdateWallFacet: (updatedFacet: WallFacet) => void;
+  onBatchUpdateFacets?: (
+    facetIds: string[],
+    patch: {
+      claddingType?: WallCladdingType;
+      kind?: WallFacetKind;
+      heightM?: number;
+      heightSource?: WallHeightSource;
+    }
+  ) => void;
   wallFilterMode?: WallFilterMode;
   onChangeWallFilterMode?: (mode: WallFilterMode) => void;
   multiSelectedFacetIds?: string[];
@@ -112,6 +121,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   onSelectWallFacet,
   onUpdateWallPlan,
   onUpdateWallFacet,
+  onBatchUpdateFacets,
   wallFilterMode: propWallFilterMode,
   onChangeWallFilterMode,
   multiSelectedFacetIds: propMultiSelectedFacetIds,
@@ -186,7 +196,9 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     onChangeMultiSelectedFacetIds?.(ids);
   };
 
+  const isEditingLenRef = useRef<boolean>(false);
   React.useEffect(() => {
+    if (isEditingLenRef.current) return;
     const target = facets.find((f) => f.id === selectedWallFacetId);
     setEditLengthVal(target ? target.lengthM.toFixed(2) : '');
   }, [selectedWallFacetId, facets]);
@@ -786,6 +798,26 @@ export const WallPlanWorkspace: React.FC<Props> = ({
       ? multiSelectedFacetIds.filter((id) => id !== facetId)
       : [...multiSelectedFacetIds, facetId];
     setMultiSelectedFacetIds(next);
+  };
+
+  const applyBatchToSelected = (patch: {
+    claddingType?: WallCladdingType;
+    kind?: WallFacetKind;
+    heightM?: number;
+    heightSource?: WallHeightSource;
+  }) => {
+    if (!wallPlan || multiSelectedFacetIds.length === 0) return;
+    if (onBatchUpdateFacets) {
+      onBatchUpdateFacets(multiSelectedFacetIds, patch);
+      return;
+    }
+    onUpdateWallPlan(
+      batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
+        ...patch,
+        roofLevels: levels,
+        roofPlanes
+      })
+    );
   };
 
   const wallAsOutline: RoofOutline | null = useMemo(() => {
@@ -1768,10 +1800,22 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                       step="0.05"
                       min="0.2"
                       value={editLengthVal}
+                      onFocus={(e) => {
+                        isEditingLenRef.current = true;
+                        e.currentTarget.select();
+                      }}
                       onChange={(e) => setEditLengthVal(e.target.value)}
-                      onBlur={handleApplyEdgeLength}
+                      onBlur={() => {
+                        isEditingLenRef.current = false;
+                        handleApplyEdgeLength();
+                      }}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter') handleApplyEdgeLength();
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          isEditingLenRef.current = false;
+                          setEditLengthVal(selectedFacet.lengthM.toFixed(2));
+                          (e.currentTarget as HTMLInputElement).blur();
+                        }
                       }}
                       className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums"
                       title="Edit wall length (m)"
@@ -1836,14 +1880,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               <button
                 type="button"
                 disabled={multiSelectedFacetIds.length === 0}
-                onClick={() =>
-                  onUpdateWallPlan(
-                    batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
-                      claddingType: batchCladding
-                    })
-                  )
-                }
-                className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+                onClick={() => applyBatchToSelected({ claddingType: batchCladding })}
+                className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40 whitespace-nowrap"
               >
                 Apply Cladding
               </button>
@@ -1863,15 +1901,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               <button
                 type="button"
                 disabled={!batchKind || multiSelectedFacetIds.length === 0}
-                onClick={() =>
-                  batchKind &&
-                  onUpdateWallPlan(
-                    batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
-                      kind: batchKind
-                    })
-                  )
-                }
-                className="px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+                onClick={() => batchKind && applyBatchToSelected({ kind: batchKind })}
+                className="px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40 whitespace-nowrap"
               >
                 Set Role
               </button>
@@ -1896,15 +1927,10 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 onClick={() => {
                   const h = parseFloat(batchHeightM);
                   if (Number.isFinite(h) && h >= 0.4) {
-                    onUpdateWallPlan(
-                      batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
-                        heightM: h,
-                        heightSource: 'manual'
-                      })
-                    );
+                    applyBatchToSelected({ heightM: h, heightSource: 'manual' });
                   }
                 }}
-                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40 whitespace-nowrap"
               >
                 Set H
               </button>
@@ -1923,15 +1949,9 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 disabled={!batchHeightSource || multiSelectedFacetIds.length === 0}
                 onClick={() =>
                   batchHeightSource &&
-                  onUpdateWallPlan(
-                    batchUpdateWallFacetsInPlan(wallPlan, multiSelectedFacetIds, {
-                      heightSource: batchHeightSource,
-                      roofLevels: levels,
-                      roofPlanes
-                    })
-                  )
+                  applyBatchToSelected({ heightSource: batchHeightSource })
                 }
-                className="px-2 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40"
+                className="px-2 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] cursor-pointer disabled:opacity-40 whitespace-nowrap"
               >
                 Set Source
               </button>

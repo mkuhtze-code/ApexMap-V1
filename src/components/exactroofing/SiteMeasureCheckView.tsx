@@ -18,6 +18,10 @@ import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBri
 import { computeAssetPlacementMetrics, dist } from '../../utils/exactRoofingEngine';
 import { computeWallTakeoffSummary } from '../../utils/wallCladdingEngine';
 import {
+  DeterministicRoofAuditReport,
+  DeterministicRoofPatch
+} from '../../utils/exactRoofingAiBridge';
+import {
   AlertTriangle,
   Building2,
   Check,
@@ -30,6 +34,7 @@ import {
   Ruler,
   Scissors,
   ShoppingCart,
+  Sparkles,
   Wrench
 } from 'lucide-react';
 
@@ -43,6 +48,7 @@ interface Props {
   assets: RoofAsset[];
   wallPlan?: WallPlan | null;
   completenessReport?: TakeoffCompletenessReport;
+  auditReport?: DeterministicRoofAuditReport;
   measureLocked: boolean;
   sheetOrderMode?: SheetOrderMode;
   onChangeSheetOrderMode?: (mode: SheetOrderMode) => void;
@@ -53,6 +59,7 @@ interface Props {
   onOpenPlaneEditor: (plane: RoofPlane) => void;
   onSelectLineForFlashing: (lineId: string) => void;
   onJumpToCompletenessIssue?: (issue: TakeoffCompletenessIssue) => void;
+  onApplyDeterministicPatches?: (patches: DeterministicRoofPatch[]) => void;
   onOpenOrderModal: () => void;
   onRecalculateLayout: () => void;
   onConfirmLockMeasure: () => void;
@@ -68,6 +75,7 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   assets,
   wallPlan = null,
   completenessReport,
+  auditReport,
   measureLocked,
   sheetOrderMode,
   onChangeSheetOrderMode,
@@ -78,6 +86,7 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   onOpenPlaneEditor,
   onSelectLineForFlashing,
   onJumpToCompletenessIssue,
+  onApplyDeterministicPatches,
   onOpenOrderModal,
   onRecalculateLayout,
   onConfirmLockMeasure
@@ -187,65 +196,118 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* 1B. LINEAR MEASURE CHECKLIST (Blockers & Actionable Items) */}
-      {!measureLocked && completenessReport && completenessReport.issues.length > 0 && (
-        <div
-          className={`rounded-2xl border p-3.5 space-y-2 ${
-            completenessReport.blockersCount > 0
-              ? 'bg-[#0b101d] border-rose-500/45'
-              : 'bg-[#0b101d] border-amber-500/40'
-          }`}
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2 text-xs font-extrabold text-white">
-              <AlertTriangle
-                className={`w-4 h-4 shrink-0 ${
-                  completenessReport.blockersCount > 0 ? 'text-rose-400' : 'text-amber-400'
-                }`}
-              />
-              <span>
-                {completenessReport.blockersCount > 0
-                  ? `${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'} Must Be Resolved Before Lock`
-                  : `${completenessReport.warningsCount} Optional Warning${completenessReport.warningsCount === 1 ? '' : 's'}`}
-              </span>
-            </div>
-            <span className="text-[11px] text-slate-400 font-mono tabular-nums">
-              {completenessReport.blockersCount} blockers · {completenessReport.warningsCount} warnings
-            </span>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5">
-            {completenessReport.issues.slice(0, 6).map((issue) => (
+      {/* 1B. LINEAR MEASURE CHECKLIST (Completeness Blockers + Safe System Fixes) */}
+      {!measureLocked &&
+        ((completenessReport && completenessReport.issues.length > 0) ||
+          (auditReport && auditReport.recommendedPatches.length > 0 && onApplyDeterministicPatches)) && (
+          <div className="space-y-2.5">
+            {completenessReport && completenessReport.issues.length > 0 && (
               <div
-                key={`top-${issue.id}`}
-                className="px-3 py-2 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2 text-xs"
+                className={`rounded-2xl border p-3.5 space-y-2 ${
+                  completenessReport.blockersCount > 0
+                    ? 'bg-[#0b101d] border-rose-500/45'
+                    : 'bg-[#0b101d] border-amber-500/40'
+                }`}
               >
-                <div className="min-w-0">
-                  <div className="font-bold text-slate-100 truncate">
-                    <span
-                      className={
-                        issue.severity === 'blocker' ? 'text-rose-400 mr-1.5' : 'text-amber-300 mr-1.5'
-                      }
-                    >
-                      [{issue.severity === 'blocker' ? 'Blocker' : 'Warn'}]
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-extrabold text-white">
+                    <AlertTriangle
+                      className={`w-4 h-4 shrink-0 ${
+                        completenessReport.blockersCount > 0 ? 'text-rose-400' : 'text-amber-400'
+                      }`}
+                    />
+                    <span>
+                      {completenessReport.blockersCount > 0
+                        ? `${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'} Must Be Resolved Before Lock`
+                        : `${completenessReport.warningsCount} Optional Warning${completenessReport.warningsCount === 1 ? '' : 's'}`}
                     </span>
-                    {issue.title}
                   </div>
-                  <div className="text-[11px] text-slate-400 truncate">{issue.detail}</div>
+                  <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+                    {completenessReport.blockersCount} blockers · {completenessReport.warningsCount} warnings
+                  </span>
                 </div>
-                {onJumpToCompletenessIssue && (
-                  <button
-                    type="button"
-                    onClick={() => onJumpToCompletenessIssue(issue)}
-                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold cursor-pointer shrink-0 whitespace-nowrap"
-                  >
-                    Fix
-                  </button>
-                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5">
+                  {completenessReport.issues.slice(0, 6).map((issue) => (
+                    <div
+                      key={`top-${issue.id}`}
+                      className="px-3 py-2 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-100 truncate">
+                          <span
+                            className={
+                              issue.severity === 'blocker' ? 'text-rose-400 mr-1.5' : 'text-amber-300 mr-1.5'
+                            }
+                          >
+                            [{issue.severity === 'blocker' ? 'Blocker' : 'Warn'}]
+                          </span>
+                          {issue.title}
+                        </div>
+                        <div className="text-[11px] text-slate-400 truncate">{issue.detail}</div>
+                      </div>
+                      {onJumpToCompletenessIssue && (
+                        <button
+                          type="button"
+                          onClick={() => onJumpToCompletenessIssue(issue)}
+                          className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold cursor-pointer shrink-0 whitespace-nowrap"
+                        >
+                          Fix
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
-            ))}
+            )}
+
+            {auditReport && auditReport.recommendedPatches.length > 0 && onApplyDeterministicPatches && (
+              <div className="rounded-2xl border border-sky-500/35 bg-[#0b101d] p-3.5 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-extrabold text-white">
+                    <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
+                    <span>
+                      System Checks &amp; Safe Fixes ({auditReport.recommendedPatches.length})
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+                      {auditReport.status} · {auditReport.prevailingWind} wind · min {auditReport.profileMinPitchDeg}°
+                    </span>
+                    {auditReport.recommendedPatches.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => onApplyDeterministicPatches(auditReport.recommendedPatches)}
+                        className="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-extrabold cursor-pointer shrink-0 whitespace-nowrap"
+                      >
+                        Apply All ({auditReport.recommendedPatches.length})
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5">
+                  {auditReport.recommendedPatches.slice(0, 6).map((patch) => (
+                    <div
+                      key={patch.id}
+                      className="px-3 py-2 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-100 truncate">{patch.label}</div>
+                        <div className="text-[11px] text-slate-400 truncate">{patch.reason}</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onApplyDeterministicPatches([patch])}
+                        className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-sky-600 border border-slate-700 hover:border-sky-500 text-sky-200 hover:text-white text-[11px] font-extrabold cursor-pointer shrink-0 whitespace-nowrap"
+                      >
+                        Apply
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        )}
 
       {/* 2. 4-STEP VERIFICATION STATUS STRIP */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">

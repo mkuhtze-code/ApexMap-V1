@@ -314,11 +314,72 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   const [batchPlaneZ, setBatchPlaneZ] = React.useState<string>('2.7');
   const [batchEdgeZ, setBatchEdgeZ] = React.useState<string>('2.7');
   const [batchWallH, setBatchWallH] = React.useState<string>('2.7');
+  const [batchPitchDraft, setBatchPitchDraft] = React.useState<number>(22.5);
+
+  const focusedFieldRef = React.useRef<string | null>(null);
+  const [planeEaveLenDraft, setPlaneEaveLenDraft] = React.useState<string>('');
+  const [planeEaveZDraft, setPlaneEaveZDraft] = React.useState<string>('');
+  const [planeSetbackDraft, setPlaneSetbackDraft] = React.useState<string>('');
+  const [parapetHDraft, setParapetHDraft] = React.useState<string>('');
+  const [levelZDrafts, setLevelZDrafts] = React.useState<Record<string, string>>({});
 
   const selectedPlanesList = React.useMemo(
     () => planes.filter((p) => selectedPlaneIds.includes(p.id)),
     [planes, selectedPlaneIds]
   );
+
+  React.useEffect(() => {
+    if (selectedPlanesList.length === 0) return;
+    const pitches = new Set(selectedPlanesList.map((p) => p.pitchDeg));
+    setBatchPitchDraft(pitches.size === 1 ? selectedPlanesList[0].pitchDeg : selectedPlanesList[0].pitchDeg);
+  }, [selectedPlaneIds.join(','), planes]);
+
+  const currentPlaneEaveLen = selectedPlane
+    ? +(
+        selectedPlane.eaveWidthM ??
+        (selectedPlane.planPolygon[1]
+          ? dist(selectedPlane.planPolygon[0], selectedPlane.planPolygon[1])
+          : 10)
+      ).toFixed(2)
+    : 0;
+  const currentPlaneEaveZ = selectedPlane ? +(selectedPlane.eaveHeightM ?? 2.7).toFixed(2) : 2.7;
+
+  React.useEffect(() => {
+    if (!selectedPlane) return;
+    if (focusedFieldRef.current !== 'planeEaveLen') {
+      setPlaneEaveLenDraft(String(currentPlaneEaveLen));
+    }
+    if (focusedFieldRef.current !== 'planeEaveZ') {
+      setPlaneEaveZDraft(String(currentPlaneEaveZ));
+    }
+    if (focusedFieldRef.current !== 'planeSetback') {
+      const owningOutline =
+        levels.find((l) => l.id === (selectedPlane.levelId || activeLevelId))?.outline || outline;
+      const edgeObj = owningOutline?.edges.find((e) => e.id === selectedPlane.eaveEdgeId);
+      setPlaneSetbackDraft(String(edgeObj ? getDefaultEdgeSetbackM(edgeObj) : 0.45));
+    }
+  }, [selectedPlane?.id, currentPlaneEaveLen, currentPlaneEaveZ, levels, outline, activeLevelId]);
+
+  React.useEffect(() => {
+    if (!selectedWallFacet) return;
+    if (focusedFieldRef.current !== 'parapetH') {
+      setParapetHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
+    }
+  }, [selectedWallFacet?.id, selectedWallFacet?.heightM]);
+
+  React.useEffect(() => {
+    setLevelZDrafts((prev) => {
+      const next: Record<string, string> = {};
+      levels.forEach((lvl) => {
+        next[lvl.id] =
+          focusedFieldRef.current === `lvlZ:${lvl.id}`
+            ? prev[lvl.id] ?? String(+lvl.eaveHeightM.toFixed(2))
+            : String(+lvl.eaveHeightM.toFixed(2));
+      });
+      return next;
+    });
+  }, [levels]);
+
   const allPlanEdges = React.useMemo(() => {
     const map = new Map<string, RoofOutline['edges'][number]>();
     (outline?.edges || []).forEach((e) => map.set(e.id, e));
@@ -374,6 +435,13 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   const focusedLevelPlanes = planes.filter((p) =>
     activeLevelId === 'all' ? true : (p.levelId || 'level-1') === activeLevelId
   );
+  const focusedLevelEaveIds = (
+    activeLevelId === 'all'
+      ? allPlanEdges
+      : levels.find((l) => l.id === activeLevelId)?.outline.edges || outline?.edges || []
+  )
+    .filter((e) => e.type === 'outline')
+    .map((e) => e.id);
   const allEaveEdgeIds = allPlanEdges.filter((e) => e.type === 'outline').map((e) => e.id);
   const allUnclassifiedEdgeIds = allPlanEdges
     .filter((e) => e.type === 'unclassified')
@@ -477,16 +545,25 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   <button
                     type="button"
                     onClick={() => onChangeSelectedPlaneIds(focusedLevelPlanes.map((p) => p.id))}
-                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 text-[10px] font-bold cursor-pointer"
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 text-[10px] font-bold cursor-pointer whitespace-nowrap"
                   >
                     This Level Faces ({focusedLevelPlanes.length})
+                  </button>
+                )}
+                {onChangeSelectedEdgeIds && activeLevelId !== 'all' && focusedLevelEaveIds.length >= 2 && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeSelectedEdgeIds(focusedLevelEaveIds)}
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-emerald-300 text-[10px] font-bold cursor-pointer whitespace-nowrap"
+                  >
+                    Level Eaves ({focusedLevelEaveIds.length})
                   </button>
                 )}
                 {onChangeSelectedEdgeIds && allEaveEdgeIds.length >= 2 && (
                   <button
                     type="button"
                     onClick={() => onChangeSelectedEdgeIds(allEaveEdgeIds)}
-                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 text-[10px] font-bold cursor-pointer"
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 text-[10px] font-bold cursor-pointer whitespace-nowrap"
                   >
                     All Eaves ({allEaveEdgeIds.length})
                   </button>
@@ -495,7 +572,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   <button
                     type="button"
                     onClick={() => onChangeSelectedEdgeIds(allUnclassifiedEdgeIds)}
-                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer"
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer whitespace-nowrap"
                   >
                     Unclassified ({allUnclassifiedEdgeIds.length})
                   </button>
@@ -504,7 +581,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   <button
                     type="button"
                     onClick={() => onChangeSelectedWallFacetIds(allUndetailedWallIds)}
-                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer"
+                    className="px-2 py-1 rounded-lg bg-slate-950 hover:bg-slate-900 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer whitespace-nowrap"
                   >
                     Undetailed Walls ({allUndetailedWallIds.length})
                   </button>
@@ -519,38 +596,52 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   <span className="font-bold text-slate-200 text-[11px] uppercase tracking-wider">
                     Batch Apply · {selectedPlanesList.length} Roof Faces
                   </span>
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-sky-300">
+                  <span className="text-[10px] font-mono text-sky-300 tabular-nums">
                     {commonPitch !== null ? `${commonPitch}°` : 'Multiple'}
                   </span>
                 </div>
 
                 {!isLockedView && onBatchPlanePitch && (
                   <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold text-slate-400">Draft Pitch</span>
+                      <span className="font-mono font-black text-xs text-sky-300 tabular-nums">
+                        {batchPitchDraft}°
+                      </span>
+                    </div>
                     <input
                       type="range"
                       min={3}
                       max={50}
                       step={0.5}
-                      value={commonPitch ?? selectedPlanesList[0].pitchDeg}
-                      onChange={(e) =>
-                        onBatchPlanePitch(
-                          selectedPlanesList.map((p) => p.id),
-                          parseFloat(e.target.value)
-                        )
-                      }
+                      value={batchPitchDraft}
+                      onChange={(e) => setBatchPitchDraft(parseFloat(e.target.value))}
                       className="w-full accent-sky-500 cursor-pointer h-2"
                     />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onBatchPlanePitch(
+                          selectedPlanesList.map((p) => p.id),
+                          batchPitchDraft
+                        )
+                      }
+                      className="w-full py-1.5 px-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-extrabold cursor-pointer whitespace-nowrap"
+                    >
+                      Apply {batchPitchDraft}° to {selectedPlanesList.length} faces
+                    </button>
                     <div className="grid grid-cols-5 gap-1.5">
                       {[5, 12, 15, 22.5, 30].map((deg) => (
                         <button
                           key={deg}
                           type="button"
-                          onClick={() =>
+                          onClick={() => {
+                            setBatchPitchDraft(deg);
                             onBatchPlanePitch(
                               selectedPlanesList.map((p) => p.id),
                               deg
-                            )
-                          }
+                            );
+                          }}
                           className={`py-1.5 rounded-lg text-[10px] font-mono font-bold border cursor-pointer ${
                             commonPitch !== null && Math.abs(commonPitch - deg) < 0.2
                               ? 'bg-sky-600 text-white border-sky-400'
@@ -1418,9 +1509,19 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               {!isLockedView && onToggleEdgeGable && selectedPlane.eaveEdgeId && (
                 <button
                   onClick={() => onToggleEdgeGable(selectedPlane.eaveEdgeId, 'gable')}
-                  className="px-3 py-1.5 rounded-xl bg-indigo-950/70 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[11px] font-bold transition-all cursor-pointer"
+                  className="px-3 py-1.5 rounded-xl bg-indigo-950/70 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[11px] font-bold transition-all cursor-pointer whitespace-nowrap"
                 >
                   Convert to Gable End
+                </button>
+              )}
+
+              {!isLockedView && onChangeSelectedPlaneIds && focusedLevelPlanes.length >= 2 && (
+                <button
+                  type="button"
+                  onClick={() => onChangeSelectedPlaneIds(focusedLevelPlanes.map((p) => p.id))}
+                  className="px-3 py-1.5 rounded-xl bg-cyan-950/60 hover:bg-cyan-700/40 text-cyan-200 border border-cyan-500/40 text-[11px] font-bold transition-all cursor-pointer whitespace-nowrap"
+                >
+                  Batch ({focusedLevelPlanes.length} level faces)
                 </button>
               )}
             </div>
@@ -1626,11 +1727,28 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                       step="0.1"
                       min="0.5"
                       max="40"
-                      value={+(selectedPlane.eaveWidthM ?? (selectedPlane.planPolygon[1] ? dist(selectedPlane.planPolygon[0], selectedPlane.planPolygon[1]) : 10)).toFixed(2)}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value);
+                      value={planeEaveLenDraft}
+                      onFocus={(e) => {
+                        focusedFieldRef.current = 'planeEaveLen';
+                        e.currentTarget.select();
+                      }}
+                      onChange={(e) => setPlaneEaveLenDraft(e.target.value)}
+                      onBlur={() => {
+                        focusedFieldRef.current = null;
+                        const val = parseFloat(planeEaveLenDraft);
                         if (Number.isFinite(val) && val > 0.4 && onUpdateEdgeLength && selectedPlane.eaveEdgeId) {
                           onUpdateEdgeLength(selectedPlane.eaveEdgeId, val);
+                          setPlaneEaveLenDraft(String(+val.toFixed(2)));
+                        } else {
+                          setPlaneEaveLenDraft(String(currentPlaneEaveLen));
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          focusedFieldRef.current = null;
+                          setPlaneEaveLenDraft(String(currentPlaneEaveLen));
+                          (e.currentTarget as HTMLInputElement).blur();
                         }
                       }}
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-blue-500"
@@ -1644,11 +1762,28 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                       step="0.1"
                       min="0.5"
                       max="15"
-                      value={+(selectedPlane.eaveHeightM ?? 2.7).toFixed(2)}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value);
+                      value={planeEaveZDraft}
+                      onFocus={(e) => {
+                        focusedFieldRef.current = 'planeEaveZ';
+                        e.currentTarget.select();
+                      }}
+                      onChange={(e) => setPlaneEaveZDraft(e.target.value)}
+                      onBlur={() => {
+                        focusedFieldRef.current = null;
+                        const val = parseFloat(planeEaveZDraft);
                         if (Number.isFinite(val) && val >= 0.5 && onUpdatePlaneEaveHeight) {
                           onUpdatePlaneEaveHeight(selectedPlane.id, val);
+                          setPlaneEaveZDraft(String(+val.toFixed(2)));
+                        } else {
+                          setPlaneEaveZDraft(String(currentPlaneEaveZ));
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          focusedFieldRef.current = null;
+                          setPlaneEaveZDraft(String(currentPlaneEaveZ));
+                          (e.currentTarget as HTMLInputElement).blur();
                         }
                       }}
                       className="w-full bg-slate-900 border border-amber-500/40 rounded-lg px-2 py-1.5 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-amber-400"
@@ -1728,11 +1863,29 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                               step="0.05"
                               min="0"
                               max="3"
-                              value={setbackVal}
-                              onChange={(e) => {
-                                const val = parseFloat(e.target.value);
+                              value={planeSetbackDraft}
+                              onFocus={(e) => {
+                                focusedFieldRef.current = 'planeSetback';
+                                e.currentTarget.select();
+                              }}
+                              onChange={(e) => setPlaneSetbackDraft(e.target.value)}
+                              onBlur={() => {
+                                focusedFieldRef.current = null;
+                                const val = parseFloat(planeSetbackDraft);
                                 if (Number.isFinite(val) && val >= 0) {
-                                  onUpdateEdgeWall(edgeObj.id, { eaveSetbackM: Math.min(3, val) });
+                                  const clamped = Math.min(3, +val.toFixed(2));
+                                  onUpdateEdgeWall(edgeObj.id, { eaveSetbackM: clamped });
+                                  setPlaneSetbackDraft(String(clamped));
+                                } else {
+                                  setPlaneSetbackDraft(String(setbackVal));
+                                }
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                if (e.key === 'Escape') {
+                                  focusedFieldRef.current = null;
+                                  setPlaneSetbackDraft(String(setbackVal));
+                                  (e.currentTarget as HTMLInputElement).blur();
                                 }
                               }}
                               className="w-14 bg-slate-900 border border-slate-700 rounded-md px-1.5 py-0.5 text-center text-white font-mono font-bold text-[10px] tabular-nums focus:outline-hidden focus:border-sky-400"
@@ -1846,6 +1999,17 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   </span>
                 )}
               </div>
+              {!isLockedView && onChangeSelectedWallFacetIds && wallFacets.length >= 2 && (
+                <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                  <button
+                    type="button"
+                    onClick={() => onChangeSelectedWallFacetIds(wallFacets.map((f) => f.id))}
+                    className="px-2.5 py-1 rounded-lg bg-cyan-950/60 hover:bg-cyan-700/40 text-cyan-200 border border-cyan-500/40 text-[10px] font-bold cursor-pointer whitespace-nowrap"
+                  >
+                    Batch ({wallFacets.length} walls)
+                  </button>
+                </div>
+              )}
               {!isLockedView && onUpdateWallFacet && (() => {
                 const curKind = getWallFacetKind(selectedWallFacet);
                 return (
@@ -1893,15 +2057,33 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                             step="0.05"
                             min="0.4"
                             max="8"
-                            value={+selectedWallFacet.heightM.toFixed(2)}
-                            onChange={(e) => {
-                              const val = parseFloat(e.target.value);
+                            value={parapetHDraft}
+                            onFocus={(e) => {
+                              focusedFieldRef.current = 'parapetH';
+                              e.currentTarget.select();
+                            }}
+                            onChange={(e) => setParapetHDraft(e.target.value)}
+                            onBlur={() => {
+                              focusedFieldRef.current = null;
+                              const val = parseFloat(parapetHDraft);
                               if (Number.isFinite(val) && val >= 0.4) {
+                                const clamped = Math.min(8, +val.toFixed(2));
                                 onUpdateWallFacet(
                                   updateWallFacetKind(selectedWallFacet, 'parapet', {
-                                    parapetHeightM: val
+                                    parapetHeightM: clamped
                                   })
                                 );
+                                setParapetHDraft(String(clamped));
+                              } else {
+                                setParapetHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                              if (e.key === 'Escape') {
+                                focusedFieldRef.current = null;
+                                setParapetHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
+                                (e.currentTarget as HTMLInputElement).blur();
                               }
                             }}
                             className="w-14 bg-slate-900 border border-purple-500/40 rounded px-1.5 py-0.5 text-right font-mono font-bold text-white text-[11px] tabular-nums"
@@ -2201,11 +2383,38 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                               step="0.1"
                               min="0.5"
                               max="15"
-                              value={+lvl.eaveHeightM.toFixed(2)}
-                              onChange={(e) => {
-                                const val = parseFloat(e.target.value);
+                              value={levelZDrafts[lvl.id] ?? String(+lvl.eaveHeightM.toFixed(2))}
+                              onFocus={(e) => {
+                                focusedFieldRef.current = `lvlZ:${lvl.id}`;
+                                e.currentTarget.select();
+                              }}
+                              onChange={(e) =>
+                                setLevelZDrafts((prev) => ({ ...prev, [lvl.id]: e.target.value }))
+                              }
+                              onBlur={() => {
+                                focusedFieldRef.current = null;
+                                const raw = levelZDrafts[lvl.id] ?? '';
+                                const val = parseFloat(raw);
                                 if (Number.isFinite(val) && val >= 0.5 && onUpdateLevelHeight) {
-                                  onUpdateLevelHeight(lvl.id, val);
+                                  const clamped = Math.min(15, +val.toFixed(2));
+                                  onUpdateLevelHeight(lvl.id, clamped);
+                                  setLevelZDrafts((prev) => ({ ...prev, [lvl.id]: String(clamped) }));
+                                } else {
+                                  setLevelZDrafts((prev) => ({
+                                    ...prev,
+                                    [lvl.id]: String(+lvl.eaveHeightM.toFixed(2))
+                                  }));
+                                }
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                if (e.key === 'Escape') {
+                                  focusedFieldRef.current = null;
+                                  setLevelZDrafts((prev) => ({
+                                    ...prev,
+                                    [lvl.id]: String(+lvl.eaveHeightM.toFixed(2))
+                                  }));
+                                  (e.currentTarget as HTMLInputElement).blur();
                                 }
                               }}
                               className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-[11px] tabular-nums text-right focus:outline-hidden focus:border-amber-400"

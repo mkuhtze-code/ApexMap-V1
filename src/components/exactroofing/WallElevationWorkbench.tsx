@@ -115,6 +115,15 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   const [imageAspect, setImageAspect] = useState<number>(1.45);
   const [promoteDepthM, setPromoteDepthM] = useState<string>('2.4');
 
+  const focusedFieldRef = useRef<string | null>(null);
+  const [wallHeightDraft, setWallHeightDraft] = useState<string>(String(+facet.heightM.toFixed(2)));
+  const [wallBottomZDraft, setWallBottomZDraft] = useState<string>(String(+facet.bottomZ.toFixed(2)));
+  const [regionSplitDraft, setRegionSplitDraft] = useState<string>('');
+  const [opWidthDraft, setOpWidthDraft] = useState<string>('');
+  const [opHeightDraft, setOpHeightDraft] = useState<string>('');
+  const [opOffsetXDraft, setOpOffsetXDraft] = useState<string>('');
+  const [opSillZDraft, setOpSillZDraft] = useState<string>('');
+
   // Zoom & Pan state for inspecting underlay scans & parametric openings
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -156,7 +165,52 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     setCalPtsNorm([]);
     openingDragRef.current = null;
     setIsOpeningDragging(false);
+    focusedFieldRef.current = null;
   }, [facet.id]);
+
+  useEffect(() => {
+    if (focusedFieldRef.current !== 'wallHeight') {
+      setWallHeightDraft(String(+facet.heightM.toFixed(2)));
+    }
+    if (focusedFieldRef.current !== 'wallBottomZ') {
+      setWallBottomZDraft(String(+facet.bottomZ.toFixed(2)));
+    }
+    if (focusedFieldRef.current !== 'regionSplit' && facet.regions && facet.regions.length > 0) {
+      const r0 = facet.regions[0];
+      const isHorizDado =
+        facet.regions.length === 2 &&
+        Math.abs(facet.regions[0].uEndM - facet.lengthM) < 0.05 &&
+        Math.abs(facet.regions[1].uEndM - facet.lengthM) < 0.05;
+      setRegionSplitDraft(String(+(isHorizDado ? r0.vEndM : r0.uEndM).toFixed(2)));
+    }
+  }, [facet.id, facet.heightM, facet.bottomZ, facet.lengthM, facet.regions]);
+
+  const selectedOpForDraftSync = useMemo(
+    () => facet.openings.find((o) => o.id === selectedOpeningId) || null,
+    [facet.openings, selectedOpeningId]
+  );
+
+  useEffect(() => {
+    if (!selectedOpForDraftSync) return;
+    if (focusedFieldRef.current !== 'opWidth') {
+      setOpWidthDraft(String(+selectedOpForDraftSync.widthM.toFixed(2)));
+    }
+    if (focusedFieldRef.current !== 'opHeight') {
+      setOpHeightDraft(String(+selectedOpForDraftSync.heightM.toFixed(2)));
+    }
+    if (focusedFieldRef.current !== 'opOffsetX') {
+      setOpOffsetXDraft(String(+selectedOpForDraftSync.distFromStartM.toFixed(2)));
+    }
+    if (focusedFieldRef.current !== 'opSillZ') {
+      setOpSillZDraft(String(+selectedOpForDraftSync.sillHeightM.toFixed(2)));
+    }
+  }, [
+    selectedOpForDraftSync?.id,
+    selectedOpForDraftSync?.widthM,
+    selectedOpForDraftSync?.heightM,
+    selectedOpForDraftSync?.distFromStartM,
+    selectedOpForDraftSync?.sillHeightM
+  ]);
 
   useEffect(() => {
     if (selectedOpeningId && !facet.openings.some((o) => o.id === selectedOpeningId)) {
@@ -1759,10 +1813,29 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                   min="0.4"
                   max="12"
                   disabled={readOnly}
-                  value={+facet.heightM.toFixed(2)}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (Number.isFinite(v)) handleSetHeight(v);
+                  value={wallHeightDraft}
+                  onFocus={(e) => {
+                    focusedFieldRef.current = 'wallHeight';
+                    e.currentTarget.select();
+                  }}
+                  onChange={(e) => setWallHeightDraft(e.target.value)}
+                  onBlur={() => {
+                    focusedFieldRef.current = null;
+                    const v = parseFloat(wallHeightDraft);
+                    if (Number.isFinite(v)) {
+                      handleSetHeight(v);
+                      setWallHeightDraft(String(+Math.max(0.4, Math.min(12, v)).toFixed(2)));
+                    } else {
+                      setWallHeightDraft(String(+facet.heightM.toFixed(2)));
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                    if (e.key === 'Escape') {
+                      focusedFieldRef.current = null;
+                      setWallHeightDraft(String(+facet.heightM.toFixed(2)));
+                      (e.currentTarget as HTMLInputElement).blur();
+                    }
                   }}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-sky-400 disabled:opacity-60"
                 />
@@ -1776,10 +1849,29 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                   min="-2"
                   max="12"
                   disabled={readOnly}
-                  value={+facet.bottomZ.toFixed(2)}
-                  onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    if (Number.isFinite(v)) handleSetBottomZ(v);
+                  value={wallBottomZDraft}
+                  onFocus={(e) => {
+                    focusedFieldRef.current = 'wallBottomZ';
+                    e.currentTarget.select();
+                  }}
+                  onChange={(e) => setWallBottomZDraft(e.target.value)}
+                  onBlur={() => {
+                    focusedFieldRef.current = null;
+                    const v = parseFloat(wallBottomZDraft);
+                    if (Number.isFinite(v)) {
+                      handleSetBottomZ(v);
+                      setWallBottomZDraft(String(+Math.max(-2, Math.min(12, v)).toFixed(2)));
+                    } else {
+                      setWallBottomZDraft(String(+facet.bottomZ.toFixed(2)));
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                    if (e.key === 'Escape') {
+                      focusedFieldRef.current = null;
+                      setWallBottomZDraft(String(+facet.bottomZ.toFixed(2)));
+                      (e.currentTarget as HTMLInputElement).blur();
+                    }
                   }}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs tabular-nums focus:outline-hidden focus:border-sky-400 disabled:opacity-60"
                 />
@@ -1870,11 +1962,30 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                                   min="0.3"
                                   max={+(facet.heightM - 0.3).toFixed(2)}
                                   disabled={readOnly}
-                                  value={+reg.vEndM.toFixed(2)}
-                                  onChange={(e) =>
-                                    handleUpdateRegion(reg.id, { vEndM: parseFloat(e.target.value) })
-                                  }
-                                  className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono font-bold"
+                                  value={regionSplitDraft || String(+reg.vEndM.toFixed(2))}
+                                  onFocus={(e) => {
+                                    focusedFieldRef.current = 'regionSplit';
+                                    e.currentTarget.select();
+                                  }}
+                                  onChange={(e) => setRegionSplitDraft(e.target.value)}
+                                  onBlur={() => {
+                                    focusedFieldRef.current = null;
+                                    const v = parseFloat(regionSplitDraft);
+                                    if (Number.isFinite(v)) {
+                                      handleUpdateRegion(reg.id, { vEndM: v });
+                                    } else {
+                                      setRegionSplitDraft(String(+reg.vEndM.toFixed(2)));
+                                    }
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                    if (e.key === 'Escape') {
+                                      focusedFieldRef.current = null;
+                                      setRegionSplitDraft(String(+reg.vEndM.toFixed(2)));
+                                      (e.currentTarget as HTMLInputElement).blur();
+                                    }
+                                  }}
+                                  className="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono font-bold"
                                 />
                               </label>
                             ) : (
@@ -1886,11 +1997,30 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                                   min="0.3"
                                   max={+(facet.lengthM - 0.3).toFixed(2)}
                                   disabled={readOnly}
-                                  value={+reg.uEndM.toFixed(2)}
-                                  onChange={(e) =>
-                                    handleUpdateRegion(reg.id, { uEndM: parseFloat(e.target.value) })
-                                  }
-                                  className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono font-bold"
+                                  value={regionSplitDraft || String(+reg.uEndM.toFixed(2))}
+                                  onFocus={(e) => {
+                                    focusedFieldRef.current = 'regionSplit';
+                                    e.currentTarget.select();
+                                  }}
+                                  onChange={(e) => setRegionSplitDraft(e.target.value)}
+                                  onBlur={() => {
+                                    focusedFieldRef.current = null;
+                                    const v = parseFloat(regionSplitDraft);
+                                    if (Number.isFinite(v)) {
+                                      handleUpdateRegion(reg.id, { uEndM: v });
+                                    } else {
+                                      setRegionSplitDraft(String(+reg.uEndM.toFixed(2)));
+                                    }
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                    if (e.key === 'Escape') {
+                                      focusedFieldRef.current = null;
+                                      setRegionSplitDraft(String(+reg.uEndM.toFixed(2)));
+                                      (e.currentTarget as HTMLInputElement).blur();
+                                    }
+                                  }}
+                                  className="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-white font-mono font-bold"
                                 />
                               </label>
                             )}
@@ -2127,12 +2257,30 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       min="0.2"
                       max={facet.lengthM}
                       disabled={readOnly}
-                      value={+selectedOpening.widthM.toFixed(2)}
-                      onChange={(e) => {
-                        const v = parseFloat(e.target.value);
-                        if (Number.isFinite(v)) handleUpdateOpening(selectedOpening.id, { widthM: v });
+                      value={opWidthDraft}
+                      onFocus={(e) => {
+                        focusedFieldRef.current = 'opWidth';
+                        e.currentTarget.select();
                       }}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
+                      onChange={(e) => setOpWidthDraft(e.target.value)}
+                      onBlur={() => {
+                        focusedFieldRef.current = null;
+                        const v = parseFloat(opWidthDraft);
+                        if (Number.isFinite(v)) {
+                          handleUpdateOpening(selectedOpening.id, { widthM: v });
+                        } else {
+                          setOpWidthDraft(String(+selectedOpening.widthM.toFixed(2)));
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          focusedFieldRef.current = null;
+                          setOpWidthDraft(String(+selectedOpening.widthM.toFixed(2)));
+                          (e.currentTarget as HTMLInputElement).blur();
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs focus:outline-hidden focus:border-sky-400"
                     />
                   </label>
                   <label className="space-y-0.5">
@@ -2143,12 +2291,30 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       min="0.2"
                       max={facet.heightM}
                       disabled={readOnly}
-                      value={+selectedOpening.heightM.toFixed(2)}
-                      onChange={(e) => {
-                        const v = parseFloat(e.target.value);
-                        if (Number.isFinite(v)) handleUpdateOpening(selectedOpening.id, { heightM: v });
+                      value={opHeightDraft}
+                      onFocus={(e) => {
+                        focusedFieldRef.current = 'opHeight';
+                        e.currentTarget.select();
                       }}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
+                      onChange={(e) => setOpHeightDraft(e.target.value)}
+                      onBlur={() => {
+                        focusedFieldRef.current = null;
+                        const v = parseFloat(opHeightDraft);
+                        if (Number.isFinite(v)) {
+                          handleUpdateOpening(selectedOpening.id, { heightM: v });
+                        } else {
+                          setOpHeightDraft(String(+selectedOpening.heightM.toFixed(2)));
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          focusedFieldRef.current = null;
+                          setOpHeightDraft(String(+selectedOpening.heightM.toFixed(2)));
+                          (e.currentTarget as HTMLInputElement).blur();
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs focus:outline-hidden focus:border-sky-400"
                     />
                   </label>
                   <label className="space-y-0.5">
@@ -2159,14 +2325,30 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       min="0"
                       max={facet.lengthM}
                       disabled={readOnly}
-                      value={+selectedOpening.distFromStartM.toFixed(2)}
-                      onChange={(e) => {
-                        const v = parseFloat(e.target.value);
+                      value={opOffsetXDraft}
+                      onFocus={(e) => {
+                        focusedFieldRef.current = 'opOffsetX';
+                        e.currentTarget.select();
+                      }}
+                      onChange={(e) => setOpOffsetXDraft(e.target.value)}
+                      onBlur={() => {
+                        focusedFieldRef.current = null;
+                        const v = parseFloat(opOffsetXDraft);
                         if (Number.isFinite(v)) {
                           handleUpdateOpening(selectedOpening.id, { distFromStartM: v });
+                        } else {
+                          setOpOffsetXDraft(String(+selectedOpening.distFromStartM.toFixed(2)));
                         }
                       }}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          focusedFieldRef.current = null;
+                          setOpOffsetXDraft(String(+selectedOpening.distFromStartM.toFixed(2)));
+                          (e.currentTarget as HTMLInputElement).blur();
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs focus:outline-hidden focus:border-sky-400"
                     />
                   </label>
                   <label className="space-y-0.5">
@@ -2177,14 +2359,30 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                       min="0"
                       max={facet.heightM}
                       disabled={readOnly}
-                      value={+selectedOpening.sillHeightM.toFixed(2)}
-                      onChange={(e) => {
-                        const v = parseFloat(e.target.value);
+                      value={opSillZDraft}
+                      onFocus={(e) => {
+                        focusedFieldRef.current = 'opSillZ';
+                        e.currentTarget.select();
+                      }}
+                      onChange={(e) => setOpSillZDraft(e.target.value)}
+                      onBlur={() => {
+                        focusedFieldRef.current = null;
+                        const v = parseFloat(opSillZDraft);
                         if (Number.isFinite(v)) {
                           handleUpdateOpening(selectedOpening.id, { sillHeightM: v });
+                        } else {
+                          setOpSillZDraft(String(+selectedOpening.sillHeightM.toFixed(2)));
                         }
                       }}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs"
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') {
+                          focusedFieldRef.current = null;
+                          setOpSillZDraft(String(+selectedOpening.sillHeightM.toFixed(2)));
+                          (e.currentTarget as HTMLInputElement).blur();
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-xs focus:outline-hidden focus:border-sky-400"
                     />
                   </label>
                 </div>

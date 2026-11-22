@@ -361,10 +361,23 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   }, [planUnderlay]);
 
   useEffect(() => {
-    if (openPlanModalSignal && openPlanModalSignal > 0) {
+    if (!readOnlyGeometry && openPlanModalSignal && openPlanModalSignal > 0) {
       setIsPlanModalOpen(true);
     }
-  }, [openPlanModalSignal]);
+  }, [openPlanModalSignal, readOnlyGeometry]);
+
+  useEffect(() => {
+    if (readOnlyGeometry) {
+      setActiveTool('set_pitch');
+      setMultiSelectMode(false);
+      setIsPlanModalOpen(false);
+      setIsMobileToolsOpen(false);
+      setDraftPoints([]);
+      setScalePoints([]);
+      setLineStartPt(null);
+      setDragBoxStart(null);
+    }
+  }, [readOnlyGeometry]);
 
   // Add internal roof line state (all 10 line types, polyline chain + 3-pt angle bisector)
   const [newLineType, setNewLineType] = useState<SkeletonLineType>('hip');
@@ -1862,7 +1875,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   ];
 
   const toolButtons = readOnlyGeometry
-    ? allToolButtons.filter((b) => b.id === 'set_pitch' || b.id === 'assign_flashing')
+    ? allToolButtons.filter(
+        (b) => b.id === 'set_pitch' || (b.id === 'assign_flashing' && Boolean(onSelectLineForFlashing))
+      )
     : allToolButtons;
 
   const shortcutForTool: Partial<Record<string, string>> = {
@@ -2530,11 +2545,13 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
         {(planUnderlay || (levels && levels.length > 1)) && (
           <div className="flex items-center gap-1.5 min-w-0 max-w-full">
           {/* Active Architectural Plan Calibration Chip */}
-          {planUnderlay && (
+          {planUnderlay && (!readOnlyGeometry || planUnderlay.isCalibrated) && (
             <button
               type="button"
+              disabled={readOnlyGeometry}
               onClick={() => {
-                if (!planUnderlay.isCalibrated && !readOnlyGeometry) {
+                if (readOnlyGeometry) return;
+                if (!planUnderlay.isCalibrated) {
                   setActiveTool('scale_plan');
                   setScalePoints([]);
                   setLockedDraftBounds({ ...bounds });
@@ -2542,13 +2559,17 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   setIsPlanModalOpen(true);
                 }
               }}
-              className={`pointer-events-auto min-h-[34px] px-2.5 rounded-xl backdrop-blur-md border text-[11px] font-extrabold flex items-center gap-1.5 shadow-xl cursor-pointer shrink-0 transition-colors ${
+              className={`pointer-events-auto min-h-[34px] px-2.5 rounded-xl backdrop-blur-md border text-[11px] font-extrabold flex items-center gap-1.5 shadow-xl shrink-0 transition-colors ${
+                readOnlyGeometry ? 'cursor-default opacity-85' : 'cursor-pointer'
+              } ${
                 planUnderlay.isCalibrated
                   ? 'bg-emerald-950/90 border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/90'
                   : 'bg-amber-500 text-slate-950 border-amber-300 hover:bg-amber-400'
               }`}
               title={
-                planUnderlay.isCalibrated
+                readOnlyGeometry
+                  ? `${planUnderlay.name} · Scale locked`
+                  : planUnderlay.isCalibrated
                   ? `${planUnderlay.name} · Scale locked (tap to adjust/replace)`
                   : 'Plan needs 2-Point scale calibration — tap to set scale'
               }

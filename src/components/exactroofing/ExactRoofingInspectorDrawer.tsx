@@ -2320,7 +2320,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl">
                   <div className="text-[10px] text-slate-500 uppercase font-bold">Repress Saved</div>
                   <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
-                    +{layout.savedMetres}m (${layout.dollarValueSavedNZD})
+                    +{layout.savedMetres}m ({layout.totalOffcutsReused} pcs)
                   </div>
                 </div>
               )}

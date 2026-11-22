@@ -941,4 +941,46 @@ console.log('✓ Test 19 Passed: Perimeter rebuild preserves wing & secondary fa
 }
 console.log('✓ Test 20 Passed: Multi-facet wall batch apply helpers preserve openings, roof sync & zero-pricing Order Pack');
 
+// 21. Batch height/kind update preserves stacked Dado/Bay regions, openings & 0.45m short return nib geometry
+{
+  const nibFacets = buildWallFacetsFromPlan({ points: splitCollinearPoints }, { defaultHeightM: 2.7 });
+  const nibWallPlan = {
+    points: splitCollinearPoints,
+    edges: buildWallEdgesFromPoints(splitCollinearPoints, 'wall-edge'),
+    defaultHeightM: 2.7,
+    facets: nibFacets.map((f, idx) =>
+      idx === 0
+        ? {
+            ...f,
+            claddingType: 'weatherboard' as const,
+            regions: createHorizontalDadoSplit(f, 1.2, 'brick', 'weatherboard'),
+            openings: [createDefaultWallOpening(f, 'window', 2.0)]
+          }
+        : idx === 3
+        ? { ...f, claddingType: 'profiled_metal' as const }
+        : f
+    )
+  };
+  const nibFacet = nibWallPlan.facets[3];
+  assert.equal(nibFacet.lengthM, 0.45);
+
+  const batchHeightUpdated = batchUpdateWallFacetsInPlan(
+    nibWallPlan,
+    [nibWallPlan.facets[0].id, nibFacet.id],
+    { heightM: 3.1, heightSource: 'manual' }
+  );
+  assert.equal(batchHeightUpdated.facets[0].heightM, 3.1);
+  assert.equal(batchHeightUpdated.facets[0].openings.length, 1, 'Batch height update preserves openings');
+  assert.equal(
+    batchHeightUpdated.facets[0].regions?.length,
+    2,
+    'Batch height update preserves stacked horizontal dado regions'
+  );
+  assert.equal(batchHeightUpdated.facets[3].lengthM, 0.45, '0.45m short return nib length remains exact');
+  assert.equal(batchHeightUpdated.facets[3].heightM, 3.1);
+  const nibMetrics = computeWallFacetMetrics(batchHeightUpdated.facets[3]);
+  assert.ok(Number.isFinite(nibMetrics.netCladdingAreaM2) && nibMetrics.netCladdingAreaM2 > 1.3);
+}
+console.log('✓ Test 21 Passed: Batch height update preserves stacked dado regions, openings & 0.45m return nib');
+
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

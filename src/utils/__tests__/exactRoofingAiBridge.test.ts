@@ -245,4 +245,47 @@ const sheetSpec: SheetSpec = {
   assert.ok(!guide.headline.includes('$') && !guide.summary.includes('$') && !guide.metricsLine.includes('$'));
 }
 
+// 7. Test Measure Locked & Install All-Complete Calm Guidance Purity
+{
+  const outline = getPresetOutline('rectangle_14x10');
+  const skeleton = generateSkeletonLines(outline);
+  const levels: RoofLevel[] = [
+    { id: 'level-lock', code: 'L1', name: 'Main Roof', eaveHeightM: 2.7, outline, skeleton }
+  ];
+  const planes = syncMultiLevelPlanes(levels, [], 22.5);
+  const layout = generateCuttingLayout(planes, sheetSpec);
+  const assignableLines = getAssignableRoofLinesMultiLevel(levels, planes, [], []);
+  const packs = computeRoofingPacks({ planes, layout });
+  const pack = buildOrderPack({
+    planes,
+    levels,
+    layout,
+    assignableLines,
+    assignments: [],
+    locked: true
+  });
+
+  const lockedMeasureGuide = buildCalmStageGuidance({
+    stage: 'measuring',
+    measureLocked: true,
+    planes,
+    layout,
+    orderPack: pack
+  });
+  assert.ok(lockedMeasureGuide.headline.includes('Locked'));
+  assert.ok(!JSON.stringify(lockedMeasureGuide).includes('$'));
+
+  const allDoneInstallGuide = buildCalmStageGuidance({
+    stage: 'installing',
+    measureLocked: true,
+    planes,
+    layout,
+    orderPack: pack,
+    roofingPacks: packs,
+    completedPlaneIds: packs.map((p) => p.planeId)
+  });
+  assert.equal(allDoneInstallGuide.headline, 'All Roof Packs Completed');
+  assert.ok(!JSON.stringify(allDoneInstallGuide).includes('$'));
+}
+
 console.log('✓ All exactRoofingAiBridge deterministic + AI verification tests passed!');

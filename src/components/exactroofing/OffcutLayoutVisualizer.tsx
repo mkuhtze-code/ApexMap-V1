@@ -1104,6 +1104,222 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
           </svg>
   );
 
+  const desktopPacksSection =
+    roofingPacks.length > 0 ? (
+      <div className="bg-[#101726] border border-slate-800/90 rounded-2xl sm:rounded-3xl p-3 sm:p-5 shadow-2xl space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-800 pb-3">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-sky-500/15 border border-sky-500/30 text-sky-300 shrink-0">
+              <Package className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-sm sm:text-base font-black text-white">
+                Roofing Packs &amp; Site Laying Schedule
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                {completedSet.size} / {roofingPacks.length} packs installed ·{' '}
+                {stagedSet.size} staged · Stock &amp; offcuts unchanged
+              </p>
+            </div>
+          </div>
+
+          {onUpdateInstallProgress && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isNumberingSequence) {
+                    onUpdateInstallProgress({
+                      customSequencePlaneIds: [],
+                      stagedPlaneIds: installProgress?.stagedPlaneIds || [],
+                      completedPlaneIds: installProgress?.completedPlaneIds || [],
+                      completedPieceIds: installProgress?.completedPieceIds || []
+                    });
+                  }
+                  setIsNumberingSequence(!isNumberingSequence);
+                }}
+                className={`px-3 py-2 min-h-[40px] rounded-xl text-xs font-extrabold flex items-center gap-1.5 cursor-pointer transition-all border ${
+                  isNumberingSequence
+                    ? 'bg-sky-600 text-white border-sky-400 shadow-lg'
+                    : 'bg-slate-900 hover:bg-slate-800 text-sky-300 border-slate-700'
+                }`}
+              >
+                <ListOrdered className="w-3.5 h-3.5" />
+                <span>
+                  {isNumberingSequence
+                    ? `Tap Faces in Order (${(installProgress?.customSequencePlaneIds || []).length}/${roofingPacks.length})`
+                    : 'Tap-Number Sequence'}
+                </span>
+              </button>
+
+              {(installProgress?.customSequencePlaneIds?.length || 0) > 0 && (
+                <button
+                  type="button"
+                  onClick={handleResetPackOrder}
+                  className="px-2.5 py-2 min-h-[40px] rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-bold flex items-center gap-1 cursor-pointer"
+                  title="Reset to Auto Sequence"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Reset</span>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {isNumberingSequence && (
+          <div className="p-2.5 rounded-xl bg-sky-950/60 border border-sky-500/40 text-sky-200 text-xs font-semibold flex items-center justify-between gap-2">
+            <span>
+              Tap each roof face on the plan or cards below in your preferred site laying order (1, 2, 3...).
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsNumberingSequence(false)}
+              className="px-2.5 py-1 rounded-lg bg-sky-600 text-white text-[11px] font-bold cursor-pointer shrink-0"
+            >
+              Done
+            </button>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+          {roofingPacks.map((pack, idx) => {
+            const isStaged = stagedSet.has(pack.planeId);
+            const isInstalled = completedSet.has(pack.planeId);
+            const isSelected = selectedPlaneId === pack.planeId;
+            const pickedIdx = (installProgress?.customSequencePlaneIds || []).indexOf(pack.planeId);
+            const packPlane = displayPlanes.find((pl) => pl.id === pack.planeId);
+            const layDirLabel =
+              packPlane?.underlapSide === 'left'
+                ? 'L→R'
+                : packPlane?.underlapSide === 'right'
+                ? 'R→L'
+                : '';
+
+            return (
+              <div
+                key={pack.planeId}
+                onClick={() => handleAssignNumberTap(pack.planeId)}
+                className={`p-3 sm:p-3.5 rounded-2xl border transition-all cursor-pointer space-y-2.5 ${
+                  isInstalled
+                    ? 'bg-emerald-950/35 border-emerald-500/50'
+                    : isSelected
+                    ? 'bg-slate-900 border-sky-400 ring-1 ring-sky-400/40'
+                    : 'bg-slate-950/75 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span
+                      className="w-8 h-8 rounded-xl flex items-center justify-center font-mono font-black text-xs text-white shrink-0 border border-white/20 tabular-nums"
+                      style={{ backgroundColor: isInstalled ? '#059669' : pack.color }}
+                    >
+                      #{pickedIdx >= 0 ? pickedIdx + 1 : pack.sequenceNumber}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="text-xs sm:text-sm font-black text-white truncate">
+                        Pack #{pack.sequenceNumber} · Face {pack.code} ({pack.planeName})
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+                        {pack.areaM2}m² · {pack.pitchDeg}° · {pack.totalPiecesNeeded} cuts
+                        {layDirLabel ? ` · Lay ${layDirLabel}` : ''}
+                      </div>
+                    </div>
+                  </div>
+
+                  {onUpdateInstallProgress && !isNumberingSequence && (
+                    <div
+                      className="flex items-center gap-1 shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        disabled={idx === 0}
+                        onClick={() => handleMovePackOrder(pack.planeId, -1)}
+                        className="w-8 h-8 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-slate-300 flex items-center justify-center cursor-pointer"
+                        title="Install Earlier"
+                      >
+                        <ArrowUp className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={idx === roofingPacks.length - 1}
+                        onClick={() => handleMovePackOrder(pack.planeId, 1)}
+                        className="w-8 h-8 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-slate-300 flex items-center justify-center cursor-pointer"
+                        title="Install Later"
+                      >
+                        <ArrowDown className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Exact Pack Load Callout e.g. "14 @ 6340mm + 5 offcuts from A" */}
+                <div className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs font-mono text-sky-300 font-bold tabular-nums">
+                  {pack.packLabel}
+                </div>
+
+                {pack.outOfOrderOffcutWarning && (
+                  <div className="p-2 rounded-xl bg-amber-950/60 border border-amber-500/40 text-amber-200 text-[11px] font-semibold flex items-start gap-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                    <span>{pack.outOfOrderOffcutWarning}</span>
+                  </div>
+                )}
+
+                {/* Site Pack Controls */}
+                <div
+                  className="flex flex-wrap items-center gap-1.5 pt-0.5"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {onUpdateInstallProgress && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleTogglePlaneStaged(pack.planeId)}
+                        className={`px-2.5 py-2 min-h-[38px] rounded-xl text-[11px] font-bold flex items-center gap-1 cursor-pointer transition-colors ${
+                          isStaged
+                            ? 'bg-sky-600/30 text-sky-200 border border-sky-500/50'
+                            : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+                        }`}
+                      >
+                        <Package className="w-3.5 h-3.5" />
+                        <span>{isStaged ? 'Staged ✓' : 'Stage on Roof'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleTogglePlaneInstalled(pack.planeId)}
+                        className={`px-2.5 py-2 min-h-[38px] rounded-xl text-[11px] font-bold flex items-center gap-1 cursor-pointer transition-colors ${
+                          isInstalled
+                            ? 'bg-emerald-600 text-white border border-emerald-400'
+                            : 'bg-slate-900 text-slate-300 hover:bg-emerald-950 hover:text-emerald-200 border border-slate-800'
+                        }`}
+                      >
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>{isInstalled ? 'Installed ✓' : 'Mark Installed'}</span>
+                      </button>
+                    </>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCutListFilterPlaneId(pack.planeId);
+                      setShowCutListDrawer(true);
+                    }}
+                    className="ml-auto px-2.5 py-2 min-h-[38px] rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Cuts</span>
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    ) : null;
+
   return (
     <>
       {isMobile ? (
@@ -1450,6 +1666,13 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
               (() => {
                 const summary = faceSheetSummaryByPlaneId.get(activeMobilePack.planeId);
                 const chipList = summary?.lengthGroups || [];
+                const activePackPlane = displayPlanes.find((pl) => pl.id === activeMobilePack.planeId);
+                const layDir =
+                  activePackPlane?.underlapSide === 'left'
+                    ? 'L→R'
+                    : activePackPlane?.underlapSide === 'right'
+                    ? 'R→L'
+                    : '';
                 return (
                   <>
                     <div
@@ -1469,12 +1692,17 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                       <div className="min-w-0">
                         <div className="text-xs font-extrabold text-white truncate flex items-center gap-1.5 tabular-nums">
                           <span>Face {activeMobilePack.code}</span>
+                          {layDir && (
+                            <span className="text-[10px] font-mono text-slate-300">
+                              {layDir}
+                            </span>
+                          )}
                           <span className="text-[10px] font-mono text-emerald-300 font-bold">
-                            {summary?.orderedCount ?? activeMobilePack.freshSheetCount} ordered
+                            {summary?.orderedCount ?? activeMobilePack.freshSheetCount} ord
                           </span>
                           {summary && summary.offcutCount > 0 && (
                             <span className="text-[10px] font-mono text-sky-300">
-                              +{summary.offcutCount} repressed
+                              +{summary.offcutCount} rep
                             </span>
                           )}
                         </div>
@@ -1914,15 +2142,27 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
                   </div>
                 </div>
 
-                <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
-                  <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight truncate">
-                    ${layout.dollarValueSavedNZD}
+                {measureLocked || lifecycleStage === 'measuring' ? (
+                  <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
+                    <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight truncate">
+                      {layout.totalRoofMetres.toFixed(1)}m
+                    </div>
+                    <div className="text-xs text-slate-400 font-semibold mt-1">Net Roof Cut</div>
                   </div>
-                  <div className="text-xs text-slate-400 font-semibold mt-1">Repress Value</div>
-                </div>
+                ) : (
+                  <div className="bg-[#101726] border border-slate-800/90 p-4 rounded-2xl">
+                    <div className="text-3xl font-extrabold text-sky-400 font-mono tabular-nums tracking-tight truncate">
+                      ${layout.dollarValueSavedNZD}
+                    </div>
+                    <div className="text-xs text-slate-400 font-semibold mt-1">Repress Value</div>
+                  </div>
+                )}
               </>
             )}
           </div>
+
+          {/* Install Mode: Pack-First Schedule Above Reference Diagrams */}
+          {lifecycleStage === 'installing' && desktopPacksSection}
 
           {/* 2.2 RECONCILED ORDERED SHEETS SCHEDULE + SEPARATE OFFCUT REPRESS NOTE */}
           {orderedSheetGroups.length > 0 && (
@@ -2251,213 +2491,8 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* 5.5 ONSITE ROOFING PACKS & LAYING SEQUENCE NAVIGATOR */}
-      {roofingPacks.length > 0 && (
-        <div className="bg-[#101726] border border-slate-800/90 rounded-2xl sm:rounded-3xl p-3 sm:p-5 shadow-2xl space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-800 pb-3">
-            <div className="flex items-center gap-2.5">
-              <div className="p-2 rounded-xl bg-sky-500/15 border border-sky-500/30 text-sky-300 shrink-0">
-                <Package className="w-4 h-4" />
-              </div>
-              <div>
-                <h3 className="text-sm sm:text-base font-black text-white">
-                  Roofing Packs &amp; Site Laying Schedule
-                </h3>
-                <p className="text-[11px] text-slate-400">
-                  {completedSet.size} / {roofingPacks.length} packs installed ·{' '}
-                  {stagedSet.size} staged · Stock &amp; offcuts unchanged
-                </p>
-              </div>
-            </div>
-
-            {onUpdateInstallProgress && (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!isNumberingSequence) {
-                      onUpdateInstallProgress({
-                        customSequencePlaneIds: [],
-                        stagedPlaneIds: installProgress?.stagedPlaneIds || [],
-                        completedPlaneIds: installProgress?.completedPlaneIds || [],
-                        completedPieceIds: installProgress?.completedPieceIds || []
-                      });
-                    }
-                    setIsNumberingSequence(!isNumberingSequence);
-                  }}
-                  className={`px-3 py-2 min-h-[40px] rounded-xl text-xs font-extrabold flex items-center gap-1.5 cursor-pointer transition-all border ${
-                    isNumberingSequence
-                      ? 'bg-sky-600 text-white border-sky-400 shadow-lg'
-                      : 'bg-slate-900 hover:bg-slate-800 text-sky-300 border-slate-700'
-                  }`}
-                >
-                  <ListOrdered className="w-3.5 h-3.5" />
-                  <span>
-                    {isNumberingSequence
-                      ? `Tap Faces in Order (${(installProgress?.customSequencePlaneIds || []).length}/${roofingPacks.length})`
-                      : 'Tap-Number Sequence'}
-                  </span>
-                </button>
-
-                {(installProgress?.customSequencePlaneIds?.length || 0) > 0 && (
-                  <button
-                    type="button"
-                    onClick={handleResetPackOrder}
-                    className="px-2.5 py-2 min-h-[40px] rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-bold flex items-center gap-1 cursor-pointer"
-                    title="Reset to Auto Sequence"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Reset</span>
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-
-          {isNumberingSequence && (
-            <div className="p-2.5 rounded-xl bg-sky-950/60 border border-sky-500/40 text-sky-200 text-xs font-semibold flex items-center justify-between gap-2">
-              <span>
-                Tap each roof face on the plan or cards below in your preferred site laying order (1, 2, 3...).
-              </span>
-              <button
-                type="button"
-                onClick={() => setIsNumberingSequence(false)}
-                className="px-2.5 py-1 rounded-lg bg-sky-600 text-white text-[11px] font-bold cursor-pointer shrink-0"
-              >
-                Done
-              </button>
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-            {roofingPacks.map((pack, idx) => {
-              const isStaged = stagedSet.has(pack.planeId);
-              const isInstalled = completedSet.has(pack.planeId);
-              const isSelected = selectedPlaneId === pack.planeId;
-              const pickedIdx = (installProgress?.customSequencePlaneIds || []).indexOf(pack.planeId);
-
-              return (
-                <div
-                  key={pack.planeId}
-                  onClick={() => handleAssignNumberTap(pack.planeId)}
-                  className={`p-3 sm:p-3.5 rounded-2xl border transition-all cursor-pointer space-y-2.5 ${
-                    isInstalled
-                      ? 'bg-emerald-950/35 border-emerald-500/50'
-                      : isSelected
-                      ? 'bg-slate-900 border-sky-400 ring-1 ring-sky-400/40'
-                      : 'bg-slate-950/75 border-slate-800 hover:border-slate-700'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <span
-                        className="w-8 h-8 rounded-xl flex items-center justify-center font-mono font-black text-xs text-white shrink-0 border border-white/20 tabular-nums"
-                        style={{ backgroundColor: isInstalled ? '#059669' : pack.color }}
-                      >
-                        #{pickedIdx >= 0 ? pickedIdx + 1 : pack.sequenceNumber}
-                      </span>
-                      <div className="min-w-0">
-                        <div className="text-xs sm:text-sm font-black text-white truncate">
-                          Pack #{pack.sequenceNumber} · Face {pack.code} ({pack.planeName})
-                        </div>
-                        <div className="text-[11px] font-mono text-slate-400 tabular-nums">
-                          {pack.areaM2}m² · {pack.pitchDeg}° · {pack.totalPiecesNeeded} cuts
-                        </div>
-                      </div>
-                    </div>
-
-                    {onUpdateInstallProgress && !isNumberingSequence && (
-                      <div
-                        className="flex items-center gap-1 shrink-0"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          disabled={idx === 0}
-                          onClick={() => handleMovePackOrder(pack.planeId, -1)}
-                          className="w-8 h-8 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-slate-300 flex items-center justify-center cursor-pointer"
-                          title="Install Earlier"
-                        >
-                          <ArrowUp className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={idx === roofingPacks.length - 1}
-                          onClick={() => handleMovePackOrder(pack.planeId, 1)}
-                          className="w-8 h-8 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-30 text-slate-300 flex items-center justify-center cursor-pointer"
-                          title="Install Later"
-                        >
-                          <ArrowDown className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Exact Pack Load Callout e.g. "14 @ 6340mm + 5 offcuts from A" */}
-                  <div className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs font-mono text-sky-300 font-bold tabular-nums">
-                    {pack.packLabel}
-                  </div>
-
-                  {pack.outOfOrderOffcutWarning && (
-                    <div className="p-2 rounded-xl bg-amber-950/60 border border-amber-500/40 text-amber-200 text-[11px] font-semibold flex items-start gap-1.5">
-                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
-                      <span>{pack.outOfOrderOffcutWarning}</span>
-                    </div>
-                  )}
-
-                  {/* Site Pack Controls */}
-                  <div
-                    className="flex flex-wrap items-center gap-1.5 pt-0.5"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {onUpdateInstallProgress && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => handleTogglePlaneStaged(pack.planeId)}
-                          className={`px-2.5 py-2 min-h-[38px] rounded-xl text-[11px] font-bold flex items-center gap-1 cursor-pointer transition-colors ${
-                            isStaged
-                              ? 'bg-sky-600/30 text-sky-200 border border-sky-500/50'
-                              : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-                          }`}
-                        >
-                          <Package className="w-3.5 h-3.5" />
-                          <span>{isStaged ? 'Staged ✓' : 'Stage on Roof'}</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => handleTogglePlaneInstalled(pack.planeId)}
-                          className={`px-2.5 py-2 min-h-[38px] rounded-xl text-[11px] font-bold flex items-center gap-1 cursor-pointer transition-colors ${
-                            isInstalled
-                              ? 'bg-emerald-600 text-white border border-emerald-400'
-                              : 'bg-slate-900 text-slate-300 hover:bg-emerald-950 hover:text-emerald-200 border border-slate-800'
-                          }`}
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>{isInstalled ? 'Installed ✓' : 'Mark Installed'}</span>
-                        </button>
-                      </>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCutListFilterPlaneId(pack.planeId);
-                        setShowCutListDrawer(true);
-                      }}
-                      className="ml-auto px-2.5 py-2 min-h-[38px] rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
-                    >
-                      <FileSpreadsheet className="w-3.5 h-3.5 text-sky-400" />
-                      <span>Cuts</span>
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      {/* 5.5 ONSITE ROOFING PACKS & LAYING SEQUENCE NAVIGATOR (Quote / Measure) */}
+      {lifecycleStage !== 'installing' && desktopPacksSection}
 
       {/* 6. SELECTED AREA DETAIL POPUP (When tapping any roof area) */}
       {selectedPlane && (

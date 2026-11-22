@@ -41,9 +41,11 @@ import {
 } from '../wallCladdingEngine';
 import {
   applyRoofStylePreset,
+  buildOutlineFromPoints,
   createRoofLevel,
   generateCuttingLayout,
   generateSkeletonLines,
+  getMultiLevelPreset,
   getPresetOutline,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
@@ -1258,6 +1260,200 @@ console.log('✓ Test 23 Passed: 3-Band mixed cladding region area reconciliatio
   stressMats.forEach((m) => m.dispose());
   glass24.dispose();
 }
-console.log('✓ Test 24 Passed: Stress 3D geometry check (corner posts, coping, dado flashing, seams, outward alcove slab)');
+  console.log('✓ Test 24 Passed: Stress 3D geometry check (corner posts, coping, dado flashing, seams, outward alcove slab)');
+
+// 25. Multi-Body Detached Roofs -> Multiple Wall Rings, Grounded Plinths & Sensible Default Cladding
+{
+  const body1Pts = [
+    { x: 0, y: 0 },
+    { x: 12, y: 0 },
+    { x: 12, y: 8 },
+    { x: 0, y: 8 }
+  ];
+  const body2Pts = [
+    { x: 16, y: 1 },
+    { x: 23, y: 1 },
+    { x: 23, y: 7 },
+    { x: 16, y: 7 }
+  ];
+  const lvl1 = createRoofLevel(1, 'Main House', 2.7, body1Pts);
+  lvl1.outline = {
+    ...buildOutlineFromPoints(body1Pts, lvl1.id),
+    edges: buildOutlineFromPoints(body1Pts, lvl1.id).edges.map((e) => ({
+      ...e,
+      type: 'outline' as const,
+      eaveHeightM: 2.7,
+      eaveSetbackM: 0.45,
+      hasWall: true
+    }))
+  };
+  lvl1.skeleton = generateSkeletonLines(lvl1.outline);
+
+  const lvl2 = createRoofLevel(2, 'Detached Studio', 3.1, body2Pts);
+  lvl2.outline = {
+    ...buildOutlineFromPoints(body2Pts, lvl2.id),
+    edges: buildOutlineFromPoints(body2Pts, lvl2.id).edges.map((e) => ({
+      ...e,
+      type: 'outline' as const,
+      eaveHeightM: 3.1,
+      eaveSetbackM: 0.45,
+      hasWall: true
+    }))
+  };
+  lvl2.skeleton = generateSkeletonLines(lvl2.outline);
+
+  const multiPlanes = syncMultiLevelPlanes([lvl1, lvl2], [], 20);
+  const multiPlan = deriveWallPlanFromRoofLevels([lvl1, lvl2], 2.7, undefined, multiPlanes);
+  assert.ok(multiPlan, 'Multi-body roof must produce a non-null WallPlan');
+  assert.equal(multiPlan.bodies?.length, 2, 'Two disconnected roofs must yield 2 wall bodies');
+  assert.equal(multiPlan.facets.length, 8, 'Two rectangular roofs must produce 8 perimeter wall facets');
+  assert.deepEqual(
+    multiPlan.facets.map((f) => f.code),
+    ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+  );
+  assert.equal(new Set(multiPlan.facets.map((f) => f.id)).size, 8, 'All multi-body facet IDs must be strictly unique');
+
+  // Default cladding must be profiled_metal (NOT unassigned/'none'), while completeness still flags unconfirmed
+  assert.ok(
+    multiPlan.facets.every((f) => f.claddingType === 'profiled_metal'),
+    'Derived multi-body walls must default to profiled_metal rather than unassigned'
+  );
+  assert.ok(
+    multiPlan.facets.every((f) => isWallFacetUndetailed(f)),
+    'Freshly derived walls with detailConfirmed=false still flag completeness until confirmed'
+  );
+
+  // Topology must analyze each closed ring independently (zero fake return corners jumping across body gap)
+  const multiTopo = analyzeWallPlanTopology(multiPlan.facets);
+  assert.equal(multiTopo.externalCornersCount, 8);
+  assert.equal(multiTopo.internalCornersCount, 0);
+  assert.equal(multiTopo.returnFacesCount, 0);
+
+  // Confirming profiled_metal cladding via batch apply clears completeness flag
+  const confirmedMulti = applyCladdingToFacets(
+    multiPlan,
+    multiPlan.facets.map((f) => f.id),
+    'profiled_metal'
+  );
+  assert.ok(
+    confirmedMulti.facets.every((f) => !isWallFacetUndetailed(f)),
+    'Confirming profiled_metal clears undetailed status'
+  );
+
+  // Verify 3D Wall Mesh builder renders both bodies + both ground plinth slabs spanning [0..23]
+  const multiGroup = new THREE.Group();
+  const multiSelectable: THREE.Mesh[] = [];
+  const multiGeos: THREE.BufferGeometry[] = [];
+  const multiMats: THREE.Material[] = [];
+  const glass25 = new THREE.MeshPhysicalMaterial({ color: '#88ccee' });
+  const stubTex25 = {
+    getEntry: () => null,
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null
+  } as any;
+
+  buildWallPlan3DGroup({
+    wallPlan: confirmedMulti,
+    bounds: {
+      minX: -2,
+      maxX: 25,
+      minY: -2,
+      maxY: 10,
+      midX: 11.5,
+      midY: 4,
+      midZ: 1.6,
+      maxZ: 3.5,
+      span: 27
+    },
+    selectedWallFacetId: confirmedMulti.facets[5].id,
+    wallFilterMode: 'all',
+    shadingMode: 'studio_finish',
+    showSheetSeams: true,
+    wallTextures: stubTex25,
+    glassMat: glass25,
+    rootGroup: multiGroup,
+    selectableMeshes: multiSelectable,
+    trackGeo: (g) => {
+      multiGeos.push(g);
+      return g;
+    },
+    trackMat: (m) => {
+      multiMats.push(m);
+      return m;
+    }
+  });
+
+  assert.equal(multiSelectable.length, 8, 'All 8 walls across both bodies must be selectable meshes in 3D');
+  const box = new THREE.Box3().setFromObject(multiGroup);
+  assert.ok(box.max.x - box.min.x > 20, '3D wall group must span across both detached building bodies');
+  multiGeos.forEach((g) => g.dispose());
+  multiMats.forEach((m) => m.dispose());
+  glass25.dispose();
+}
+console.log('✓ Test 25 Passed: Multi-body detached roofs yield 2 wall rings, 8 metal walls, zero fake returns & full 3D coverage');
+
+// 26. 2-Tier Split Roof Fixture -> Walls Under Both Tiers + Preserved Wing Walls + Independent Body Edge Edit
+{
+  const twoTier = getMultiLevelPreset('two_storey_split', 22.5);
+  const twoTierWithWalls = {
+    ...twoTier,
+    levels: twoTier.levels.map((lvl) => ({
+      ...lvl,
+      outline: {
+        ...lvl.outline,
+        edges: lvl.outline.edges.map((e) => ({
+          ...e,
+          hasWall: true,
+          eaveSetbackM: 0.45
+        }))
+      }
+    }))
+  };
+
+  // Seed a freestanding wing wall first and verify multi-tier re-derive preserves it alongside both roof rings
+  const existingWithWing = addWingWallToPlan(
+    null,
+    [{ x: -2, y: 2 }, { x: -2, y: 6 }],
+    { claddingType: 'brick', heightM: 2.1 }
+  );
+  const tierWallPlan = deriveWallPlanFromRoofLevels(
+    twoTierWithWalls.levels,
+    2.7,
+    existingWithWing.facets,
+    twoTierWithWalls.planes
+  )!;
+  assert.ok(tierWallPlan, '2-tier split roof must derive a WallPlan');
+  assert.equal(tierWallPlan.bodies?.length, 2, '2-tier roof must derive 2 body rings');
+  const lowerRingFacets = tierWallPlan.facets.filter(
+    (f) => f.bodyId === twoTierWithWalls.levels[0].id
+  );
+  const upperRingFacets = tierWallPlan.facets.filter(
+    (f) => f.bodyId === twoTierWithWalls.levels[1].id
+  );
+  const preservedWings = tierWallPlan.facets.filter((f) => f.kind === 'wing' || f.isSpur);
+  assert.ok(lowerRingFacets.length >= 4, 'Lower tier walls created');
+  assert.ok(upperRingFacets.length >= 4, 'Upper tier walls created');
+  assert.equal(preservedWings.length, 1, 'Existing wing wall preserved across multi-tier roof derive');
+  assert.ok(
+    Math.max(...upperRingFacets.map((f) => f.topZ)) > Math.max(...lowerRingFacets.map((f) => f.topZ)),
+    'Upper tier walls reach higher eave/roof elevation than lower tier walls'
+  );
+
+  // Editing an edge on Body 2 preserves Body 1 and wings cleanly
+  const resizedTierPlan = updateWallPlanEdgeLength(
+    tierWallPlan,
+    upperRingFacets[0].id,
+    6.2,
+    twoTierWithWalls.levels
+  );
+  assert.equal(resizedTierPlan.bodies?.length, 2);
+  assert.equal(
+    resizedTierPlan.facets.filter((f) => f.bodyId === twoTierWithWalls.levels[0].id).length,
+    lowerRingFacets.length,
+    'Body 1 facets remain intact after editing Body 2 edge'
+  );
+}
+console.log('✓ Test 26 Passed: 2-tier split roof derives lower & upper wall envelopes, preserves wings, and supports independent body edits');
 
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

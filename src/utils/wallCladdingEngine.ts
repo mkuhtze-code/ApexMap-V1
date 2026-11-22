@@ -14,6 +14,7 @@ import {
   WallOpening,
   WallOpeningType,
   WallPlan,
+  WallPlanBody,
   WallPlanEdge,
   WallRoofProfilePoint,
   WallSecondaryZone
@@ -69,9 +70,9 @@ export const WALL_CLADDING_OPTIONS: WallCladdingMeta[] = [
     type: 'profiled_metal',
     label: 'Profiled Metal Cladding',
     shortLabel: 'Metal',
-    hex: '#475569',
-    roughness: 0.42,
-    metalness: 0.48
+    hex: '#4b525a',
+    roughness: 0.36,
+    metalness: 0.54
   },
   {
     type: 'weatherboard',
@@ -623,9 +624,13 @@ export function buildWallFacetsFromPlan(
     defaultBottomZ?: number;
     defaultHeightSource?: 'roof' | 'manual';
     defaultCladdingType?: WallCladdingType;
+    defaultDetailConfirmed?: boolean;
     existingFacets?: WallFacet[];
     roofLevels?: RoofLevel[];
     mergeCollinear?: boolean;
+    bodyId?: string;
+    levelId?: string;
+    groupId?: string;
   }
 ): WallFacet[] {
   const defaultHeightM = +(options?.defaultHeightM ?? 2.7).toFixed(3);
@@ -731,6 +736,22 @@ export function buildWallFacetsFromPlan(
       : undefined;
     const resolvedKind = prev?.kind;
     const isParapet = resolvedKind === 'parapet';
+    const resolvedCladding = prev?.claddingType ?? defaultCladding;
+    const resolvedDetailConfirmed =
+      prev !== undefined
+        ? prev.detailConfirmed
+        : options?.defaultDetailConfirmed === false
+        ? false
+        : undefined;
+    const resolvedDerivedDefault =
+      prev !== undefined
+        ? prev.derivedDefaultCladding
+        : options?.defaultDetailConfirmed === false
+        ? defaultCladding
+        : undefined;
+    const resolvedGroupId = prev?.groupId ?? options?.groupId;
+    const resolvedLevelId = prev?.levelId ?? options?.levelId;
+    const resolvedBodyId = prev?.bodyId ?? options?.bodyId;
 
     return {
       id,
@@ -744,7 +765,7 @@ export function buildWallFacetsFromPlan(
       topZ,
       heightSource: isParapet ? 'manual' : prev?.heightSource ?? defaultHeightSource,
       roofProfile: isParapet || resolvedKind === 'wing' || resolvedKind === 'secondary' ? undefined : prev?.roofProfile,
-      claddingType: prev?.claddingType ?? defaultCladding,
+      claddingType: resolvedCladding,
       openings,
       regions,
       underlay: prev?.underlay ?? null,
@@ -754,29 +775,19 @@ export function buildWallFacetsFromPlan(
       ...(prev?.hasCopingFlashing !== undefined ? { hasCopingFlashing: prev.hasCopingFlashing } : {}),
       ...(prev?.secondaryZoneId ? { secondaryZoneId: prev.secondaryZoneId } : {}),
       ...(prev?.isSpur ? { isSpur: prev.isSpur } : {}),
-      ...(prev?.groupId ? { groupId: prev.groupId } : {})
+      ...(resolvedGroupId ? { groupId: resolvedGroupId } : {}),
+      ...(resolvedLevelId ? { levelId: resolvedLevelId } : {}),
+      ...(resolvedBodyId ? { bodyId: resolvedBodyId } : {}),
+      ...(resolvedDetailConfirmed !== undefined ? { detailConfirmed: resolvedDetailConfirmed } : {}),
+      ...(resolvedDerivedDefault !== undefined
+        ? { derivedDefaultCladding: resolvedDerivedDefault }
+        : {})
     };
   });
 }
 
-/**
- * Derives a single-storey WallPlan directly from the primary roof footprint
- * using each roof edge's eave setback when defined, and links tops to roof eaves.
- */
-export function deriveWallPlanFromRoofLevels(
-  levels: RoofLevel[],
-  defaultHeightM = 2.7,
-  existingFacets?: WallFacet[],
-  roofPlanes?: RoofPlane[]
-): WallPlan | null {
-  const baseLevel = levels.find((l) => l.outline.points.length >= 3);
-  if (!baseLevel) return null;
-
-  const outline = baseLevel.outline;
+function computeMiteredWallPointsForOutline(outline: RoofOutline): Point2D[] {
   const edges = outline.edges;
-  const hM = +(baseLevel.eaveHeightM || defaultHeightM).toFixed(3);
-
-  let wallPoints: Point2D[] = [];
   if (edges.length >= 3) {
     const setbackLines = edges.map((edge) => {
       const sb = isEdgeWallEnabled(edge)
@@ -806,10 +817,28 @@ export function deriveWallPlanFromRoofLevels(
         }
       }
     }
-    wallPoints = cornerPts;
-  } else {
-    wallPoints = outline.points.map((p) => ({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) }));
+    return cornerPts;
   }
+  return outline.points.map((p) => ({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) }));
+}
+
+/**
+ * Derives WallPlan envelopes across ALL closed roof levels/bodies (multi-body and multi-tier),
+ * applying eave setbacks cleanly, defaulting cladding to profiled_metal for 3D visual parity,
+ * preserving wing/secondary walls, and linking wall tops back to overlying roof eaves/rakes.
+ */
+export function deriveWallPlanFromRoofLevels(
+  levels: RoofLevel[],
+  defaultHeightM = 2.7,
+  existingFacets?: WallFacet[],
+  roofPlanes?: RoofPlane[],
+  options?: {
+    defaultCladdingType?: WallCladdingType;
+    detailConfirmed?: boolean;
+  }
+): WallPlan | null {
+  const validLevels = (levels || []).filter((l) => l.outline.points.length >= 3);
+  if (validLevels.length === 0) return null;
 
   const ringOnlyExisting = (existingFacets || []).filter(
     (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
@@ -817,29 +846,88 @@ export function deriveWallPlanFromRoofLevels(
   const preservedNonRing = (existingFacets || []).filter(
     (f) => f.isSpur || f.kind === 'wing' || f.kind === 'secondary'
   );
+  const claimedExistingIds = new Set<string>();
+  const resolvedDefaultCladding: WallCladdingType =
+    options?.defaultCladdingType ?? 'profiled_metal';
+  const resolvedDetailConfirmed = options?.detailConfirmed ?? false;
 
-  const wallEdges = buildWallEdgesFromPoints(wallPoints, 'wall-edge');
-  const rawRingFacets = buildWallFacetsFromPlan(
-    { points: wallPoints, edges: wallEdges },
-    {
-      defaultHeightM: hM,
-      defaultHeightSource: 'roof',
-      existingFacets: ringOnlyExisting,
-      roofLevels: levels
-    }
-  );
+  const bodies: WallPlanBody[] = [];
+  const allRingFacetsRaw: WallFacet[] = [];
 
-  const combinedFacets = ensureUniqueWallFacetIds([...rawRingFacets, ...preservedNonRing]);
+  validLevels.forEach((lvl, lvlIdx) => {
+    const hM = +(lvl.eaveHeightM || defaultHeightM).toFixed(3);
+    const wallPoints = computeMiteredWallPointsForOutline(lvl.outline);
+    const wallEdges = buildWallEdgesFromPoints(
+      wallPoints,
+      lvlIdx === 0 ? 'wall-edge' : `wall-edge-${lvl.id}`
+    );
+
+    const scopedExisting = [
+      ...ringOnlyExisting.filter(
+        (f) => !claimedExistingIds.has(f.id) && (f.levelId === lvl.id || f.bodyId === lvl.id)
+      ),
+      ...ringOnlyExisting.filter(
+        (f) => !claimedExistingIds.has(f.id) && f.levelId !== lvl.id && f.bodyId !== lvl.id
+      )
+    ];
+
+    const bodyFacets = buildWallFacetsFromPlan(
+      { points: wallPoints, edges: wallEdges },
+      {
+        defaultHeightM: hM,
+        defaultHeightSource: 'roof',
+        defaultCladdingType: resolvedDefaultCladding,
+        defaultDetailConfirmed: resolvedDetailConfirmed,
+        existingFacets: scopedExisting,
+        roofLevels: [lvl],
+        bodyId: lvl.id,
+        levelId: lvl.id,
+        groupId: lvl.id
+      }
+    );
+
+    bodyFacets.forEach((bf) => {
+      if (ringOnlyExisting.some((e) => e.id === bf.id)) {
+        claimedExistingIds.add(bf.id);
+      }
+    });
+
+    bodies.push({
+      id: lvl.id,
+      levelId: lvl.id,
+      levelCode: lvl.code,
+      name: lvl.name,
+      points: wallPoints,
+      edges: wallEdges,
+      eaveHeightM: hM
+    });
+
+    allRingFacetsRaw.push(...bodyFacets);
+  });
+
+  // Ensure unique IDs across all bodies and assign continuous exterior face codes A, B, C...
+  const uniqueRingFacets = ensureUniqueWallFacetIds(allRingFacetsRaw).map((f, idx) => {
+    const code = indexToWallCode(idx);
+    const isDefaultWallName = !f.name || /^Wall [A-Z]+$/.test(f.name);
+    return {
+      ...f,
+      code,
+      name: isDefaultWallName ? `Wall ${code}` : f.name
+    };
+  });
+
+  const combinedFacets = ensureUniqueWallFacetIds([...uniqueRingFacets, ...preservedNonRing]);
 
   const plan: WallPlan = {
-    points: wallPoints,
-    edges: wallEdges,
-    defaultHeightM: hM,
+    points: bodies[0].points,
+    edges: bodies[0].edges,
+    bodies,
+    defaultHeightM: bodies[0].eaveHeightM,
     facets: combinedFacets,
     builtAt: new Date().toISOString()
   };
 
-  return syncWallPlanWithRoof(plan, levels, roofPlanes);
+  return syncWallPlanWithRoof(plan, validLevels, roofPlanes);
 }
 
 /**
@@ -910,6 +998,98 @@ export function updateWallPlanEdgeLength(
     };
   }
 
+  // Multi-body check: preserve secondary bodies when editing an edge length
+  if (plan.bodies && plan.bodies.length > 1) {
+    const matchedFacet = plan.facets.find((f) => f.id === edgeIdOrFacetId);
+    let targetBodyIdx = matchedFacet?.bodyId
+      ? plan.bodies.findIndex((b) => b.id === matchedFacet.bodyId)
+      : plan.bodies.findIndex((b) => b.edges.some((e) => e.id === edgeIdOrFacetId));
+    if (targetBodyIdx < 0 && matchedFacet) {
+      targetBodyIdx = plan.bodies.findIndex((b) =>
+        b.edges.some(
+          (e) =>
+            pointsClose(e.from, matchedFacet.from, 0.05) &&
+            pointsClose(e.to, matchedFacet.to, 0.05)
+        )
+      );
+    }
+    if (targetBodyIdx >= 0) {
+      const targetBody = plan.bodies[targetBodyIdx];
+      let bEdgeIdx = targetBody.edges.findIndex((e) => e.id === edgeIdOrFacetId);
+      if (bEdgeIdx < 0 && matchedFacet) {
+        bEdgeIdx = targetBody.edges.findIndex(
+          (e) =>
+            pointsClose(e.from, matchedFacet.from, 0.05) &&
+            pointsClose(e.to, matchedFacet.to, 0.05)
+        );
+      }
+      if (bEdgeIdx >= 0 && targetBody.edges.length >= 3) {
+        const tEdge = targetBody.edges[bEdgeIdx];
+        const cLen = dist(tEdge.from, tEdge.to);
+        if (cLen >= 0.02) {
+          const ux = (tEdge.to.x - tEdge.from.x) / cLen;
+          const uy = (tEdge.to.y - tEdge.from.y) / cLen;
+          const nextEndIdx = (bEdgeIdx + 1) % targetBody.points.length;
+          const updPts = targetBody.points.map((pt, idx) =>
+            idx === nextEndIdx
+              ? {
+                  x: +(tEdge.from.x + ux * newLengthM).toFixed(3),
+                  y: +(tEdge.from.y + uy * newLengthM).toFixed(3)
+                }
+              : { ...pt }
+          );
+          const prefix = targetBodyIdx === 0 ? 'wall-edge' : `wall-edge-${targetBody.id}`;
+          const updEdges = buildWallEdgesFromPoints(updPts, prefix);
+          const bodyExisting = plan.facets.filter(
+            (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary' && f.bodyId === targetBody.id
+          );
+          const rebuiltBodyFacets = buildWallFacetsFromPlan(
+            { points: updPts, edges: updEdges },
+            {
+              defaultHeightM: targetBody.eaveHeightM || plan.defaultHeightM,
+              existingFacets: bodyExisting,
+              roofLevels,
+              mergeCollinear: false,
+              bodyId: targetBody.id,
+              levelId: targetBody.levelId,
+              groupId: targetBody.id
+            }
+          );
+          const nextBodies = plan.bodies.map((b, i) =>
+            i === targetBodyIdx ? { ...b, points: updPts, edges: updEdges } : b
+          );
+          const otherFacets = plan.facets.filter((f) => f.bodyId !== targetBody.id);
+          // Re-build ordered facets list preserving body ordering + codes
+          const nextRingByBody: WallFacet[] = [];
+          nextBodies.forEach((b) => {
+            if (b.id === targetBody.id) {
+              nextRingByBody.push(...rebuiltBodyFacets);
+            } else {
+              nextRingByBody.push(
+                ...otherFacets.filter(
+                  (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary' && f.bodyId === b.id
+                )
+              );
+            }
+          });
+          const relabeledRing = ensureUniqueWallFacetIds(nextRingByBody).map((f, i) => {
+            const c = indexToWallCode(i);
+            const defName = !f.name || /^Wall [A-Z]+$/.test(f.name);
+            return { ...f, code: c, name: defName ? `Wall ${c}` : f.name };
+          });
+          return {
+            ...plan,
+            points: nextBodies[0].points,
+            edges: nextBodies[0].edges,
+            bodies: nextBodies,
+            facets: mergePreservedExtraFacets(plan, relabeledRing),
+            builtAt: new Date().toISOString()
+          };
+        }
+      }
+    }
+  }
+
   if (plan.edges.length < 3) return plan;
   let edgeIdx = plan.edges.findIndex((e) => e.id === edgeIdOrFacetId);
   if (edgeIdx < 0) {
@@ -959,6 +1139,9 @@ export function updateWallPlanEdgeLength(
     ...plan,
     points: updatedPoints,
     edges: updatedEdges,
+    ...(plan.bodies && plan.bodies.length === 1
+      ? { bodies: [{ ...plan.bodies[0], points: updatedPoints, edges: updatedEdges }] }
+      : {}),
     facets: mergePreservedExtraFacets(plan, updatedRingFacets),
     builtAt: new Date().toISOString()
   };
@@ -977,9 +1160,24 @@ export function moveWallPlanVertex(
   const updatedPoints = plan.points.map((pt, idx) =>
     idx === vertexIdx ? { x: +newPt.x.toFixed(3), y: +newPt.y.toFixed(3) } : { ...pt }
   );
+  const primaryBodyId = plan.bodies && plan.bodies.length > 1 ? plan.bodies[0].id : undefined;
   const ringExisting = plan.facets.filter(
-    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
+    (f) =>
+      !f.isSpur &&
+      f.kind !== 'wing' &&
+      f.kind !== 'secondary' &&
+      (!primaryBodyId || !f.bodyId || f.bodyId === primaryBodyId)
   );
+  const otherBodiesRing = primaryBodyId
+    ? plan.facets.filter(
+        (f) =>
+          !f.isSpur &&
+          f.kind !== 'wing' &&
+          f.kind !== 'secondary' &&
+          f.bodyId &&
+          f.bodyId !== primaryBodyId
+      )
+    : [];
   const updatedEdges = buildWallEdgesFromPoints(updatedPoints, 'wall-edge');
   const updatedRingFacets = buildWallFacetsFromPlan(
     { points: updatedPoints, edges: updatedEdges },
@@ -987,14 +1185,35 @@ export function moveWallPlanVertex(
       defaultHeightM: plan.defaultHeightM,
       existingFacets: ringExisting,
       roofLevels,
-      mergeCollinear: false
+      mergeCollinear: false,
+      ...(primaryBodyId
+        ? {
+            bodyId: primaryBodyId,
+            levelId: plan.bodies![0].levelId,
+            groupId: primaryBodyId
+          }
+        : {})
+    }
+  );
+  const allRing = ensureUniqueWallFacetIds([...updatedRingFacets, ...otherBodiesRing]).map(
+    (f, idx) => {
+      const code = indexToWallCode(idx);
+      const isDefaultName = !f.name || /^Wall [A-Z]+$/.test(f.name);
+      return { ...f, code, name: isDefaultName ? `Wall ${code}` : f.name };
     }
   );
   return {
     ...plan,
     points: updatedPoints,
     edges: updatedEdges,
-    facets: mergePreservedExtraFacets(plan, updatedRingFacets),
+    ...(plan.bodies && plan.bodies.length > 0
+      ? {
+          bodies: plan.bodies.map((b, i) =>
+            i === 0 ? { ...b, points: updatedPoints, edges: updatedEdges } : b
+          )
+        }
+      : {}),
+    facets: mergePreservedExtraFacets(plan, allRing),
     builtAt: new Date().toISOString()
   };
 }
@@ -1182,7 +1401,14 @@ export function isWallFacetUndetailed(facet: WallFacet): boolean {
   if (facet.regions && facet.regions.length > 0) {
     return facet.regions.every((r) => r.claddingType === 'none');
   }
-  return facet.claddingType === 'none';
+  if (facet.claddingType === 'none') return true;
+  if (
+    facet.detailConfirmed === false &&
+    (!facet.derivedDefaultCladding || facet.claddingType === facet.derivedDefaultCladding)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function getFacetPrimaryDisplayCladding(facet: WallFacet): WallCladdingType {
@@ -1582,57 +1808,87 @@ export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
     };
   }
 
-  // Signed area in screen-down 2D coordinates (x right, y down)
-  let signedArea2 = 0;
-  for (let i = 0; i < ringFacets.length; i++) {
-    const f = ringFacets[i];
-    signedArea2 += f.from.x * f.to.y - f.to.x * f.from.y;
+  // Partition perimeter ring facets into contiguous closed loops so multi-body plans
+  // never synthesize fake corners or return faces across disconnected building rings.
+  const subRings: WallFacet[][] = [];
+  let activeRing: WallFacet[] = [];
+  for (const f of ringFacets) {
+    if (activeRing.length === 0) {
+      activeRing.push(f);
+      continue;
+    }
+    const prev = activeRing[activeRing.length - 1];
+    const sameBody =
+      (!prev.bodyId && !f.bodyId) ||
+      Boolean(prev.bodyId && f.bodyId && prev.bodyId === f.bodyId);
+    const connected = pointsClose(prev.to, f.from, 0.15);
+    if (sameBody && connected) {
+      activeRing.push(f);
+    } else {
+      subRings.push(activeRing);
+      activeRing = [f];
+    }
   }
-  const orientationSign = signedArea2 >= 0 ? 1 : -1;
+  if (activeRing.length > 0) subRings.push(activeRing);
 
   const cornerDetails: WallCornerTopologyItem[] = [];
+  const returnFacetIdSet = new Set<string>(explicitReturns.map((f) => f.id));
   let externalCornersCount = 0;
   let internalCornersCount = 0;
 
-  for (let i = 0; i < ringFacets.length; i++) {
-    const prev = ringFacets[(i - 1 + ringFacets.length) % ringFacets.length];
-    const curr = ringFacets[i];
-    const lenA = dist(prev.from, prev.to) || 1;
-    const lenB = dist(curr.from, curr.to) || 1;
-    const ax = (prev.to.x - prev.from.x) / lenA;
-    const ay = (prev.to.y - prev.from.y) / lenA;
-    const bx = (curr.to.x - curr.from.x) / lenB;
-    const by = (curr.to.y - curr.from.y) / lenB;
+  subRings.forEach((ring) => {
+    if (ring.length < 3) return;
 
-    const cross = (ax * by - ay * bx) * orientationSign;
-    const dot = Math.max(-1, Math.min(1, ax * bx + ay * by));
-    const turnAngleDeg = (Math.acos(dot) * 180) / Math.PI;
-    // In screen-down CW (orientationSign > 0), right-hand exterior turn has cross > 0 -> interior angle < 180
-    // Left-hand reflex/notch turn has cross < 0 -> interior angle = 180 + turnAngleDeg > 180
-    const isInternal = cross < -0.04;
-    const interiorAngleDeg = +(isInternal ? 180 + turnAngleDeg : 180 - turnAngleDeg).toFixed(1);
-    const kind = isInternal ? 'internal' : 'external';
-
-    if (isInternal) internalCornersCount++;
-    else externalCornersCount++;
-
-    cornerDetails.push({
-      vertexIndex: i,
-      point: curr.from,
-      kind,
-      interiorAngleDeg
-    });
-  }
-
-  const returnFacetIdSet = new Set<string>(explicitReturns.map((f) => f.id));
-  for (let i = 0; i < ringFacets.length; i++) {
-    const startCorner = cornerDetails[i];
-    const endCorner = cornerDetails[(i + 1) % ringFacets.length];
-    const isShortNib = ringFacets[i].lengthM <= 2.2 && ringFacets.length >= 6;
-    if (startCorner?.kind === 'internal' || endCorner?.kind === 'internal' || isShortNib) {
-      returnFacetIdSet.add(ringFacets[i].id);
+    // Signed area in screen-down 2D coordinates (x right, y down)
+    let signedArea2 = 0;
+    for (let i = 0; i < ring.length; i++) {
+      const f = ring[i];
+      signedArea2 += f.from.x * f.to.y - f.to.x * f.from.y;
     }
-  }
+    const orientationSign = signedArea2 >= 0 ? 1 : -1;
+    const ringCorners: WallCornerTopologyItem[] = [];
+
+    for (let i = 0; i < ring.length; i++) {
+      const prev = ring[(i - 1 + ring.length) % ring.length];
+      const curr = ring[i];
+      const lenA = dist(prev.from, prev.to) || 1;
+      const lenB = dist(curr.from, curr.to) || 1;
+      const ax = (prev.to.x - prev.from.x) / lenA;
+      const ay = (prev.to.y - prev.from.y) / lenA;
+      const bx = (curr.to.x - curr.from.x) / lenB;
+      const by = (curr.to.y - curr.from.y) / lenB;
+
+      const cross = (ax * by - ay * bx) * orientationSign;
+      const dot = Math.max(-1, Math.min(1, ax * bx + ay * by));
+      const turnAngleDeg = (Math.acos(dot) * 180) / Math.PI;
+      // In screen-down CW (orientationSign > 0), right-hand exterior turn has cross > 0 -> interior angle < 180
+      // Left-hand reflex/notch turn has cross < 0 -> interior angle = 180 + turnAngleDeg > 180
+      const isInternal = cross < -0.04;
+      const interiorAngleDeg = +(isInternal ? 180 + turnAngleDeg : 180 - turnAngleDeg).toFixed(1);
+      const kind = isInternal ? 'internal' : 'external';
+
+      if (isInternal) internalCornersCount++;
+      else externalCornersCount++;
+
+      const cornerItem: WallCornerTopologyItem = {
+        vertexIndex: cornerDetails.length,
+        point: curr.from,
+        kind,
+        interiorAngleDeg
+      };
+      cornerDetails.push(cornerItem);
+      ringCorners.push(cornerItem);
+    }
+
+    for (let i = 0; i < ring.length; i++) {
+      const startCorner = ringCorners[i];
+      const endCorner = ringCorners[(i + 1) % ring.length];
+      const isShortNib = ring[i].lengthM <= 2.2 && ring.length >= 6;
+      if (startCorner?.kind === 'internal' || endCorner?.kind === 'internal' || isShortNib) {
+        returnFacetIdSet.add(ring[i].id);
+      }
+    }
+  });
 
   return {
     externalCornersCount,
@@ -1996,11 +2252,20 @@ export function deriveRoofOutlineFromWallPlan(
 ): { outline: RoofOutline; linkedWallPlan: WallPlan } | null {
   if (!wallPlan) return null;
 
+  const primaryBodyId = wallPlan.bodies && wallPlan.bodies.length > 1 ? wallPlan.bodies[0].id : undefined;
   const ringCandidates = wallPlan.facets.filter(
-    (f) => !f.isSpur && f.kind !== 'wing' && f.kind !== 'secondary'
+    (f) =>
+      !f.isSpur &&
+      f.kind !== 'wing' &&
+      f.kind !== 'secondary' &&
+      (!primaryBodyId || !f.bodyId || f.bodyId === primaryBodyId)
   );
   const nonRingExtras = wallPlan.facets.filter(
-    (f) => f.isSpur || f.kind === 'wing' || f.kind === 'secondary'
+    (f) =>
+      f.isSpur ||
+      f.kind === 'wing' ||
+      f.kind === 'secondary' ||
+      Boolean(primaryBodyId && f.bodyId && f.bodyId !== primaryBodyId)
   );
 
   const baseFacets: WallFacet[] =
@@ -2368,6 +2633,8 @@ export function batchUpdateWallFacetsInPlan(
     if (patch.claddingType) {
       updated.claddingType = patch.claddingType;
       updated.regions = undefined;
+      updated.detailConfirmed = patch.claddingType !== 'none';
+      updated.derivedDefaultCladding = undefined;
     }
     if (patch.heightSource === 'roof' && patch.roofLevels && patch.roofPlanes) {
       updated = fitWallFacetTopToRoof(updated, patch.roofLevels, patch.roofPlanes);

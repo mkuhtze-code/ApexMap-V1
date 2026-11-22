@@ -650,12 +650,30 @@ export interface WallFacet {
   isSpur?: boolean;
   /** Optional grouping tag for multi-zone or phased wall systems */
   groupId?: string;
+  /** Linked roof level ID when derived in multi-body / multi-level roofs */
+  levelId?: string;
+  /** Perimeter ring / building body identifier in multi-body wall plans */
+  bodyId?: string;
+  /** False when auto-defaulted from roof derive and awaiting human confirmation */
+  detailConfirmed?: boolean;
+  /** Tracks which claddingType was auto-assigned during derive */
+  derivedDefaultCladding?: WallCladdingType;
 }
 
 export interface WallPlanEdge {
   id: string;
   from: Point2D;
   to: Point2D;
+}
+
+export interface WallPlanBody {
+  id: string;
+  levelId?: string;
+  levelCode?: string;
+  name?: string;
+  points: Point2D[];
+  edges: WallPlanEdge[];
+  eaveHeightM: number;
 }
 
 export interface WallSecondaryZone {
@@ -672,6 +690,8 @@ export interface WallSecondaryZone {
 export interface WallPlan {
   points: Point2D[];
   edges: WallPlanEdge[];
+  /** All closed building rings when derived from multi-body / multi-level roofs */
+  bodies?: WallPlanBody[];
   defaultHeightM: number;
   facets: WallFacet[];
   builtAt?: string;

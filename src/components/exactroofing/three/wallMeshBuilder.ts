@@ -343,10 +343,10 @@ export function buildWallPlan3DGroup(params: {
   const seamLineMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#0f172a',
-      metalness: 0.35,
-      roughness: 0.72,
+      metalness: 0.42,
+      roughness: 0.64,
       transparent: true,
-      opacity: 0.32,
+      opacity: 0.4,
       wireframe: isWireframe
     })
   );
@@ -599,7 +599,7 @@ export function buildWallPlan3DGroup(params: {
         facetGroup.add(divBar);
       }
 
-      // Cladding sheet / panel joint cues (clipped neatly above/below openings when showSheetSeams enabled)
+      // Cladding sheet / panel joint cues (clipped cleanly above/below openings when showSheetSeams enabled)
       if (
         showSheetSeams &&
         !isWireframe &&
@@ -623,6 +623,30 @@ export function buildWallPlan3DGroup(params: {
           seamMesh.position.set(su, reg.vStartM + (reg.vEndM - reg.vStartM) / 2, 0);
           facetGroup.add(seamMesh);
         }
+      }
+
+      // Ground-base metal Z-flashing trim along clad bottom edges (broken cleanly around threshold doors/garages)
+      if (!isWireframe && !isDimmedByFilter && reg.vStartM <= 0.04 && reg.claddingType !== 'none') {
+        const thresholds = sanitizedOpenings
+          .filter((op) => op.isThreshold && op.u1 > reg.uStartM && op.u0 < reg.uEndM)
+          .sort((a, b) => a.u0 - b.u0);
+        let curU = reg.uStartM;
+        const baseSegs: [number, number][] = [];
+        thresholds.forEach((op) => {
+          const s = Math.max(reg.uStartM, op.u0);
+          const e = Math.min(reg.uEndM, op.u1);
+          if (s - curU >= 0.12) baseSegs.push([curU, s]);
+          curU = Math.max(curU, e);
+        });
+        if (reg.uEndM - curU >= 0.12) baseSegs.push([curU, reg.uEndM]);
+        baseSegs.forEach(([bu0, bu1]) => {
+          const barMesh = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(bu1 - bu0, 0.024, wallThickness + 0.018)),
+            trimFlashingMat
+          );
+          barMesh.position.set((bu0 + bu1) / 2, 0.012, 0);
+          facetGroup.add(barMesh);
+        });
       }
     });
 
@@ -847,8 +871,26 @@ export function buildWallPlan3DGroup(params: {
     })
   );
 
-  if (wallPlan.points && wallPlan.points.length >= 3) {
-    const shapePts = wallPlan.points.map(
+  const padRings: Array<{ points: { x: number; y: number }[]; baseZ: number }> = [];
+  if (wallPlan.bodies && wallPlan.bodies.length > 0) {
+    wallPlan.bodies.forEach((b) => {
+      if (!b.points || b.points.length < 3) return;
+      const bodyFacets = wallPlan.facets.filter(
+        (f) => f.bodyId === b.id || f.levelId === b.levelId
+      );
+      const minBottomZ =
+        bodyFacets.length > 0 ? Math.min(...bodyFacets.map((f) => f.bottomZ || 0)) : 0;
+      if (minBottomZ <= 0.25) {
+        padRings.push({ points: b.points, baseZ: minBottomZ });
+      }
+    });
+  }
+  if (padRings.length === 0 && wallPlan.points && wallPlan.points.length >= 3) {
+    padRings.push({ points: wallPlan.points, baseZ: 0 });
+  }
+
+  padRings.forEach((ring) => {
+    const shapePts = ring.points.map(
       (pt) => new THREE.Vector2(pt.x - bounds.midX, pt.y - bounds.midY)
     );
     if (Math.abs(THREE.ShapeUtils.area(shapePts)) > 0.05) {
@@ -858,11 +900,11 @@ export function buildWallPlan3DGroup(params: {
       );
       padGeo.rotateX(Math.PI / 2);
       const padMesh = new THREE.Mesh(padGeo, padMat);
-      padMesh.position.y = -0.002;
+      padMesh.position.y = ring.baseZ - 0.002;
       padMesh.receiveShadow = true;
       rootGroup.add(padMesh);
     }
-  }
+  });
 
   // Secondary Zone concrete plinth pads (for outward patio/entry alcove enclosures)
   if (wallPlan.secondaryZones && wallPlan.secondaryZones.length > 0) {

@@ -1422,7 +1422,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setWallSubView('plan');
     setWallViewKey((k) => k + 1);
     setActiveTab('wall_plan');
-    triggerNotice(`✓ Built ${derived.facets.length} labelled wall faces`);
+    const bodyCount = derived.bodies?.length || 1;
+    triggerNotice(
+      `✓ Built ${bodyCount} ${bodyCount === 1 ? 'body' : 'bodies'} · ${derived.facets.length} faces`
+    );
   };
 
   const handleOpenWallElevation = (facetId: string) => {

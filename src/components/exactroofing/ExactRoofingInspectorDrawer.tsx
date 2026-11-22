@@ -2195,7 +2195,24 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                     : 'Cladding Material'}
                 </span>
                 {!isLockedView && onUpdateWallFacet && (
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-wrap justify-end">
+                    {selectedWallFacet.detailConfirmed === false &&
+                      selectedWallFacet.claddingType !== 'none' && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateWallFacet({
+                              ...selectedWallFacet,
+                              detailConfirmed: true,
+                              derivedDefaultCladding: undefined
+                            })
+                          }
+                          className="px-2 py-0.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-[10px] font-extrabold text-white cursor-pointer whitespace-nowrap"
+                          title="Confirm defaulted cladding choice"
+                        >
+                          Confirm
+                        </button>
+                      )}
                     {selectedWallFacet.regions && selectedWallFacet.regions.length > 0 ? (
                       <button
                         type="button"
@@ -2213,6 +2230,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                           onClick={() =>
                             onUpdateWallFacet({
                               ...selectedWallFacet,
+                              detailConfirmed: true,
+                              derivedDefaultCladding: undefined,
                               regions: createHorizontalDadoSplit(
                                 selectedWallFacet,
                                 Math.min(1.2, selectedWallFacet.heightM * 0.45)
@@ -2228,6 +2247,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                           onClick={() =>
                             onUpdateWallFacet({
                               ...selectedWallFacet,
+                              detailConfirmed: true,
+                              derivedDefaultCladding: undefined,
                               regions: createHorizontalBandSplit(selectedWallFacet)
                             })
                           }
@@ -2240,6 +2261,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                           onClick={() =>
                             onUpdateWallFacet({
                               ...selectedWallFacet,
+                              detailConfirmed: true,
+                              derivedDefaultCladding: undefined,
                               regions: createVerticalBaySplit(selectedWallFacet)
                             })
                           }
@@ -2271,6 +2294,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                             if (!onUpdateWallFacet || !selectedWallFacet.regions) return;
                             onUpdateWallFacet({
                               ...selectedWallFacet,
+                              detailConfirmed: true,
+                              derivedDefaultCladding: undefined,
                               regions: selectedWallFacet.regions.map((r) =>
                                 r.id === rb.regionId
                                   ? { ...r, claddingType: e.target.value as WallCladdingType }
@@ -2305,7 +2330,9 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                         onClick={() =>
                           onUpdateWallFacet?.({
                             ...selectedWallFacet,
-                            claddingType: opt.type as WallCladdingType
+                            claddingType: opt.type as WallCladdingType,
+                            detailConfirmed: opt.type !== 'none',
+                            derivedDefaultCladding: undefined
                           })
                         }
                         className={`px-2 py-1.5 rounded-xl border text-left text-[11px] font-bold flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-60 ${

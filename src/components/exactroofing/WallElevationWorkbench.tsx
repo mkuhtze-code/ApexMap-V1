@@ -340,6 +340,8 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     onUpdateFacet({
       ...facet,
       claddingType,
+      detailConfirmed: claddingType !== 'none',
+      derivedDefaultCladding: undefined,
       regions: undefined
     });
   };
@@ -347,19 +349,34 @@ export const WallElevationWorkbench: React.FC<Props> = ({
   const handleEnableDadoSplit = () => {
     if (readOnly) return;
     const regions = createHorizontalDadoSplit(facet, Math.min(1.2, facet.heightM * 0.45));
-    onUpdateFacet({ ...facet, regions });
+    onUpdateFacet({
+      ...facet,
+      detailConfirmed: true,
+      derivedDefaultCladding: undefined,
+      regions
+    });
   };
 
   const handleEnableBandSplit = () => {
     if (readOnly) return;
     const regions = createHorizontalBandSplit(facet);
-    onUpdateFacet({ ...facet, regions });
+    onUpdateFacet({
+      ...facet,
+      detailConfirmed: true,
+      derivedDefaultCladding: undefined,
+      regions
+    });
   };
 
   const handleEnableBaySplit = () => {
     if (readOnly) return;
     const regions = createVerticalBaySplit(facet, facet.lengthM * 0.5);
-    onUpdateFacet({ ...facet, regions });
+    onUpdateFacet({
+      ...facet,
+      detailConfirmed: true,
+      derivedDefaultCladding: undefined,
+      regions
+    });
   };
 
   const handleUpdateRegion = (regId: string, patch: Partial<WallCladdingRegion>) => {

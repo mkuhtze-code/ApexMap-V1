@@ -154,6 +154,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
   const [batchKind, setBatchKind] = useState<WallFacetKind | ''>('');
   const [batchHeightM, setBatchHeightM] = useState<string>('');
   const [batchHeightSource, setBatchHeightSource] = useState<WallHeightSource | ''>('');
+  const [deriveStatusText, setDeriveStatusText] = useState<string | null>(null);
 
   // Zoom & Pan state for the wall floor plan CAD viewport
   const [zoom, setZoom] = useState<number>(1);
@@ -292,7 +293,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
       minY: minY - pad,
       maxY: maxY + pad
     };
-  }, [levels, wallPlan?.points, draftPoints, planUnderlay]);
+  }, [levels, wallPlan?.points, wallPlan?.bodies, facets, draftPoints, planUnderlay]);
 
   const svgW = 860;
   const svgH = 520;
@@ -603,6 +604,23 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     if (derived.facets[0]) {
       onSelectWallFacet(derived.facets[0].id);
     }
+    const bodyCount = derived.bodies?.length || 1;
+    setDeriveStatusText(
+      `${bodyCount} ${bodyCount === 1 ? 'body' : 'bodies'} · ${derived.facets.length} faces`
+    );
+  };
+
+  const handleConfirmAllDerived = () => {
+    if (readOnly || !wallPlan) return;
+    onUpdateWallPlan({
+      ...wallPlan,
+      facets: wallPlan.facets.map((f) =>
+        f.claddingType !== 'none'
+          ? { ...f, detailConfirmed: true, derivedDefaultCladding: undefined }
+          : f
+      ),
+      builtAt: new Date().toISOString()
+    });
   };
 
   const handleSyncRoofTops = () => {
@@ -945,11 +963,20 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                 type="button"
                 onClick={handleSeedFromRoof}
                 className="px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-bold text-sky-300 flex items-center gap-1.5 cursor-pointer"
-                title="Derive single-storey wall footprint under roof eaves"
+                title="Derive wall footprints under all roof bodies and eaves"
               >
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>From Roof</span>
               </button>
+
+              {(deriveStatusText || (wallPlan?.bodies && wallPlan.bodies.length > 1)) && (
+                <span className="px-2 py-1 rounded-lg bg-sky-950/60 border border-sky-500/35 text-[11px] font-mono font-bold text-sky-200 tabular-nums">
+                  {deriveStatusText ||
+                    `${wallPlan?.bodies?.length || 1} ${
+                      (wallPlan?.bodies?.length || 1) === 1 ? 'body' : 'bodies'
+                    } · ${facets.length} faces`}
+                </span>
+              )}
 
               <button
                 type="button"
@@ -1187,28 +1214,43 @@ export const WallPlanWorkspace: React.FC<Props> = ({
           </div>
         )}
 
-      {/* Undetailed Faces Prompt Strip */}
+      {/* Undetailed / Pending Confirmation Faces Prompt Strip */}
       {takeoffSummary.undetailedCount > 0 && nextUndetailedFacet && !isDrawing && (
         <div className="bg-amber-950/35 border border-amber-500/35 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="flex items-center gap-2 text-amber-200">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
             <span className="font-bold">
-              {takeoffSummary.undetailedCount} wall {takeoffSummary.undetailedCount === 1 ? 'face still needs' : 'faces still need'} cladding assignment
+              {takeoffSummary.undetailedCount} wall{' '}
+              {takeoffSummary.undetailedCount === 1 ? 'face still needs' : 'faces still need'}{' '}
+              cladding confirmation or openings detail
               {topology.internalCornersCount > 0
                 ? ` · ${topology.internalCornersCount} internal notch corners detected`
                 : ''}
             </span>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              onSelectWallFacet(nextUndetailedFacet.id);
-              setSubView('elevation');
-            }}
-            className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-extrabold cursor-pointer"
-          >
-            Detail Wall {nextUndetailedFacet.code}
-          </button>
+          <div className="flex items-center gap-1.5">
+            {!readOnly &&
+              facets.some((f) => isWallFacetUndetailed(f) && f.claddingType !== 'none') && (
+                <button
+                  type="button"
+                  onClick={handleConfirmAllDerived}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer"
+                  title="Accept defaulted Profiled Metal cladding on derived faces"
+                >
+                  Confirm Cladding
+                </button>
+              )}
+            <button
+              type="button"
+              onClick={() => {
+                onSelectWallFacet(nextUndetailedFacet.id);
+                setSubView('elevation');
+              }}
+              className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-extrabold cursor-pointer"
+            >
+              Detail Wall {nextUndetailedFacet.code}
+            </button>
+          </div>
         </div>
       )}
 
@@ -1336,15 +1378,24 @@ export const WallPlanWorkspace: React.FC<Props> = ({
               );
             })}
 
-            {/* Closed Floor Plan Polygon Fill */}
-            {wallPlan && wallPlan.points.length >= 3 && (
-              <polygon
-                points={wallPlan.points.map((p) => `${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ')}
-                fill="rgba(14, 165, 233, 0.08)"
-                stroke="none"
-                pointerEvents="none"
-              />
-            )}
+            {/* Closed Floor Plan Polygon Fills (all multi-body rings) */}
+            {wallPlan &&
+              (wallPlan.bodies && wallPlan.bodies.length > 0
+                ? wallPlan.bodies
+                : wallPlan.points.length >= 3
+                ? [{ id: 'primary', points: wallPlan.points }]
+                : []
+              ).map((b, bIdx) =>
+                b.points.length >= 3 ? (
+                  <polygon
+                    key={`wall-body-fill-${b.id || bIdx}`}
+                    points={b.points.map((p) => `${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ')}
+                    fill="rgba(14, 165, 233, 0.08)"
+                    stroke="none"
+                    pointerEvents="none"
+                  />
+                ) : null
+              )}
 
             {/* Labelled Wall Facets */}
             {wallAsOutline &&

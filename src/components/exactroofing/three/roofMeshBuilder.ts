@@ -1409,7 +1409,7 @@ export function buildRoofSceneGroup(params: {
         );
         if (linkedRaked) return false;
       }
-      if (linkedRoofEdgeIds.has(wall.edgeId) && wall.bottomZ < 0.2) return false;
+      if (wall.wallKind !== 'abutment_wall' && linkedRoofEdgeIds.has(wall.edgeId)) return false;
       return true;
     });
 

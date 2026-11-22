@@ -361,6 +361,30 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
     };
   });
 
+  const wbAlbedoCanvas = document.createElement('canvas');
+  wbAlbedoCanvas.width = size;
+  wbAlbedoCanvas.height = size;
+  const wbCtx = wbAlbedoCanvas.getContext('2d')!;
+  const wbImg = wbCtx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    const v = 1 - y / size;
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      const boards = 8;
+      const f = (v * boards) % 1;
+      const grain = (hash2D(Math.floor(u * 64), Math.floor(v * 256)) - 0.5) * 10;
+      const shade = f < 0.14 ? 196 : 238 + (f - 0.14) * 16 + grain;
+      const c = Math.round(THREE.MathUtils.clamp(shade, 180, 255));
+      const idx = (y * size + x) * 4;
+      wbImg.data[idx] = c;
+      wbImg.data[idx + 1] = c;
+      wbImg.data[idx + 2] = c;
+      wbImg.data[idx + 3] = 255;
+    }
+  }
+  wbCtx.putImageData(wbImg, 0, 0);
+  const wbColorMap = configureTex(new THREE.CanvasTexture(wbAlbedoCanvas), 0.5, 0.833, true);
+
   // 2. Vertical Profiled Metal Cladding (ribs vary strictly along U = horizontal, running vertically)
   const metalMaps = buildWallPbrFromHeightSampler(
     size,
@@ -388,6 +412,33 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
       };
     }
   );
+
+  const metalAlbedoCanvas = document.createElement('canvas');
+  metalAlbedoCanvas.width = size;
+  metalAlbedoCanvas.height = size;
+  const metalCtx = metalAlbedoCanvas.getContext('2d')!;
+  const metalImg = metalCtx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      const phase = (u * 4) % 1;
+      let val = 236;
+      if (phase < 0.11 || phase > 0.89) {
+        val = 254; // rib crest highlight
+      } else if (phase < 0.22 || phase > 0.78) {
+        val = 204; // sharp crisp rib cheek shadow
+      } else if (phase > 0.45 && phase < 0.55) {
+        val = 222; // central tray swage line
+      }
+      const idx = (y * size + x) * 4;
+      metalImg.data[idx] = val;
+      metalImg.data[idx + 1] = val;
+      metalImg.data[idx + 2] = val;
+      metalImg.data[idx + 3] = 255;
+    }
+  }
+  metalCtx.putImageData(metalImg, 0, 0);
+  const metalColorMap = configureTex(new THREE.CanvasTexture(metalAlbedoCanvas), 1 / 0.762, 0.5, true);
 
   // 3. Stretcher-Bond Brickwork (4 bricks across x 10 courses high per tile -> 0.96m x 0.86m)
   const brickCols = 4;
@@ -456,6 +507,27 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
       rough: isJoint ? 0.95 : 0.8 + grain * 0.5
     };
   });
+
+  const fcAlbedoCanvas = document.createElement('canvas');
+  fcAlbedoCanvas.width = size;
+  fcAlbedoCanvas.height = size;
+  const fcCtx = fcAlbedoCanvas.getContext('2d')!;
+  const fcImg = fcCtx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    const v = 1 - y / size;
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      const isJoint = u < 0.018 || u > 0.982 || v < 0.014 || v > 0.986;
+      const val = isJoint ? 175 : 244;
+      const idx = (y * size + x) * 4;
+      fcImg.data[idx] = val;
+      fcImg.data[idx + 1] = val;
+      fcImg.data[idx + 2] = val;
+      fcImg.data[idx + 3] = 255;
+    }
+  }
+  fcCtx.putImageData(fcImg, 0, 0);
+  const fcColorMap = configureTex(new THREE.CanvasTexture(fcAlbedoCanvas), 1 / 1.2, 1 / 2.4, true);
 
   // 5. Fine Architectural Plaster / Stucco
   const plasterMaps = buildWallPbrFromHeightSampler(size, 1.8, 1.25, 1.25, aniso, allTextures, (u, v) => {
@@ -535,13 +607,15 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
 
   const weatherboard: WallCladdingTextureEntry = {
     ...wbMaps,
+    map: wbColorMap,
     normalScale: 0.68,
     bumpScale: 0.018
   };
   const profiled_metal: WallCladdingTextureEntry = {
     ...metalMaps,
-    normalScale: 0.72,
-    bumpScale: 0.022
+    map: metalColorMap,
+    normalScale: 0.78,
+    bumpScale: 0.024
   };
   const brick: WallCladdingTextureEntry = {
     ...brickMaps,
@@ -551,6 +625,7 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
   };
   const fibre_cement: WallCladdingTextureEntry = {
     ...fcMaps,
+    map: fcColorMap,
     normalScale: 0.52,
     bumpScale: 0.015
   };

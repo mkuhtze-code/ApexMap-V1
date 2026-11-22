@@ -46,6 +46,7 @@ import {
   clampWallRegionToFacet,
   computeWallFacetMetrics,
   createDefaultWallOpening,
+  createHorizontalBandSplit,
   createHorizontalDadoSplit,
   createVerticalBaySplit,
   duplicateWallOpening,
@@ -349,6 +350,12 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     onUpdateFacet({ ...facet, regions });
   };
 
+  const handleEnableBandSplit = () => {
+    if (readOnly) return;
+    const regions = createHorizontalBandSplit(facet);
+    onUpdateFacet({ ...facet, regions });
+  };
+
   const handleEnableBaySplit = () => {
     if (readOnly) return;
     const regions = createVerticalBaySplit(facet, facet.lengthM * 0.5);
@@ -360,12 +367,24 @@ export const WallElevationWorkbench: React.FC<Props> = ({
     const next = facet.regions.map((r) =>
       r.id === regId ? clampWallRegionToFacet(facet, { ...r, ...patch }) : r
     );
-    // Keep synchronized shared boundary if 2 dado or 2 bay regions share seam
+    // Keep synchronized shared boundary if 2 dado, 2 bay, or 3 band regions share horizontal seams
     if (next.length === 2) {
       if (patch.vEndM !== undefined && next[0].id === regId) {
         next[1] = clampWallRegionToFacet(facet, { ...next[1], vStartM: next[0].vEndM });
       } else if (patch.uEndM !== undefined && next[0].id === regId) {
         next[1] = clampWallRegionToFacet(facet, { ...next[1], uStartM: next[0].uEndM });
+      }
+    } else if (next.length === 3 && patch.vEndM !== undefined) {
+      if (next[0].id === regId) {
+        const clampedMidEnd = Math.max(next[0].vEndM + 0.15, next[1].vEndM);
+        next[1] = clampWallRegionToFacet(facet, {
+          ...next[1],
+          vStartM: next[0].vEndM,
+          vEndM: clampedMidEnd
+        });
+        next[2] = clampWallRegionToFacet(facet, { ...next[2], vStartM: next[1].vEndM });
+      } else if (next[1].id === regId) {
+        next[2] = clampWallRegionToFacet(facet, { ...next[2], vStartM: next[1].vEndM });
       }
     }
     onUpdateFacet({ ...facet, regions: next });
@@ -1902,14 +1921,21 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                           className="px-2 py-0.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 flex items-center gap-1 cursor-pointer"
                         >
                           <Layers className="w-3 h-3" />
-                          <span>Dado Split</span>
+                          <span>Dado</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleEnableBandSplit}
+                          className="px-2 py-0.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-cyan-300 cursor-pointer"
+                        >
+                          3-Band
                         </button>
                         <button
                           type="button"
                           onClick={handleEnableBaySplit}
                           className="px-2 py-0.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-300 cursor-pointer"
                         >
-                          Bay Split
+                          Bay
                         </button>
                       </>
                     )}
@@ -1920,10 +1946,12 @@ export const WallElevationWorkbench: React.FC<Props> = ({
               {facet.regions && facet.regions.length > 0 ? (
                 <div className="space-y-1.5">
                   {facet.regions.slice(0, 3).map((reg, rIdx) => {
-                    const isHorizDado =
-                      facet.regions!.length === 2 &&
-                      Math.abs(facet.regions![0].uEndM - facet.lengthM) < 0.05 &&
-                      Math.abs(facet.regions![1].uEndM - facet.lengthM) < 0.05;
+                    const isHorizMulti =
+                      facet.regions!.length >= 2 &&
+                      facet.regions!.every(
+                        (r) => Math.abs(r.uEndM - r.uStartM - facet.lengthM) < 0.08
+                      );
+                    const showSplitControl = isHorizMulti ? rIdx < facet.regions!.length - 1 : rIdx === 0;
                     return (
                       <div
                         key={reg.id}
@@ -1951,35 +1979,55 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                           </select>
                         </div>
 
-                        {rIdx === 0 && (
+                        {showSplitControl && (
                           <div className="flex items-center gap-2 text-[10px] text-slate-400 tabular-nums">
-                            {isHorizDado ? (
+                            {isHorizMulti ? (
                               <label className="flex items-center gap-1.5">
-                                <span>Dado Height (m)</span>
+                                <span>{rIdx === 0 ? 'Split 1 Z (m)' : 'Split 2 Z (m)'}</span>
                                 <input
                                   type="number"
                                   step="0.05"
-                                  min="0.3"
-                                  max={+(facet.heightM - 0.3).toFixed(2)}
+                                  min="0.25"
+                                  max={+(facet.heightM - 0.25).toFixed(2)}
                                   disabled={readOnly}
-                                  value={regionSplitDraft || String(+reg.vEndM.toFixed(2))}
+                                  value={
+                                    rIdx === 0
+                                      ? regionSplitDraft || String(+reg.vEndM.toFixed(2))
+                                      : String(+reg.vEndM.toFixed(2))
+                                  }
                                   onFocus={(e) => {
-                                    focusedFieldRef.current = 'regionSplit';
+                                    if (rIdx === 0) focusedFieldRef.current = 'regionSplit';
                                     e.currentTarget.select();
                                   }}
-                                  onChange={(e) => setRegionSplitDraft(e.target.value)}
-                                  onBlur={() => {
-                                    focusedFieldRef.current = null;
-                                    const v = parseFloat(regionSplitDraft);
-                                    if (Number.isFinite(v)) {
-                                      handleUpdateRegion(reg.id, { vEndM: v });
+                                  onChange={(e) => {
+                                    if (rIdx === 0) {
+                                      setRegionSplitDraft(e.target.value);
                                     } else {
-                                      setRegionSplitDraft(String(+reg.vEndM.toFixed(2)));
+                                      const v = parseFloat(e.target.value);
+                                      if (Number.isFinite(v) && v > reg.vStartM + 0.15) {
+                                        handleUpdateRegion(reg.id, { vEndM: v });
+                                      }
+                                    }
+                                  }}
+                                  onBlur={(e) => {
+                                    if (rIdx === 0) {
+                                      focusedFieldRef.current = null;
+                                      const v = parseFloat(regionSplitDraft);
+                                      if (Number.isFinite(v)) {
+                                        handleUpdateRegion(reg.id, { vEndM: v });
+                                      } else {
+                                        setRegionSplitDraft(String(+reg.vEndM.toFixed(2)));
+                                      }
+                                    } else {
+                                      const v = parseFloat(e.currentTarget.value);
+                                      if (Number.isFinite(v)) {
+                                        handleUpdateRegion(reg.id, { vEndM: v });
+                                      }
                                     }
                                   }}
                                   onKeyDown={(e) => {
                                     if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
-                                    if (e.key === 'Escape') {
+                                    if (e.key === 'Escape' && rIdx === 0) {
                                       focusedFieldRef.current = null;
                                       setRegionSplitDraft(String(+reg.vEndM.toFixed(2)));
                                       (e.currentTarget as HTMLInputElement).blur();
@@ -2386,6 +2434,51 @@ export const WallElevationWorkbench: React.FC<Props> = ({
                     />
                   </label>
                 </div>
+
+                {/* Quick Sill Presets & Center Horizontal Alignment */}
+                {!readOnly && (
+                  <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1 border-t border-slate-800/70">
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px] font-bold text-slate-500">Sill:</span>
+                      {[0, 0.6, 0.9, 2.1].map((sillVal) => (
+                        <button
+                          key={sillVal}
+                          type="button"
+                          onClick={() =>
+                            handleUpdateOpening(selectedOpening.id, {
+                              sillHeightM: Math.min(
+                                sillVal,
+                                Math.max(0, +(facet.heightM - selectedOpening.heightM).toFixed(2))
+                              )
+                            })
+                          }
+                          className={`px-1.5 py-0.5 rounded border text-[10px] font-mono font-bold cursor-pointer ${
+                            Math.abs(selectedOpening.sillHeightM - sillVal) < 0.03
+                              ? 'bg-sky-600/30 border-sky-400 text-sky-200'
+                              : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          {sillVal === 0 ? '0.0' : sillVal.toFixed(1)}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleUpdateOpening(selectedOpening.id, {
+                          distFromStartM: +Math.max(
+                            0,
+                            (facet.lengthM - selectedOpening.widthM) / 2
+                          ).toFixed(3)
+                        })
+                      }
+                      className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-cyan-300 cursor-pointer"
+                      title="Center opening horizontally on this wall"
+                    >
+                      Center X
+                    </button>
+                  </div>
+                )}
 
                 {/* Void Promotion -> Secondary Wall Section (e.g. Patio Alcove / Entry Court) */}
                 {selectedOpening.type === 'void' && onPromoteVoidToSecondary && (

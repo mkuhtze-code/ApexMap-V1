@@ -1380,6 +1380,7 @@ export function buildRoofSceneGroup(params: {
         selectedWallFacetId,
         wallFilterMode,
         shadingMode,
+        showSheetSeams,
         wallTextures,
         glassMat: wallGlassMat,
         rootGroup,

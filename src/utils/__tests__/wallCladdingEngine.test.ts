@@ -16,6 +16,7 @@ import {
   computeWallFacetMetrics,
   computeWallTakeoffSummary,
   createDefaultWallOpening,
+  createHorizontalBandSplit,
   createHorizontalDadoSplit,
   createSecondaryZoneFromVoid,
   createVerticalBaySplit,
@@ -982,5 +983,281 @@ console.log('✓ Test 20 Passed: Multi-facet wall batch apply helpers preserve o
   assert.ok(Number.isFinite(nibMetrics.netCladdingAreaM2) && nibMetrics.netCladdingAreaM2 > 1.3);
 }
 console.log('✓ Test 21 Passed: Batch height update preserves stacked dado regions, openings & 0.45m return nib');
+
+// 22. Overlapping openings block measure lock in evaluateTakeoffCompleteness; stacked vertical openings pass cleanly
+{
+  const baseOutline22 = getPresetOutline('rectangle_14x10');
+  const lvl22 = createRoofLevel(1, 'Main Roof', 3.4, baseOutline22.points);
+  const planes22 = syncMultiLevelPlanes([lvl22], [], 22.5);
+  const wp22 = deriveWallPlanFromRoofLevels([lvl22], 3.4, undefined, planes22)!;
+  const detailedPlan22 = applyCladdingToFacets(
+    wp22,
+    wp22.facets.map((f) => f.id),
+    'weatherboard'
+  );
+  const host22 = detailedPlan22.facets[0];
+  const winLeft = createDefaultWallOpening(host22, 'window', 2.0);
+  const doorOverlap = {
+    ...createDefaultWallOpening(host22, 'door', 2.4),
+    id: 'op-door-overlap-22'
+  };
+  const stackedTop = {
+    id: 'op-stacked-top-22',
+    type: 'window' as const,
+    distFromStartM: doorOverlap.distFromStartM,
+    sillHeightM: 2.35,
+    widthM: doorOverlap.widthM,
+    heightM: 0.75,
+    label: 'Highlight Above Door'
+  };
+
+  // Stacked vertical openings must NOT trigger opening_overlap
+  const stackedPlan22 = {
+    ...detailedPlan22,
+    facets: detailedPlan22.facets.map((f) =>
+      f.id === host22.id ? { ...f, openings: [doorOverlap, stackedTop] } : f
+    )
+  };
+  const compStacked = evaluateTakeoffCompleteness({
+    levels: [lvl22],
+    planes: planes22,
+    assignableLines: [],
+    flashingAssignments: [],
+    wallPlan: stackedPlan22,
+    assets: []
+  });
+  assert.equal(
+    compStacked.issues.some((i) => i.category === 'opening_overlap'),
+    false,
+    'Vertically stacked openings must not trigger opening_overlap'
+  );
+
+  // Overlapping openings MUST emit a blocker
+  const overlappingPlan22 = {
+    ...detailedPlan22,
+    facets: detailedPlan22.facets.map((f) =>
+      f.id === host22.id ? { ...f, openings: [winLeft, doorOverlap] } : f
+    )
+  };
+  const compOverlap = evaluateTakeoffCompleteness({
+    levels: [lvl22],
+    planes: planes22,
+    assignableLines: [],
+    flashingAssignments: [],
+    wallPlan: overlappingPlan22,
+    assets: []
+  });
+  assert.ok(
+    compOverlap.issues.some((i) => i.category === 'opening_overlap' && i.severity === 'blocker'),
+    'Overlapping wall openings must emit a blocker issue'
+  );
+  assert.equal(compOverlap.canLockMeasure, false);
+
+  // Resolving overlap clears the blocker cleanly
+  const resolvedOps = resolveOpeningOverlap(overlappingPlan22.facets[0], doorOverlap.id);
+  const resolvedPlan22 = {
+    ...detailedPlan22,
+    facets: detailedPlan22.facets.map((f) =>
+      f.id === host22.id ? { ...f, openings: resolvedOps } : f
+    )
+  };
+  const compResolved = evaluateTakeoffCompleteness({
+    levels: [lvl22],
+    planes: planes22,
+    assignableLines: [],
+    flashingAssignments: [],
+    wallPlan: resolvedPlan22,
+    assets: []
+  });
+  assert.equal(
+    compResolved.issues.some((i) => i.category === 'opening_overlap'),
+    false,
+    'resolveOpeningOverlap clears the opening_overlap completeness blocker'
+  );
+}
+console.log('✓ Test 22 Passed: Overlapping openings completeness blocker & stacked clearance');
+
+// 23. 3-Zone Horizontal Band split preserves area accounting & zero-$ Order Pack
+{
+  const f23: typeof batched.facets[0] = {
+    ...batched.facets[0],
+    lengthM: 10,
+    heightM: 3.6,
+    topZ: 3.6,
+    claddingType: 'brick',
+    openings: []
+  };
+  const bands = createHorizontalBandSplit(f23, 0.9, 2.5, 'brick', 'profiled_metal', 'plaster');
+  assert.equal(bands.length, 3);
+  const fWithBands = {
+    ...f23,
+    regions: bands,
+    openings: [
+      {
+        id: 'op-band-win',
+        type: 'window' as const,
+        distFromStartM: 3.0,
+        sillHeightM: 1.0,
+        widthM: 2.0,
+        heightM: 1.2
+      }
+    ]
+  };
+  const m23 = computeWallFacetMetrics(fWithBands);
+  const sumRegNet = m23.regionBreakdown.reduce((s, r) => s + r.netAreaM2, 0);
+  assert.ok(
+    Math.abs(sumRegNet - m23.netCladdingAreaM2) < 0.05,
+    `3-band region net sum (${sumRegNet}) must equal facet net (${m23.netCladdingAreaM2})`
+  );
+  assert.equal(m23.regionBreakdown[0].claddingType, 'brick');
+  assert.equal(m23.regionBreakdown[1].claddingType, 'profiled_metal');
+  assert.equal(m23.regionBreakdown[2].claddingType, 'plaster');
+
+  const bandPlan23 = {
+    ...batched,
+    facets: [fWithBands, ...batched.facets.slice(1)]
+  };
+  const base23 = getPresetOutline('rectangle_14x10');
+  const lvl23 = createRoofLevel(1, 'Main Roof', 2.7, base23.points);
+  const planes23 = syncMultiLevelPlanes([lvl23], [], 22.5);
+  const layout23 = generateCuttingLayout(planes23, { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 });
+  const pack23 = buildOrderPack({
+    planes: planes23,
+    levels: [lvl23],
+    layout: layout23,
+    assignableLines: [],
+    assignments: [],
+    wallPlan: bandPlan23,
+    completenessReport: evaluateTakeoffCompleteness({
+      levels: [lvl23],
+      planes: planes23,
+      assignableLines: [],
+      flashingAssignments: [],
+      wallPlan: bandPlan23,
+      assets: []
+    })
+  });
+  const csv23 = exportOrderPackToCsv(pack23);
+  assert.ok(!csv23.includes('$'), '3-Band wall Order Pack CSV must contain zero pricing symbols');
+}
+console.log('✓ Test 23 Passed: 3-Band mixed cladding region area reconciliation & commercial-neutral export');
+
+// 24. Deep U-notch + wing + parapet + outward secondary alcove + stone ('other') + tall windows 3D build validation
+{
+  const courtyardPlan24 = addWingWallToPlan(
+    robustPlan,
+    [
+      { x: 1, y: 1 },
+      { x: 1, y: 4.5 }
+    ],
+    { heightM: 2.4, claddingType: 'other' }
+  );
+  const hostOutward = {
+    ...courtyardPlan24.facets[1],
+    claddingType: 'other' as const,
+    openings: [
+      {
+        id: 'void-outward-24',
+        type: 'void' as const,
+        distFromStartM: 1.5,
+        sillHeightM: 0,
+        widthM: 3.0,
+        heightM: 2.4
+      }
+    ]
+  };
+  const withHost24 = {
+    ...courtyardPlan24,
+    facets: courtyardPlan24.facets.map((f, idx) => (idx === 1 ? hostOutward : f))
+  };
+  const secRes24 = createSecondaryZoneFromVoid(withHost24, hostOutward.id, 'void-outward-24', {
+    depthM: 2.2,
+    direction: 'outward',
+    claddingType: 'fibre_cement'
+  });
+  assert.ok(secRes24, 'Outward secondary alcove created');
+  const tallWinFacet = {
+    ...secRes24.wallPlan.facets[0],
+    heightM: 3.6,
+    topZ: 3.6,
+    openings: [
+      {
+        id: 'tall-win-24',
+        type: 'window' as const,
+        distFromStartM: 1.2,
+        sillHeightM: 0.6,
+        widthM: 2.2,
+        heightM: 1.9
+      },
+      {
+        id: 'gar-24',
+        type: 'garage' as const,
+        distFromStartM: 4.5,
+        sillHeightM: 0,
+        widthM: 2.6,
+        heightM: 2.1
+      }
+    ]
+  };
+  const stressPlan24 = {
+    ...secRes24.wallPlan,
+    facets: [tallWinFacet, ...secRes24.wallPlan.facets.slice(1)]
+  };
+
+  const stressGroup = new THREE.Group();
+  const stressSelectable: THREE.Mesh[] = [];
+  const stressGeos: THREE.BufferGeometry[] = [];
+  const stressMats: THREE.Material[] = [];
+  const glass24 = new THREE.MeshPhysicalMaterial({ color: '#88ccee' });
+
+  buildWallPlan3DGroup({
+    wallPlan: stressPlan24,
+    bounds: {
+      minX: -4,
+      maxX: 20,
+      minY: -4,
+      maxY: 14,
+      midX: 8,
+      midY: 5,
+      midZ: 1.8,
+      maxZ: 3.6,
+      span: 24
+    },
+    selectedWallFacetId: stressPlan24.facets[0].id,
+    wallFilterMode: 'all',
+    shadingMode: 'studio_finish',
+    showSheetSeams: true,
+    wallTextures: stubTextures,
+    glassMat: glass24,
+    rootGroup: stressGroup,
+    selectableMeshes: stressSelectable,
+    trackGeo: (g) => {
+      stressGeos.push(g);
+      return g;
+    },
+    trackMat: (m) => {
+      stressMats.push(m);
+      return m;
+    }
+  });
+
+  let meshCount = 0;
+  stressGroup.traverse((obj) => {
+    if ((obj as THREE.Mesh).isMesh) {
+      meshCount += 1;
+      const geo = (obj as THREE.Mesh).geometry;
+      const pos = geo.getAttribute('position');
+      assert.ok(pos && pos.count > 0, 'Every 3D wall/trim/plinth mesh has vertices');
+      for (let i = 0; i < pos.count; i++) {
+        assert.ok(Number.isFinite(pos.getX(i)) && Number.isFinite(pos.getY(i)) && Number.isFinite(pos.getZ(i)), 'All 3D vertices must be finite non-NaN');
+      }
+    }
+  });
+  assert.ok(meshCount > stressSelectable.length, 'Corner posts, coping caps, head flashings & outward plinth slabs generated cleanly');
+  stressGeos.forEach((g) => g.dispose());
+  stressMats.forEach((m) => m.dispose());
+  glass24.dispose();
+}
+console.log('✓ Test 24 Passed: Stress 3D geometry check (corner posts, coping, dado flashing, seams, outward alcove slab)');
 
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

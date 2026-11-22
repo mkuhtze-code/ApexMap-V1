@@ -52,8 +52,14 @@ import {
 } from '../../utils/exactRoofingEngine';
 import {
   buildWallOpeningsSchedule,
+  clampWallOpeningToFacet,
+  clampWallRegionToFacet,
   computeWallFacetMetrics,
   computeWallTakeoffSummary,
+  createHorizontalBandSplit,
+  createHorizontalDadoSplit,
+  createVerticalBaySplit,
+  findOpeningOverlaps,
   fitWallFacetTopToRoof,
   getFacetPrimaryDisplayCladding,
   getWallCladdingMeta,
@@ -321,6 +327,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   const [planeEaveZDraft, setPlaneEaveZDraft] = React.useState<string>('');
   const [planeSetbackDraft, setPlaneSetbackDraft] = React.useState<string>('');
   const [parapetHDraft, setParapetHDraft] = React.useState<string>('');
+  const [wallHDraft, setWallHDraft] = React.useState<string>('');
   const [levelZDrafts, setLevelZDrafts] = React.useState<Record<string, string>>({});
 
   const selectedPlanesList = React.useMemo(
@@ -364,6 +371,9 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
     if (!selectedWallFacet) return;
     if (focusedFieldRef.current !== 'parapetH') {
       setParapetHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
+    }
+    if (focusedFieldRef.current !== 'wallH') {
+      setWallHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
     }
   }, [selectedWallFacet?.id, selectedWallFacet?.heightM]);
 
@@ -2092,6 +2102,63 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                         </div>
                       </div>
                     )}
+                    {curKind !== 'parapet' && (
+                      <div className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5 text-[11px]">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                          Wall Height
+                        </span>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0.4"
+                            max="12"
+                            value={wallHDraft}
+                            onFocus={(e) => {
+                              focusedFieldRef.current = 'wallH';
+                              e.currentTarget.select();
+                            }}
+                            onChange={(e) => setWallHDraft(e.target.value)}
+                            onBlur={() => {
+                              focusedFieldRef.current = null;
+                              const val = parseFloat(wallHDraft);
+                              if (Number.isFinite(val) && val >= 0.4) {
+                                const h = +Math.max(0.4, Math.min(12, val)).toFixed(2);
+                                const nextBase = { lengthM: selectedWallFacet.lengthM, heightM: h };
+                                onUpdateWallFacet({
+                                  ...selectedWallFacet,
+                                  heightM: h,
+                                  topZ: +(selectedWallFacet.bottomZ + h).toFixed(3),
+                                  heightSource: 'manual',
+                                  roofProfile: undefined,
+                                  openings: selectedWallFacet.openings.map((op) =>
+                                    clampWallOpeningToFacet(nextBase, op)
+                                  ),
+                                  regions: selectedWallFacet.regions
+                                    ? selectedWallFacet.regions.map((r) =>
+                                        clampWallRegionToFacet(nextBase, r)
+                                      )
+                                    : undefined
+                                });
+                                setWallHDraft(String(h));
+                              } else {
+                                setWallHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                              if (e.key === 'Escape') {
+                                focusedFieldRef.current = null;
+                                setWallHDraft(String(+selectedWallFacet.heightM.toFixed(2)));
+                                (e.currentTarget as HTMLInputElement).blur();
+                              }
+                            }}
+                            className="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-right font-mono font-bold text-white text-[11px] tabular-nums focus:outline-hidden focus:border-sky-400"
+                          />
+                          <span className="text-[10px] text-slate-400">m</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })()}
@@ -2107,34 +2174,126 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   <span>Fit Top to Roof ({selRoofMatch.topZ.toFixed(2)}m Z)</span>
                 </button>
               )}
+              {selectedWallFacet.openings.length >= 2 &&
+                selectedWallFacet.openings.some(
+                  (op) => findOpeningOverlaps(selectedWallFacet, op, op.id).hasOverlap
+                ) && (
+                  <div className="bg-rose-950/45 border border-rose-500/45 rounded-xl px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] text-rose-200 font-bold">
+                    <span className="flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                      <span>Overlapping openings detected</span>
+                    </span>
+                  </div>
+                )}
             </div>
 
-            {selectedWallFacet.regions && selectedWallFacet.regions.length > 1 ? (
-              <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2">
-                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
-                  Mixed Cladding Regions ({selectedWallFacet.regions.length})
-                </div>
+            <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
+                  {selectedWallFacet.regions && selectedWallFacet.regions.length > 1
+                    ? `Mixed Cladding (${selectedWallFacet.regions.length})`
+                    : 'Cladding Material'}
+                </span>
+                {!isLockedView && onUpdateWallFacet && (
+                  <div className="flex items-center gap-1">
+                    {selectedWallFacet.regions && selectedWallFacet.regions.length > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onUpdateWallFacet({ ...selectedWallFacet, regions: undefined })
+                        }
+                        className="px-2 py-0.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-300 cursor-pointer whitespace-nowrap"
+                      >
+                        Single
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateWallFacet({
+                              ...selectedWallFacet,
+                              regions: createHorizontalDadoSplit(
+                                selectedWallFacet,
+                                Math.min(1.2, selectedWallFacet.heightM * 0.45)
+                              )
+                            })
+                          }
+                          className="px-2 py-0.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-sky-300 cursor-pointer whitespace-nowrap"
+                        >
+                          Dado
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateWallFacet({
+                              ...selectedWallFacet,
+                              regions: createHorizontalBandSplit(selectedWallFacet)
+                            })
+                          }
+                          className="px-2 py-0.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-cyan-300 cursor-pointer whitespace-nowrap"
+                        >
+                          3-Band
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateWallFacet({
+                              ...selectedWallFacet,
+                              regions: createVerticalBaySplit(selectedWallFacet)
+                            })
+                          }
+                          className="px-2 py-0.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-300 cursor-pointer whitespace-nowrap"
+                        >
+                          Bay
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {selectedWallFacet.regions && selectedWallFacet.regions.length > 1 ? (
                 <div className="space-y-1.5">
                   {selMetrics.regionBreakdown.map((rb, idx) => (
                     <div
                       key={rb.regionId || idx}
-                      className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5 text-[11px]"
+                      className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5 text-[11px]"
                     >
-                      <span className="font-bold text-slate-200">
-                        {rb.label || `Zone ${idx + 1}`} · {getWallCladdingMeta(rb.claddingType).shortLabel}
+                      <span className="font-bold text-slate-200 truncate">
+                        {rb.label || `Zone ${idx + 1}`}
                       </span>
-                      <span className="font-mono font-bold text-emerald-400 tabular-nums">
-                        {rb.netAreaM2.toFixed(2)} m²
-                      </span>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <select
+                          disabled={isLockedView || !onUpdateWallFacet || !rb.regionId}
+                          value={rb.claddingType}
+                          onChange={(e) => {
+                            if (!onUpdateWallFacet || !selectedWallFacet.regions) return;
+                            onUpdateWallFacet({
+                              ...selectedWallFacet,
+                              regions: selectedWallFacet.regions.map((r) =>
+                                r.id === rb.regionId
+                                  ? { ...r, claddingType: e.target.value as WallCladdingType }
+                                  : r
+                              )
+                            });
+                          }}
+                          className="bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-0.5 text-[10px] font-bold text-white cursor-pointer disabled:opacity-60"
+                        >
+                          {WALL_CLADDING_OPTIONS.map((opt) => (
+                            <option key={opt.type} value={opt.type}>
+                              {opt.shortLabel}
+                            </option>
+                          ))}
+                        </select>
+                        <span className="font-mono font-bold text-emerald-400 tabular-nums">
+                          {rb.netAreaM2.toFixed(1)}m²
+                        </span>
+                      </div>
                     </div>
                   ))}
                 </div>
-              </div>
-            ) : (
-              <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
-                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
-                  Cladding Material
-                </div>
+              ) : (
                 <div className="grid grid-cols-2 gap-1.5">
                   {WALL_CLADDING_OPTIONS.map((opt) => {
                     const active = selectedWallFacet.claddingType === opt.type;
@@ -2164,8 +2323,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                     );
                   })}
                 </div>
-              </div>
-            )}
+              )}
+            </div>
 
             <div className="grid grid-cols-3 gap-2 text-xs tabular-nums">
               <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl">

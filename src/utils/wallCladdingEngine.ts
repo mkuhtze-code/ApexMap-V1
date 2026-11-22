@@ -1127,6 +1127,57 @@ export function createVerticalBaySplit(
   ];
 }
 
+/**
+ * Splits a wall face horizontally into 3 distinct architectural cladding bands
+ * (Base Dado -> Feature Mid Band -> Upper Gable/Soffit Band), preserving exact area sum.
+ */
+export function createHorizontalBandSplit(
+  facet: WallFacet,
+  lowerHeightM?: number,
+  upperSplitM?: number,
+  lowerCladding?: WallCladdingType,
+  middleCladding?: WallCladdingType,
+  upperCladding?: WallCladdingType
+): WallCladdingRegion[] {
+  const H = Math.max(0.9, facet.heightM);
+  const v1 = +Math.max(0.25, Math.min(H - 0.5, lowerHeightM ?? Math.min(0.9, H * 0.32))).toFixed(3);
+  const v2 = +Math.max(v1 + 0.25, Math.min(H - 0.25, upperSplitM ?? Math.max(v1 + 0.3, H * 0.72))).toFixed(3);
+  const base = facet.claddingType !== 'none' ? facet.claddingType : 'brick';
+  const lowType = lowerCladding ?? base;
+  const midType = middleCladding ?? (lowType === 'weatherboard' ? 'profiled_metal' : 'weatherboard');
+  const upType = upperCladding ?? (midType === 'plaster' ? 'profiled_metal' : 'plaster');
+  const L = +facet.lengthM.toFixed(3);
+  return [
+    {
+      id: `reg-b1-${Date.now().toString(36)}`,
+      label: 'Base Band',
+      claddingType: lowType,
+      uStartM: 0,
+      uEndM: L,
+      vStartM: 0,
+      vEndM: v1
+    },
+    {
+      id: `reg-b2-${Date.now().toString(36)}`,
+      label: 'Middle Band',
+      claddingType: midType,
+      uStartM: 0,
+      uEndM: L,
+      vStartM: v1,
+      vEndM: v2
+    },
+    {
+      id: `reg-b3-${Date.now().toString(36)}`,
+      label: 'Upper Band',
+      claddingType: upType,
+      uStartM: 0,
+      uEndM: L,
+      vStartM: v2,
+      vEndM: +H.toFixed(3)
+    }
+  ];
+}
+
 export function isWallFacetUndetailed(facet: WallFacet): boolean {
   if (facet.regions && facet.regions.length > 0) {
     return facet.regions.every((r) => r.claddingType === 'none');

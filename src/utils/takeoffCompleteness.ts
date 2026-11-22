@@ -11,6 +11,7 @@ import {
 import { getFlashingKindDisplayLabel } from './exactRoofingFlashingBridge';
 import {
   analyzeWallPlanTopology,
+  findOpeningOverlaps,
   isWallFacetUndetailed
 } from './wallCladdingEngine';
 
@@ -29,7 +30,7 @@ export function evaluateTakeoffCompleteness(
   const { levels, planes, assignableLines, flashingAssignments, wallPlan, assets } = params;
   const issues: TakeoffCompletenessIssue[] = [];
 
-  // 1. Wall faces & internal notch returns
+  // 1. Wall faces, internal notch returns & overlapping openings
   let undetailedWallsCount = 0;
   let undetailedReturnsCount = 0;
 
@@ -38,6 +39,24 @@ export function evaluateTakeoffCompleteness(
     const returnIds = new Set(topology.returnFacetIds);
 
     wallPlan.facets.forEach((facet) => {
+      // Flag overlapping openings as structural takeoff/CAD blockers
+      if (facet.openings.length >= 2) {
+        const hasAnyOverlap = facet.openings.some(
+          (op) => findOpeningOverlaps(facet, op, op.id).hasOverlap
+        );
+        if (hasAnyOverlap) {
+          issues.push({
+            id: `issue-opening-overlap-${facet.id}`,
+            category: 'opening_overlap',
+            severity: 'blocker',
+            title: `Wall ${facet.code} has overlapping openings`,
+            detail: 'Separate or resolve overlapping windows/doors in Elevation view before locking measure.',
+            targetId: facet.id,
+            targetCode: facet.code
+          });
+        }
+      }
+
       if (!isWallFacetUndetailed(facet)) return;
       undetailedWallsCount += 1;
       const isReturn = returnIds.has(facet.id) || facet.kind === 'return';

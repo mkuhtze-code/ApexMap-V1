@@ -206,8 +206,11 @@ export function createProfileTextureSet(
 
 export interface WallCladdingTextureEntry {
   normalMap: THREE.CanvasTexture;
+  roughnessMap: THREE.CanvasTexture;
+  bumpMap: THREE.CanvasTexture;
   map?: THREE.CanvasTexture;
   normalScale: number;
+  bumpScale: number;
 }
 
 export interface WallCladdingTextureSet {
@@ -216,31 +219,57 @@ export interface WallCladdingTextureSet {
   brick: WallCladdingTextureEntry;
   fibre_cement: WallCladdingTextureEntry;
   plaster: WallCladdingTextureEntry;
+  stone: WallCladdingTextureEntry;
   garageDoor: THREE.CanvasTexture;
+  garageDoorRoughness: THREE.CanvasTexture;
+  garageDoorBump: THREE.CanvasTexture;
   getEntry: (type: WallCladdingType) => WallCladdingTextureEntry | null;
   dispose: () => void;
 }
 
-function buildNormalFromHeightSampler(
+function buildWallPbrFromHeightSampler(
   size: number,
   strength: number,
-  sampleH: (u: number, v: number) => number
-): THREE.CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d')!;
-  const img = ctx.createImageData(size, size);
+  repX: number,
+  repY: number,
+  aniso: number,
+  allTextures: THREE.CanvasTexture[],
+  sampleFn: (u: number, v: number) => { h: number; rough?: number }
+): {
+  normalMap: THREE.CanvasTexture;
+  roughnessMap: THREE.CanvasTexture;
+  bumpMap: THREE.CanvasTexture;
+} {
+  const normalCanvas = document.createElement('canvas');
+  normalCanvas.width = size;
+  normalCanvas.height = size;
+  const normalCtx = normalCanvas.getContext('2d')!;
+  const normalImg = normalCtx.createImageData(size, size);
+
+  const roughCanvas = document.createElement('canvas');
+  roughCanvas.width = size;
+  roughCanvas.height = size;
+  const roughCtx = roughCanvas.getContext('2d')!;
+  const roughImg = roughCtx.createImageData(size, size);
+
+  const bumpCanvas = document.createElement('canvas');
+  bumpCanvas.width = size;
+  bumpCanvas.height = size;
+  const bumpCtx = bumpCanvas.getContext('2d')!;
+  const bumpImg = bumpCtx.createImageData(size, size);
+
   const eps = 1 / size;
 
   for (let y = 0; y < size; y++) {
-    const v = y / size;
+    // Three.js CanvasTexture uses flipY = true, so canvas y = 0 corresponds to UV v = 1
+    const v = 1 - y / size;
     for (let x = 0; x < size; x++) {
       const u = x / size;
-      const hL = sampleH((u - eps + 1) % 1, v);
-      const hR = sampleH((u + eps) % 1, v);
-      const hD = sampleH(u, (v - eps + 1) % 1);
-      const hU = sampleH(u, (v + eps) % 1);
+      const cSample = sampleFn(u, v);
+      const hL = sampleFn((u - eps + 1) % 1, v).h;
+      const hR = sampleFn((u + eps) % 1, v).h;
+      const hD = sampleFn(u, (v - eps + 1) % 1).h;
+      const hU = sampleFn(u, (v + eps) % 1).h;
 
       const nx = -(hR - hL) * strength;
       const ny = -(hU - hD) * strength;
@@ -248,23 +277,58 @@ function buildNormalFromHeightSampler(
       const invLen = 1 / Math.hypot(nx, ny, nz);
 
       const idx = (y * size + x) * 4;
-      img.data[idx] = Math.round(((nx * invLen) * 0.5 + 0.5) * 255);
-      img.data[idx + 1] = Math.round(((ny * invLen) * 0.5 + 0.5) * 255);
-      img.data[idx + 2] = Math.round(((nz * invLen) * 0.5 + 0.5) * 255);
-      img.data[idx + 3] = 255;
+      normalImg.data[idx] = Math.round(((nx * invLen) * 0.5 + 0.5) * 255);
+      normalImg.data[idx + 1] = Math.round(((ny * invLen) * 0.5 + 0.5) * 255);
+      normalImg.data[idx + 2] = Math.round(((nz * invLen) * 0.5 + 0.5) * 255);
+      normalImg.data[idx + 3] = 255;
+
+      const bVal = Math.round(THREE.MathUtils.clamp(cSample.h, 0, 1) * 255);
+      bumpImg.data[idx] = bVal;
+      bumpImg.data[idx + 1] = bVal;
+      bumpImg.data[idx + 2] = bVal;
+      bumpImg.data[idx + 3] = 255;
+
+      const rNorm = cSample.rough !== undefined
+        ? cSample.rough
+        : THREE.MathUtils.clamp(0.86 - cSample.h * 0.22, 0.3, 0.96);
+      const rVal = Math.round(THREE.MathUtils.clamp(rNorm, 0, 1) * 255);
+      roughImg.data[idx] = rVal;
+      roughImg.data[idx + 1] = rVal;
+      roughImg.data[idx + 2] = rVal;
+      roughImg.data[idx + 3] = 255;
     }
   }
-  ctx.putImageData(img, 0, 0);
-  return new THREE.CanvasTexture(canvas);
+
+  normalCtx.putImageData(normalImg, 0, 0);
+  bumpCtx.putImageData(bumpImg, 0, 0);
+  roughCtx.putImageData(roughImg, 0, 0);
+
+  const setup = (canvas: HTMLCanvasElement) => {
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(repX, repY);
+    tex.anisotropy = aniso;
+    tex.needsUpdate = true;
+    allTextures.push(tex);
+    return tex;
+  };
+
+  return {
+    normalMap: setup(normalCanvas),
+    roughnessMap: setup(roughCanvas),
+    bumpMap: setup(bumpCanvas)
+  };
 }
 
 /**
  * Generates cladding-specific seamless PBR textures calibrated in real-world wall (u, v) metres:
- * - weatherboard: horizontal lap bevel boards
- * - profiled_metal: vertical trapezoidal metal ribs (vertical architectural cladding)
- * - brick: NZ stretcher-bond brickwork with subtle mortar lines & tonal variation
- * - fibre_cement: 1.2m expressed panel joints
+ * - weatherboard: horizontal lap bevel boards with sharp undercut shadows
+ * - profiled_metal: vertical trapezoidal ribs matching long-run architectural cladding
+ * - brick: NZ stretcher-bond brickwork with mortar recess, roughness & subtle tone variation
+ * - fibre_cement: 1.2m x 2.4m expressed-joint architectural panel grid
  * - plaster: fine architectural stucco grain
+ * - stone ('other'): coursed split-face architectural stone veneer
  */
 export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTextureSet {
   const size = 256;
@@ -285,30 +349,44 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
   };
 
   // 1. Horizontal Bevel Weatherboard (8 boards per tile -> 1.2m/tile => ~150mm per board)
-  const wbNormal = configureTex(
-    buildNormalFromHeightSampler(size, 3.6, (u, v) => {
-      const boards = 8;
-      const f = (v * boards) % 1;
-      const woodGrain = (hash2D(Math.floor(u * 64), Math.floor(v * 256)) - 0.5) * 0.03;
-      // Sharp shadow undercut at bottom 12% of each board, smooth lap slope across top 88%
-      const profile = f < 0.12 ? (f / 0.12) * 0.92 : 0.92 - ((f - 0.12) / 0.88) * 0.78;
-      return profile + woodGrain;
-    }),
-    0.5,
-    0.833
-  );
+  const wbMaps = buildWallPbrFromHeightSampler(size, 3.8, 0.5, 0.833, aniso, allTextures, (u, v) => {
+    const boards = 8;
+    const f = (v * boards) % 1;
+    const woodGrain = (hash2D(Math.floor(u * 64), Math.floor(v * 256)) - 0.5) * 0.032;
+    const profile = f < 0.12 ? (f / 0.12) * 0.92 : 0.92 - ((f - 0.12) / 0.88) * 0.78;
+    const isShadowGap = f < 0.12;
+    return {
+      h: profile + woodGrain,
+      rough: isShadowGap ? 0.92 : 0.72 - profile * 0.08 + woodGrain * 0.4
+    };
+  });
 
-  // 2. Vertical Profiled Metal Cladding (ribs vary strictly along U = horizontal, running vertically!)
-  const metalNormal = configureTex(
-    buildNormalFromHeightSampler(size, 4.4, (u) => {
-      const phase = (u * 4) % 1;
-      if (phase < 0.12 || phase > 0.88) return 0.9;
-      if (phase < 0.22) return 0.9 - ((phase - 0.12) / 0.1) * 0.78;
-      if (phase > 0.78) return 0.9 - ((0.88 - phase) / 0.1) * 0.78;
-      return 0.12;
-    }),
+  // 2. Vertical Profiled Metal Cladding (ribs vary strictly along U = horizontal, running vertically)
+  const metalMaps = buildWallPbrFromHeightSampler(
+    size,
+    4.6,
     1 / 0.762,
-    0.5
+    0.5,
+    aniso,
+    allTextures,
+    (u, v) => {
+      const phase = (u * 4) % 1;
+      const rollMicro = (hash2D(Math.floor(u * size) % size, Math.floor(v * 32) % 32) - 0.5) * 0.015;
+      let h = 0.14;
+      if (phase < 0.12 || phase > 0.88) {
+        h = 0.92;
+      } else if (phase < 0.22) {
+        h = 0.92 - ((phase - 0.12) / 0.1) * 0.78;
+      } else if (phase > 0.78) {
+        h = 0.92 - ((0.88 - phase) / 0.1) * 0.78;
+      } else if (phase > 0.44 && phase < 0.56) {
+        h = 0.22;
+      }
+      return {
+        h: h + rollMicro,
+        rough: 0.72 - h * 0.22
+      };
+    }
   );
 
   // 3. Stretcher-Bond Brickwork (4 bricks across x 10 courses high per tile -> 0.96m x 0.86m)
@@ -332,11 +410,13 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
     };
   };
 
-  const brickNormal = configureTex(
-    buildNormalFromHeightSampler(size, 3.2, (u, v) => sampleBrickHeight(u, v).h),
-    1.04,
-    1.16
-  );
+  const brickMaps = buildWallPbrFromHeightSampler(size, 3.4, 1.04, 1.16, aniso, allTextures, (u, v) => {
+    const s = sampleBrickHeight(u, v);
+    return {
+      h: s.h,
+      rough: s.isMortar ? 0.96 : 0.84
+    };
+  });
 
   const brickAlbedoCanvas = document.createElement('canvas');
   brickAlbedoCanvas.width = size;
@@ -354,7 +434,6 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
         brickImg.data[idx + 1] = 200;
         brickImg.data[idx + 2] = 192;
       } else {
-        // Neutral bright tone multiplier so wall material's base color tints brick naturally
         const c = Math.round(THREE.MathUtils.clamp(sample.tone * 242, 185, 255));
         brickImg.data[idx] = c;
         brickImg.data[idx + 1] = Math.round(c * 0.96);
@@ -367,50 +446,125 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
   const brickColorMap = configureTex(new THREE.CanvasTexture(brickAlbedoCanvas), 1.04, 1.16, true);
 
   // 4. Expressed-Joint Fibre Cement Sheets (1.2m wide x 2.4m tall module joints)
-  const fcNormal = configureTex(
-    buildNormalFromHeightSampler(size, 3.8, (u, v) => {
-      const seamU = u < 0.018 || u > 0.982;
-      const seamV = v < 0.014 || v > 0.986;
-      const grain = (hash2D(Math.floor(u * 128), Math.floor(v * 128)) - 0.5) * 0.04;
-      return seamU || seamV ? 0.15 : 0.85 + grain;
-    }),
-    1 / 1.2,
-    1 / 2.4
-  );
+  const fcMaps = buildWallPbrFromHeightSampler(size, 4.0, 1 / 1.2, 1 / 2.4, aniso, allTextures, (u, v) => {
+    const seamU = u < 0.018 || u > 0.982;
+    const seamV = v < 0.014 || v > 0.986;
+    const grain = (hash2D(Math.floor(u * 128), Math.floor(v * 128)) - 0.5) * 0.04;
+    const isJoint = seamU || seamV;
+    return {
+      h: isJoint ? 0.14 : 0.85 + grain,
+      rough: isJoint ? 0.95 : 0.8 + grain * 0.5
+    };
+  });
 
   // 5. Fine Architectural Plaster / Stucco
-  const plasterNormal = configureTex(
-    buildNormalFromHeightSampler(size, 1.6, (u, v) => {
-      const gx = Math.floor(u * 128);
-      const gy = Math.floor(v * 128);
-      return 0.5 + (hash2D(gx, gy) - 0.5) * 0.35;
-    }),
-    1.25,
-    1.25
-  );
+  const plasterMaps = buildWallPbrFromHeightSampler(size, 1.8, 1.25, 1.25, aniso, allTextures, (u, v) => {
+    const gx = Math.floor(u * 128);
+    const gy = Math.floor(v * 128);
+    const h = 0.5 + (hash2D(gx, gy) - 0.5) * 0.36;
+    return {
+      h,
+      rough: 0.88 + (0.5 - h) * 0.1
+    };
+  });
 
-  // 6. Horizontal Sectional Garage Door Panels
-  const garageDoor = configureTex(
-    buildNormalFromHeightSampler(size, 3.8, (_u, v) => {
-      const panels = 4;
-      const f = (v * panels) % 1;
-      if (f < 0.09) return 0.25;
-      if (f > 0.91) return 0.95;
-      return 0.8;
-    }),
-    0.5,
-    0.5
-  );
-
-  const weatherboard: WallCladdingTextureEntry = { normalMap: wbNormal, normalScale: 0.62 };
-  const profiled_metal: WallCladdingTextureEntry = { normalMap: metalNormal, normalScale: 0.65 };
-  const brick: WallCladdingTextureEntry = {
-    normalMap: brickNormal,
-    map: brickColorMap,
-    normalScale: 0.48
+  // 6. Coursed Split-Face Architectural Stone ('other')
+  const stoneRows = 6;
+  const sampleStone = (u: number, v: number): { h: number; isJoint: boolean; tone: number } => {
+    const row = Math.floor(v * stoneRows);
+    const rv = (v * stoneRows) % 1;
+    const cols = row % 2 === 0 ? 3 : 2;
+    const shift = (row * 0.37) % 1;
+    const cu = (u * cols + shift) % 1;
+    const col = Math.floor((u * cols + shift) % cols);
+    const isJoint = rv < 0.11 || rv > 0.96 || cu < 0.045 || cu > 0.975;
+    const roughRock =
+      (hash2D(Math.floor(u * 64), Math.floor(v * 64)) - 0.5) * 0.24 +
+      (hash2D(Math.floor(u * 16) + col, Math.floor(v * 16) + row) - 0.5) * 0.18;
+    const tone = 0.82 + hash2D(col + 17, row + 29) * 0.32;
+    return {
+      h: isJoint ? 0.15 : THREE.MathUtils.clamp(0.74 + roughRock, 0.28, 0.98),
+      isJoint,
+      tone
+    };
   };
-  const fibre_cement: WallCladdingTextureEntry = { normalMap: fcNormal, normalScale: 0.45 };
-  const plaster: WallCladdingTextureEntry = { normalMap: plasterNormal, normalScale: 0.22 };
+
+  const stoneMaps = buildWallPbrFromHeightSampler(size, 4.4, 0.85, 0.95, aniso, allTextures, (u, v) => {
+    const s = sampleStone(u, v);
+    return {
+      h: s.h,
+      rough: s.isJoint ? 0.96 : 0.78 + (1 - s.h) * 0.15
+    };
+  });
+
+  const stoneAlbedoCanvas = document.createElement('canvas');
+  stoneAlbedoCanvas.width = size;
+  stoneAlbedoCanvas.height = size;
+  const stoneCtx = stoneAlbedoCanvas.getContext('2d')!;
+  const stoneImg = stoneCtx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    const v = 1 - y / size;
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      const s = sampleStone(u, v);
+      const idx = (y * size + x) * 4;
+      if (s.isJoint) {
+        stoneImg.data[idx] = 135;
+        stoneImg.data[idx + 1] = 132;
+        stoneImg.data[idx + 2] = 128;
+      } else {
+        const c = Math.round(THREE.MathUtils.clamp(s.tone * 235, 165, 255));
+        stoneImg.data[idx] = c;
+        stoneImg.data[idx + 1] = Math.round(c * 0.98);
+        stoneImg.data[idx + 2] = Math.round(c * 0.95);
+      }
+      stoneImg.data[idx + 3] = 255;
+    }
+  }
+  stoneCtx.putImageData(stoneImg, 0, 0);
+  const stoneColorMap = configureTex(new THREE.CanvasTexture(stoneAlbedoCanvas), 0.85, 0.95, true);
+
+  // 7. Horizontal Sectional Garage Door Panels
+  const garageMaps = buildWallPbrFromHeightSampler(size, 4.0, 0.5, 0.5, aniso, allTextures, (_u, v) => {
+    const panels = 4;
+    const f = (v * panels) % 1;
+    if (f < 0.09) return { h: 0.25, rough: 0.65 };
+    if (f > 0.91) return { h: 0.95, rough: 0.44 };
+    return { h: 0.8, rough: 0.48 };
+  });
+
+  const weatherboard: WallCladdingTextureEntry = {
+    ...wbMaps,
+    normalScale: 0.68,
+    bumpScale: 0.018
+  };
+  const profiled_metal: WallCladdingTextureEntry = {
+    ...metalMaps,
+    normalScale: 0.72,
+    bumpScale: 0.022
+  };
+  const brick: WallCladdingTextureEntry = {
+    ...brickMaps,
+    map: brickColorMap,
+    normalScale: 0.58,
+    bumpScale: 0.02
+  };
+  const fibre_cement: WallCladdingTextureEntry = {
+    ...fcMaps,
+    normalScale: 0.52,
+    bumpScale: 0.015
+  };
+  const plaster: WallCladdingTextureEntry = {
+    ...plasterMaps,
+    normalScale: 0.26,
+    bumpScale: 0.008
+  };
+  const stone: WallCladdingTextureEntry = {
+    ...stoneMaps,
+    map: stoneColorMap,
+    normalScale: 0.76,
+    bumpScale: 0.026
+  };
 
   return {
     weatherboard,
@@ -418,7 +572,10 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
     brick,
     fibre_cement,
     plaster,
-    garageDoor,
+    stone,
+    garageDoor: garageMaps.normalMap,
+    garageDoorRoughness: garageMaps.roughnessMap,
+    garageDoorBump: garageMaps.bumpMap,
     getEntry: (type: WallCladdingType) => {
       switch (type) {
         case 'weatherboard':
@@ -432,7 +589,7 @@ export function createWallCladdingTextureSet(maxAnisotropy = 4): WallCladdingTex
         case 'plaster':
           return plaster;
         case 'other':
-          return fibre_cement;
+          return stone;
         default:
           return null;
       }

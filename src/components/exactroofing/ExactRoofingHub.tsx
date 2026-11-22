@@ -2398,6 +2398,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
       }
       return;
     }
+    if (issue.category === 'opening_overlap') {
+      setWallFilterMode('all');
+      if (issue.targetId) {
+        handleOpenWallElevation(issue.targetId);
+      } else {
+        setActiveTab('wall_plan');
+      }
+      return;
+    }
     if (issue.category === 'undetailed_wall') {
       setWallFilterMode('undetailed');
       if (issue.targetId) {

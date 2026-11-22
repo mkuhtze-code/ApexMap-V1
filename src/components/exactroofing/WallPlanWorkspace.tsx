@@ -1442,10 +1442,20 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                           ? '#2dd4bf'
                           : isSecondary
                           ? '#a78bfa'
+                          : facetKind === 'abutment'
+                          ? '#fb923c'
                           : meta.hex
                       }
                       strokeWidth={isSel ? 5.5 : isReturn ? 4.2 : 3.5}
-                      strokeDasharray={isWing ? '7 4' : isSecondary ? '5 3' : undefined}
+                      strokeDasharray={
+                        isWing
+                          ? '7 4'
+                          : isSecondary
+                          ? '5 3'
+                          : facetKind === 'void_edge'
+                          ? '2 3'
+                          : undefined
+                      }
                       strokeLinecap="round"
                     />
 
@@ -1465,6 +1475,8 @@ export const WallPlanWorkspace: React.FC<Props> = ({
                             ? '#2dd4bf'
                             : isSecondary
                             ? '#a78bfa'
+                            : facetKind === 'abutment'
+                            ? '#fb923c'
                             : isUndetailed
                             ? '#f59e0b'
                             : meta.hex

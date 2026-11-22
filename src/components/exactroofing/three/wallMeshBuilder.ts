@@ -206,11 +206,15 @@ function getCladdingVisualProps(
   roughness: number;
   metalness: number;
   normalMap: THREE.CanvasTexture | null;
+  roughnessMap: THREE.CanvasTexture | null;
+  bumpMap: THREE.CanvasTexture | null;
   map: THREE.CanvasTexture | null;
   normalScale: number;
+  bumpScale: number;
+  envMapIntensity: number;
 } {
   const meta = getWallCladdingMeta(claddingType);
-  const texEntry = wallTextures.getEntry(claddingType);
+  const texEntry = wallTextures?.getEntry?.(claddingType) || null;
 
   if (shadingMode === 'wireframe') {
     return {
@@ -218,8 +222,12 @@ function getCladdingVisualProps(
       roughness: 0.6,
       metalness: 0.2,
       normalMap: null,
+      roughnessMap: null,
+      bumpMap: null,
       map: null,
-      normalScale: 0
+      normalScale: 0,
+      bumpScale: 0,
+      envMapIntensity: 0.3
     };
   }
   if (shadingMode === 'facet_zones') {
@@ -237,8 +245,12 @@ function getCladdingVisualProps(
       roughness: 0.58,
       metalness: 0.12,
       normalMap: texEntry?.normalMap || null,
+      roughnessMap: texEntry?.roughnessMap || null,
+      bumpMap: texEntry?.bumpMap || null,
       map: null,
-      normalScale: texEntry ? Math.min(0.45, texEntry.normalScale) : 0
+      normalScale: texEntry ? Math.min(0.45, texEntry.normalScale) : 0,
+      bumpScale: texEntry ? Math.min(0.012, texEntry.bumpScale ?? 0.01) : 0,
+      envMapIntensity: 0.65
     };
   }
   return {
@@ -246,8 +258,12 @@ function getCladdingVisualProps(
     roughness: meta.roughness,
     metalness: meta.metalness,
     normalMap: texEntry?.normalMap || null,
+    roughnessMap: texEntry?.roughnessMap || null,
+    bumpMap: texEntry?.bumpMap || null,
     map: texEntry?.map || null,
-    normalScale: texEntry?.normalScale ?? 0.35
+    normalScale: texEntry?.normalScale ?? 0.35,
+    bumpScale: texEntry?.bumpScale ?? 0.015,
+    envMapIntensity: claddingType === 'profiled_metal' ? 1.18 : 0.82
   };
 }
 
@@ -257,6 +273,7 @@ export function buildWallPlan3DGroup(params: {
   selectedWallFacetId?: string | null;
   wallFilterMode?: WallFilterMode;
   shadingMode: Roof3DShadingMode;
+  showSheetSeams?: boolean;
   wallTextures: WallCladdingTextureSet;
   glassMat: THREE.MeshPhysicalMaterial;
   rootGroup: THREE.Group;
@@ -270,6 +287,7 @@ export function buildWallPlan3DGroup(params: {
     selectedWallFacetId,
     wallFilterMode = 'all',
     shadingMode,
+    showSheetSeams = true,
     wallTextures,
     glassMat,
     rootGroup,
@@ -285,7 +303,7 @@ export function buildWallPlan3DGroup(params: {
   const takeoffSummary = computeWallTakeoffSummary(wallPlan.facets);
   const returnFacetIdSet = new Set(takeoffSummary.returnFacetIds);
 
-  // Shared opening joinery, coping & leaf materials
+  // Shared opening joinery, coping, flashings, seams & leaf materials
   const frameMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#1e293b',
@@ -295,11 +313,40 @@ export function buildWallPlan3DGroup(params: {
     })
   );
 
-  const parapetCopingMat = trackMat(
+  const trimFlashingMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#334155',
-      metalness: 0.68,
-      roughness: 0.28,
+      metalness: 0.62,
+      roughness: 0.3,
+      wireframe: isWireframe
+    })
+  );
+
+  const parapetCopingMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: '#384152',
+      metalness: 0.7,
+      roughness: 0.26,
+      wireframe: isWireframe
+    })
+  );
+
+  const stainlessHardwareMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: '#cbd5e1',
+      metalness: 0.88,
+      roughness: 0.2,
+      wireframe: isWireframe
+    })
+  );
+
+  const seamLineMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: '#0f172a',
+      metalness: 0.35,
+      roughness: 0.72,
+      transparent: true,
+      opacity: 0.32,
       wireframe: isWireframe
     })
   );
@@ -307,7 +354,7 @@ export function buildWallPlan3DGroup(params: {
   const doorLeafMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#334155',
-      roughness: 0.52,
+      roughness: 0.48,
       metalness: 0.24,
       wireframe: isWireframe
     })
@@ -316,13 +363,64 @@ export function buildWallPlan3DGroup(params: {
   const garageLeafMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: '#5a6575',
-      normalMap: wallTextures.garageDoor,
-      normalScale: new THREE.Vector2(0.85, 0.85),
+      normalMap: wallTextures?.garageDoor || null,
+      roughnessMap: wallTextures?.garageDoorRoughness || null,
+      bumpMap: wallTextures?.garageDoorBump || null,
+      bumpScale: wallTextures?.garageDoorBump ? 0.015 : 0,
+      normalScale: new THREE.Vector2(0.88, 0.88),
       roughness: 0.42,
       metalness: 0.45,
       wireframe: isWireframe
     })
   );
+
+  // Corner tracking so every exterior, internal notch, wing, and secondary corner gets a crisp post/flashing
+  const cornerAgg = new Map<
+    string,
+    {
+      x: number;
+      y: number;
+      minBottomZ: number;
+      maxTopZ: number;
+      parapetMaxZ: number | null;
+      count: number;
+      allDimmed: boolean;
+      hasParapetCap: boolean;
+    }
+  >();
+  const registerCornerVertex = (
+    x: number,
+    y: number,
+    bottomZ: number,
+    topZ: number,
+    isDimmed: boolean,
+    parapetCapZ: number | null
+  ) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(bottomZ) || !Number.isFinite(topZ)) return;
+    const key = `${Math.round(x * 40)},${Math.round(y * 40)}`; // 2.5cm spatial weld tolerance
+    const prev = cornerAgg.get(key);
+    if (!prev) {
+      cornerAgg.set(key, {
+        x,
+        y,
+        minBottomZ: bottomZ,
+        maxTopZ: topZ,
+        parapetMaxZ: parapetCapZ,
+        count: 1,
+        allDimmed: isDimmed,
+        hasParapetCap: parapetCapZ !== null
+      });
+    } else {
+      prev.minBottomZ = Math.min(prev.minBottomZ, bottomZ);
+      prev.maxTopZ = Math.max(prev.maxTopZ, topZ);
+      if (parapetCapZ !== null) {
+        prev.parapetMaxZ = prev.parapetMaxZ !== null ? Math.max(prev.parapetMaxZ, parapetCapZ) : parapetCapZ;
+        prev.hasParapetCap = true;
+      }
+      prev.allDimmed = prev.allDimmed && isDimmed;
+      prev.count += 1;
+    }
+  };
 
   wallPlan.facets.forEach((facet) => {
     const dx = facet.to.x - facet.from.x;
@@ -379,6 +477,14 @@ export function buildWallPlan3DGroup(params: {
           }))
         : undefined;
 
+    const startTopZ = roofProfileLocal ? facet.bottomZ + roofProfileLocal[0].v : facet.bottomZ + H;
+    const endTopZ = roofProfileLocal
+      ? facet.bottomZ + roofProfileLocal[roofProfileLocal.length - 1].v
+      : facet.bottomZ + H;
+    const parapetCapZ = isParapet && facet.hasCopingFlashing !== false ? facet.bottomZ + H : null;
+    registerCornerVertex(facet.from.x, facet.from.y, facet.bottomZ, startTopZ, isDimmedByFilter, parapetCapZ);
+    registerCornerVertex(facet.to.x, facet.to.y, facet.bottomZ, endTopZ, isDimmedByFilter, parapetCapZ);
+
     const regionsToBuild =
       facet.regions && facet.regions.length > 0
         ? facet.regions.slice(0, 3).map((r) => clampWallRegionToFacet(facet, r))
@@ -430,7 +536,11 @@ export function buildWallPlan3DGroup(params: {
           roughness: vis.roughness,
           metalness: vis.metalness,
           normalMap: vis.normalMap,
+          roughnessMap: vis.roughnessMap,
+          bumpMap: vis.bumpMap,
+          bumpScale: vis.bumpScale,
           normalScale: new THREE.Vector2(vis.normalScale, vis.normalScale),
+          envMapIntensity: vis.envMapIntensity,
           emissive: new THREE.Color(baseEmissiveHex),
           emissiveIntensity: baseEmissiveIntensity,
           transparent: isDimmedByFilter,
@@ -476,31 +586,79 @@ export function buildWallPlan3DGroup(params: {
           facetGroup.add(new THREE.LineSegments(edgesGeo, edgeMat));
         }
       });
+
+      // Architectural Z-flashing divider bar at horizontal dado / band seams
+      if (regionsToBuild.length >= 2 && reg.vEndM < H - 0.04 && reg.uEndM - reg.uStartM > 0.25 && !isDimmedByFilter) {
+        const divSpan = reg.uEndM - reg.uStartM;
+        const divBar = new THREE.Mesh(
+          trackGeo(new THREE.BoxGeometry(divSpan + 0.01, 0.026, wallThickness + 0.024)),
+          trimFlashingMat
+        );
+        divBar.position.set((reg.uStartM + reg.uEndM) / 2, reg.vEndM, 0);
+        divBar.castShadow = true;
+        facetGroup.add(divBar);
+      }
+
+      // Cladding sheet / panel joint cues (clipped neatly above/below openings when showSheetSeams enabled)
+      if (
+        showSheetSeams &&
+        !isWireframe &&
+        !isDimmedByFilter &&
+        (reg.claddingType === 'profiled_metal' || reg.claddingType === 'fibre_cement')
+      ) {
+        const pitchM = reg.claddingType === 'profiled_metal' ? 0.762 : 1.2;
+        const maxSeams = 28;
+        let seamCount = 0;
+        for (
+          let su = reg.uStartM + pitchM;
+          su < reg.uEndM - 0.14 && seamCount < maxSeams;
+          su += pitchM
+        ) {
+          seamCount += 1;
+          const hitsOpening = sanitizedOpenings.some((op) => su > op.u0 - 0.02 && su < op.u1 + 0.02);
+          if (hitsOpening) continue;
+          const seamH = Math.max(0.1, reg.vEndM - reg.vStartM - 0.04);
+          const seamGeo = trackGeo(new THREE.BoxGeometry(0.011, seamH, wallThickness + 0.008));
+          const seamMesh = new THREE.Mesh(seamGeo, seamLineMat);
+          seamMesh.position.set(su, reg.vStartM + (reg.vEndM - reg.vStartM) / 2, 0);
+          facetGroup.add(seamMesh);
+        }
+      }
     });
 
-    // Architectural metal coping cap on parapet walls
+    // Architectural metal coping cap + joint ticks on parapet walls
     if (isParapet && facet.hasCopingFlashing !== false) {
-      const copingGeo = trackGeo(new THREE.BoxGeometry(L + 0.04, 0.042, wallThickness + 0.055));
+      const copingGeo = trackGeo(new THREE.BoxGeometry(L + 0.06, 0.044, wallThickness + 0.064));
       const copingMesh = new THREE.Mesh(copingGeo, parapetCopingMat);
-      copingMesh.position.set(L / 2, H + 0.018, 0);
+      copingMesh.position.set(L / 2, H + 0.02, 0);
       copingMesh.castShadow = !isDimmedByFilter;
       copingMesh.receiveShadow = true;
       copingMesh.userData = { wallFacetId: facet.id };
       facetGroup.add(copingMesh);
+
+      if (showSheetSeams && !isWireframe && L > 3.2) {
+        for (let ju = 3.0; ju < L - 0.2; ju += 3.0) {
+          const tick = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(0.016, 0.05, wallThickness + 0.072)),
+            trimFlashingMat
+          );
+          tick.position.set(ju, H + 0.02, 0);
+          facetGroup.add(tick);
+        }
+      }
     }
 
-    // Crisp Opening Joinery Frames, Architectural Glazing & Recessed Door/Garage Leaves
+    // Crisp Opening Joinery Frames, Head Flashings, Transoms, Handles & Recessed Leaves
     sanitizedOpenings.forEach((op) => {
       const w = op.u1 - op.u0;
       const h = op.v1 - op.v0;
       const uMid = (op.u0 + op.u1) / 2;
       const vMid = (op.v0 + op.v1) / 2;
 
-      // Voids linked to secondary enclosure zones act as clean open portals; unlinked voids show slim reveal
       if (op.raw.type === 'void') {
         if (!op.raw.linkedSecondaryZoneId) {
-          const revealW = 0.025;
-          const revealDepth = wallThickness + 0.012;
+          const revealW = 0.026;
+          const revealDepth = wallThickness + 0.016;
           const headMesh = new THREE.Mesh(
             trackGeo(new THREE.BoxGeometry(w, revealW, revealDepth)),
             frameMat
@@ -523,6 +681,15 @@ export function buildWallPlan3DGroup(params: {
       headMesh.castShadow = !isDimmedByFilter;
       facetGroup.add(headMesh);
 
+      // Projecting metal head flashing apron above every glazed/door opening
+      const headFlashingMesh = new THREE.Mesh(
+        trackGeo(new THREE.BoxGeometry(w + 0.05, 0.024, wallThickness + 0.068)),
+        trimFlashingMat
+      );
+      headFlashingMesh.position.set(uMid, op.v1 + 0.01, 0);
+      headFlashingMesh.castShadow = !isDimmedByFilter;
+      facetGroup.add(headFlashingMesh);
+
       const leftJamb = new THREE.Mesh(
         trackGeo(new THREE.BoxGeometry(jambW, h, frameDepth)),
         frameMat
@@ -541,8 +708,8 @@ export function buildWallPlan3DGroup(params: {
 
       if (!op.isThreshold) {
         const sillMesh = new THREE.Mesh(
-          trackGeo(new THREE.BoxGeometry(w + 0.04, jambW * 1.15, frameDepth + 0.025)),
-          frameMat
+          trackGeo(new THREE.BoxGeometry(w + 0.05, jambW * 1.15, frameDepth + 0.034)),
+          trimFlashingMat
         );
         sillMesh.position.set(uMid, op.v0 + jambW / 2, 0);
         sillMesh.castShadow = !isDimmedByFilter;
@@ -564,11 +731,21 @@ export function buildWallPlan3DGroup(params: {
         // Architectural center mullion on wider windows (>= 1.15m)
         if (innerW >= 1.15) {
           const mullionMesh = new THREE.Mesh(
-            trackGeo(new THREE.BoxGeometry(0.032, innerH, 0.042)),
+            trackGeo(new THREE.BoxGeometry(0.032, innerH, 0.044)),
             frameMat
           );
           mullionMesh.position.set(uMid, vMid, 0);
           facetGroup.add(mullionMesh);
+        }
+
+        // Architectural horizontal transom bar on tall windows (>= 1.65m)
+        if (innerH >= 1.65) {
+          const transomMesh = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(innerW, 0.03, 0.042)),
+            frameMat
+          );
+          transomMesh.position.set(uMid, op.v1 - jambW - Math.min(0.45, innerH * 0.28), 0);
+          facetGroup.add(transomMesh);
         }
       } else if (op.raw.type === 'door') {
         const innerW = Math.max(0.08, w - jambW * 1.8);
@@ -581,6 +758,26 @@ export function buildWallPlan3DGroup(params: {
         doorMesh.castShadow = !isDimmedByFilter;
         doorMesh.receiveShadow = true;
         facetGroup.add(doorMesh);
+
+        // Glazed vertical vision lite + brushed stainless pull handle
+        if (innerW >= 0.65 && innerH >= 1.4) {
+          const liteW = Math.min(0.16, innerW * 0.2);
+          const liteH = innerH * 0.72;
+          const liteMesh = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(liteW, liteH, 0.058)),
+            glassMat
+          );
+          liteMesh.position.set(uMid - innerW * 0.22, op.v0 + innerH * 0.52, 0);
+          facetGroup.add(liteMesh);
+
+          const handleOffset = innerW * 0.34;
+          const handleMesh = new THREE.Mesh(
+            trackGeo(new THREE.BoxGeometry(0.022, 0.42, 0.082)),
+            stainlessHardwareMat
+          );
+          handleMesh.position.set(uMid + handleOffset, op.v0 + 1.05, 0);
+          facetGroup.add(handleMesh);
+        }
       } else if (op.raw.type === 'garage') {
         const innerW = Math.max(0.1, w - jambW * 1.8);
         const innerH = Math.max(0.1, h - jambW);
@@ -592,13 +789,64 @@ export function buildWallPlan3DGroup(params: {
         garageMesh.castShadow = !isDimmedByFilter;
         garageMesh.receiveShadow = true;
         facetGroup.add(garageMesh);
+
+        // Bottom rubber weather seal
+        const sealMesh = new THREE.Mesh(
+          trackGeo(new THREE.BoxGeometry(innerW + 0.01, 0.026, 0.068)),
+          frameMat
+        );
+        sealMesh.position.set(uMid, op.v0 + 0.013, 0);
+        facetGroup.add(sealMesh);
       }
     });
 
     rootGroup.add(facetGroup);
   });
 
-  // Grounded concrete floor slab plinth matching closed WallPlan footprint (guarded against degenerate shapes)
+  // Render crisp vertical Corner Box Flashings & Parapet Corner Coping Caps at connected wall vertices
+  cornerAgg.forEach((c) => {
+    const colH = c.maxTopZ - c.minBottomZ;
+    if (!Number.isFinite(colH) || colH < 0.2) return;
+    // Render corner box post wherever 2+ walls meet, or where a wing end cap needs clean closure
+    const postSize = wallThickness + 0.018;
+    const postGeo = trackGeo(new THREE.BoxGeometry(postSize, colH, postSize));
+    const postMat = c.allDimmed
+      ? trackMat(
+          new THREE.MeshStandardMaterial({
+            color: '#334155',
+            metalness: 0.5,
+            roughness: 0.4,
+            transparent: true,
+            opacity: 0.2,
+            wireframe: isWireframe
+          })
+        )
+      : trimFlashingMat;
+    const postMesh = new THREE.Mesh(postGeo, postMat);
+    postMesh.position.set(c.x - bounds.midX, c.minBottomZ + colH / 2, c.y - bounds.midY);
+    postMesh.castShadow = !c.allDimmed;
+    postMesh.receiveShadow = true;
+    rootGroup.add(postMesh);
+
+    if (c.hasParapetCap && c.parapetMaxZ !== null) {
+      const capGeo = trackGeo(new THREE.BoxGeometry(wallThickness + 0.072, 0.048, wallThickness + 0.072));
+      const capMesh = new THREE.Mesh(capGeo, parapetCopingMat);
+      capMesh.position.set(c.x - bounds.midX, c.parapetMaxZ + 0.022, c.y - bounds.midY);
+      capMesh.castShadow = !c.allDimmed;
+      rootGroup.add(capMesh);
+    }
+  });
+
+  // Grounded concrete floor slab plinth matching closed WallPlan footprint (top flush at y = -0.002 so thresholds never Z-fight)
+  const padMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: '#283244',
+      roughness: 0.92,
+      metalness: 0.05,
+      wireframe: isWireframe
+    })
+  );
+
   if (wallPlan.points && wallPlan.points.length >= 3) {
     const shapePts = wallPlan.points.map(
       (pt) => new THREE.Vector2(pt.x - bounds.midX, pt.y - bounds.midY)
@@ -606,22 +854,40 @@ export function buildWallPlan3DGroup(params: {
     if (Math.abs(THREE.ShapeUtils.area(shapePts)) > 0.05) {
       const floorShape = new THREE.Shape(shapePts);
       const padGeo = trackGeo(
-        new THREE.ExtrudeGeometry(floorShape, { depth: 0.12, bevelEnabled: false })
+        new THREE.ExtrudeGeometry(floorShape, { depth: 0.14, bevelEnabled: false })
       );
       padGeo.rotateX(Math.PI / 2);
-      const padMat = trackMat(
-        new THREE.MeshStandardMaterial({
-          color: '#283244',
-          roughness: 0.92,
-          metalness: 0.05,
-          wireframe: isWireframe
-        })
-      );
       const padMesh = new THREE.Mesh(padGeo, padMat);
-      padMesh.position.y = 0.06;
+      padMesh.position.y = -0.002;
       padMesh.receiveShadow = true;
       rootGroup.add(padMesh);
     }
+  }
+
+  // Secondary Zone concrete plinth pads (for outward patio/entry alcove enclosures)
+  if (wallPlan.secondaryZones && wallPlan.secondaryZones.length > 0) {
+    wallPlan.secondaryZones.forEach((zone) => {
+      if (zone.direction !== 'outward') return;
+      const zFacets = wallPlan.facets.filter((f) => zone.facetIds.includes(f.id));
+      if (zFacets.length < 3) return;
+      const quadPts = [
+        new THREE.Vector2(zFacets[0].from.x - bounds.midX, zFacets[0].from.y - bounds.midY),
+        new THREE.Vector2(zFacets[0].to.x - bounds.midX, zFacets[0].to.y - bounds.midY),
+        new THREE.Vector2(zFacets[1].to.x - bounds.midX, zFacets[1].to.y - bounds.midY),
+        new THREE.Vector2(zFacets[2].to.x - bounds.midX, zFacets[2].to.y - bounds.midY)
+      ];
+      if (Math.abs(THREE.ShapeUtils.area(quadPts)) > 0.05) {
+        const zShape = new THREE.Shape(quadPts);
+        const zGeo = trackGeo(
+          new THREE.ExtrudeGeometry(zShape, { depth: 0.12, bevelEnabled: false })
+        );
+        zGeo.rotateX(Math.PI / 2);
+        const zPad = new THREE.Mesh(zGeo, padMat);
+        zPad.position.y = (zFacets[0].bottomZ || 0) - 0.004;
+        zPad.receiveShadow = true;
+        rootGroup.add(zPad);
+      }
+    });
   }
 }
 

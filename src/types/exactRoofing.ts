@@ -857,6 +857,7 @@ export type TakeoffCompletenessCategory =
   | 'undetailed_return'
   | 'undetailed_parapet'
   | 'undetailed_secondary'
+  | 'opening_overlap'
   | 'missing_flashing'
   | 'incomplete_plane'
   | 'mixed_pitch'

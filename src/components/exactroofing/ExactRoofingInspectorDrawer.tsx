@@ -45,6 +45,7 @@ import {
   getRoofEdgeTypeMeta,
   getSkeletonLineTypeMeta,
   isEdgeWallEnabled,
+  isGableEdgeType,
   repositionAssetToPlane,
   ROOF_LINE_TYPE_CATALOG,
   updateAssetFromPlacement,
@@ -76,6 +77,7 @@ import { getFlashingKindDisplayLabel } from '../../utils/exactRoofingFlashingBri
 interface Props {
   isOpen: boolean;
   onClose: () => void;
+  embeddedInRightPanel?: boolean;
   selectedPlane: RoofPlane | null;
   selectedAsset?: RoofAsset | null;
   selectedPitchBreak?: PitchBreakLine | null;
@@ -101,6 +103,9 @@ interface Props {
   onToggleEdgeGable?: (edgeId: string, forceMode?: 'hipped' | 'gable') => void;
   onSetEdgeMode?: (edgeId: string, mode: 'hipped' | 'gable' | 'wall') => void;
   onApplyRoofStylePreset?: (mode: 'hipped' | 'gable') => void;
+  onDeletePlane?: (planeId: string) => void;
+  onDeletePlanes?: (planeIds: string[]) => void;
+  onBuildFacesFromClassification?: () => void;
   onSelectPlane: (planeId: string | null) => void;
   onSelectAsset?: (assetId: string | null) => void;
   onUpdateAsset?: (asset: RoofAsset) => void;
@@ -158,6 +163,7 @@ interface Props {
 export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   isOpen,
   onClose,
+  embeddedInRightPanel = false,
   selectedPlane,
   selectedAsset,
   selectedPitchBreak,
@@ -183,6 +189,9 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   onToggleEdgeGable,
   onSetEdgeMode,
   onApplyRoofStylePreset,
+  onDeletePlane,
+  onDeletePlanes,
+  onBuildFacesFromClassification,
   onSelectPlane,
   onSelectAsset,
   onUpdateAsset,
@@ -461,7 +470,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
     .map((f) => f.id);
 
   const inspectorBody = (
-    <div className="flex-1 overflow-y-auto p-4 space-y-3.5 text-xs font-sans">
+    <div className="flex-1 min-h-0 overflow-y-auto p-3.5 space-y-3.5 text-xs font-sans">
       {hasMultiRoofOrWallSelection ? (() => {
         const distinctPitches = new Set(selectedPlanesList.map((p) => p.pitchDeg));
         const commonPitch =
@@ -785,6 +794,21 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                       </button>
                     </div>
                   </div>
+                )}
+                {!isLockedView && (onDeletePlanes || onDeletePlane) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const ids = selectedPlanesList.map((p) => p.id);
+                      if (onDeletePlanes) onDeletePlanes(ids);
+                      else ids.forEach((pid) => onDeletePlane?.(pid));
+                      onChangeSelectedPlaneIds?.([]);
+                    }}
+                    className="w-full py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/35 border border-rose-500/45 text-rose-200 text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete {selectedPlanesList.length} Selected Faces</span>
+                  </button>
                 )}
               </div>
             )}
@@ -1534,6 +1558,20 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   Batch ({focusedLevelPlanes.length} level faces)
                 </button>
               )}
+
+              {!isLockedView && (onDeletePlanes || onDeletePlane) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onDeletePlanes) onDeletePlanes([selectedPlane.id]);
+                    else onDeletePlane?.(selectedPlane.id);
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-rose-600/20 hover:bg-rose-600/35 text-rose-200 border border-rose-500/45 text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1 whitespace-nowrap"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Delete Face</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -1998,10 +2036,17 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               <div className="text-[11px] font-mono text-slate-400 tabular-nums">
                 {selectedWallFacet.lengthM.toFixed(2)}m L × {selectedWallFacet.heightM.toFixed(2)}m H ·{' '}
                 {selMetrics.netCladdingAreaM2.toFixed(2)} m² net
+                {(selectedWallFacet.bottomZ ?? 0) > 0.08 && (
+                  <span className="text-amber-300">
+                    {' '}
+                    · Step {(selectedWallFacet.bottomZ ?? 0).toFixed(2)}m→{selectedWallFacet.topZ.toFixed(2)}m
+                  </span>
+                )}
               </div>
               <div className="flex flex-wrap items-center justify-between gap-2 text-[10px]">
                 <span className={selectedWallFacet.heightSource === 'roof' ? 'text-sky-300 font-bold' : 'text-slate-400 font-bold'}>
                   Height: {selectedWallFacet.heightSource === 'roof' ? 'From Roof Eave' : 'Manual'}
+                  {selectedWallFacet.bodyId ? ` · ${selectedWallFacet.bodyId}` : ''}
                 </span>
                 {selectedWallFacet.underlay && (
                   <span className="text-emerald-300 font-bold">
@@ -2009,15 +2054,30 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   </span>
                 )}
               </div>
-              {!isLockedView && onChangeSelectedWallFacetIds && wallFacets.length >= 2 && (
+              {(!isLockedView || onOpenWallElevation) && (
                 <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-                  <button
-                    type="button"
-                    onClick={() => onChangeSelectedWallFacetIds(wallFacets.map((f) => f.id))}
-                    className="px-2.5 py-1 rounded-lg bg-cyan-950/60 hover:bg-cyan-700/40 text-cyan-200 border border-cyan-500/40 text-[10px] font-bold cursor-pointer whitespace-nowrap"
-                  >
-                    Batch ({wallFacets.length} walls)
-                  </button>
+                  {onOpenWallElevation && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onOpenWallElevation(selectedWallFacet.id);
+                        if (isMobile) onClose();
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-amber-600/25 hover:bg-amber-600/40 text-amber-200 border border-amber-500/40 text-[10px] font-bold cursor-pointer whitespace-nowrap flex items-center gap-1"
+                    >
+                      <Building2 className="w-3 h-3" />
+                      <span>Openings &amp; Elevation ({selectedWallFacet.openings.length})</span>
+                    </button>
+                  )}
+                  {!isLockedView && onChangeSelectedWallFacetIds && wallFacets.length >= 2 && (
+                    <button
+                      type="button"
+                      onClick={() => onChangeSelectedWallFacetIds(wallFacets.map((f) => f.id))}
+                      className="px-2.5 py-1 rounded-lg bg-cyan-950/60 hover:bg-cyan-700/40 text-cyan-200 border border-cyan-500/40 text-[10px] font-bold cursor-pointer whitespace-nowrap"
+                    >
+                      Batch ({wallFacets.length} walls)
+                    </button>
+                  )}
                 </div>
               )}
               {!isLockedView && onUpdateWallFacet && (() => {
@@ -2631,17 +2691,29 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
                 Facets, Walls &amp; Gables
               </div>
-              {outline && outline.edges.length > 0 && (() => {
-                const vergeCount = outline.edges.filter((e) => e.type === 'verge').length;
-                const wallCount = outline.edges.filter((e) => e.type === 'wall').length;
-                const modeLabel =
-                  wallCount > 0 ? 'Terraced / Wall' : vergeCount === 0 ? 'Hipped' : vergeCount >= 2 && planes.length <= 2 ? 'Gable' : 'Mixed';
-                return (
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-slate-800 text-sky-300 border border-slate-700">
-                    {modeLabel}
-                  </span>
-                );
-              })()}
+              <div className="flex items-center gap-1.5">
+                {!isLockedView && onBuildFacesFromClassification && outline && outline.edges.length >= 3 && (
+                  <button
+                    type="button"
+                    onClick={onBuildFacesFromClassification}
+                    className="text-[10px] font-extrabold px-2 py-0.5 rounded-md bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 cursor-pointer"
+                    title="Build missing roof faces from classified edges & lines"
+                  >
+                    Build Faces
+                  </button>
+                )}
+                {outline && outline.edges.length > 0 && (() => {
+                  const vergeCount = outline.edges.filter((e) => isGableEdgeType(e.type)).length;
+                  const wallCount = outline.edges.filter((e) => e.type === 'wall' || e.type === 'apron').length;
+                  const modeLabel =
+                    wallCount > 0 ? 'Terraced / Wall' : vergeCount === 0 ? 'Hipped' : vergeCount >= 2 && planes.length <= 2 ? 'Gable' : 'Mixed';
+                  return (
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-slate-800 text-sky-300 border border-slate-700">
+                      {modeLabel}
+                    </span>
+                  );
+                })()}
+              </div>
             </div>
 
             {!isLockedView && onApplyRoofStylePreset && outline && outline.edges.length > 0 && (
@@ -2659,7 +2731,7 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 <button
                   onClick={() => onApplyRoofStylePreset('gable')}
                   className={`py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
-                    outline.edges.some((e) => e.type === 'verge')
+                    outline.edges.some((e) => isGableEdgeType(e.type))
                       ? 'bg-indigo-600 text-white shadow-xs'
                       : 'text-slate-400 hover:text-white'
                   }`}
@@ -2673,8 +2745,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               {outline && outline.edges.length > 0
                 ? outline.edges.map((edge, idx) => {
                     const matchedPlane = planes.find((p) => p.eaveEdgeId === edge.id);
-                    const isGable = edge.type === 'verge';
-                    const isWall = edge.type === 'wall';
+                    const isGable = isGableEdgeType(edge.type);
+                    const isWall = edge.type === 'wall' || edge.type === 'apron';
                     const edgeLen = dist(edge.from, edge.to).toFixed(1);
                     const edgeZ = (edge.eaveHeightM ?? matchedPlane?.eaveHeightM ?? 2.7).toFixed(1);
                     return (
@@ -3134,10 +3206,18 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
     );
   }
 
+  if (embeddedInRightPanel) {
+    return (
+      <div className="w-full flex-1 min-h-0 bg-[#0c121e] text-white flex flex-col">
+        {inspectorBody}
+      </div>
+    );
+  }
+
   // Desktop / Large Tablet: Side-by-side right CAD panel
   return (
-    <div className="w-80 md:w-88 shrink-0 bg-[#0c121e] border-l border-slate-800 text-white flex flex-col h-full animate-in slide-in-from-right duration-200 shadow-2xl z-20">
-      <div className="p-3.5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
+    <div className="w-80 xl:w-88 shrink-0 bg-[#0c121e] border-l border-slate-800 text-white flex flex-col h-full min-h-0 shadow-2xl z-20">
+      <div className="p-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/60 shrink-0">
         <div className="flex items-center gap-2">
           <Sliders className="w-4 h-4 text-blue-400" />
           <h3 className="font-extrabold text-xs uppercase tracking-wider text-slate-300">

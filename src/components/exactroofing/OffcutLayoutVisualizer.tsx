@@ -151,9 +151,9 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
     return { minX, maxX, minY, maxY, width, height };
   }, [displayPlanes]);
 
-  const padding = isMobile ? 28 : 70;
-  const svgWidth = isMobile ? vpSize.w : 860;
-  const svgHeight = isMobile ? vpSize.h : 540;
+  const padding = isMobile ? 28 : 56;
+  const svgWidth = vpSize.w;
+  const svgHeight = vpSize.h;
   const drawWidth = Math.max(80, svgWidth - padding * 2);
   const drawHeight = Math.max(80, svgHeight - padding * 2);
   const scale = Math.min(drawWidth / bounds.width, drawHeight / bounds.height);
@@ -2376,7 +2376,7 @@ export const OffcutLayoutVisualizer: React.FC<Props> = ({
           <div className="bg-[#101726] border border-slate-800/90 rounded-3xl p-5 shadow-2xl relative overflow-hidden space-y-4">
             <div
               ref={svgViewportRef}
-              className="w-full bg-[#0b101d] rounded-2xl border border-slate-800/80 relative overflow-hidden flex items-center justify-center min-h-[480px]"
+              className="w-full bg-[#0b101d] rounded-2xl border border-slate-800/80 relative overflow-hidden flex items-center justify-center h-[480px] lg:h-[560px] xl:h-[620px]"
             >
               {roofMapSvg}
           <div className="w-full sm:w-auto sm:absolute sm:bottom-3 sm:left-3 sm:right-auto bg-[#0a0f1d]/95 sm:bg-[#0a0f1d]/90 sm:backdrop-blur-md border-t sm:border border-slate-800 px-3 sm:px-3.5 py-2 sm:rounded-2xl text-xs shadow-xl">

@@ -455,7 +455,7 @@ export default function App() {
 
   if (isExactRoofingRoute) {
     return (
-      <div className="min-h-screen min-h-[100dvh] bg-[#070b14] text-white font-sans antialiased overflow-hidden">
+      <div className="h-[100dvh] w-full flex flex-col bg-[#070b14] text-white font-sans antialiased overflow-hidden p-1.5 sm:p-2">
         <ExactRoofingHub
           project={projects.find((p) => p.id === selectedProjectId) || projects[0]}
           projects={projects}
@@ -526,9 +526,16 @@ export default function App() {
   }
 
   const isMobileFullscreenRoofing = isMobile && activeTab === 'exact_roofing' && !isClientPortalMode;
+  const isDesktopRoofingStudio = !isMobile && activeTab === 'exact_roofing' && !isClientPortalMode;
 
   return (
-    <div className="min-h-screen bg-slate-100/70 text-slate-900 flex font-sans antialiased overflow-x-hidden">
+    <div
+      className={
+        isDesktopRoofingStudio
+          ? 'h-[100dvh] w-full bg-[#070b14] text-slate-900 flex font-sans antialiased overflow-hidden'
+          : 'min-h-screen bg-slate-100/70 text-slate-900 flex font-sans antialiased overflow-x-hidden'
+      }
+    >
       {/* Desktop Persistent Sidebar */}
       {!isMobile && (
         <Sidebar
@@ -578,7 +585,7 @@ export default function App() {
       )}
 
       {/* Main Workspace Frame */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
         {/* Top Bar Navigation (Hidden when Exact Roofing Engine runs fullscreen on mobile) */}
         {!isMobileFullscreenRoofing && (
           <TopBar
@@ -616,7 +623,9 @@ export default function App() {
         <main
           className={
             isMobileFullscreenRoofing
-              ? 'flex-1 w-full p-0 overflow-hidden'
+              ? 'flex-1 min-h-0 w-full p-0 overflow-hidden flex flex-col'
+              : isDesktopRoofingStudio
+              ? 'flex-1 min-h-0 w-full p-2 flex flex-col overflow-hidden bg-[#070b14]'
               : 'flex-1 p-3 sm:p-6 lg:p-7 max-w-[1700px] w-full mx-auto'
           }
         >
@@ -777,8 +786,8 @@ export default function App() {
           )}
         </main>
 
-        {/* Trade Footer (Hidden in fullscreen mobile CAD mode) */}
-        {!isMobileFullscreenRoofing && (
+        {/* Trade Footer (Hidden in fullscreen mobile & desktop CAD modes) */}
+        {!isMobileFullscreenRoofing && !isDesktopRoofingStudio && (
           <footer className="bg-white border-t border-slate-200 mt-auto py-3 px-6 text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <span className="font-bold text-slate-900">Archtech Architectural Roofing</span>

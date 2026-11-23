@@ -945,7 +945,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     hoveredWallFacet || (!hoveredPlane && !selectedPlane ? selectedWallFacet : null);
 
   return (
-    <div className="relative w-full h-full flex-1 min-h-[360px] sm:min-h-[480px] rounded-2xl sm:rounded-3xl overflow-hidden bg-[#cad9e8] border border-slate-800 shadow-2xl select-none">
+    <div className="relative w-full h-full flex-1 min-w-0 min-h-[300px] rounded-xl overflow-hidden bg-[#cad9e8] border border-slate-800 shadow-2xl select-none">
       {/* Dedicated Empty WebGL Canvas Container */}
       <div ref={mountRef} className="w-full h-full touch-none" />
 

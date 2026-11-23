@@ -24,7 +24,9 @@ import {
   deriveRoofWallSegments,
   dist,
   getDefaultEdgeSetbackM,
+  getPointElevationFromPlanes,
   isEdgeWallEnabled,
+  isPointInPolygon,
   pointsClose
 } from './exactRoofingEngine';
 
@@ -254,7 +256,8 @@ function mergeCollinearWallRuns(segments: SegmentCandidate[]): SegmentCandidate[
 function findMatchingRoofEdgeId(
   from: Point2D,
   to: Point2D,
-  roofLevels?: RoofLevel[]
+  roofLevels?: RoofLevel[],
+  preferredLevelId?: string
 ): string | undefined {
   if (!roofLevels || roofLevels.length === 0) return undefined;
   const wallMid = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 };
@@ -263,10 +266,17 @@ function findMatchingRoofEdgeId(
   const wux = (to.x - from.x) / wallLen;
   const wuy = (to.y - from.y) / wallLen;
 
+  // Scope strictly to the owning roof level when known so multi-tier setback lines
+  // (e.g. 2-storey split / cascading terrace) never match an adjacent tier's edge.
+  const scopedLevels =
+    preferredLevelId && roofLevels.some((l) => l.id === preferredLevelId)
+      ? roofLevels.filter((l) => l.id === preferredLevelId)
+      : roofLevels;
+
   let bestEdgeId: string | undefined;
   let bestScore = Infinity;
 
-  for (const lvl of roofLevels) {
+  for (const lvl of scopedLevels) {
     for (const edge of lvl.outline.edges) {
       const sb = computeEdgeSetbackLine(lvl.outline, edge.id);
       const refFrom = sb?.wallFrom || edge.from;
@@ -752,6 +762,9 @@ export function buildWallFacetsFromPlan(
     const resolvedGroupId = prev?.groupId ?? options?.groupId;
     const resolvedLevelId = prev?.levelId ?? options?.levelId;
     const resolvedBodyId = prev?.bodyId ?? options?.bodyId;
+    const matchedRoofEdgeId =
+      prev?.roofEdgeId ??
+      findMatchingRoofEdgeId(seg.from, seg.to, options?.roofLevels, resolvedLevelId ?? resolvedBodyId);
 
     return {
       id,
@@ -769,7 +782,7 @@ export function buildWallFacetsFromPlan(
       openings,
       regions,
       underlay: prev?.underlay ?? null,
-      roofEdgeId: prev?.roofEdgeId ?? findMatchingRoofEdgeId(seg.from, seg.to, options?.roofLevels),
+      roofEdgeId: matchedRoofEdgeId,
       ...(resolvedKind ? { kind: resolvedKind } : {}),
       ...(prev?.parapetAboveM !== undefined ? { parapetAboveM: prev.parapetAboveM } : {}),
       ...(prev?.hasCopingFlashing !== undefined ? { hasCopingFlashing: prev.hasCopingFlashing } : {}),
@@ -822,10 +835,44 @@ function computeMiteredWallPointsForOutline(outline: RoofOutline): Point2D[] {
   return outline.points.map((p) => ({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) }));
 }
 
+function areWallSegmentsCoincident2D(
+  aFrom: Point2D,
+  aTo: Point2D,
+  bFrom: Point2D,
+  bTo: Point2D,
+  maxPerpDistM = 0.12
+): boolean {
+  const lenA = dist(aFrom, aTo);
+  const lenB = dist(bFrom, bTo);
+  if (lenA < 0.15 || lenB < 0.15) return false;
+  const ux = (aTo.x - aFrom.x) / lenA;
+  const uy = (aTo.y - aFrom.y) / lenA;
+  const bx = (bTo.x - bFrom.x) / lenB;
+  const by = (bTo.y - bFrom.y) / lenB;
+  const dot = Math.abs(ux * bx + uy * by);
+  if (dot < 0.985) return false;
+
+  const midB = { x: (bFrom.x + bTo.x) / 2, y: (bFrom.y + bTo.y) / 2 };
+  const perpDist = Math.abs((midB.x - aFrom.x) * -uy + (midB.y - aFrom.y) * ux);
+  if (perpDist > maxPerpDistM) return false;
+
+  const p0 = (bFrom.x - aFrom.x) * ux + (bFrom.y - aFrom.y) * uy;
+  const p1 = (bTo.x - aFrom.x) * ux + (bTo.y - aFrom.y) * uy;
+  const minB = Math.min(p0, p1);
+  const maxB = Math.max(p0, p1);
+  const overlap = Math.min(lenA, maxB) - Math.max(0, minB);
+  return overlap >= Math.min(lenA, lenB) * 0.65;
+}
+
 /**
- * Derives WallPlan envelopes across ALL closed roof levels/bodies (multi-body and multi-tier),
- * applying eave setbacks cleanly, defaulting cladding to profiled_metal for 3D visual parity,
- * preserving wing/secondary walls, and linking wall tops back to overlying roof eaves/rakes.
+ * Multi-tier / multi-body WallPlan rules:
+ * 1. One closed wall ring per roof body / level outline (`bodies[]`).
+ * 2. Single ownership of shared 2D segments between levels: if a lower-tier `wall` / abutment edge
+ *    coincides in 2D with an upper-tier facet (e.g. cascading terrace junctions), only one owner
+ *    facet is emitted (no duplicate overlapping full-height walls on identical 2D coordinates).
+ * 3. Explicit step/riser ownership at roof steps: upper-tier walls sitting over a lower roof plane
+ *    receive explicit `bottomZ` (lower roof plane elevation) -> `topZ` (upper roof), `kind: 'abutment'`.
+ * 4. Per-level height & roof-edge scoping prevents cross-tier `heightSource: 'roof'` overwriting.
  */
 export function deriveWallPlanFromRoofLevels(
   levels: RoofLevel[],
@@ -852,7 +899,9 @@ export function deriveWallPlanFromRoofLevels(
   const resolvedDetailConfirmed = options?.detailConfirmed ?? false;
 
   const bodies: WallPlanBody[] = [];
-  const allRingFacetsRaw: WallFacet[] = [];
+  const facetsByLevelId = new Map<string, WallFacet[]>();
+  const levelById = new Map<string, RoofLevel>();
+  validLevels.forEach((l) => levelById.set(l.id, l));
 
   validLevels.forEach((lvl, lvlIdx) => {
     const hM = +(lvl.eaveHeightM || defaultHeightM).toFixed(3);
@@ -902,11 +951,57 @@ export function deriveWallPlanFromRoofLevels(
       eaveHeightM: hM
     });
 
-    allRingFacetsRaw.push(...bodyFacets);
+    facetsByLevelId.set(lvl.id, bodyFacets);
   });
 
-  // Ensure unique IDs across all bodies and assign continuous exterior face codes A, B, C...
-  const uniqueRingFacets = ensureUniqueWallFacetIds(allRingFacetsRaw).map((f, idx) => {
+  // Ensure unique IDs across all bodies BEFORE Rule 2 suppression so facet IDs on distinct bodies never collide
+  const rawCollectedUnunique: WallFacet[] = [];
+  validLevels.forEach((lvl) => {
+    rawCollectedUnunique.push(...(facetsByLevelId.get(lvl.id) || []));
+  });
+  const rawCollected = ensureUniqueWallFacetIds(rawCollectedUnunique);
+
+  // Rule 2: Enforce single ownership of shared 2D segments between levels (no duplicate overlapping walls).
+  const suppressedFacetIds = new Set<string>();
+  const promotedStepOverrides = new Map<string, { kind: WallFacetKind }>();
+
+  for (let i = 0; i < rawCollected.length; i++) {
+    const fA = rawCollected[i];
+    if (suppressedFacetIds.has(fA.id)) continue;
+    const lvlA = fA.levelId ? levelById.get(fA.levelId) : undefined;
+    const edgeA = lvlA?.outline.edges.find((e) => e.id === fA.roofEdgeId);
+
+    for (let j = i + 1; j < rawCollected.length; j++) {
+      const fB = rawCollected[j];
+      if (suppressedFacetIds.has(fB.id)) continue;
+      if (fA.levelId === fB.levelId) continue;
+      if (!areWallSegmentsCoincident2D(fA.from, fA.to, fB.from, fB.to, 0.12)) continue;
+
+      const lvlB = fB.levelId ? levelById.get(fB.levelId) : undefined;
+      const edgeB = lvlB?.outline.edges.find((e) => e.id === fB.roofEdgeId);
+      const zA = lvlA?.eaveHeightM ?? fA.topZ;
+      const zB = lvlB?.eaveHeightM ?? fB.topZ;
+
+      // Upper level owns the shared step/riser boundary when adjacent tier edges coincide in 2D
+      if (zB > zA + 0.05 || (edgeA?.type === 'wall' && edgeB?.type !== 'wall')) {
+        suppressedFacetIds.add(fA.id);
+        promotedStepOverrides.set(fB.id, { kind: 'abutment' });
+      } else if (zA > zB + 0.05 || (edgeB?.type === 'wall' && edgeA?.type !== 'wall')) {
+        suppressedFacetIds.add(fB.id);
+        promotedStepOverrides.set(fA.id, { kind: 'abutment' });
+      }
+    }
+  }
+
+  const allRingFacetsRaw = rawCollected
+    .filter((f) => !suppressedFacetIds.has(f.id))
+    .map((f) => {
+      const ov = promotedStepOverrides.get(f.id);
+      return ov ? { ...f, kind: ov.kind } : f;
+    });
+
+  // Assign continuous exterior face codes A, B, C... across surviving unique facets
+  const uniqueRingFacets = allRingFacetsRaw.map((f, idx) => {
     const code = indexToWallCode(idx);
     const isDefaultWallName = !f.name || /^Wall [A-Z]+$/.test(f.name);
     return {
@@ -1580,8 +1675,69 @@ export function computeWallFacetMetrics(facet: WallFacet): WallFacetMetrics {
   };
 }
 
+function resolveWallStepBottomZ(
+  facet: WallFacet,
+  roofLevels: RoofLevel[],
+  roofPlanes: RoofPlane[],
+  upperTopZ: number
+): number {
+  const facetLevelId = facet.levelId || facet.bodyId;
+  if (!facetLevelId || roofLevels.length < 2 || roofPlanes.length === 0) {
+    return facet.bottomZ;
+  }
+  const ownerLevel = roofLevels.find((l) => l.id === facetLevelId);
+  if (!ownerLevel) return facet.bottomZ;
+
+  const lowerLevels = roofLevels.filter(
+    (l) => l.id !== facetLevelId && (l.eaveHeightM ?? 2.7) < (ownerLevel.eaveHeightM ?? 2.7) - 0.1
+  );
+  if (lowerLevels.length === 0) return facet.bottomZ;
+
+  const lowerLevelIdSet = new Set(lowerLevels.map((l) => l.id));
+  const lowerPlanes = roofPlanes.filter((p) => lowerLevelIdSet.has(p.levelId || 'level-1'));
+  if (lowerPlanes.length === 0) return facet.bottomZ;
+
+  const dx = facet.to.x - facet.from.x;
+  const dy = facet.to.y - facet.from.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const leftNx = -dy / len;
+  const leftNy = dx / len;
+  const samples = [0.2, 0.5, 0.8];
+  const detectedLowerZs: number[] = [];
+
+  for (const t of samples) {
+    const pt = { x: facet.from.x + dx * t, y: facet.from.y + dy * t };
+    const probes = [
+      pt,
+      { x: pt.x + leftNx * 0.08, y: pt.y + leftNy * 0.08 },
+      { x: pt.x - leftNx * 0.08, y: pt.y - leftNy * 0.08 }
+    ];
+    for (const probe of probes) {
+      const matchedLowerLvl = lowerLevels.find(
+        (ll) => ll.outline.points.length >= 3 && isPointInPolygon(probe, ll.outline.points)
+      );
+      if (!matchedLowerLvl) continue;
+      const lvlPlanes = lowerPlanes.filter((p) => (p.levelId || 'level-1') === matchedLowerLvl.id);
+      const res = getPointElevationFromPlanes(probe, lvlPlanes, matchedLowerLvl.outline);
+      if (res.matchedPlaneIds.length > 0 && Number.isFinite(res.z)) {
+        detectedLowerZs.push(res.z);
+        break;
+      }
+    }
+  }
+
+  if (detectedLowerZs.length >= 2) {
+    const minLowerZ = Math.min(...detectedLowerZs);
+    if (minLowerZ > 0.15 && minLowerZ < upperTopZ - 0.12) {
+      return +minLowerZ.toFixed(3);
+    }
+  }
+  return facet.bottomZ;
+}
+
 /**
- * Resolves vertical eave height & optional raked gable profile from matching roof edge / planes.
+ * Resolves vertical eave height, explicit multi-tier step bottomZ, and optional raked gable profile
+ * scoped cleanly to the facet's owning roof level so tiers never overwrite each other.
  */
 export function resolveRoofTopForWallFacet(
   facet: WallFacet,
@@ -1589,18 +1745,24 @@ export function resolveRoofTopForWallFacet(
   roofPlanes: RoofPlane[] = []
 ): {
   roofEdgeId?: string;
+  bottomZ: number;
   topZ: number;
   heightM: number;
   roofProfile?: WallRoofProfilePoint[];
+  suggestedKind?: WallFacetKind;
 } | null {
   if (!roofLevels || roofLevels.length === 0) return null;
 
+  const facetLevelId = facet.levelId || facet.bodyId;
   const matchedEdgeId =
-    facet.roofEdgeId ?? findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
+    facet.roofEdgeId ?? findMatchingRoofEdgeId(facet.from, facet.to, roofLevels, facetLevelId);
   if (!matchedEdgeId) return null;
 
   const wallSegments = deriveRoofWallSegments(roofLevels, roofPlanes);
-  const segMatch = wallSegments.find((w) => w.edgeId === matchedEdgeId);
+  const segMatch =
+    wallSegments.find(
+      (w) => w.edgeId === matchedEdgeId && (!facetLevelId || w.levelId === facetLevelId)
+    ) || wallSegments.find((w) => w.edgeId === matchedEdgeId);
 
   let rawTopZ: number | null = null;
   let profile: WallRoofProfilePoint[] | undefined;
@@ -1626,7 +1788,7 @@ export function resolveRoofTopForWallFacet(
             0,
             Math.min(facet.lengthM, (dFromStart / segLen) * facet.lengthM)
           ).toFixed(3);
-          const tuckedTopZ = +Math.max(facet.bottomZ + 0.4, tp.z - 0.025).toFixed(3);
+          const tuckedTopZ = +Math.max(0.4, tp.z - 0.025).toFixed(3);
           return { distM, topZ: tuckedTopZ };
         })
         .sort((a, b) => a.distM - b.distM);
@@ -1639,10 +1801,16 @@ export function resolveRoofTopForWallFacet(
       rawTopZ = minZ;
     }
   } else {
-    for (const lvl of roofLevels) {
+    const searchLevels =
+      facetLevelId && roofLevels.some((l) => l.id === facetLevelId)
+        ? roofLevels.filter((l) => l.id === facetLevelId)
+        : roofLevels;
+    for (const lvl of searchLevels) {
       const edge = lvl.outline.edges.find((e) => e.id === matchedEdgeId);
       if (edge) {
-        const planeMatch = roofPlanes.find((p) => p.eaveEdgeId === edge.id);
+        const planeMatch = roofPlanes.find(
+          (p) => p.eaveEdgeId === edge.id && (p.levelId || 'level-1') === lvl.id
+        );
         rawTopZ = edge.eaveHeightM ?? planeMatch?.eaveHeightM ?? lvl.eaveHeightM ?? 2.7;
         break;
       }
@@ -1651,16 +1819,39 @@ export function resolveRoofTopForWallFacet(
 
   if (rawTopZ === null || !Number.isFinite(rawTopZ)) return null;
 
-  const tuckedTopZ = profile
-    ? +Math.max(...profile.map((p) => p.topZ)).toFixed(3)
-    : +Math.max(facet.bottomZ + 0.4, rawTopZ - 0.025).toFixed(3);
-  const heightM = +Math.max(0.4, tuckedTopZ - facet.bottomZ).toFixed(3);
+  const tentativeTopZ = profile
+    ? Math.max(...profile.map((p) => p.topZ))
+    : Math.max(0.4, rawTopZ - 0.025);
+
+  // Explicit step/riser ownership where upper walls sit over lower roof planes
+  const segBottomZ =
+    segMatch && segMatch.bottomZ > 0.15 && segMatch.bottomZ < tentativeTopZ - 0.12
+      ? +segMatch.bottomZ.toFixed(3)
+      : undefined;
+  const resolvedBottomZ =
+    segBottomZ ?? resolveWallStepBottomZ(facet, roofLevels, roofPlanes, tentativeTopZ);
+  const isStepRiser = resolvedBottomZ > 0.12;
+  const minRiserClearance = isStepRiser ? 0.12 : 0.4;
+
+  const adjustedProfile = profile
+    ? profile.map((p) => ({
+        distM: p.distM,
+        topZ: +Math.max(resolvedBottomZ + minRiserClearance, p.topZ).toFixed(3)
+      }))
+    : undefined;
+
+  const tuckedTopZ = adjustedProfile
+    ? +Math.max(...adjustedProfile.map((p) => p.topZ)).toFixed(3)
+    : +Math.max(resolvedBottomZ + minRiserClearance, rawTopZ - 0.025).toFixed(3);
+  const heightM = +Math.max(minRiserClearance, tuckedTopZ - resolvedBottomZ).toFixed(3);
 
   return {
     roofEdgeId: matchedEdgeId,
-    topZ: +(facet.bottomZ + heightM).toFixed(3),
+    bottomZ: +resolvedBottomZ.toFixed(3),
+    topZ: +(resolvedBottomZ + heightM).toFixed(3),
     heightM,
-    roofProfile: profile
+    roofProfile: adjustedProfile,
+    suggestedKind: isStepRiser ? 'abutment' : undefined
   };
 }
 
@@ -1679,9 +1870,14 @@ export function fitWallFacetTopToRoof(
     ...facet,
     roofEdgeId: resolved.roofEdgeId ?? facet.roofEdgeId,
     heightSource: 'roof',
+    bottomZ: resolved.bottomZ,
     heightM: resolved.heightM,
     topZ: resolved.topZ,
     roofProfile: resolved.roofProfile,
+    ...(resolved.suggestedKind && !facet.kind ? { kind: resolved.suggestedKind } : {}),
+    ...(resolved.suggestedKind === 'abutment' && facet.kind === 'exterior'
+      ? { kind: 'abutment' as const }
+      : {}),
     openings: facet.openings.map((op) => clampWallOpeningToFacet(nextBase, op)),
     regions: facet.regions
       ? facet.regions.map((r) => clampWallRegionToFacet(nextBase, r))
@@ -1702,8 +1898,10 @@ export function syncWallPlanWithRoof(
     if (facet.kind === 'parapet' || facet.kind === 'wing' || facet.kind === 'secondary') {
       return facet;
     }
+    const facetLevelId = facet.levelId || facet.bodyId;
     const matchedId =
-      facet.roofEdgeId ?? findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
+      facet.roofEdgeId ??
+      findMatchingRoofEdgeId(facet.from, facet.to, roofLevels, facetLevelId);
     const shouldSync =
       options?.forceAllLinked
         ? Boolean(matchedId)
@@ -1722,7 +1920,9 @@ export function syncWallPlanWithRoof(
     );
     if (
       fitted.heightM !== facet.heightM ||
+      fitted.bottomZ !== facet.bottomZ ||
       fitted.topZ !== facet.topZ ||
+      fitted.kind !== facet.kind ||
       fitted.roofEdgeId !== facet.roofEdgeId ||
       JSON.stringify(fitted.roofProfile || null) !== JSON.stringify(facet.roofProfile || null)
     ) {
@@ -1839,18 +2039,31 @@ export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
   subRings.forEach((ring) => {
     if (ring.length < 3) return;
 
+    // Only wrap the closing corner when the sub-ring is genuinely closed.
+    // Open U/C chains (e.g. when a shared 2-tier abutment wall is owned by an upper tier)
+    // must never synthesize a fake corner across the open gap.
+    const isClosedRing = pointsClose(ring[ring.length - 1].to, ring[0].from, 0.18);
+
     // Signed area in screen-down 2D coordinates (x right, y down)
     let signedArea2 = 0;
     for (let i = 0; i < ring.length; i++) {
       const f = ring[i];
       signedArea2 += f.from.x * f.to.y - f.to.x * f.from.y;
     }
+    if (!isClosedRing) {
+      const lastPt = ring[ring.length - 1].to;
+      const firstPt = ring[0].from;
+      signedArea2 += lastPt.x * firstPt.y - firstPt.x * lastPt.y;
+    }
     const orientationSign = signedArea2 >= 0 ? 1 : -1;
-    const ringCorners: WallCornerTopologyItem[] = [];
+    const cornerByIndex = new Map<number, WallCornerTopologyItem>();
 
-    for (let i = 0; i < ring.length; i++) {
+    const startIdx = isClosedRing ? 0 : 1;
+    for (let i = startIdx; i < ring.length; i++) {
       const prev = ring[(i - 1 + ring.length) % ring.length];
       const curr = ring[i];
+      if (!pointsClose(prev.to, curr.from, 0.18)) continue;
+
       const lenA = dist(prev.from, prev.to) || 1;
       const lenB = dist(curr.from, curr.to) || 1;
       const ax = (prev.to.x - prev.from.x) / lenA;
@@ -1877,13 +2090,15 @@ export function analyzeWallPlanTopology(facets: WallFacet[]): WallPlanTopology {
         interiorAngleDeg
       };
       cornerDetails.push(cornerItem);
-      ringCorners.push(cornerItem);
+      cornerByIndex.set(i, cornerItem);
     }
 
     for (let i = 0; i < ring.length; i++) {
-      const startCorner = ringCorners[i];
-      const endCorner = ringCorners[(i + 1) % ring.length];
-      const isShortNib = ring[i].lengthM <= 2.2 && ring.length >= 6;
+      const startCorner = cornerByIndex.get(i);
+      const endCorner = isClosedRing
+        ? cornerByIndex.get((i + 1) % ring.length)
+        : cornerByIndex.get(i + 1);
+      const isShortNib = isClosedRing && ring[i].lengthM <= 2.2 && ring.length >= 6;
       if (startCorner?.kind === 'internal' || endCorner?.kind === 'internal' || isShortNib) {
         returnFacetIdSet.add(ring[i].id);
       }
@@ -2551,7 +2766,7 @@ export function splitWallFacetInPlan(
       ...f,
       code,
       name: f.name && !/^Wall [A-Z]+$/.test(f.name) ? f.name : `Wall ${code}`,
-      roofEdgeId: f.roofEdgeId ?? findMatchingRoofEdgeId(f.from, f.to, roofLevels)
+      roofEdgeId: f.roofEdgeId ?? findMatchingRoofEdgeId(f.from, f.to, roofLevels, f.levelId || f.bodyId)
     };
   });
 

@@ -173,7 +173,7 @@ export const RoofMapOffcutVisualizer: React.FC<Props> = ({
   };
 
   return (
-    <div className="space-y-4">
+    <div className={embedded ? 'space-y-3' : 'flex flex-col flex-1 min-h-0 h-full gap-3'}>
       {/* Toast Notice */}
       {saveSuccessNotice && (
         <div className="bg-emerald-950 text-emerald-200 border border-emerald-700 p-3 rounded-2xl text-xs font-bold flex items-center gap-2 shadow-lg animate-in fade-in slide-in-from-top-2">

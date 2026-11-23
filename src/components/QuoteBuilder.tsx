@@ -3813,7 +3813,7 @@ export const QuoteBuilder: React.FC<Props> = ({
               <span>Back to Quote</span>
             </button>
           </div>
-          <div className="flex-1 min-h-0 overflow-hidden">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col p-2">
             <ExactRoofingHub
               project={activeTakeoffProject}
               projects={projects}

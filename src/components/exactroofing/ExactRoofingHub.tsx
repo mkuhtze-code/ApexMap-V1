@@ -61,6 +61,11 @@ import {
   applyPitchToPlanes,
   applyDirectionToPlanes,
   applyOrderedSheetLengthToPlanes,
+  deleteRoofPlanes,
+  unsuppressOutlineEdges,
+  buildFacesFromClassification,
+  remapSkeletonForOutlineResize,
+  isStationaryEdgeType,
   dist
 } from '../../utils/exactRoofingEngine';
 import {
@@ -131,7 +136,9 @@ import {
   Unlock,
   FileImage,
   Package,
-  Undo2
+  Undo2,
+  PanelLeft,
+  AlertTriangle
 } from 'lucide-react';
 
 export type ExactRoofingHubTab =
@@ -457,14 +464,21 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setFlashingWorkshopView(initialWorkshopView);
   }, [initialWorkshopView]);
 
-  // 6. Inspector Drawer State (Open by default on Desktop except Install Pack home; closed Bottom-Sheet on Mobile)
+  // 6. Desktop Persistent Docks & Inspector Drawer State (Open on Desktop except Install Pack home)
+  const [isToolsDockOpen, setIsToolsDockOpen] = useState<boolean>(
+    () => !isMobile && resolvedInitialStage !== 'installing'
+  );
   const [isInspectorOpen, setIsInspectorOpen] = useState<boolean>(
     () => !isMobile && resolvedInitialStage !== 'installing'
   );
+  const [isMeasureExpanded, setIsMeasureExpanded] = useState<boolean>(false);
+  const [measureRightTab, setMeasureRightTab] = useState<'checklist' | 'inspect'>('checklist');
+  const [isPresetsExpanded, setIsPresetsExpanded] = useState<boolean>(false);
 
-  // Sync default inspector state when crossing mobile/desktop breakpoint
+  // Sync default dock/inspector state when crossing mobile/desktop breakpoint
   useEffect(() => {
     setIsInspectorOpen(!isMobile && lifecycleStage !== 'installing');
+    setIsToolsDockOpen(!isMobile && lifecycleStage !== 'installing');
   }, [isMobile]);
 
   // 7. Templates & Mobile Hub Popout Dropdowns
@@ -491,6 +505,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
   } | null>(null);
   const [layoutResult, setLayoutResult] = useState<LayoutResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [pendingAutoLinesConfirm, setPendingAutoLinesConfirm] = useState<{
+    targetIds: string[];
+    existingLineCount: number;
+    existingPlaneCount: number;
+  } | null>(null);
 
   // Hydrate saved snapshot whenever the scoped Project or Quote switches
   const lastHydratedKeyRef = useRef<string>('');
@@ -851,6 +870,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
         sheetOrderMode
       });
       setLayoutResult(res);
+    } else {
+      setLayoutResult(null);
     }
   }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks, sheetOrderMode]);
 
@@ -1047,7 +1068,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         ? scaleSkeletonUniformly(targetLvl.skeleton, options.scaleFactor, options.scaleAnchor).map(
             (s) => ({ ...s, levelId: s.levelId ?? targetLvl.id })
           )
-        : targetLvl.skeleton;
+        : remapSkeletonForOutlineResize(targetLvl.outline, normalizedOutline, targetLvl.skeleton);
 
     const nextLevels = levels.map((l) =>
       l.id === targetLvl.id
@@ -1137,6 +1158,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // Preserves empty / manually-drawn skeletons instead of auto-regenerating lines unexpectedly
   const handleSetEdgeMode = (edgeId: string, mode: 'hipped' | 'gable' | 'wall') => {
     if (isReadOnlyGeometry) return;
+    pushUndoSnapshot();
     const owningLvl = findLevelForEdge(edgeId);
     const usesManualOrEmptySkel =
       owningLvl.skeleton.length === 0 || owningLvl.skeleton.some((s) => !s.id.includes('skel-'));
@@ -1145,9 +1167,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
       const targetType: EdgeType =
         mode === 'gable' ? 'verge' : mode === 'wall' ? 'wall' : 'outline';
       const nextOutline = classifyOutlineEdge(owningLvl.outline, edgeId, targetType);
-      const nextLevels = levels.map((l) =>
+      let nextLevels = levels.map((l) =>
         l.id === owningLvl.id ? { ...l, outline: nextOutline } : l
       );
+      if (targetType === 'outline') {
+        nextLevels = unsuppressOutlineEdges(nextLevels, [edgeId]);
+      }
       const updatedPlanes = applyLevelsUpdate(nextLevels, planes);
       if (selectedPlaneId && !updatedPlanes.some((p) => p.id === selectedPlaneId)) {
         setSelectedPlaneId(null);
@@ -1167,9 +1192,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
       triggerNotice('At least 1 edge must remain a sloped roof eave');
       return;
     }
-    const nextLevels = levels.map((l) =>
+    let nextLevels = levels.map((l) =>
       l.id === owningLvl.id ? { ...l, outline: res.outline, skeleton: res.skeleton } : l
     );
+    if (mode === 'hipped') {
+      nextLevels = unsuppressOutlineEdges(nextLevels, [edgeId]);
+    }
     const updatedPlanes = applyLevelsUpdate(nextLevels, planes);
     if (selectedPlaneId && !updatedPlanes.some((p) => p.id === selectedPlaneId)) {
       setSelectedPlaneId(null);
@@ -1188,19 +1216,22 @@ export const ExactRoofingHub: React.FC<Props> = ({
     const owningLvl = findLevelForEdge(edgeId);
     const edge = owningLvl.outline.edges.find((e) => e.id === edgeId);
     const targetMode: 'hipped' | 'gable' =
-      forceMode ?? (edge?.type === 'verge' ? 'hipped' : 'gable');
+      forceMode ?? (edge?.type === 'verge' || edge?.type === 'rake' ? 'hipped' : 'gable');
     handleSetEdgeMode(edgeId, targetMode);
   };
 
   // Direct Edge Eave Length Resize (establishes exact wall/eave length for related facets)
   const handleUpdateEdgeLength = (edgeId: string, lengthM: number) => {
     if (isReadOnlyGeometry) return;
+    pushUndoSnapshot();
     const clampedLen = +Math.max(0.5, Math.min(100, lengthM)).toFixed(2);
     const owningLvl = findLevelForEdge(edgeId);
     const resizedOutline = updateEdgeLength(owningLvl.outline, edgeId, clampedLen);
-    const shouldRegenAuto =
-      owningLvl.skeleton.length > 0 && owningLvl.skeleton.every((s) => s.id.includes('skel-'));
-    const nextSkel = shouldRegenAuto ? generateSkeletonLines(resizedOutline) : owningLvl.skeleton;
+    const nextSkel = remapSkeletonForOutlineResize(
+      owningLvl.outline,
+      resizedOutline,
+      owningLvl.skeleton
+    );
     const nextLevels = levels.map((l) =>
       l.id === owningLvl.id ? { ...l, outline: resizedOutline, skeleton: nextSkel } : l
     );
@@ -1372,8 +1403,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedAssetId(null);
     setSelectedPitchBreakId(null);
     if (planeId) setSelectedWallFacetId(null);
-    if (planeId && !isInspectorOpen && !isMobile && lifecycleStage !== 'installing') {
-      setIsInspectorOpen(true);
+    if (planeId && !isMobile && lifecycleStage !== 'installing') {
+      if (!isInspectorOpen) setIsInspectorOpen(true);
+      if (lifecycleStage === 'measuring' && activeTab === 'measure_check' && !isMeasureExpanded) {
+        setMeasureRightTab('inspect');
+      }
     }
   };
 
@@ -1384,8 +1418,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setSelectedAssetId(null);
       setSelectedPitchBreakId(null);
     }
-    if (facetId && !isInspectorOpen && !isMobile) {
-      setIsInspectorOpen(true);
+    if (facetId && !isMobile) {
+      if (!isInspectorOpen) setIsInspectorOpen(true);
+      if (lifecycleStage === 'measuring' && activeTab === 'measure_check' && !isMeasureExpanded) {
+        setMeasureRightTab('inspect');
+      }
     }
   };
 
@@ -1414,14 +1451,21 @@ export const ExactRoofingHub: React.FC<Props> = ({
       wallPlan?.facets,
       planes
     );
-    if (!derived) return;
+    if (!derived) {
+      triggerNotice('Draw or load a closed roof outline first');
+      return;
+    }
     setWallPlan(derived);
     if (derived.facets[0]) {
       setSelectedWallFacetId(derived.facets[0].id);
+      setSelectedPlaneId(null);
+      setSelectedAssetId(null);
+      setSelectedPitchBreakId(null);
     }
-    setWallSubView('plan');
-    setWallViewKey((k) => k + 1);
-    setActiveTab('wall_plan');
+    setActiveTab('canvas_plan');
+    if (!isMobile) {
+      setIsInspectorOpen(true);
+    }
     const bodyCount = derived.bodies?.length || 1;
     triggerNotice(
       `✓ Built ${bodyCount} ${bodyCount === 1 ? 'body' : 'bodies'} · ${derived.facets.length} faces`
@@ -1436,6 +1480,25 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setWallSubView('elevation');
     setWallViewKey((k) => k + 1);
     setActiveTab('wall_plan');
+  };
+
+  const handleOpenWallElevationVerb = () => {
+    if (wallPlan && wallPlan.facets.length > 0) {
+      handleOpenWallElevation(selectedWallFacetId || wallPlan.facets[0].id);
+      return;
+    }
+    const derived = deriveWallPlanFromRoofLevels(
+      levels,
+      levels[0]?.eaveHeightM || 2.7,
+      undefined,
+      planes
+    );
+    if (!derived || derived.facets.length === 0) {
+      triggerNotice('Draw or load a closed roof outline first');
+      return;
+    }
+    setWallPlan(derived);
+    handleOpenWallElevation(derived.facets[0].id);
   };
 
   const applyRoofFromWallPlan = (sourcePlan: WallPlan) => {
@@ -1494,8 +1557,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedAssetId(assetId);
     setSelectedPitchBreakId(null);
     if (assetId) setSelectedWallFacetId(null);
-    if (assetId && !isInspectorOpen) {
-      setIsInspectorOpen(true);
+    if (assetId) {
+      if (!isInspectorOpen) setIsInspectorOpen(true);
+      if (!isMobile && lifecycleStage === 'measuring' && activeTab === 'measure_check' && !isMeasureExpanded) {
+        setMeasureRightTab('inspect');
+      }
     }
   };
 
@@ -1503,8 +1569,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedPitchBreakId(pbId);
     setSelectedAssetId(null);
     if (pbId) setSelectedWallFacetId(null);
-    if (pbId && !isInspectorOpen) {
-      setIsInspectorOpen(true);
+    if (pbId) {
+      if (!isInspectorOpen) setIsInspectorOpen(true);
+      if (!isMobile && lifecycleStage === 'measuring' && activeTab === 'measure_check' && !isMeasureExpanded) {
+        setMeasureRightTab('inspect');
+      }
     }
   };
 
@@ -1622,8 +1691,102 @@ export const ExactRoofingHub: React.FC<Props> = ({
     triggerNotice(`✓ Imported outline (${newOutline.points.length} corners)`);
   };
 
-  // Auto Generate Roof Lines (ONLY on explicit user button click; preserves existing verge/wall tags)
+  // Delete single or multiple roof faces cleanly (persists across subsequent unrelated edits; lines remain untouched)
+  const handleDeletePlanes = (planeIds: string[]) => {
+    if (isReadOnlyGeometry || planeIds.length === 0) return;
+    pushUndoSnapshot();
+    const idSet = new Set(planeIds);
+    const res = deleteRoofPlanes(levels, planes, planeIds);
+    setLevels(res.levels);
+    const focusLvl = res.levels.find((l) => l.id === focusedLevel.id) || res.levels[0];
+    if (focusLvl) {
+      setOutline(focusLvl.outline);
+      setSkeleton(focusLvl.skeleton);
+    }
+    setPlanes(res.planes);
+    setAssets((prev) => prev.filter((a) => !idSet.has(a.planeId)));
+    setPitchBreaks((prev) => prev.filter((pb) => !idSet.has(pb.planeId)));
+    if (selectedPlaneId && idSet.has(selectedPlaneId)) {
+      setSelectedPlaneId(null);
+    }
+    setSelectedPlaneIds((prev) => prev.filter((id) => !idSet.has(id)));
+    if (startPlaneId && idSet.has(startPlaneId)) {
+      setStartPlaneId(null);
+    }
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, res.levels, res.planes) : prev));
+    triggerNotice(
+      planeIds.length === 1
+        ? 'Roof face removed (outline & roof lines kept)'
+        : `Removed ${planeIds.length} roof faces (outline & roof lines kept)`
+    );
+  };
+
+  // Explicit user action: build/rebuild roof planes from classified eaves, gables & walls
+  const handleBuildFacesFromClassification = () => {
+    if (isReadOnlyGeometry) return;
+    if (!levels.some((l) => l.outline.points.length >= 3)) {
+      triggerNotice('Draw or load a roof outline first');
+      return;
+    }
+    pushUndoSnapshot();
+    const res = buildFacesFromClassification(levels, planes, 22.5);
+    const rebuiltIdSet = new Set(res.planes.map((p) => p.id));
+    setLevels(res.levels);
+    const focusLvl = res.levels.find((l) => l.id === focusedLevel.id) || res.levels[0];
+    if (focusLvl) {
+      setOutline(focusLvl.outline);
+      setSkeleton(focusLvl.skeleton);
+    }
+    setPlanes(res.planes);
+    setAssets((prev) => prev.filter((a) => rebuiltIdSet.has(a.planeId)));
+    setPitchBreaks((prev) => prev.filter((pb) => rebuiltIdSet.has(pb.planeId)));
+    if (selectedPlaneId && !rebuiltIdSet.has(selectedPlaneId)) {
+      setSelectedPlaneId(null);
+    }
+    setSelectedPlaneIds((prev) => prev.filter((id) => rebuiltIdSet.has(id)));
+    if (startPlaneId && !rebuiltIdSet.has(startPlaneId)) {
+      setStartPlaneId(null);
+    }
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, res.levels, res.planes) : prev));
+    if (res.planes.length === 0) {
+      triggerNotice('Classify at least 1 edge as Eave to build roof faces');
+    } else {
+      triggerNotice(`✓ Built ${res.planes.length} roof face${res.planes.length === 1 ? '' : 's'} from classification`);
+    }
+  };
+
+  const executeAutoLines = (targetIds: string[]) => {
+    pushUndoSnapshot();
+    let totalLines = 0;
+    const nextLevels = levels.map((l) => {
+      if (!targetIds.includes(l.id)) return l;
+      const preparedOutline: RoofOutline = {
+        ...l.outline,
+        edges: l.outline.edges.map((e) => ({
+          ...e,
+          type: isStationaryEdgeType(e.type) ? e.type : 'outline'
+        }))
+      };
+      const generated = generateSkeletonLines(preparedOutline).map((s) => ({
+        ...s,
+        levelId: s.levelId ?? l.id
+      }));
+      totalLines += generated.length;
+      return {
+        ...l,
+        outline: preparedOutline,
+        skeleton: generated,
+        suppressedPlaneEdgeIds: undefined
+      };
+    });
+    applyLevelsUpdate(nextLevels, planes);
+    setPendingAutoLinesConfirm(null);
+    triggerNotice(`✓ Generated ${totalLines} roof lines`);
+  };
+
+  // Auto Generate Roof Lines (ONLY on explicit user button click; confirms before replacing existing lines/faces)
   const handleRunAutoLines = () => {
+    if (isReadOnlyGeometry) return;
     const targetIds =
       activeLevelId === 'all' && levels.length > 1
         ? levels.filter((l) => l.outline.points.length >= 3).map((l) => l.id)
@@ -1636,25 +1799,25 @@ export const ExactRoofingHub: React.FC<Props> = ({
       return;
     }
 
-    let totalLines = 0;
-    const nextLevels = levels.map((l) => {
-      if (!targetIds.includes(l.id)) return l;
-      const preparedOutline: RoofOutline = {
-        ...l.outline,
-        edges: l.outline.edges.map((e) => ({
-          ...e,
-          type: e.type === 'verge' || e.type === 'wall' ? e.type : 'outline'
-        }))
-      };
-      const generated = generateSkeletonLines(preparedOutline).map((s) => ({
-        ...s,
-        levelId: s.levelId ?? l.id
-      }));
-      totalLines += generated.length;
-      return { ...l, outline: preparedOutline, skeleton: generated };
-    });
-    applyLevelsUpdate(nextLevels, planes);
-    triggerNotice(`✓ Generated ${totalLines} roof lines`);
+    const targetLevels = levels.filter((l) => targetIds.includes(l.id));
+    const existingLineCount = targetLevels.reduce((sum, l) => sum + l.skeleton.length, 0);
+    const existingPlaneCount = planes.filter((p) =>
+      targetIds.includes(p.levelId || 'level-1')
+    ).length;
+    const hasSuppressed = targetLevels.some(
+      (l) => (l.suppressedPlaneEdgeIds?.length || 0) > 0
+    );
+
+    if (existingLineCount > 0 || existingPlaneCount > 0 || hasSuppressed) {
+      setPendingAutoLinesConfirm({
+        targetIds,
+        existingLineCount,
+        existingPlaneCount
+      });
+      return;
+    }
+
+    executeAutoLines(targetIds);
   };
 
   // Classify a boundary edge without mutating skeleton or other edges' fall direction
@@ -1663,9 +1826,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
     pushUndoSnapshot();
     const owningLvl = findLevelForEdge(edgeId);
     const nextOutline = classifyOutlineEdge(owningLvl.outline, edgeId, edgeType);
-    const nextLevels = levels.map((l) =>
+    let nextLevels = levels.map((l) =>
       l.id === owningLvl.id ? { ...l, outline: nextOutline } : l
     );
+    if (edgeType === 'outline') {
+      nextLevels = unsuppressOutlineEdges(nextLevels, [edgeId]);
+    }
     applyLevelsUpdate(nextLevels, planes);
     triggerNotice(`✓ Classified edge as ${getRoofEdgeTypeMeta(edgeType).label}`);
   };
@@ -1729,12 +1895,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
     if (isReadOnlyGeometry || edgeIds.length === 0) return;
     pushUndoSnapshot();
     const targetSet = new Set(edgeIds);
-    const nextLevels = levels.map((lvl) => {
+    let nextLevels = levels.map((lvl) => {
       const matched = lvl.outline.edges.filter((e) => targetSet.has(e.id)).map((e) => e.id);
       return matched.length > 0
         ? { ...lvl, outline: applyEdgeType(lvl.outline, matched, edgeType) }
         : lvl;
     });
+    if (edgeType === 'outline') {
+      nextLevels = unsuppressOutlineEdges(nextLevels, edgeIds);
+    }
     applyLevelsUpdate(nextLevels, planes);
     triggerNotice(`✓ Classified ${edgeIds.length} edges as ${getRoofEdgeTypeMeta(edgeType).label}`);
   };
@@ -1893,9 +2062,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
     name: string;
   }) => {
     if (!selectedEdgeForPlane) return;
+    pushUndoSnapshot();
     const owningLvl = findLevelForEdge(selectedEdgeForPlane.id);
     let nextOutline = owningLvl.outline;
-    const nextSkel = owningLvl.skeleton;
+    let nextSkel = owningLvl.skeleton;
 
     const targetEaveId = options.eaveEdgeId || selectedEdgeForPlane.id;
     const targetEaveObjBefore =
@@ -1906,7 +2076,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       options.eaveLengthM > 0.3 &&
       Math.abs(options.eaveLengthM - currentLen) > 0.01
     ) {
+      const prevOut = nextOutline;
       nextOutline = updateEdgeLength(nextOutline, targetEaveId, options.eaveLengthM);
+      nextSkel = remapSkeletonForOutlineResize(prevOut, nextOutline, nextSkel);
     }
 
     // 1. Classify clicked edge as requested without shifting other edges' fall
@@ -1932,9 +2104,16 @@ export const ExactRoofingHub: React.FC<Props> = ({
       });
     }
 
-    const nextLevels = levels.map((l) =>
+    let nextLevels = levels.map((l) =>
       l.id === owningLvl.id ? { ...l, outline: nextOutline, skeleton: nextSkel } : l
     );
+    if (
+      targetEaveId !== selectedEdgeForPlane.id ||
+      options.edgeType === 'outline' ||
+      options.edgeType === 'unclassified'
+    ) {
+      nextLevels = unsuppressOutlineEdges(nextLevels, [targetEaveId]);
+    }
 
     const updatedEdge =
       nextOutline.edges.find((e) => e.id === targetEaveId) || targetEaveObjBefore;
@@ -2360,6 +2539,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setMeasureLocked(true);
     setLifecycleStage('installing');
     setActiveTab('layout_results');
+    setIsToolsDockOpen(false);
+    setIsInspectorOpen(false);
     persistSnapshotToProject(nextSnap);
     triggerNotice('Measure confirmed & locked · Order Pack emitted for site & yard');
   };
@@ -2472,22 +2653,38 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setMeasureLocked(false);
     setLifecycleStage('measuring');
     setActiveTab('measure_check');
+    setIsMeasureExpanded(false);
+    setMeasureRightTab('checklist');
+    if (!isMobile) {
+      setIsToolsDockOpen(true);
+      setIsInspectorOpen(true);
+    }
     persistSnapshotToProject(nextSnap);
     triggerNotice('Measure unlocked for variations & re-measure');
   };
 
   const handleSelectStage = (nextStage: RoofLifecycleStage) => {
+    const prevStage = lifecycleStage;
     setLifecycleStage(nextStage);
     setIsTemplateDropdownOpen(false);
     setIsMobileToolsOpen(false);
     setIsInstallViewsOpen(false);
     if (nextStage === 'installing') {
       setActiveTab('layout_results');
+      setIsToolsDockOpen(false);
       setIsInspectorOpen(false);
       setIsAiDrawerOpen(false);
       setIsAiCopilotOpen(false);
     } else if (nextStage === 'measuring') {
       setActiveTab('measure_check');
+      setIsMeasureExpanded(false);
+      setMeasureRightTab('checklist');
+      if (!isMobile) {
+        setIsInspectorOpen(true);
+        if (prevStage === 'installing') {
+          setIsToolsDockOpen(true);
+        }
+      }
     } else if (nextStage === 'quoting') {
       if (
         activeTab === 'measure_check' ||
@@ -2495,6 +2692,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
         activeTab === 'flashing_workshop'
       ) {
         setActiveTab('canvas_plan');
+      }
+      if (!isMobile && prevStage === 'installing') {
+        setIsToolsDockOpen(true);
+        setIsInspectorOpen(true);
       }
     }
   };
@@ -2649,14 +2850,32 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const templateDropdownMenu = isTemplateDropdownOpen && (
     <div className="absolute top-full left-0 mt-1.5 w-64 bg-[#0e1526] border border-slate-750 rounded-2xl p-1.5 shadow-2xl z-50 animate-in fade-in slide-in-from-top-1 space-y-0.5 max-h-[75vh] overflow-y-auto">
       <div className="px-2 py-1 text-[10px] font-mono uppercase text-slate-400 font-bold">
-        Contextual Tools &amp; Views
+        Actions &amp; Tools
       </div>
+      {!isReadOnlyGeometry && (
+        <button
+          type="button"
+          onClick={() => {
+            setIsTemplateDropdownOpen(false);
+            handleBuildWallFaces();
+          }}
+          className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 text-amber-200 hover:bg-amber-600/20 transition-colors cursor-pointer"
+        >
+          <span className="flex items-center gap-2">
+            <Building2 className="w-3.5 h-3.5 text-amber-400" />
+            <span>{wallPlan?.facets.length ? 'Refresh walls from roof' : 'Build walls from roof'}</span>
+          </span>
+          {wallPlan && wallPlan.facets.length > 0 && (
+            <span className="text-[10px] font-mono text-amber-400">{wallPlan.facets.length}</span>
+          )}
+        </button>
+      )}
+
       <button
         type="button"
         onClick={() => {
           setIsTemplateDropdownOpen(false);
-          setWallSubView('plan');
-          setActiveTab('wall_plan');
+          handleOpenWallElevationVerb();
         }}
         className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
           activeTab === 'wall_plan'
@@ -2664,8 +2883,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
             : 'text-slate-200 hover:bg-slate-800'
         }`}
       >
-        <Building2 className="w-3.5 h-3.5 text-amber-400" />
-        <span>Walls &amp; Elevations</span>
+        <Sliders className="w-3.5 h-3.5 text-amber-400" />
+        <span>Edit wall openings &amp; elevation</span>
       </button>
 
       <button
@@ -2681,7 +2900,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         }`}
       >
         <Box className="w-3.5 h-3.5 text-blue-400" />
-        <span>3D Roof &amp; Wall Model</span>
+        <span>Inspect 3D model</span>
       </button>
 
       <button
@@ -2697,7 +2916,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         }`}
       >
         <Scissors className="w-3.5 h-3.5 text-sky-400" />
-        <span>Sheet Cuts &amp; Offcuts</span>
+        <span>View sheet cuts &amp; offcuts</span>
       </button>
 
       <button
@@ -2713,7 +2932,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         }`}
       >
         <Ruler className="w-3.5 h-3.5 text-sky-400" />
-        <span>Flashings Workshop</span>
+        <span>Open flashings workshop</span>
       </button>
 
       {!isReadOnlyGeometry && canUndo && (
@@ -2821,6 +3040,30 @@ export const ExactRoofingHub: React.FC<Props> = ({
             <button onClick={() => setNotice(null)} className="text-emerald-400 ml-2 font-bold">
               ✕
             </button>
+          </div>
+        )}
+        {pendingAutoLinesConfirm && !isReadOnlyGeometry && (
+          <div className="fixed top-14 left-3 right-3 z-[86] bg-[#0b101d]/98 border border-amber-500/60 text-white px-3.5 py-2.5 rounded-2xl text-xs flex flex-col gap-2 shadow-2xl">
+            <div className="font-bold text-amber-200">
+              Replace {pendingAutoLinesConfirm.existingLineCount} existing roof lines &amp; rebuild{' '}
+              {pendingAutoLinesConfirm.existingPlaneCount} faces?
+            </div>
+            <div className="flex items-center gap-2 justify-end">
+              <button
+                type="button"
+                onClick={() => setPendingAutoLinesConfirm(null)}
+                className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold cursor-pointer"
+              >
+                Keep Existing
+              </button>
+              <button
+                type="button"
+                onClick={() => executeAutoLines(pendingAutoLinesConfirm.targetIds)}
+                className="px-3 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-extrabold cursor-pointer"
+              >
+                Overwrite Lines
+              </button>
+            </div>
           </div>
         )}
 
@@ -3251,11 +3494,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
               onUpdateOutline={handleUpdateOutline}
               onUpdateSkeleton={handleUpdateSkeleton}
               onSelectEdgeToDefine={(edge) => setSelectedEdgeForPlane(edge)}
-              onDeletePlane={(planeId) => {
-                setPlanes((prev) => prev.filter((p) => p.id !== planeId));
-                if (selectedPlaneId === planeId) setSelectedPlaneId(null);
-                triggerNotice('Roof area removed');
-              }}
+              onDeletePlane={(planeId) => handleDeletePlanes([planeId])}
+              onDeletePlanes={handleDeletePlanes}
+              onBuildFacesFromClassification={handleBuildFacesFromClassification}
               onRunSkeletonKey={handleRunAutoLines}
               onClearToBlank={handleStartBlank}
               onToggleJunctionGable={handleToggleJunctionGable}
@@ -3313,6 +3554,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 onBatchUpdateSkeletonType={handleBatchSkeletonLineType}
                 onUndo={handleUndo}
                 canUndo={canUndo}
+                wallPlan={wallPlan}
+                selectedWallFacetId={selectedWallFacetId}
+                selectedWallFacetIds={selectedWallFacetIds}
+                onSelectWallFacet={handleSelectWallFacet}
+                onChangeSelectedWallFacetIds={setSelectedWallFacetIds}
+                onOpenWallElevation={handleOpenWallElevation}
+                onBuildWallFaces={handleBuildWallFaces}
+                onBatchWallUpdate={handleBatchWallUpdate}
               />
           )}
 
@@ -3486,7 +3735,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               <div className="w-10 h-1 bg-slate-600 rounded-full mx-auto" />
               <div className="flex items-center justify-between">
                 <span className="text-xs font-extrabold uppercase tracking-wider text-slate-300">
-                  Contextual Tools &amp; Views
+                  Actions &amp; Tools
                 </span>
                 <button
                   type="button"
@@ -3497,12 +3746,27 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
+                {!isReadOnlyGeometry && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMobileToolsOpen(false);
+                      handleBuildWallFaces();
+                    }}
+                    className="min-h-[44px] px-3 rounded-2xl border bg-amber-950/40 border-amber-500/40 text-amber-200 text-left flex items-center justify-between text-xs font-bold cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Building2 className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>{wallPlan?.facets.length ? 'Refresh Walls' : 'Build Walls'}</span>
+                    </span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() => {
                     setIsMobileToolsOpen(false);
-                    setWallSubView('plan');
-                    setActiveTab('wall_plan');
+                    handleOpenWallElevationVerb();
                   }}
                   className={`min-h-[44px] px-3 rounded-2xl border text-left flex items-center justify-between text-xs font-bold cursor-pointer ${
                     activeTab === 'wall_plan'
@@ -3511,8 +3775,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   }`}
                 >
                   <span className="flex items-center gap-2">
-                    <Building2 className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>Walls</span>
+                    <Sliders className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span>Wall Elevation</span>
                   </span>
                 </button>
 
@@ -3530,7 +3794,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 >
                   <span className="flex items-center gap-2">
                     <Box className="w-4 h-4 text-blue-400 shrink-0" />
-                    <span>3D Model</span>
+                    <span>Inspect 3D</span>
                   </span>
                 </button>
 
@@ -3969,6 +4233,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onBatchEdgeHeight={handleBatchEdgeHeight}
           onBatchSkeletonLineType={handleBatchSkeletonLineType}
           onBatchWallUpdate={handleBatchWallUpdate}
+          onDeletePlane={(planeId) => handleDeletePlanes([planeId])}
+          onDeletePlanes={handleDeletePlanes}
+          onBuildFacesFromClassification={handleBuildFacesFromClassification}
           onUndo={handleUndo}
           canUndo={canUndo}
         />
@@ -4165,35 +4432,339 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // ============================================================================
   // DESKTOP / LARGE TABLET CAD WORKSPACE
   // ============================================================================
-  return (
-    <div
-      className={
-        isFullscreen
-          ? 'fixed inset-0 z-[75] bg-[#070b14] p-3 flex flex-col space-y-3 font-sans select-none overflow-hidden'
-          : 'w-full max-w-7xl mx-auto space-y-3 font-sans select-none pb-8'
+  const desktopRootClass = isFullscreen
+    ? 'fixed inset-0 z-[75] h-[100dvh] w-full bg-[#070b14] p-2 flex flex-col gap-2 font-sans select-none overflow-hidden text-white'
+    : embedded
+    ? 'w-full h-[calc(100dvh-130px)] min-h-[600px] flex flex-col gap-2 font-sans select-none overflow-hidden text-white'
+    : 'w-full flex-1 min-h-0 h-full flex flex-col gap-2 font-sans select-none overflow-hidden text-white';
+
+  const isMeasureSplitDesktop =
+    lifecycleStage === 'measuring' && activeTab === 'measure_check' && !isMeasureExpanded;
+  const isCanvasHeroMode =
+    activeTab === 'canvas_plan' || activeTab === 'view_3d' || isMeasureSplitDesktop;
+
+  const missingStructuralFlashings = assignableLines.filter(
+    (l) => l.flashingKind !== 'eave' && !flashingAssignments.some((a) => a.lineId === l.lineId)
+  );
+  const totalMultiSelectCount =
+    selectedPlaneIds.length +
+    selectedEdgeIds.length +
+    selectedSkeletonLineIds.length +
+    selectedWallFacetIds.length;
+  const hasAnySelection =
+    totalMultiSelectCount > 0 ||
+    Boolean(selectedPlaneId || selectedAssetId || selectedPitchBreakId || selectedWallFacetId);
+
+  const selectedWallFacetObj =
+    wallPlan?.facets.find((f) => f.id === selectedWallFacetId) || null;
+  const selectionSummaryLabel =
+    totalMultiSelectCount > 0
+      ? `${totalMultiSelectCount} selected`
+      : selectedPlane
+      ? `Area ${selectedPlane.code} (${selectedPlane.pitchDeg}°)`
+      : selectedWallFacetObj
+      ? `Wall ${selectedWallFacetObj.code}`
+      : selectedAsset
+      ? selectedAsset.label || selectedAsset.type
+      : selectedPitchBreak
+      ? 'Pitch break'
+      : 'No selection';
+
+  const desktopInspectorProps = {
+    lifecycleStage,
+    readOnlyGeometry: isReadOnlyGeometry,
+    selectedPlane,
+    selectedAsset,
+    selectedPitchBreak,
+    outline,
+    levels,
+    activeLevelId,
+    onSelectLevel: handleSelectLevel,
+    onAddLevel: handleAddLevel,
+    onUpdateLevelHeight: handleUpdateLevelHeight,
+    onDeleteLevel: handleDeleteLevel,
+    planes,
+    assets,
+    pitchBreaks,
+    layout: layoutResult,
+    startPlaneId: startPlaneId || layoutResult?.startPlaneId || null,
+    onToggleEdgeGable: handleToggleEdgeGable,
+    onSetEdgeMode: handleSetEdgeMode,
+    onUpdatePlaneEaveHeight: handleUpdatePlaneEaveHeight,
+    onUpdateEdgeLength: handleUpdateEdgeLength,
+    onUpdateEdgeWall: handleUpdateEdgeWall,
+    onApplyRoofStylePreset: handleApplyRoofStylePreset,
+    onSetStartPlane: handleSetStartPlane,
+    onUpdatePlanePitch: handleUpdatePlanePitch,
+    onUpdatePlaneDirection: handleUpdatePlaneDirection,
+    onUpdatePlaneOrderedSheetLength: handleUpdatePlaneOrderedSheetLength,
+    onSelectPlane: handleSelectPlane,
+    onSelectAsset: handleSelectAsset,
+    onUpdateAsset: (asset: RoofAsset) => {
+      if (isReadOnlyGeometry) return;
+      setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+    },
+    onDeleteAsset: (assetId: string) => {
+      if (isReadOnlyGeometry) return;
+      setAssets((prev) => prev.filter((a) => a.id !== assetId));
+      if (selectedAssetId === assetId) setSelectedAssetId(null);
+      triggerNotice('Feature removed');
+    },
+    onSelectPitchBreak: handleSelectPitchBreak,
+    onUpdatePitchBreak: (pb: PitchBreakLine) => {
+      if (isReadOnlyGeometry) return;
+      setPitchBreaks((prev) => prev.map((x) => (x.id === pb.id ? pb : x)));
+    },
+    onDeletePitchBreak: (pbId: string) => {
+      if (isReadOnlyGeometry) return;
+      setPitchBreaks((prev) => prev.filter((x) => x.id !== pbId));
+      if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
+      triggerNotice('Pitch break removed');
+    },
+    onOpenCutList: () => setActiveTab('layout_results'),
+    onOpenAiCopilot: () => setIsAiCopilotOpen(true),
+    assignableLines,
+    flashingAssignments,
+    onSelectLineForFlashing: (lineId: string) => setActiveFlashingLineId(lineId),
+    onOpenOrderModal: () => setIsOrderModalOpen(true),
+    wallPlan,
+    selectedWallFacetId,
+    onSelectWallFacet: handleSelectWallFacet,
+    onOpenWallElevation: handleOpenWallElevation,
+    onUpdateWallFacet: handleUpdateWallFacet,
+    onBuildWallFaces: handleBuildWallFaces,
+    wallFilterMode,
+    onChangeWallFilterMode: setWallFilterMode,
+    completenessReport,
+    onJumpToCompletenessIssue: handleJumpToCompletenessIssue,
+    selectedPlaneIds,
+    onChangeSelectedPlaneIds: setSelectedPlaneIds,
+    selectedEdgeIds,
+    onChangeSelectedEdgeIds: setSelectedEdgeIds,
+    selectedSkeletonLineIds,
+    onChangeSelectedSkeletonLineIds: setSelectedSkeletonLineIds,
+    selectedWallFacetIds,
+    onChangeSelectedWallFacetIds: setSelectedWallFacetIds,
+    onBatchPlanePitch: handleBatchPlanePitch,
+    onBatchPlaneDirection: handleBatchPlaneDirection,
+    onBatchPlaneOrderedSheetLength: handleBatchPlaneOrderedSheetLength,
+    onBatchPlaneEaveHeight: handleBatchPlaneEaveHeight,
+    onBatchEdgeType: handleBatchEdgeType,
+    onBatchEdgeWall: handleBatchEdgeWall,
+    onBatchEdgeHeight: handleBatchEdgeHeight,
+    onBatchSkeletonLineType: handleBatchSkeletonLineType,
+    onBatchWallUpdate: handleBatchWallUpdate,
+    onDeletePlane: (planeId: string) => handleDeletePlanes([planeId]),
+    onDeletePlanes: handleDeletePlanes,
+    onBuildFacesFromClassification: handleBuildFacesFromClassification,
+    onUndo: handleUndo,
+    canUndo
+  };
+
+  const renderPlanCanvas = () => (
+    <ExactRoofingCanvas
+      outline={outline}
+      skeleton={skeleton}
+      planes={planes}
+      levels={levels}
+      activeLevelId={activeLevelId}
+      onSelectLevel={handleSelectLevel}
+      onAddLevel={handleAddLevel}
+      onUpdateEdgeEaveHeight={handleUpdateEdgeEaveHeight}
+      onUpdateEdgeWall={handleUpdateEdgeWall}
+      onSetEdgeMode={handleSetEdgeMode}
+      selectedPlaneId={selectedPlaneId}
+      layout={layoutResult || undefined}
+      startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
+      assets={assets}
+      pitchBreaks={pitchBreaks}
+      selectedAssetId={selectedAssetId}
+      selectedPitchBreakId={selectedPitchBreakId}
+      onSetStartPlane={handleSetStartPlane}
+      onSelectPlane={handleSelectPlane}
+      onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
+      onUpdateOutline={handleUpdateOutline}
+      onUpdateSkeleton={handleUpdateSkeleton}
+      onSelectEdgeToDefine={(edge) => setSelectedEdgeForPlane(edge)}
+      onDeletePlane={(planeId) => handleDeletePlanes([planeId])}
+      onDeletePlanes={handleDeletePlanes}
+      onBuildFacesFromClassification={handleBuildFacesFromClassification}
+      onRunSkeletonKey={handleRunAutoLines}
+      onClearToBlank={handleStartBlank}
+      onToggleJunctionGable={handleToggleJunctionGable}
+      onToggleEdgeGable={handleToggleEdgeGable}
+      onAddAsset={(asset) => {
+        if (isReadOnlyGeometry) return;
+        setAssets((prev) => [...prev, asset]);
+        triggerNotice(`✓ Added ${asset.label || asset.type}`);
+      }}
+      onUpdateAsset={(asset) => {
+        if (isReadOnlyGeometry) return;
+        setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+      }}
+      onDeleteAsset={(assetId) => {
+        if (isReadOnlyGeometry) return;
+        setAssets((prev) => prev.filter((a) => a.id !== assetId));
+        if (selectedAssetId === assetId) setSelectedAssetId(null);
+        triggerNotice('Feature removed');
+      }}
+      onSelectAsset={handleSelectAsset}
+      onAddPitchBreak={(pb) => {
+        if (isReadOnlyGeometry) return;
+        setPitchBreaks((prev) => [...prev.filter((x) => x.planeId !== pb.planeId), pb]);
+        triggerNotice(`✓ Pitch break added (${pb.lowerPitchDeg}° apron)`);
+      }}
+      onDeletePitchBreak={(pbId) => {
+        if (isReadOnlyGeometry) return;
+        setPitchBreaks((prev) => prev.filter((p) => p.id !== pbId));
+        if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
+        triggerNotice('Pitch break removed');
+      }}
+      onSelectPitchBreak={handleSelectPitchBreak}
+      flashingAssignments={flashingAssignments}
+      assignableLines={assignableLines}
+      onSelectLineForFlashing={
+        isReadOnlyGeometry ? undefined : (lineId) => setActiveFlashingLineId(lineId)
       }
-    >
-      {/* Toast Notice */}
+      readOnlyGeometry={isReadOnlyGeometry}
+      customSequenceMap={customSequenceMap}
+      completedPlaneIds={installProgress.completedPlaneIds}
+      onInstallSelectPlane={handleInstallSelectPlaneTap}
+      onOpenAiAssistant={() => setIsAiDrawerOpen(true)}
+      onOpenInspector={() => {
+        setIsInspectorOpen(true);
+        if (isMeasureSplitDesktop) setMeasureRightTab('inspect');
+      }}
+      planUnderlay={planUnderlay}
+      projectPlans={projectPlans}
+      onUpdatePlanUnderlay={setPlanUnderlay}
+      openPlanModalSignal={openPlanModalSignal}
+      selectedPlaneIds={selectedPlaneIds}
+      onChangeSelectedPlaneIds={setSelectedPlaneIds}
+      selectedEdgeIds={selectedEdgeIds}
+      onChangeSelectedEdgeIds={setSelectedEdgeIds}
+      selectedSkeletonLineIds={selectedSkeletonLineIds}
+      onChangeSelectedSkeletonLineIds={setSelectedSkeletonLineIds}
+      onBatchUpdatePlanePitch={handleBatchPlanePitch}
+      onBatchClassifyEdges={handleBatchEdgeType}
+      onBatchUpdateSkeletonType={handleBatchSkeletonLineType}
+      onUndo={handleUndo}
+      canUndo={canUndo}
+      wallPlan={wallPlan}
+      selectedWallFacetId={selectedWallFacetId}
+      selectedWallFacetIds={selectedWallFacetIds}
+      onSelectWallFacet={handleSelectWallFacet}
+      onChangeSelectedWallFacetIds={setSelectedWallFacetIds}
+      onOpenWallElevation={handleOpenWallElevation}
+      onBuildWallFaces={handleBuildWallFaces}
+      onBatchWallUpdate={handleBatchWallUpdate}
+    />
+  );
+
+  const renderMeasureCheckFullView = () => (
+    <SiteMeasureCheckView
+      project={project}
+      planes={planes}
+      layout={layoutResult}
+      bom={roofBom}
+      assignableLines={assignableLines}
+      flashingAssignments={flashingAssignments}
+      assets={assets}
+      wallPlan={wallPlan}
+      completenessReport={completenessReport}
+      auditReport={deterministicAuditReport}
+      measureLocked={measureLocked}
+      sheetOrderMode={sheetOrderMode}
+      onChangeSheetOrderMode={handleChangeSheetOrderMode}
+      sheetOrderComparison={sheetOrderComparison}
+      onSelectPlane={(planeId) => {
+        handleSelectPlane(planeId);
+        setIsInspectorOpen(true);
+      }}
+      onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
+      onOpenPlanTab={() => setActiveTab('canvas_plan')}
+      onOpenPlaneEditor={(plane) => {
+        const edge = levels
+          .flatMap((l) => l.outline.edges)
+          .find((e) => e.id === plane.eaveEdgeId);
+        if (edge) setSelectedEdgeForPlane(edge);
+      }}
+      onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
+      onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
+      onApplyDeterministicPatches={handleApplyDeterministicPatches}
+      onOpenOrderModal={() => {
+        setOrderModalTab('orders');
+        setIsOrderModalOpen(true);
+      }}
+      onRecalculateLayout={handleGenerateLayoutClick}
+      onConfirmLockMeasure={handleRequestLockMeasure}
+    />
+  );
+
+  return (
+    <div className={desktopRootClass}>
+      {/* Floating Toast Notice (never shifts workspace layout) */}
       {notice && (
-        <div className="bg-emerald-950/90 text-emerald-200 border border-emerald-600/80 px-4 py-2.5 rounded-2xl text-xs font-bold flex items-center justify-between shadow-2xl animate-in fade-in slide-in-from-top-2">
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[90] max-w-md bg-emerald-950/95 text-emerald-100 border border-emerald-500/70 px-4 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-3 shadow-2xl animate-in fade-in slide-in-from-top-2">
           <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
             <span>{notice}</span>
           </div>
           <button
+            type="button"
             onClick={() => setNotice(null)}
-            className="text-emerald-400 hover:text-white font-bold cursor-pointer"
+            className="text-emerald-300 hover:text-white font-bold cursor-pointer"
           >
             ✕
           </button>
         </div>
       )}
+      {pendingAutoLinesConfirm && !isReadOnlyGeometry && (
+        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-[91] max-w-lg w-[calc(100%-24px)] bg-[#0b101d]/98 border border-amber-500/60 text-white px-4 py-2.5 rounded-xl text-xs flex items-center justify-between gap-3 shadow-2xl">
+          <span className="font-bold text-amber-200">
+            Overwrite {pendingAutoLinesConfirm.existingLineCount} existing roof lines &amp; rebuild{' '}
+            {pendingAutoLinesConfirm.existingPlaneCount} faces?
+          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setPendingAutoLinesConfirm(null)}
+              className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold cursor-pointer"
+            >
+              Keep Existing
+            </button>
+            <button
+              type="button"
+              onClick={() => executeAutoLines(pendingAutoLinesConfirm.targetIds)}
+              className="px-3 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-extrabold cursor-pointer"
+            >
+              Overwrite Lines
+            </button>
+          </div>
+        </div>
+      )}
 
-      {/* 1. CALM 3-ZONE SYSTEMS WORKSPACE BAR */}
-      <div className="bg-[#0b101d] border border-slate-800 rounded-2xl px-3.5 py-2.5 text-white shadow-xl shrink-0">
+      {/* 1. FULL-WIDTH TOP WORKSPACE BAR */}
+      <div className="bg-[#0b101d] border border-slate-800 rounded-xl px-3 py-2 text-white shadow-xl shrink-0">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          {/* Zone 1: Active Job & 3 Primary Modes (Quote | Measure | Install) */}
+          {/* Zone 1: Tools Dock Toggle (lg+) + 3 Primary Modes (Quote | Measure | Install) + Project */}
           <div className="flex flex-wrap items-center gap-2">
+            {lifecycleStage !== 'installing' && (
+              <button
+                type="button"
+                onClick={() => setIsToolsDockOpen((v) => !v)}
+                className={`hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                  isToolsDockOpen
+                    ? 'bg-slate-800 text-sky-300 border-sky-500/40'
+                    : 'bg-slate-900 hover:bg-slate-800 text-slate-400 border-slate-800 hover:text-white'
+                }`}
+                title="Toggle Tools Dock"
+              >
+                <PanelLeft className="w-3.5 h-3.5" />
+                <span className="hidden xl:inline">Tools</span>
+              </button>
+            )}
+
             <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
               {(['quoting', 'measuring', 'installing'] as const).map((st) => (
                 <button
@@ -4226,7 +4797,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               <select
                 value={project?.id || ''}
                 onChange={(e) => onSelectProject(e.target.value)}
-                className="bg-slate-900 border border-slate-800 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-200 max-w-[190px] truncate outline-none cursor-pointer"
+                className="bg-slate-900 border border-slate-800 rounded-xl px-2.5 py-1.5 text-xs font-bold text-slate-200 max-w-[180px] xl:max-w-[240px] truncate outline-none cursor-pointer"
                 aria-label="Active Project"
               >
                 {projects.map((p) => (
@@ -4238,7 +4809,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
             )}
           </div>
 
-          {/* Zone 2: Stage-Owned Main Workspace Switch + Contextual Tools */}
+          {/* Zone 2: Stage-Owned View Switch + Tablet (<lg) Contextual Tools */}
           <div className="flex items-center gap-1.5">
             {lifecycleStage === 'installing' ? (
               <>
@@ -4339,20 +4910,41 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 <div className="flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
                   <button
                     type="button"
-                    onClick={() => setActiveTab('measure_check')}
+                    onClick={() => {
+                      setActiveTab('measure_check');
+                      setIsMeasureExpanded(false);
+                      if (!isMobile) setIsInspectorOpen(true);
+                    }}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-extrabold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
-                      activeTab === 'measure_check'
+                      activeTab === 'measure_check' && !isMeasureExpanded
                         ? 'bg-emerald-600 text-white shadow-xs'
                         : 'text-slate-400 hover:text-white'
                     }`}
                   >
                     <ClipboardCheck className="w-3.5 h-3.5" />
-                    <span>Checklist</span>
+                    <span className="hidden lg:inline">Split Check</span>
+                    <span className="lg:hidden">Checklist</span>
                     {completenessReport.blockersCount > 0 && (
                       <span className="font-mono text-[10px] px-1.5 py-0.2 rounded bg-rose-600 text-white tabular-nums">
                         {completenessReport.blockersCount}
                       </span>
                     )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTab('measure_check');
+                      setIsMeasureExpanded(true);
+                    }}
+                    className={`hidden lg:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      activeTab === 'measure_check' && isMeasureExpanded
+                        ? 'bg-sky-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Ruler className="w-3.5 h-3.5" />
+                    <span>Full Tables</span>
                   </button>
 
                   <button
@@ -4369,7 +4961,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   </button>
                 </div>
 
-                <div className="relative" ref={templateDropdownRef}>
+                {/* Tablet (<lg) Tools Dropdown */}
+                <div className="relative lg:hidden" ref={templateDropdownRef}>
                   <button
                     type="button"
                     onClick={() => setIsTemplateDropdownOpen(!isTemplateDropdownOpen)}
@@ -4385,7 +4978,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                     <LayoutTemplate className="w-3.5 h-3.5 text-sky-400" />
                     <span>
                       {activeTab === 'wall_plan'
-                        ? 'Tools · Walls'
+                        ? 'Tools · Elevation'
                         : activeTab === 'view_3d'
                         ? 'Tools · 3D'
                         : activeTab === 'layout_results'
@@ -4416,7 +5009,50 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   </button>
                 )}
 
-                <div className="relative" ref={templateDropdownRef}>
+                {/* Quick desktop mode pills when tools dock is collapsed */}
+                {!isToolsDockOpen && (
+                  <div className="hidden lg:flex items-center p-0.5 bg-[#070b14] rounded-xl border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('canvas_plan')}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold cursor-pointer ${
+                        activeTab === 'canvas_plan' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Plan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('view_3d')}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold cursor-pointer ${
+                        activeTab === 'view_3d' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      3D
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleOpenWallElevationVerb}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold cursor-pointer ${
+                        activeTab === 'wall_plan' ? 'bg-amber-600 text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Walls
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleGenerateLayoutClick}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold cursor-pointer ${
+                        activeTab === 'layout_results' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Cuts
+                    </button>
+                  </div>
+                )}
+
+                {/* Tablet (<lg) Tools Dropdown */}
+                <div className="relative lg:hidden" ref={templateDropdownRef}>
                   <button
                     type="button"
                     onClick={() => setIsTemplateDropdownOpen(!isTemplateDropdownOpen)}
@@ -4429,7 +5065,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                     <LayoutTemplate className="w-3.5 h-3.5 text-sky-400" />
                     <span>
                       {activeTab === 'wall_plan'
-                        ? 'Tools · Walls'
+                        ? 'Tools · Elevation'
                         : activeTab === 'view_3d'
                         ? 'Tools · 3D'
                         : activeTab === 'layout_results'
@@ -4489,9 +5125,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
                     title="Confirm & lock site measure to emit Order Pack"
                   >
                     <Lock className="w-3.5 h-3.5" />
-                    <span>
+                    <span className="tabular-nums">
                       {completenessReport.blockersCount > 0
-                        ? `Confirm & lock (${completenessReport.blockersCount} blocker${completenessReport.blockersCount === 1 ? '' : 's'})`
+                        ? `Confirm & lock (${completenessReport.blockersCount})`
                         : 'Confirm & lock'}
                     </span>
                   </button>
@@ -4532,7 +5168,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                     title="Unlock for variation"
                   >
                     <Unlock className="w-3 h-3" />
-                    <span>Unlock (Variation)</span>
+                    <span>Unlock</span>
                   </button>
                 )}
               </div>
@@ -4551,14 +5187,23 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
             <button
               onClick={() => setIsInspectorOpen(!isInspectorOpen)}
-              className={`p-2 rounded-xl text-xs font-bold transition-all cursor-pointer border flex items-center gap-1.5 shrink-0 ${
+              className={`px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer border flex items-center gap-1.5 shrink-0 ${
                 isInspectorOpen
                   ? 'bg-slate-800 text-sky-400 border-sky-500/50'
                   : 'bg-slate-900 hover:bg-slate-800 text-slate-400 border-slate-800 hover:text-white'
               }`}
-              title={lifecycleStage === 'installing' ? 'Toggle Job Spec Panel' : 'Toggle Inspector Drawer'}
+              title={
+                lifecycleStage === 'installing'
+                  ? 'Toggle Job Spec Panel'
+                  : isMeasureSplitDesktop
+                  ? 'Toggle Measure & Inspect Dock'
+                  : 'Toggle Inspect Panel'
+              }
             >
-              <Sliders className="w-4 h-4" />
+              <Sliders className="w-3.5 h-3.5" />
+              <span className="hidden xl:inline">
+                {lifecycleStage === 'installing' ? 'Job Spec' : 'Inspect'}
+              </span>
             </button>
 
             {embedded && (
@@ -4582,362 +5227,720 @@ export const ExactRoofingHub: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* 2. MAIN CAD WORKSPACE CONTAINER */}
-      <div
-        className={`flex flex-row w-full relative overflow-hidden rounded-3xl border border-slate-800 bg-[#070b14] shadow-2xl ${
-          isFullscreen ? 'flex-1 min-h-0' : 'h-[calc(100vh-190px)] min-h-[560px]'
-        }`}
-      >
-        {/* Main View Area */}
-        <div className="flex-1 h-full relative overflow-y-auto overflow-x-hidden flex flex-col p-2 sm:p-3">
-          {activeTab === 'canvas_plan' && (
-            <ExactRoofingCanvas
-              outline={outline}
-              skeleton={skeleton}
-              planes={planes}
-              levels={levels}
-              activeLevelId={activeLevelId}
-              onSelectLevel={handleSelectLevel}
-              onAddLevel={handleAddLevel}
-              onUpdateEdgeEaveHeight={handleUpdateEdgeEaveHeight}
-              onUpdateEdgeWall={handleUpdateEdgeWall}
-              onSetEdgeMode={handleSetEdgeMode}
-              selectedPlaneId={selectedPlaneId}
-              layout={layoutResult || undefined}
-              startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
-              assets={assets}
-              pitchBreaks={pitchBreaks}
-              selectedAssetId={selectedAssetId}
-              selectedPitchBreakId={selectedPitchBreakId}
-              onSetStartPlane={handleSetStartPlane}
-              onSelectPlane={handleSelectPlane}
-              onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
-              onUpdateOutline={handleUpdateOutline}
-              onUpdateSkeleton={handleUpdateSkeleton}
-              onSelectEdgeToDefine={(edge) => setSelectedEdgeForPlane(edge)}
-              onDeletePlane={(planeId) => {
-                if (isReadOnlyGeometry) return;
-                setPlanes((prev) => prev.filter((p) => p.id !== planeId));
-                if (selectedPlaneId === planeId) setSelectedPlaneId(null);
-                triggerNotice('Roof area removed');
-              }}
-              onRunSkeletonKey={handleRunAutoLines}
-              onClearToBlank={handleStartBlank}
-              onToggleJunctionGable={handleToggleJunctionGable}
-              onToggleEdgeGable={handleToggleEdgeGable}
-              onAddAsset={(asset) => {
-                if (isReadOnlyGeometry) return;
-                setAssets((prev) => [...prev, asset]);
-                triggerNotice(`✓ Added ${asset.label || asset.type}`);
-              }}
-              onUpdateAsset={(asset) => {
-                if (isReadOnlyGeometry) return;
-                setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
-              }}
-              onDeleteAsset={(assetId) => {
-                if (isReadOnlyGeometry) return;
-                setAssets((prev) => prev.filter((a) => a.id !== assetId));
-                if (selectedAssetId === assetId) setSelectedAssetId(null);
-                triggerNotice('Feature removed');
-              }}
-              onSelectAsset={handleSelectAsset}
-              onAddPitchBreak={(pb) => {
-                if (isReadOnlyGeometry) return;
-                setPitchBreaks((prev) => [...prev.filter((x) => x.planeId !== pb.planeId), pb]);
-                triggerNotice(`✓ Pitch break added (${pb.lowerPitchDeg}° apron)`);
-              }}
-              onDeletePitchBreak={(pbId) => {
-                if (isReadOnlyGeometry) return;
-                setPitchBreaks((prev) => prev.filter((p) => p.id !== pbId));
-                if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
-                triggerNotice('Pitch break removed');
-              }}
-              onSelectPitchBreak={handleSelectPitchBreak}
-              flashingAssignments={flashingAssignments}
-              assignableLines={assignableLines}
-              onSelectLineForFlashing={
-                isReadOnlyGeometry ? undefined : (lineId) => setActiveFlashingLineId(lineId)
-              }
-              readOnlyGeometry={isReadOnlyGeometry}
-              customSequenceMap={customSequenceMap}
-              completedPlaneIds={installProgress.completedPlaneIds}
-              onInstallSelectPlane={handleInstallSelectPlaneTap}
-              onOpenAiAssistant={() => setIsAiDrawerOpen(true)}
-              onOpenInspector={() => setIsInspectorOpen(true)}
-              planUnderlay={planUnderlay}
-              projectPlans={projectPlans}
-              onUpdatePlanUnderlay={setPlanUnderlay}
-              openPlanModalSignal={openPlanModalSignal}
-              selectedPlaneIds={selectedPlaneIds}
-              onChangeSelectedPlaneIds={setSelectedPlaneIds}
-              selectedEdgeIds={selectedEdgeIds}
-              onChangeSelectedEdgeIds={setSelectedEdgeIds}
-              selectedSkeletonLineIds={selectedSkeletonLineIds}
-              onChangeSelectedSkeletonLineIds={setSelectedSkeletonLineIds}
-              onBatchUpdatePlanePitch={handleBatchPlanePitch}
-              onBatchClassifyEdges={handleBatchEdgeType}
-              onBatchUpdateSkeletonType={handleBatchSkeletonLineType}
-              onUndo={handleUndo}
-              canUndo={canUndo}
-            />
-          )}
-
-          {activeTab === 'wall_plan' && (
-            <WallPlanWorkspace
-              key={wallViewKey}
-              wallPlan={wallPlan}
-              levels={levels}
-              roofPlanes={planes}
-              projectPlans={projectPlans}
-              planUnderlay={planUnderlay}
-              selectedWallFacetId={selectedWallFacetId}
-              onSelectWallFacet={handleSelectWallFacet}
-              onUpdateWallPlan={handleUpdateWallPlan}
-              onUpdateWallFacet={handleUpdateWallFacet}
-              onBatchUpdateFacets={handleBatchWallUpdate}
-              wallFilterMode={wallFilterMode}
-              onChangeWallFilterMode={setWallFilterMode}
-              multiSelectedFacetIds={selectedWallFacetIds}
-              onChangeMultiSelectedFacetIds={setSelectedWallFacetIds}
-              onBuildRoofFromWalls={handleBuildRoofFromWallPlan}
-              initialSubView={wallSubView}
-              readOnly={isReadOnlyGeometry}
-            />
-          )}
-
-          {activeTab === 'view_3d' && (
-            <ExactRoofing3DViewer
-              outline={outline}
-              skeleton={skeleton}
-              planes={planes}
-              levels={levels}
-              assets={assets}
-              pitchBreaks={pitchBreaks}
-              wallPlan={wallPlan}
-              selectedPlaneId={selectedPlaneId}
-              onSelectPlane={handleSelectPlane}
-              selectedWallFacetId={selectedWallFacetId}
-              onSelectWallFacet={handleSelectWallFacet}
-              wallFilterMode={wallFilterMode}
-              onChangeWallFilterMode={setWallFilterMode}
-              roofProfileName={project?.profile}
-              coilColorName={project?.colorName}
-            />
-          )}
-
-          {activeTab === 'layout_results' && (
-            layoutResult ? (
-              <OffcutLayoutVisualizer
-                layout={layoutResult}
-                planes={planes}
-                selectedPlaneId={selectedPlaneId}
-                startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
-                onSetStartPlane={handleSetStartPlane}
-                onSelectPlane={handleSelectPlane}
-                projectName={
-                  project?.title ||
-                  (selectedPreset === 'l_shape_standard'
-                    ? 'L-Shape Hip & Valley'
-                    : selectedPreset === 'straight_gable'
-                    ? 'Classic Duo-Pitch Gable'
-                    : selectedPreset === 't_shape'
-                    ? 'T-Shape Villa'
-                    : selectedPreset === 'two_storey_split'
-                    ? '2-Storey Split Roof'
-                    : selectedPreset === 'cascading_terrace'
-                    ? 'Cascading Terraced Roof'
-                    : '14m × 10m Hip & Valley')
-                }
-                siteAddress={project?.siteAddress}
-                roofProfileLabel={project?.profile}
-                coilColorLabel={project?.colorName}
-                windZoneLabel={project?.windZone}
-                onRegenerateLayout={handleGenerateLayoutClick}
-                onOpenPlaneEditor={(plane) => {
-                  if (isReadOnlyGeometry) return;
-                  const edge = levels
-                    .flatMap((l) => l.outline.edges)
-                    .find((e) => e.id === plane.eaveEdgeId);
-                  if (edge) setSelectedEdgeForPlane(edge);
-                }}
-                lifecycleStage={lifecycleStage}
-                measureLocked={measureLocked}
-                roofingPacks={roofingPacks}
-                installProgress={installProgress}
-                onUpdateInstallProgress={handleUpdateInstallProgress}
-                sheetOrderMode={sheetOrderMode}
-                onChangeSheetOrderMode={handleChangeSheetOrderMode}
-                sheetOrderComparison={sheetOrderComparison}
-              />
-            ) : (
-              <div className="h-full flex items-center justify-center p-6">
-                <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-6 max-w-md text-center space-y-2.5">
-                  <Package className="w-8 h-8 text-slate-500 mx-auto" />
-                  <div className="text-base font-black text-white">No sheet packs computed yet</div>
-                  <p className="text-xs text-slate-400">
-                    Define roof faces in Quote or Measure first to generate pack sequencing and cut sheets.
-                  </p>
-                </div>
+      {/* 2. FULL-VIEWPORT MULTI-COLUMN CAD WORKSPACE */}
+      <div className="flex-1 min-h-0 flex flex-row w-full relative overflow-hidden rounded-2xl border border-slate-800 bg-[#070b14] shadow-2xl">
+        {/* LEFT PERSISTENT TOOLS DOCK (Desktop lg+, hidden in Install stage for purity) */}
+        {isToolsDockOpen && lifecycleStage !== 'installing' && (
+          <aside className="hidden lg:flex w-52 xl:w-56 shrink-0 bg-[#0b101d] border-r border-slate-800 flex-col h-full min-h-0 overflow-y-auto p-2.5 gap-3">
+            {/* Workspace Views */}
+            <div className="space-y-1">
+              <div className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-slate-500 font-bold">
+                Workspace
               </div>
-            )
-          )}
+              <button
+                type="button"
+                onClick={() => setActiveTab('canvas_plan')}
+                className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+                  activeTab === 'canvas_plan'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                }`}
+              >
+                <Compass className="w-3.5 h-3.5 shrink-0" />
+                <span>Site Plan (Roof + Walls)</span>
+              </button>
 
-          {activeTab === 'measure_check' && (
-            <SiteMeasureCheckView
-              project={project}
-              planes={planes}
-              layout={layoutResult}
-              bom={roofBom}
-              assignableLines={assignableLines}
-              flashingAssignments={flashingAssignments}
-              assets={assets}
-              wallPlan={wallPlan}
-              completenessReport={completenessReport}
-              auditReport={deterministicAuditReport}
-              measureLocked={measureLocked}
-              sheetOrderMode={sheetOrderMode}
-              onChangeSheetOrderMode={handleChangeSheetOrderMode}
-              sheetOrderComparison={sheetOrderComparison}
-              onSelectPlane={(planeId) => {
-                handleSelectPlane(planeId);
-                setIsInspectorOpen(true);
-              }}
-              onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
-              onOpenPlanTab={() => setActiveTab('canvas_plan')}
-              onOpenPlaneEditor={(plane) => {
-                const edge = levels
-                  .flatMap((l) => l.outline.edges)
-                  .find((e) => e.id === plane.eaveEdgeId);
-                if (edge) setSelectedEdgeForPlane(edge);
-              }}
-              onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
-              onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
-              onApplyDeterministicPatches={handleApplyDeterministicPatches}
-              onOpenOrderModal={() => {
-                setOrderModalTab('orders');
-                setIsOrderModalOpen(true);
-              }}
-              onRecalculateLayout={handleGenerateLayoutClick}
-              onConfirmLockMeasure={handleRequestLockMeasure}
-            />
-          )}
+              {lifecycleStage === 'measuring' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('measure_check');
+                    setIsMeasureExpanded(false);
+                    setIsInspectorOpen(true);
+                    setMeasureRightTab('checklist');
+                  }}
+                  className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                    activeTab === 'measure_check'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                  }`}
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <ClipboardCheck className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Measure Checklist</span>
+                  </span>
+                  {completenessReport.blockersCount > 0 && (
+                    <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white font-mono text-[10px] tabular-nums shrink-0">
+                      {completenessReport.blockersCount}
+                    </span>
+                  )}
+                </button>
+              )}
 
-          {activeTab === 'flashing_workshop' && (
-            <div className="p-1 sm:p-2">
-              {lifecycleStage === 'installing' ? (
-                <ContractorFlashingGuide
-                  project={project}
-                  assignableLines={assignableLines}
-                  assignments={flashingAssignments}
-                  libraryProfiles={libraryProfiles}
-                  bom={roofBom}
+              <button
+                type="button"
+                onClick={() => setActiveTab('view_3d')}
+                className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+                  activeTab === 'view_3d'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                }`}
+              >
+                <Box className="w-3.5 h-3.5 shrink-0" />
+                <span>3D Model</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleGenerateLayoutClick}
+                className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+                  activeTab === 'layout_results'
+                    ? 'bg-sky-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                }`}
+              >
+                <Scissors className="w-3.5 h-3.5 shrink-0" />
+                <span>Sheet Cuts &amp; Offcuts</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleOpenWallElevationVerb}
+                className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+                  activeTab === 'wall_plan'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                }`}
+              >
+                <Sliders className="w-3.5 h-3.5 shrink-0" />
+                <span>Wall Openings &amp; Elev</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveTab('flashing_workshop')}
+                className={`w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+                  activeTab === 'flashing_workshop'
+                    ? 'bg-sky-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                }`}
+              >
+                <Ruler className="w-3.5 h-3.5 shrink-0" />
+                <span>Flashings Workshop</span>
+              </button>
+            </div>
+
+            {/* Site Actions (Verbs) */}
+            {!isReadOnlyGeometry && (
+              <div className="space-y-1 pt-2 border-t border-slate-800/80">
+                <div className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-slate-500 font-bold">
+                  Site Actions
+                </div>
+                <button
+                  type="button"
+                  onClick={handleBuildWallFaces}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 text-amber-200 hover:bg-amber-600/20 transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <Building2 className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span className="truncate">
+                      {wallPlan?.facets.length ? 'Refresh walls' : 'Build walls from roof'}
+                    </span>
+                  </span>
+                  {wallPlan && wallPlan.facets.length > 0 && (
+                    <span className="text-[10px] font-mono text-amber-400 tabular-nums shrink-0">
+                      {wallPlan.facets.length}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleBuildFacesFromClassification}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 text-sky-200 hover:bg-sky-600/20 transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <Compass className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span className="truncate">Build faces from edges</span>
+                  </span>
+                  {planes.length > 0 && (
+                    <span className="text-[10px] font-mono text-sky-400 tabular-nums shrink-0">
+                      {planes.length}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!canUndo}
+                  onClick={handleUndo}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 text-slate-300 hover:bg-slate-800/80 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-2">
+                    <Undo2 className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+                    <span>Undo Edit</span>
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-500">⌘Z</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('canvas_plan');
+                    setOpenPlanModalSignal((s) => s + 1);
+                  }}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-amber-300 hover:bg-amber-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+                >
+                  <FileImage className="w-3.5 h-3.5 shrink-0" />
+                  <span>2-Pt Plan Scale</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setIsImportModalOpen(true)}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-blue-300 hover:bg-blue-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5 shrink-0" />
+                  <span>Import SVG / DXF</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleStartBlank}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-emerald-300 hover:bg-emerald-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5 shrink-0" />
+                  <span>Draw Blank</span>
+                </button>
+              </div>
+            )}
+
+            {/* Collapsible Roof Presets */}
+            {!isReadOnlyGeometry && (
+              <div className="pt-2 border-t border-slate-800/80">
+                <button
+                  type="button"
+                  onClick={() => setIsPresetsExpanded((v) => !v)}
+                  className="w-full px-2 py-1 flex items-center justify-between text-[10px] font-mono uppercase tracking-wider text-slate-400 hover:text-white font-bold cursor-pointer"
+                >
+                  <span>Roof Presets</span>
+                  <ChevronDown
+                    className={`w-3.5 h-3.5 transition-transform ${
+                      isPresetsExpanded ? 'rotate-180' : ''
+                    }`}
+                  />
+                </button>
+                {isPresetsExpanded && (
+                  <div className="mt-1 space-y-0.5">
+                    {[
+                      { key: 'rectangle_14x10' as const, label: '14m × 10m Hip & Ridge' },
+                      { key: 'l_shape_standard' as const, label: 'L-Shape Valley & Hips' },
+                      { key: 'straight_gable' as const, label: 'Classic Duo-Pitch Gable' },
+                      { key: 't_shape' as const, label: 'T-Shape Villa' },
+                      { key: 'two_storey_split' as const, label: '2-Storey Upper + Lower' },
+                      { key: 'cascading_terrace' as const, label: 'Cascading Terraced Roof' }
+                    ].map((item) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onClick={() => handleSelectPreset(item.key)}
+                        className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[11px] font-bold flex items-center justify-between transition-colors cursor-pointer ${
+                          selectedPreset === item.key
+                            ? 'bg-blue-600 text-white'
+                            : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                        }`}
+                      >
+                        <span className="truncate">{item.label}</span>
+                        {selectedPreset === item.key && <span className="text-[10px]">✓</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </aside>
+        )}
+
+        {/* CENTER WORKSPACE COLUMN (Canvas / 3D / Views + Quiet Status Strip) */}
+        <div className="flex-1 min-w-0 h-full min-h-0 flex flex-col overflow-hidden">
+          <div
+            className={
+              isCanvasHeroMode
+                ? 'flex-1 min-w-0 min-h-0 relative flex flex-col overflow-hidden p-1.5'
+                : 'flex-1 min-w-0 min-h-0 relative overflow-y-auto overflow-x-hidden flex flex-col p-2.5 sm:p-3'
+            }
+          >
+            {activeTab === 'canvas_plan' && renderPlanCanvas()}
+
+            {isMeasureSplitDesktop && (
+              <>
+                <div className="hidden lg:flex flex-1 min-h-0 min-w-0 flex-col">
+                  {renderPlanCanvas()}
+                </div>
+                <div className="lg:hidden flex-1 min-h-0 overflow-y-auto">
+                  {renderMeasureCheckFullView()}
+                </div>
+              </>
+            )}
+
+            {activeTab === 'measure_check' && !isMeasureSplitDesktop && renderMeasureCheckFullView()}
+
+            {activeTab === 'wall_plan' && (
+              <WallPlanWorkspace
+                key={wallViewKey}
+                wallPlan={wallPlan}
+                levels={levels}
+                roofPlanes={planes}
+                projectPlans={projectPlans}
+                planUnderlay={planUnderlay}
+                selectedWallFacetId={selectedWallFacetId}
+                onSelectWallFacet={handleSelectWallFacet}
+                onUpdateWallPlan={handleUpdateWallPlan}
+                onUpdateWallFacet={handleUpdateWallFacet}
+                onBatchUpdateFacets={handleBatchWallUpdate}
+                wallFilterMode={wallFilterMode}
+                onChangeWallFilterMode={setWallFilterMode}
+                multiSelectedFacetIds={selectedWallFacetIds}
+                onChangeMultiSelectedFacetIds={setSelectedWallFacetIds}
+                onBuildRoofFromWalls={handleBuildRoofFromWallPlan}
+                initialSubView={wallSubView}
+                readOnly={isReadOnlyGeometry}
+              />
+            )}
+
+            {activeTab === 'view_3d' && (
+              <ExactRoofing3DViewer
+                outline={outline}
+                skeleton={skeleton}
+                planes={planes}
+                levels={levels}
+                assets={assets}
+                pitchBreaks={pitchBreaks}
+                wallPlan={wallPlan}
+                selectedPlaneId={selectedPlaneId}
+                onSelectPlane={handleSelectPlane}
+                selectedWallFacetId={selectedWallFacetId}
+                onSelectWallFacet={handleSelectWallFacet}
+                wallFilterMode={wallFilterMode}
+                onChangeWallFilterMode={setWallFilterMode}
+                roofProfileName={project?.profile}
+                coilColorName={project?.colorName}
+              />
+            )}
+
+            {activeTab === 'layout_results' && (
+              layoutResult ? (
+                <OffcutLayoutVisualizer
+                  layout={layoutResult}
+                  planes={planes}
+                  selectedPlaneId={selectedPlaneId}
+                  startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
+                  onSetStartPlane={handleSetStartPlane}
+                  onSelectPlane={handleSelectPlane}
+                  projectName={
+                    project?.title ||
+                    (selectedPreset === 'l_shape_standard'
+                      ? 'L-Shape Hip & Valley'
+                      : selectedPreset === 'straight_gable'
+                      ? 'Classic Duo-Pitch Gable'
+                      : selectedPreset === 't_shape'
+                      ? 'T-Shape Villa'
+                      : selectedPreset === 'two_storey_split'
+                      ? '2-Storey Split Roof'
+                      : selectedPreset === 'cascading_terrace'
+                      ? 'Cascading Terraced Roof'
+                      : '14m × 10m Hip & Valley')
+                  }
+                  siteAddress={project?.siteAddress}
+                  roofProfileLabel={project?.profile}
+                  coilColorLabel={project?.colorName}
+                  windZoneLabel={project?.windZone}
+                  onRegenerateLayout={handleGenerateLayoutClick}
+                  onOpenPlaneEditor={(plane) => {
+                    if (isReadOnlyGeometry) return;
+                    const edge = levels
+                      .flatMap((l) => l.outline.edges)
+                      .find((e) => e.id === plane.eaveEdgeId);
+                    if (edge) setSelectedEdgeForPlane(edge);
+                  }}
+                  lifecycleStage={lifecycleStage}
+                  measureLocked={measureLocked}
+                  roofingPacks={roofingPacks}
+                  installProgress={installProgress}
+                  onUpdateInstallProgress={handleUpdateInstallProgress}
+                  sheetOrderMode={sheetOrderMode}
+                  onChangeSheetOrderMode={handleChangeSheetOrderMode}
+                  sheetOrderComparison={sheetOrderComparison}
                 />
               ) : (
-                <FlashingWorkshop
-                  view={flashingWorkshopView}
-                  onChangeView={setFlashingWorkshopView}
-                  projects={projects.length > 0 ? projects : project ? [project] : []}
-                  project={project}
-                  activeMemberName={activeMemberName || 'Archtech team'}
-                  theme="dark"
-                  roofAssignments={flashingAssignments}
-                  onUpdateProject={onUpdateProject}
-                />
+                <div className="h-full flex items-center justify-center p-6">
+                  <div className="bg-[#0b101d] border border-slate-800 rounded-2xl p-6 max-w-md text-center space-y-2.5">
+                    <Package className="w-8 h-8 text-slate-500 mx-auto" />
+                    <div className="text-base font-black text-white">No sheet packs computed yet</div>
+                    <p className="text-xs text-slate-400">
+                      Define roof faces in Quote or Measure first to generate pack sequencing and cut sheets.
+                    </p>
+                  </div>
+                </div>
+              )
+            )}
+
+            {activeTab === 'flashing_workshop' && (
+              <div className="p-1 sm:p-2">
+                {lifecycleStage === 'installing' ? (
+                  <ContractorFlashingGuide
+                    project={project}
+                    assignableLines={assignableLines}
+                    assignments={flashingAssignments}
+                    libraryProfiles={libraryProfiles}
+                    bom={roofBom}
+                  />
+                ) : (
+                  <FlashingWorkshop
+                    view={flashingWorkshopView}
+                    onChangeView={setFlashingWorkshopView}
+                    projects={projects.length > 0 ? projects : project ? [project] : []}
+                    project={project}
+                    activeMemberName={activeMemberName || 'Archtech team'}
+                    theme="dark"
+                    roofAssignments={flashingAssignments}
+                    onUpdateProject={onUpdateProject}
+                  />
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Quiet Desktop Status Strip */}
+          <div className="hidden lg:flex shrink-0 items-center justify-between gap-4 px-3 py-1.5 bg-[#0b101d] border-t border-slate-800/90 text-[11px] text-slate-400 tabular-nums">
+            <div className="flex items-center gap-2 min-w-0 truncate">
+              <span className="font-bold text-slate-200">
+                {lifecycleStage === 'quoting'
+                  ? 'Quote · Draft'
+                  : lifecycleStage === 'measuring'
+                  ? measureLocked
+                    ? 'Measure · Locked'
+                    : 'Measure · Open'
+                  : measureLocked
+                  ? 'Install · Locked'
+                  : 'Install'}
+              </span>
+              <span className="text-slate-600">·</span>
+              <span>
+                {levels.length} {levels.length === 1 ? 'tier' : 'tiers'} · {planes.length} roof{' '}
+                {planes.length === 1 ? 'face' : 'faces'} · {wallPlan?.facets.length || 0} walls
+              </span>
+              <span className="text-slate-600">·</span>
+              <span>
+                {sheetOrderMode === 'practical' ? 'Practical cuts' : 'Optimized cuts'} (
+                {roofBom.totalOrderedLm.toFixed(1)} m)
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <span className={hasAnySelection ? 'text-sky-300 font-semibold' : 'text-slate-500'}>
+                {selectionSummaryLabel}
+              </span>
+              {hasAnySelection && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearMultiSelections();
+                    setSelectedPlaneId(null);
+                    setSelectedAssetId(null);
+                    setSelectedPitchBreakId(null);
+                    setSelectedWallFacetId(null);
+                  }}
+                  className="text-slate-400 hover:text-white font-bold cursor-pointer"
+                >
+                  Clear
+                </button>
               )}
             </div>
-          )}
+          </div>
         </div>
 
-        {/* Collapsible Inspector Drawer */}
-        <ExactRoofingInspectorDrawer
-          isOpen={isInspectorOpen}
-          onClose={() => setIsInspectorOpen(false)}
-          lifecycleStage={lifecycleStage}
-          readOnlyGeometry={isReadOnlyGeometry}
-          selectedPlane={selectedPlane}
-          selectedAsset={selectedAsset}
-          selectedPitchBreak={selectedPitchBreak}
-          outline={outline}
-          levels={levels}
-          activeLevelId={activeLevelId}
-          onSelectLevel={handleSelectLevel}
-          onAddLevel={handleAddLevel}
-          onUpdateLevelHeight={handleUpdateLevelHeight}
-          onDeleteLevel={handleDeleteLevel}
-          planes={planes}
-          assets={assets}
-          pitchBreaks={pitchBreaks}
-          layout={layoutResult}
-          startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
-          onToggleEdgeGable={handleToggleEdgeGable}
-          onSetEdgeMode={handleSetEdgeMode}
-          onUpdatePlaneEaveHeight={handleUpdatePlaneEaveHeight}
-          onUpdateEdgeLength={handleUpdateEdgeLength}
-          onUpdateEdgeWall={handleUpdateEdgeWall}
-          onApplyRoofStylePreset={handleApplyRoofStylePreset}
-          onSetStartPlane={handleSetStartPlane}
-          onUpdatePlanePitch={handleUpdatePlanePitch}
-          onUpdatePlaneDirection={handleUpdatePlaneDirection}
-          onUpdatePlaneOrderedSheetLength={handleUpdatePlaneOrderedSheetLength}
-          onSelectPlane={handleSelectPlane}
-          onSelectAsset={handleSelectAsset}
-          onUpdateAsset={(asset) => {
-            if (isReadOnlyGeometry) return;
-            setAssets((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
-          }}
-          onDeleteAsset={(assetId) => {
-            if (isReadOnlyGeometry) return;
-            setAssets((prev) => prev.filter((a) => a.id !== assetId));
-            if (selectedAssetId === assetId) setSelectedAssetId(null);
-            triggerNotice('Feature removed');
-          }}
-          onSelectPitchBreak={handleSelectPitchBreak}
-          onUpdatePitchBreak={(pb) => {
-            if (isReadOnlyGeometry) return;
-            setPitchBreaks((prev) => prev.map((x) => (x.id === pb.id ? pb : x)));
-          }}
-          onDeletePitchBreak={(pbId) => {
-            if (isReadOnlyGeometry) return;
-            setPitchBreaks((prev) => prev.filter((x) => x.id !== pbId));
-            if (selectedPitchBreakId === pbId) setSelectedPitchBreakId(null);
-            triggerNotice('Pitch break removed');
-          }}
-          onOpenCutList={() => setActiveTab('layout_results')}
-          onOpenAiCopilot={() => setIsAiCopilotOpen(true)}
-          assignableLines={assignableLines}
-          flashingAssignments={flashingAssignments}
-          onSelectLineForFlashing={(lineId) => setActiveFlashingLineId(lineId)}
-          onOpenOrderModal={() => setIsOrderModalOpen(true)}
-          wallPlan={wallPlan}
-          selectedWallFacetId={selectedWallFacetId}
-          onSelectWallFacet={handleSelectWallFacet}
-          onOpenWallElevation={handleOpenWallElevation}
-          onUpdateWallFacet={handleUpdateWallFacet}
-          onBuildWallFaces={handleBuildWallFaces}
-          wallFilterMode={wallFilterMode}
-          onChangeWallFilterMode={setWallFilterMode}
-          completenessReport={completenessReport}
-          onJumpToCompletenessIssue={handleJumpToCompletenessIssue}
-          selectedPlaneIds={selectedPlaneIds}
-          onChangeSelectedPlaneIds={setSelectedPlaneIds}
-          selectedEdgeIds={selectedEdgeIds}
-          onChangeSelectedEdgeIds={setSelectedEdgeIds}
-          selectedSkeletonLineIds={selectedSkeletonLineIds}
-          onChangeSelectedSkeletonLineIds={setSelectedSkeletonLineIds}
-          selectedWallFacetIds={selectedWallFacetIds}
-          onChangeSelectedWallFacetIds={setSelectedWallFacetIds}
-          onBatchPlanePitch={handleBatchPlanePitch}
-          onBatchPlaneDirection={handleBatchPlaneDirection}
-          onBatchPlaneOrderedSheetLength={handleBatchPlaneOrderedSheetLength}
-          onBatchPlaneEaveHeight={handleBatchPlaneEaveHeight}
-          onBatchEdgeType={handleBatchEdgeType}
-          onBatchEdgeWall={handleBatchEdgeWall}
-          onBatchEdgeHeight={handleBatchEdgeHeight}
-          onBatchSkeletonLineType={handleBatchSkeletonLineType}
-          onBatchWallUpdate={handleBatchWallUpdate}
-          onUndo={handleUndo}
-          canUndo={canUndo}
-        />
+        {/* RIGHT DOCK: Tabbed Checklist + Inspector in Measure Split View (lg+); Standard Inspector otherwise */}
+        {isMeasureSplitDesktop ? (
+          <>
+            {isInspectorOpen && (
+              <aside className="hidden lg:flex w-88 xl:w-[400px] shrink-0 bg-[#0b101d] border-l border-slate-800 flex-col h-full min-h-0 z-20">
+                <div className="px-3 py-2 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0 bg-[#090d16]">
+                  <div className="flex items-center p-0.5 bg-[#070b14] rounded-lg border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setMeasureRightTab('checklist')}
+                      className={`px-2.5 py-1 rounded-md text-xs font-extrabold cursor-pointer flex items-center gap-1.5 ${
+                        measureRightTab === 'checklist'
+                          ? 'bg-emerald-600 text-white'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <span>Checklist</span>
+                      {completenessReport.blockersCount > 0 && (
+                        <span className="px-1 py-0.2 rounded bg-rose-600 text-white font-mono text-[10px] tabular-nums">
+                          {completenessReport.blockersCount}
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMeasureRightTab('inspect')}
+                      className={`px-2.5 py-1 rounded-md text-xs font-extrabold cursor-pointer ${
+                        measureRightTab === 'inspect'
+                          ? 'bg-blue-600 text-white'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Inspect
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsMeasureExpanded(true)}
+                    className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[11px] font-bold text-slate-300 hover:text-white cursor-pointer"
+                  >
+                    Full Tables
+                  </button>
+                </div>
+
+                {measureRightTab === 'inspect' ? (
+                  <ExactRoofingInspectorDrawer
+                    {...desktopInspectorProps}
+                    isOpen={true}
+                    embeddedInRightPanel={true}
+                    onClose={() => setMeasureRightTab('checklist')}
+                  />
+                ) : (
+                  <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3 text-xs">
+                    {/* Readiness & Lock Summary */}
+                    <div
+                      className={`p-3 rounded-xl border space-y-2 ${
+                        measureLocked
+                          ? 'bg-amber-950/25 border-amber-500/40'
+                          : completenessReport.blockersCount > 0
+                          ? 'bg-rose-950/25 border-rose-500/45'
+                          : 'bg-emerald-950/20 border-emerald-500/40'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="font-extrabold text-white flex items-center gap-1.5">
+                          {measureLocked ? (
+                            <Lock className="w-3.5 h-3.5 text-amber-400" />
+                          ) : completenessReport.blockersCount > 0 ? (
+                            <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                          ) : (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          )}
+                          <span>
+                            {measureLocked
+                              ? 'Measure Locked'
+                              : completenessReport.blockersCount > 0
+                              ? `${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'} Open`
+                              : 'Ready to Lock Measure'}
+                          </span>
+                        </div>
+                        <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                          {completenessReport.warningsCount} warn
+                        </span>
+                      </div>
+
+                      {!measureLocked && (
+                        <button
+                          type="button"
+                          onClick={handleRequestLockMeasure}
+                          className={`w-full py-2 rounded-lg text-xs font-extrabold text-white cursor-pointer flex items-center justify-center gap-1.5 ${
+                            completenessReport.blockersCount > 0
+                              ? 'bg-rose-700 hover:bg-rose-600'
+                              : 'bg-emerald-600 hover:bg-emerald-500'
+                          }`}
+                        >
+                          <Lock className="w-3.5 h-3.5" />
+                          <span>
+                            {completenessReport.blockersCount > 0
+                              ? `Resolve ${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'}`
+                              : 'Confirm & lock'}
+                          </span>
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Completeness Issues */}
+                    {!measureLocked && completenessReport.issues.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
+                          Completeness Items ({completenessReport.issues.length})
+                        </div>
+                        <div className="space-y-1.5">
+                          {completenessReport.issues.map((issue) => (
+                            <div
+                              key={issue.id}
+                              className="p-2.5 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2"
+                            >
+                              <div className="min-w-0">
+                                <div className="font-bold text-slate-100 truncate">
+                                  <span
+                                    className={
+                                      issue.severity === 'blocker'
+                                        ? 'text-rose-400 mr-1'
+                                        : 'text-amber-300 mr-1'
+                                    }
+                                  >
+                                    [{issue.severity === 'blocker' ? 'Blocker' : 'Warn'}]
+                                  </span>
+                                  {issue.title}
+                                </div>
+                                <div className="text-[11px] text-slate-400 truncate">
+                                  {issue.detail}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleJumpToCompletenessIssue(issue)}
+                                className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold cursor-pointer shrink-0"
+                              >
+                                Fix
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Deterministic Audit Safe Patches */}
+                    {!measureLocked && deterministicAuditReport.recommendedPatches.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[10px] font-mono uppercase tracking-wider text-sky-400 font-bold">
+                            Safe System Fixes ({deterministicAuditReport.recommendedPatches.length})
+                          </span>
+                          {deterministicAuditReport.recommendedPatches.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleApplyDeterministicPatches(
+                                  deterministicAuditReport.recommendedPatches
+                                )
+                              }
+                              className="px-2 py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-[10px] font-extrabold cursor-pointer"
+                            >
+                              Apply All
+                            </button>
+                          )}
+                        </div>
+                        <div className="space-y-1.5">
+                          {deterministicAuditReport.recommendedPatches.map((patch) => (
+                            <div
+                              key={patch.id}
+                              className="p-2.5 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2"
+                            >
+                              <div className="min-w-0">
+                                <div className="font-bold text-slate-100 truncate">{patch.label}</div>
+                                <div className="text-[11px] text-slate-400 truncate">
+                                  {patch.reason}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleApplyDeterministicPatches([patch])}
+                                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-sky-600 text-sky-200 hover:text-white text-[11px] font-extrabold cursor-pointer shrink-0"
+                              >
+                                Apply
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Sheet Cut Mode & Totals */}
+                    <div className="p-3 rounded-xl bg-[#070b14] border border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
+                          Sheet Lengths
+                        </span>
+                        <span className="font-mono font-bold text-sky-300 tabular-nums">
+                          {roofBom.totalSheetsCount} sheets · {roofBom.totalOrderedLm.toFixed(1)} m
+                        </span>
+                      </div>
+                      {!measureLocked && (
+                        <div className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-[#0b101d] border border-slate-800">
+                          {(['practical', 'optimized'] as const).map((mode) => (
+                            <button
+                              key={mode}
+                              type="button"
+                              onClick={() => handleChangeSheetOrderMode(mode)}
+                              className={`py-1 rounded-md text-[11px] font-bold cursor-pointer ${
+                                sheetOrderMode === mode
+                                  ? 'bg-sky-600 text-white'
+                                  : 'text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              {mode === 'practical' ? 'Practical' : 'Optimized'}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setIsMeasureExpanded(true)}
+                        className="w-full py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[11px] font-bold text-slate-300 cursor-pointer"
+                      >
+                        Open Full Sheet &amp; Line Tables
+                      </button>
+                    </div>
+
+                    {/* Unassigned Structural Flashings */}
+                    {missingStructuralFlashings.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-mono uppercase tracking-wider text-amber-300 font-bold">
+                          Unassigned Flashings ({missingStructuralFlashings.length})
+                        </div>
+                        <div className="space-y-1">
+                          {missingStructuralFlashings.slice(0, 6).map((line) => (
+                            <div
+                              key={line.lineId}
+                              className="px-2.5 py-2 rounded-xl bg-[#070b14] border border-slate-800 flex items-center justify-between gap-2"
+                            >
+                              <div className="min-w-0">
+                                <div className="font-bold text-slate-100 truncate">{line.label}</div>
+                                <div className="text-[10px] text-slate-400 font-mono tabular-nums">
+                                  {line.trueSlopeLengthM.toFixed(2)} m
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setActiveFlashingLineId(line.lineId)}
+                                className="px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-extrabold cursor-pointer shrink-0"
+                              >
+                                Assign
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </aside>
+            )}
+
+            <div className="lg:hidden contents">
+              <ExactRoofingInspectorDrawer
+                {...desktopInspectorProps}
+                isOpen={isInspectorOpen}
+                onClose={() => setIsInspectorOpen(false)}
+              />
+            </div>
+          </>
+        ) : (
+          <ExactRoofingInspectorDrawer
+            {...desktopInspectorProps}
+            isOpen={isInspectorOpen}
+            onClose={() => setIsInspectorOpen(false)}
+          />
+        )}
       </div>
 
       {/* Set Pitch Modal */}

@@ -40,18 +40,22 @@ import {
   updateWallPlanEdgeLength
 } from '../wallCladdingEngine';
 import {
+  applyEdgeType,
   applyRoofStylePreset,
   buildOutlineFromPoints,
   createRoofLevel,
+  deriveRoofWallSegments,
   generateCuttingLayout,
   generateSkeletonLines,
   getMultiLevelPreset,
   getPresetOutline,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
+import type { WallPlan } from '../../types/exactRoofing';
 import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
 import { buildOrderPack, exportOrderPackToCsv } from '../exactRoofingBomBridge';
 import { buildWallPlan3DGroup } from '../../components/exactroofing/three/wallMeshBuilder';
+import { buildRoofSceneGroup } from '../../components/exactroofing/three/roofMeshBuilder';
 
 console.log('--- Starting Wall Cladding Phase 1 & Phase 2 Engine Tests ---');
 
@@ -1455,5 +1459,191 @@ console.log('✓ Test 25 Passed: Multi-body detached roofs yield 2 wall rings, 8
   );
 }
 console.log('✓ Test 26 Passed: 2-tier split roof derives lower & upper wall envelopes, preserves wings, and supports independent body edits');
+
+// 27. 2-Tier Rule Integrity: Step Riser bottomZ/topZ Ownership + Per-Level Roof Fit Isolation + Quiet Completeness
+{
+  const twoTier = getMultiLevelPreset('two_storey_split', 22.5);
+  const derived27 = deriveWallPlanFromRoofLevels(
+    twoTier.levels,
+    2.7,
+    undefined,
+    twoTier.planes
+  )!;
+  assert.ok(derived27, 'two_storey_split must derive WallPlan');
+
+  // Step riser on upper level south boundary (over lower verandah) resolves explicit step bottomZ & kind='abutment'
+  const upperStepFacet = derived27.facets.find(
+    (f) => f.levelId === 'level-2' && (f.bottomZ ?? 0) > 0.5
+  );
+  assert.ok(upperStepFacet, 'Upper tier step riser wall above lower roof exists');
+  assert.ok(
+    (upperStepFacet!.bottomZ ?? 0) > 0.5,
+    `Step riser bottomZ must sit above lower roof (${upperStepFacet!.bottomZ})`
+  );
+  assert.equal(upperStepFacet!.kind, 'abutment', 'Step riser owns wall kind abutment');
+  assert.ok(
+    upperStepFacet!.heightM < 3.0,
+    `Step riser net height (${upperStepFacet!.heightM}) equals upper topZ - lower roof Z, not full ground height`
+  );
+
+  // Changing upper level eave height (5.4 -> 6.8) updates level-2 walls cleanly without mutating level-1 lower walls
+  const lowerHeightsBefore = new Map(
+    derived27.facets
+      .filter((f) => f.levelId === 'level-1')
+      .map((f) => [f.id, { heightM: f.heightM, topZ: f.topZ }])
+  );
+  const raisedLevels = twoTier.levels.map((lvl) =>
+    lvl.id === 'level-2' ? { ...lvl, eaveHeightM: 6.8 } : lvl
+  );
+  const raisedPlanes = syncMultiLevelPlanes(raisedLevels, twoTier.planes).map((p) =>
+    p.levelId === 'level-2' ? { ...p, eaveHeightM: 6.8 } : p
+  );
+  const synced27 = syncWallPlanWithRoof(derived27, raisedLevels, raisedPlanes);
+
+  synced27.facets
+    .filter((f) => f.levelId === 'level-1')
+    .forEach((f) => {
+      const before = lowerHeightsBefore.get(f.id)!;
+      assert.equal(f.heightM, before.heightM, `Lower tier facet ${f.code} height stayed isolated`);
+      assert.equal(f.topZ, before.topZ, `Lower tier facet ${f.code} topZ stayed isolated`);
+    });
+  const syncedStep = synced27.facets.find((f) => f.id === upperStepFacet!.id)!;
+  assert.ok(syncedStep.topZ >= 6.7, `Upper step facet rose with level-2 eave (${syncedStep.topZ})`);
+  assert.ok(
+    syncedStep.heightM > upperStepFacet!.heightM + 1.0,
+    'Upper step riser height grew cleanly when level-2 eave rose'
+  );
+
+  // Completeness on confirmed 2-tier walls has zero return blockers
+  const confirmed27: WallPlan = {
+    ...synced27,
+    facets: synced27.facets.map((f) => ({ ...f, detailConfirmed: true }))
+  };
+  const comp27 = evaluateTakeoffCompleteness({
+    planes: raisedPlanes,
+    levels: raisedLevels,
+    assignableLines: [],
+    flashingAssignments: [],
+    assets: [],
+    wallPlan: confirmed27
+  });
+  assert.equal(comp27.undetailedReturnsCount, 0, '2-tier roof generates zero spurious return blockers');
+  assert.equal(comp27.blockersCount, 0, 'Confirmed 2-tier wall plan passes completeness quietly');
+}
+console.log('✓ Test 27 Passed: 2-tier step riser ownership, per-level roof height scoping, and quiet completeness');
+
+// 28. Cascading 3-Tier Terrace: Single Ownership of Shared 2D Segments + No Open-Chain False Returns + 3D Scene
+{
+  const terrace = getMultiLevelPreset('cascading_terrace', 15);
+  const tWallPlan = deriveWallPlanFromRoofLevels(
+    terrace.levels,
+    2.4,
+    undefined,
+    terrace.planes
+  )!;
+  assert.ok(tWallPlan, 'cascading_terrace must derive WallPlan');
+  assert.equal(tWallPlan.bodies?.length, 3, 'Cascading terrace keeps all 3 roof body rings');
+
+  // Shared boundaries y=8 (T2/T3) and y=4 (T1/T2) must have only one owner wall facet each -> 4 + 3 + 3 = 10 total facets
+  assert.equal(
+    tWallPlan.facets.length,
+    10,
+    `Cascading 3-tier shared walls deduplicated to single owner per shared line (got ${tWallPlan.facets.length})`
+  );
+
+  // Verify no two facets share the exact same unordered 2D endpoint line
+  const segKeys = tWallPlan.facets.map((f) => {
+    const a = `${f.from.x.toFixed(2)},${f.from.y.toFixed(2)}`;
+    const b = `${f.to.x.toFixed(2)},${f.to.y.toFixed(2)}`;
+    return a < b ? `${a}|${b}` : `${b}|${a}`;
+  });
+  assert.equal(new Set(segKeys).size, tWallPlan.facets.length, 'Zero overlapping duplicate wall facets in 2D plan');
+
+  // Open lower chains resulting from shared-wall dedup must NOT synthesize false internal corners or return faces
+  const tTopo = analyzeWallPlanTopology(tWallPlan.facets);
+  assert.equal(tTopo.internalCornersCount, 0, 'Open lower tier chains do not fabricate internal corners');
+  assert.equal(tTopo.returnFacesCount, 0, 'Open lower tier chains do not fabricate short returns');
+
+  // Shared upper step walls remain abutments with positive bottomZ
+  const stepWalls = tWallPlan.facets.filter((f) => (f.bottomZ ?? 0) > 0.2);
+  assert.equal(stepWalls.length, 2, 'Two terrace step walls (y=8 and y=4) carry explicit bottomZ');
+  assert.ok(
+    stepWalls.every((f) => f.kind === 'abutment'),
+    'Both terrace step walls carry abutment role'
+  );
+
+  // Full 3D scene builds cleanly for roof + multi-tier walls
+  const stubRoofTex = {
+    normalMap: null,
+    roughnessMap: null,
+    bumpMap: null,
+    dispose: () => {}
+  } as any;
+  const stubWallTex28 = {
+    getEntry: () => null,
+    weatherboard: { normalMap: null },
+    fibre_cement: { normalMap: null },
+    brick: { map: null, normalMap: null },
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null
+  } as any;
+  const tScene = buildRoofSceneGroup({
+    outline: terrace.levels[0].outline,
+    skeleton: terrace.levels[0].skeleton,
+    planes: terrace.planes,
+    levels: terrace.levels,
+    wallPlan: tWallPlan,
+    shadingMode: 'studio_finish',
+    swatch: { name: 'Ebony', hex: '#1e293b', metalness: 0.45, roughness: 0.35 } as any,
+    textures: stubRoofTex,
+    wallTextures: stubWallTex28,
+    showFlashings: true,
+    showWalls: true,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+  assert.ok(tScene.rootGroup.children.length > 0, 'Cascading terrace 3D roof + wall scene built cleanly');
+  assert.ok(tScene.selectableMeshes.length >= 10, '3D scene exposes roof + wall selectable meshes cleanly');
+  tScene.dispose();
+}
+console.log('✓ Test 28 Passed: Cascading 3-tier terrace enforces single shared-wall ownership, clean topology, and valid 3D scene');
+
+// 29. Gable end walls ('verge' & 'rake') reach true ridge apex cleanly in both deriveRoofWallSegments & WallPlan 3D
+{
+  const rect29 = getPresetOutline('rectangle_14x10');
+  const rakeGableOutline = applyEdgeType(
+    rect29,
+    [rect29.edges[1].id, rect29.edges[3].id],
+    'rake'
+  );
+  const rakeSkel29 = generateSkeletonLines(rakeGableOutline);
+  const lvl29 = {
+    ...createRoofLevel(1, 'Main Gable', 2.7, rakeGableOutline.points),
+    outline: rakeGableOutline,
+    skeleton: rakeSkel29
+  };
+  const planes29 = syncMultiLevelPlanes([lvl29], [], 25); // 5m half-span * tan(25°) ≈ 2.33m rise -> apex ≈ 5.03m
+
+  const roofWallSegs = deriveRoofWallSegments([lvl29], planes29);
+  const gableSegs = roofWallSegs.filter((w) => w.wallKind === 'gable_end');
+  assert.equal(gableSegs.length, 2, 'Expected 2 gable wall segments from deriveRoofWallSegments');
+  gableSegs.forEach((seg) => {
+    const maxPeakZ = Math.max(...seg.topProfilePoints3D.map((p) => p.z));
+    assert.ok(
+      maxPeakZ > 4.9,
+      `Gable wall segment peak Z (${maxPeakZ.toFixed(2)}m) must reach ridge apex (~5.03m), never fallbackZ`
+    );
+  });
+
+  const wp29 = deriveWallPlanFromRoofLevels([lvl29], 2.7, undefined, planes29)!;
+  const syncedWp29 = syncWallPlanWithRoof(wp29, [lvl29], planes29);
+  assert.equal(syncedWp29.facets.length, 4, 'Gable rectangle produces 4 perimeter wall facets');
+  assert.ok(
+    syncedWp29.facets.some((f) => f.roofProfile && Math.max(...f.roofProfile.map((p) => p.topZ)) > 4.9),
+    'WallPlan synced gable facets carry raked peak roofProfile reaching true ridge apex'
+  );
+}
+console.log('✓ Test 29 Passed: Gable end walls (verge & rake) reach true ridge apex cleanly in roof & wall 3D');
 
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');

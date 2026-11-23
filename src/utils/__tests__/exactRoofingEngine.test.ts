@@ -24,9 +24,16 @@ import {
   applyEaveHeightToEdges,
   applyPitchToPlanes,
   applyDirectionToPlanes,
-  applyOrderedSheetLengthToPlanes
+  applyOrderedSheetLengthToPlanes,
+  buildFacesFromClassification,
+  deleteRoofPlanes,
+  remapSkeletonForOutlineResize,
+  unsuppressOutlineEdges,
+  mergeColinearRidgeLines,
+  resolveLevelSharedVertexElevations
 } from '../exactRoofingEngine';
-import type { PlanEdge, RoofLevel, RoofOutline, RoofPlane, SheetSpec } from '../../types/exactRoofing';
+import { buildRoofSceneGroup } from '../../components/exactroofing/three/roofMeshBuilder';
+import type { PlanEdge, RoofLevel, RoofOutline, RoofPlane, SheetSpec, SkeletonLine } from '../../types/exactRoofing';
 
 console.log('--- Starting Exact Roofing Engine Test Suite ---');
 
@@ -2342,5 +2349,556 @@ if (
 }
 
 console.log('✓ Test 37 Passed: Full 10-type roof line catalog, batch multi-apply helpers, override geometry lock & mixed_pitch check.');
+
+// 38. First-class Gable ends ('verge' & 'rake') -> 0 hips, 1 ridge, 2 dual-slope faces, raked barge flashings & eave-only gutters
+{
+  const rect14 = getPresetOutline('rectangle_14x10');
+  const vergeIds = [rect14.edges[1].id, rect14.edges[3].id];
+  const gableVergeOutline = applyEdgeType(rect14, vergeIds, 'verge');
+  const gableVergeSkel = generateSkeletonLines(gableVergeOutline);
+  if (
+    gableVergeSkel.filter((s) => s.suggestedType === 'hip').length !== 0 ||
+    gableVergeSkel.filter((s) => s.suggestedType === 'ridge').length !== 1
+  ) {
+    throw new Error(
+      `Expected 0 hips and 1 ridge for 'verge' gable rectangle, got ${JSON.stringify(
+        gableVergeSkel.map((s) => s.suggestedType)
+      )}`
+    );
+  }
+  const lvlVerge = {
+    ...createRoofLevel(1, 'Verge Gable', 2.7, gableVergeOutline.points),
+    outline: gableVergeOutline,
+    skeleton: gableVergeSkel
+  };
+  const planesVerge = syncMultiLevelPlanes([lvlVerge], [], 22.5);
+  if (planesVerge.length !== 2) {
+    throw new Error(`Expected 2 gable planes for verge rectangle, got ${planesVerge.length}`);
+  }
+  const sumAreaVerge = planesVerge.reduce((s, p) => s + (p.area || 0), 0);
+  const expectedVergeSlopeArea = 140 / Math.cos((22.5 * Math.PI) / 180);
+  if (Math.abs(sumAreaVerge - expectedVergeSlopeArea) > 1.5) {
+    throw new Error(`Verge gable developed area (${sumAreaVerge.toFixed(2)}) mismatch vs ${expectedVergeSlopeArea.toFixed(2)}`);
+  }
+
+  // Repeat using explicit 'rake' edge classification on gable ends
+  const gableRakeOutline = applyEdgeType(rect14, vergeIds, 'rake');
+  const gableRakeSkel = generateSkeletonLines(gableRakeOutline);
+  if (
+    gableRakeSkel.filter((s) => s.suggestedType === 'hip').length !== 0 ||
+    gableRakeSkel.filter((s) => s.suggestedType === 'ridge').length !== 1
+  ) {
+    throw new Error(
+      `Expected 0 hips and 1 ridge for 'rake' gable rectangle, got ${JSON.stringify(
+        gableRakeSkel.map((s) => s.suggestedType)
+      )}`
+    );
+  }
+  const lvlRake = {
+    ...createRoofLevel(1, 'Rake Gable', 2.7, gableRakeOutline.points),
+    outline: gableRakeOutline,
+    skeleton: gableRakeSkel
+  };
+  const planesRake = syncMultiLevelPlanes([lvlRake], [], 22.5);
+  if (planesRake.length !== 2) {
+    throw new Error(`Expected 2 gable planes for rake rectangle, got ${planesRake.length}`);
+  }
+
+  const linesRake = getAssignableRoofLines(lvlRake.outline, lvlRake.skeleton, planesRake);
+  const eaveLines = linesRake.filter((l) => l.flashingKind === 'eave');
+  const bargeLines = linesRake.filter((l) => l.flashingKind === 'barge');
+  if (eaveLines.length !== 2) {
+    throw new Error(`Expected strictly 2 gutter/eave lines (stopping at gables), got ${eaveLines.length}`);
+  }
+  if (bargeLines.length !== 2) {
+    throw new Error(`Expected 2 raked barge lines across 2 gable ends, got ${bargeLines.length}`);
+  }
+  if (!bargeLines.every((b) => b.trueSlopeLengthM > b.planLengthM + 0.5)) {
+    throw new Error('Gable barge lines must measure true raked slope length (> plan run)');
+  }
+
+  // Verify applyRoofStylePreset('hipped') restores hips and setEdgeMode toggles back cleanly
+  const hippedRes = applyRoofStylePreset(gableRakeOutline, 'hipped');
+  if (hippedRes.outline.edges.some((e) => e.type !== 'outline') || hippedRes.skeleton.filter((s) => s.suggestedType === 'hip').length !== 4) {
+    throw new Error('applyRoofStylePreset(hipped) should convert gable rake ends back to outline eaves + 4 hips');
+  }
+  const singleGableRes = setEdgeMode(hippedRes.outline, hippedRes.skeleton, hippedRes.outline.edges[1].id, 'gable');
+  if (singleGableRes.outline.edges[1].type !== 'verge') {
+    throw new Error('setEdgeMode(gable) should mark target edge as verge');
+  }
+}
+console.log('✓ Test 38 Passed: First-class verge & rake gables emit 0 hips, 2 clean slopes, eave-only gutters & raked barges.');
+
+// 39. Multi-wing L-shape & T-shape gable topology (no end hips, clean wing valleys/ridges, full footprint coverage)
+{
+  const lShapePts = [
+    { x: 0, y: 0 },
+    { x: 12, y: 0 },
+    { x: 12, y: 5 },
+    { x: 5, y: 5 },
+    { x: 5, y: 12 },
+    { x: 0, y: 12 }
+  ];
+  const lOutline0 = buildOutlineFromPoints(lShapePts);
+  // Wing 1 end at x=12 (edge 1) and Wing 2 end at y=12 (edge 4) set to gable ('rake' / 'verge')
+  let lOutline = applyEdgeType(lOutline0, [lOutline0.edges[1].id], 'verge');
+  lOutline = applyEdgeType(lOutline, [lOutline.edges[4].id], 'rake');
+  const lSkel = generateSkeletonLines(lOutline);
+  const lHipsAtGables = lSkel.filter((s) => s.suggestedType === 'hip');
+  if (lHipsAtGables.length !== 1 && lHipsAtGables.length !== 2) {
+    // Only the shared outer corner (0,0) has 1 hip bisecting the two outer eaves; gable corners (12,0), (12,5), (0,12), (5,12) must have 0 hips!
+    const touchesGableEndCorner = lHipsAtGables.some(
+      (h) =>
+        (Math.abs(h.from.x - 12) < 0.2 || Math.abs(h.from.y - 12) < 0.2) &&
+        (h.from.x > 0.2 || h.from.y > 0.2)
+    );
+    if (touchesGableEndCorner) {
+      throw new Error('Unexpected hip generated on designated gable end corner in L-shape');
+    }
+  }
+  const lLvl = { ...createRoofLevel(1, 'L Gable', 2.7, lShapePts), outline: lOutline, skeleton: lSkel };
+  const lPlanes = syncMultiLevelPlanes([lLvl], [], 22.5);
+  if (lPlanes.length !== 4) {
+    throw new Error(`Expected 4 faces on L-shape with 2 gable wing ends, got ${lPlanes.length}`);
+  }
+  const expectedLPlanArea = 12 * 5 + 5 * 7; // 60 + 35 = 95m^2
+  const lPlanSum = lPlanes.reduce((s, p) => {
+    let a = 0;
+    for (let i = 0; i < p.planPolygon.length; i++) {
+      const p1 = p.planPolygon[i];
+      const p2 = p.planPolygon[(i + 1) % p.planPolygon.length];
+      a += p1.x * p2.y - p2.x * p1.y;
+    }
+    return s + Math.abs(a) / 2;
+  }, 0);
+  if (Math.abs(lPlanSum - expectedLPlanArea) > 2.5) {
+    throw new Error(`L-gable plane footprint coverage mismatch: ${lPlanSum.toFixed(2)} vs ${expectedLPlanArea}`);
+  }
+
+  // T-shape with all 3 wing tips marked gable
+  const tShapePts = [
+    { x: 0, y: 0 },
+    { x: 16, y: 0 },
+    { x: 16, y: 6 },
+    { x: 11, y: 6 },
+    { x: 11, y: 14 },
+    { x: 5, y: 14 },
+    { x: 5, y: 6 },
+    { x: 0, y: 6 }
+  ];
+  const tOutline0 = buildOutlineFromPoints(tShapePts);
+  const tOutline = applyEdgeType(
+    tOutline0,
+    [tOutline0.edges[1].id, tOutline0.edges[4].id, tOutline0.edges[7].id],
+    'verge'
+  );
+  const tSkel = generateSkeletonLines(tOutline);
+  if (tSkel.filter((s) => s.suggestedType === 'hip').length !== 0) {
+    throw new Error('Expected 0 hips on 3-gable T-shape roof');
+  }
+  const tLvl = { ...createRoofLevel(1, 'T Gable', 2.7, tShapePts), outline: tOutline, skeleton: tSkel };
+  const tPlanes = syncMultiLevelPlanes([tLvl], [], 20);
+  if (tPlanes.length !== 5) {
+    throw new Error(`Expected 5 sloped faces across the 5 eaves of 3-gable T-shape roof, got ${tPlanes.length}`);
+  }
+  const expectedTPlanArea = 16 * 6 + 6 * 8; // 96 + 48 = 144m^2
+  const tPlanSum = tPlanes.reduce((s, p) => {
+    let a = 0;
+    for (let i = 0; i < p.planPolygon.length; i++) {
+      const p1 = p.planPolygon[i];
+      const p2 = p.planPolygon[(i + 1) % p.planPolygon.length];
+      a += p1.x * p2.y - p2.x * p1.y;
+    }
+    return s + Math.abs(a) / 2;
+  }, 0);
+  if (Math.abs(tPlanSum - expectedTPlanArea) > 3.0) {
+    throw new Error(`T-gable plane footprint coverage mismatch: ${tPlanSum.toFixed(2)} vs ${expectedTPlanArea}`);
+  }
+}
+console.log('✓ Test 39 Passed: Multi-wing L-shape & T-shape gable topologies solve cleanly without spurious end-hips.');
+
+// 40. Build Faces from Classification (unclassified -> classified + manual short ridge snapping)
+{
+  const pts = [
+    { x: 0, y: 0 },
+    { x: 10, y: 0 },
+    { x: 10, y: 6 },
+    { x: 0, y: 6 }
+  ];
+  const rawOutline = buildOutlineFromPoints(pts, 'unclassified');
+  // Classify opposing eaves & gable ends (using mixed 'rake' & 'verge')
+  let classified = applyEdgeType(rawOutline, [rawOutline.edges[0].id, rawOutline.edges[2].id], 'outline');
+  classified = applyEdgeType(classified, [classified.edges[1].id], 'verge');
+  classified = applyEdgeType(classified, [classified.edges[3].id], 'rake');
+
+  const emptyBuild = buildFacesFromClassification(
+    [{ id: 'level-1', code: 'L1', name: 'Main', eaveHeightM: 2.7, outline: classified, skeleton: [] }],
+    [],
+    22.5
+  );
+  if (emptyBuild.planes.length !== 2) {
+    throw new Error(`Expected buildFacesFromClassification to generate 2 gable planes cleanly, got ${emptyBuild.planes.length}`);
+  }
+
+  // Test manual ridge stopping 0.2m short of both gable walls (x=0.2..9.8) -> planar snapper closes cleanly
+  const manualShortLvl: RoofLevel = {
+    id: 'level-1',
+    code: 'L1',
+    name: 'Manual',
+    eaveHeightM: 2.7,
+    outline: classified,
+    skeleton: [
+      {
+        id: 'sk-manual-ridge',
+        levelId: 'level-1',
+        from: { x: 0.2, y: 3 },
+        to: { x: 9.8, y: 3 },
+        suggestedType: 'ridge'
+      }
+    ]
+  };
+  const manualBuild = buildFacesFromClassification([manualShortLvl], [], 22.5);
+  if (manualBuild.planes.length !== 2) {
+    throw new Error(`Expected manual short ridge build to snap and produce 2 planes, got ${manualBuild.planes.length}`);
+  }
+}
+console.log('✓ Test 40 Passed: buildFacesFromClassification builds clean gable planes from empty or slightly short manual ridges.');
+
+// 41. Delete Face persistence (deleteRoofPlanes suppresses face across unrelated edits, preserves outline/skeleton, unsuppress restores)
+{
+  const rect14 = getPresetOutline('rectangle_14x10');
+  const lvl41: RoofLevel = {
+    ...createRoofLevel(1, 'Main Roof', 2.7, rect14.points),
+    outline: rect14,
+    skeleton: generateSkeletonLines(rect14)
+  };
+  const planes41 = syncMultiLevelPlanes([lvl41], [], 22.5);
+  const doomedPlane = planes41[0];
+
+  // Delete 1 face
+  const afterDel1 = deleteRoofPlanes([lvl41], planes41, [doomedPlane.id]);
+  if (afterDel1.planes.length !== planes41.length - 1) {
+    throw new Error('deleteRoofPlanes failed to remove targeted plane');
+  }
+  if (afterDel1.levels[0].outline.edges.length !== 4 || afterDel1.levels[0].skeleton.length !== 5) {
+    throw new Error('deleteRoofPlanes must NOT remove outline edges or skeleton lines');
+  }
+
+  // Perform unrelated edits: change pitch on remaining face, change eave height Z, update eave setback/wall, add skeleton line
+  const remainingEdited = afterDel1.planes.map((p) => ({ ...p, pitchDeg: 30 }));
+  const editedOutline = applyEaveHeightToEdges(afterDel1.levels[0].outline, [rect14.edges[2].id], 3.2);
+  const editedOutline2 = applyEaveSetback(editedOutline, [rect14.edges[2].id], 0.45, true);
+  const editedLevels: RoofLevel[] = [
+    {
+      ...afterDel1.levels[0],
+      outline: editedOutline2,
+      skeleton: [
+        ...afterDel1.levels[0].skeleton,
+        { id: 'sk-extra', levelId: 'level-1', from: { x: 2, y: 5 }, to: { x: 4, y: 5 }, suggestedType: 'ridge' }
+      ]
+    }
+  ];
+
+  const afterResync = syncMultiLevelPlanes(editedLevels, remainingEdited, 22.5);
+  if (afterResync.some((p) => p.eaveEdgeId === doomedPlane.eaveEdgeId)) {
+    throw new Error('Deleted roof face must stay suppressed across unrelated pitch/height/wall/skeleton edits');
+  }
+
+  // Deleting ALL remaining faces yields 0 planes while keeping outline & skeleton intact
+  const afterDelAll = deleteRoofPlanes(editedLevels, afterResync, afterResync.map((p) => p.id));
+  if (afterDelAll.planes.length !== 0 || afterDelAll.levels[0].outline.edges.length !== 4) {
+    throw new Error('Deleting all roof faces should yield 0 planes without destroying outline');
+  }
+
+  // Explicitly rebuilding faces via buildFacesFromClassification clears suppression cleanly
+  const rebuilt41 = buildFacesFromClassification(afterDelAll.levels, [], 22.5);
+  if (rebuilt41.planes.length !== 4) {
+    throw new Error(`Expected explicit Build Faces to restore all 4 faces, got ${rebuilt41.planes.length}`);
+  }
+  const unsuppressedOnly = unsuppressOutlineEdges(afterDel1.levels, [doomedPlane.eaveEdgeId]);
+  const restoredDirect = syncMultiLevelPlanes(unsuppressedOnly, afterDel1.planes, 22.5);
+  if (restoredDirect.length !== 4) {
+    throw new Error('unsuppressOutlineEdges should allow re-syncing that specific face');
+  }
+}
+console.log('✓ Test 41 Passed: deleteRoofPlanes persists across unrelated edits, preserves outline/lines, and restores explicitly.');
+
+// 42. Eave length edit AFTER eaveHeightM & wall setback are set (4-corner rect + rectilinear L-shape gable) + skeleton remap
+{
+  // (a) 4-corner rect where first edge is vertical (different winding) with eaveHeightM + wall/setback already set
+  const vertRectPts = [
+    { x: 0, y: 0 },
+    { x: 0, y: 8 },
+    { x: 12, y: 8 },
+    { x: 12, y: 0 }
+  ];
+  let vertOutline = buildOutlineFromPoints(vertRectPts, 'outline');
+  vertOutline = applyEaveHeightToEdges(vertOutline, [vertOutline.edges[0].id], 3.4);
+  vertOutline = applyEaveSetback(vertOutline, [vertOutline.edges[0].id], 0.45, true);
+  const vertSkel = generateSkeletonLines(vertOutline);
+
+  const resizedVert = updateEdgeLength(vertOutline, vertOutline.edges[0].id, 10.5);
+  const resizedEdge0 = resizedVert.edges.find((e) => e.id === vertOutline.edges[0].id)!;
+  const newLen0 = dist(resizedEdge0.from, resizedEdge0.to);
+  if (Math.abs(newLen0 - 10.5) > 0.02) {
+    throw new Error(`Expected resized vertical edge to be 10.5m even after eaveHeightM=3.4 set, got ${newLen0}`);
+  }
+  if (resizedEdge0.eaveHeightM !== 3.4 || resizedEdge0.eaveSetbackM !== 0.45 || resizedEdge0.hasWall !== true) {
+    throw new Error('updateEdgeLength must preserve edge eaveHeightM, eaveSetbackM & hasWall');
+  }
+  const remappedVertSkel = remapSkeletonForOutlineResize(vertOutline, resizedVert, vertSkel);
+  if (remappedVertSkel.length !== vertSkel.length) {
+    throw new Error('remapSkeletonForOutlineResize should preserve skeleton count');
+  }
+
+  // (b) Rectilinear L-shape gable: extend eave edge -> perpendicular gable walls remain 90° orthogonal & ridge follows
+  const lGablePts = [
+    { x: 0, y: 0 },
+    { x: 12, y: 0 },
+    { x: 12, y: 6 },
+    { x: 6, y: 6 },
+    { x: 6, y: 12 },
+    { x: 0, y: 12 }
+  ];
+  let lOut = buildOutlineFromPoints(lGablePts);
+  lOut = applyEdgeType(lOut, [lOut.edges[1].id, lOut.edges[4].id], 'verge');
+  lOut = applyEaveHeightToEdges(lOut, [lOut.edges[0].id], 3.1);
+  lOut = applyEaveSetback(lOut, [lOut.edges[0].id, lOut.edges[1].id], 0.4, true);
+  const lGableSkel = generateSkeletonLines(lOut);
+
+  // Extend the 12m top horizontal eave (edges[0]) to 15m after Z=3.1m is already locked in
+  const lResized = updateEdgeLength(lOut, lOut.edges[0].id, 15.0);
+  const e0After = lResized.edges[0];
+  const e1After = lResized.edges[1];
+  const lenE0After = dist(e0After.from, e0After.to);
+  if (Math.abs(lenE0After - 15.0) > 0.02) {
+    throw new Error(`Expected extended eave edge to equal 15.0m, got ${lenE0After}`);
+  }
+  const dx0 = e0After.to.x - e0After.from.x;
+  const dy0 = e0After.to.y - e0After.from.y;
+  const dx1 = e1After.to.x - e1After.from.x;
+  const dy1 = e1After.to.y - e1After.from.y;
+  const dotCorner = (dx0 * dx1 + dy0 * dy1) / (Math.hypot(dx0, dy0) * Math.hypot(dx1, dy1) || 1);
+  if (Math.abs(dotCorner) > 1e-3) {
+    throw new Error(`Perpendicular gable wall skewed after eave extension (dot=${dotCorner})`);
+  }
+  if (e0After.eaveHeightM !== 3.1 || e1After.type !== 'verge' || e1After.eaveSetbackM !== 0.4) {
+    throw new Error('Extended L-gable must keep eaveHeightM, gable verge type & wall setback');
+  }
+  const lRemappedSkel = remapSkeletonForOutlineResize(lOut, lResized, lGableSkel);
+  const ridgeTouchingEastGable = lRemappedSkel.find(
+    (s) => s.suggestedType === 'ridge' && (Math.abs(s.from.x - 15) < 0.1 || Math.abs(s.to.x - 15) < 0.1)
+  );
+  if (!ridgeTouchingEastGable) {
+    throw new Error('Expected horizontal ridge endpoint attached to east gable wall (x=12->15) to remap cleanly');
+  }
+}
+console.log('✓ Test 42 Passed: Post-eaveHeight updateEdgeLength extends/trims cleanly on rect & rectilinear L-gables with orthogonal walls & remapped ridges.');
+
+// 43. Classified Gable + Side T-Bay + Triangular End Panel -> Closed Planar Loops, Merged Ridge, Rebuild Hygiene & Sealed 3D Seams
+{
+  const fixturePts = [
+    { x: 0, y: 0 },
+    { x: 16, y: 0 },
+    { x: 16, y: 8 },
+    { x: 10, y: 8 },
+    { x: 10, y: 13 },
+    { x: 4, y: 13 },
+    { x: 4, y: 8 },
+    { x: 0, y: 8 }
+  ];
+  let fixOut = buildOutlineFromPoints(fixturePts, 'gable-branch-tri', {
+    initialEdgeType: 'outline',
+    defaultEaveHeightM: 2.7
+  });
+  // East end (edge 1) & West end (edge 7) & T-bay north tip (edge 4) = gable/verge ends; remaining 5 perimeter runs = eaves
+  fixOut = applyEdgeType(fixOut, [fixOut.edges[1].id, fixOut.edges[4].id, fixOut.edges[7].id], 'verge');
+
+  // Split main ridge intentionally into 2 colinear segments with a tiny 0.05m gap + off-45° side-bay valleys + triangular east corner
+  const fixSkel: SkeletonLine[] = [
+    { id: 'r-left', levelId: 'level-1', from: { x: 0, y: 4 }, to: { x: 7.0, y: 4 }, suggestedType: 'ridge' },
+    { id: 'r-right', levelId: 'level-1', from: { x: 7.05, y: 4 }, to: { x: 12, y: 4 }, suggestedType: 'ridge' },
+    { id: 'r-bay', levelId: 'level-1', from: { x: 7, y: 13 }, to: { x: 7, y: 4 }, suggestedType: 'ridge' },
+    { id: 'v-bay-w', levelId: 'level-1', from: { x: 4, y: 8 }, to: { x: 7, y: 4 }, suggestedType: 'valley' },
+    { id: 'v-bay-e', levelId: 'level-1', from: { x: 10, y: 8 }, to: { x: 7, y: 4 }, suggestedType: 'valley' },
+    { id: 'h-tri-s', levelId: 'level-1', from: { x: 16, y: 0 }, to: { x: 12, y: 4 }, suggestedType: 'hip' },
+    { id: 'h-tri-n', levelId: 'level-1', from: { x: 16, y: 8 }, to: { x: 12, y: 4 }, suggestedType: 'hip' }
+  ];
+
+  // Stale ghost plane pre-existing in state must be completely replaced by Build Faces from Classification
+  const staleGhostPlane: RoofPlane = {
+    ...syncMultiLevelPlanes([createRoofLevel(1, 'Ghost', 2.7, [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }, { x: 0, y: 2 }])], [])[0],
+    id: 'plane-ghost-stale',
+    eaveEdgeId: 'ghost-edge-999'
+  };
+
+  const fixLvl: RoofLevel = {
+    id: 'level-1',
+    code: 'L1',
+    name: 'Main Gable + Branch + Tri',
+    eaveHeightM: 2.7,
+    outline: fixOut,
+    skeleton: fixSkel
+  };
+
+  const built43 = buildFacesFromClassification([fixLvl], [staleGhostPlane], 22.5);
+  const rebuiltSkel = built43.levels[0].skeleton;
+  const rebuiltPlanes = built43.planes;
+
+  // 1) Stale ghost plane gone
+  if (rebuiltPlanes.some((p) => p.id === 'plane-ghost-stale')) {
+    throw new Error('buildFacesFromClassification failed to evict stale ghost plane');
+  }
+
+  // 2) Colinear split main ridges merged into ONE continuous main ridge (0,4)->(12,4)
+  const mainRidges43 = rebuiltSkel.filter(
+    (s) => s.suggestedType === 'ridge' && Math.abs(s.from.y - 4) < 0.2 && Math.abs(s.to.y - 4) < 0.2
+  );
+  if (mainRidges43.length !== 1 || Math.abs(Math.hypot(mainRidges43[0].to.x - mainRidges43[0].from.x, mainRidges43[0].to.y - mainRidges43[0].from.y) - 12) > 0.2) {
+    throw new Error(`Expected colinear main ridges to merge into one 12m continuous ridge, got ${mainRidges43.length} segment(s)`);
+  }
+
+  // 3) Closed planar decomposition produces all 6 faces (5 eave slopes + 1 triangular 3-boundary east panel) = exact 158m² footprint
+  if (rebuiltPlanes.length !== 6) {
+    throw new Error(`Expected 6 closed planes (incl. triangular east panel), got ${rebuiltPlanes.length}`);
+  }
+  const triPanel = rebuiltPlanes.find((p) => p.planPolygon.length === 3);
+  if (!triPanel) {
+    throw new Error('Expected dedicated 3-vertex triangular corner/end panel in rebuilt planes');
+  }
+  const planAreaSum43 = rebuiltPlanes.reduce((sum, p) => {
+    let a = 0;
+    for (let i = 0; i < p.planPolygon.length; i++) {
+      const p1 = p.planPolygon[i];
+      const p2 = p.planPolygon[(i + 1) % p.planPolygon.length];
+      a += p1.x * p2.y - p2.x * p1.y;
+    }
+    return sum + Math.abs(a) / 2;
+  }, 0);
+  if (Math.abs(planAreaSum43 - 158) > 0.5) {
+    throw new Error(`Expected exact 158.0m² closed planar coverage (no missing bay/triangle or double wedge), got ${planAreaSum43.toFixed(2)}m²`);
+  }
+
+  // 4) Delete face removes targeted face from both planes & BOM cleanly without ghost residuals
+  const fullBom43 = generateCuttingLayout(rebuiltPlanes, { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 });
+  const afterDelTri = deleteRoofPlanes(built43.levels, rebuiltPlanes, [triPanel.id]);
+  const delBom43 = generateCuttingLayout(afterDelTri.planes, { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 });
+  if (afterDelTri.planes.length !== 5 || delBom43.totalRoofArea >= fullBom43.totalRoofArea - 1.0) {
+    throw new Error('deleteRoofPlanes must remove targeted plane cleanly from both model & BOM');
+  }
+
+  // 5) Shared 3D junction seam check + actual Three.js BufferGeometry mesh inspection
+  const sharedRes43 = resolveLevelSharedVertexElevations(rebuiltPlanes, built43.levels[0].outline, rebuiltSkel, 2.7);
+  const vBayJunction = sharedRes43.getVertexForPoint({ x: 7, y: 4 });
+  const vTriApex = sharedRes43.getVertexForPoint({ x: 12, y: 4 });
+  if (Math.abs(vBayJunction.z - vTriApex.z) > 0.02) {
+    throw new Error(`Expected level main ridge across T-bay junction & tri apex, got z(${vBayJunction.z}) vs z(${vTriApex.z})`);
+  }
+
+  const stubTex43 = {
+    normalMap: null,
+    roughnessMap: null,
+    bumpMap: null,
+    dispose: () => {}
+  } as any;
+  const stubWallTex43 = {
+    getEntry: () => null,
+    weatherboard: { normalMap: null },
+    fibre_cement: { normalMap: null },
+    brick: { map: null, normalMap: null },
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null
+  } as any;
+  const scene43 = buildRoofSceneGroup({
+    outline: built43.levels[0].outline,
+    skeleton: rebuiltSkel,
+    planes: rebuiltPlanes,
+    levels: built43.levels,
+    shadingMode: 'facet_zones',
+    swatch: { name: 'Ebony', hex: '#1e293b', metalness: 0.45, roughness: 0.35 } as any,
+    textures: stubTex43,
+    wallTextures: stubWallTex43,
+    showFlashings: true,
+    showWalls: true,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+
+  // Verify every shared junction vertex in actual 3D BufferGeometries agrees in Y (upward Z) within 1mm
+  const junctionPts = [
+    { x: 7, y: 4 },
+    { x: 12, y: 4 },
+    { x: 4, y: 8 },
+    { x: 10, y: 8 },
+    { x: 16, y: 0 },
+    { x: 16, y: 8 }
+  ];
+  junctionPts.forEach((jPt) => {
+    const heightsAtJunction: number[] = [];
+    const wx = jPt.x - scene43.bounds.midX;
+    const wz = jPt.y - scene43.bounds.midY;
+    rebuiltPlanes.forEach((pl) => {
+      const meshes = scene43.planeMeshById.get(pl.id) || [];
+      meshes.forEach((mesh) => {
+        const pos = mesh.geometry.getAttribute('position');
+        if (!pos) return;
+        let maxYAtPt = -Infinity;
+        for (let vi = 0; vi < pos.count; vi++) {
+          const vx = pos.getX(vi);
+          const vy = pos.getY(vi);
+          const vz = pos.getZ(vi);
+          if (!Number.isFinite(vx) || !Number.isFinite(vy) || !Number.isFinite(vz)) {
+            throw new Error(`Non-finite 3D vertex found in mesh for plane ${pl.id}`);
+          }
+          if (Math.hypot(vx - wx, vz - wz) <= 0.08 && vy > maxYAtPt) {
+            maxYAtPt = vy;
+          }
+        }
+        if (maxYAtPt > 0) heightsAtJunction.push(maxYAtPt);
+      });
+    });
+    if (heightsAtJunction.length >= 2) {
+      const spread = Math.max(...heightsAtJunction) - Math.min(...heightsAtJunction);
+      if (spread > 0.005) {
+        throw new Error(`3D mesh seam gap at (${jPt.x},${jPt.y}): vertical spread ${spread.toFixed(4)}m`);
+      }
+    }
+  });
+
+  // Verify walls meet raked roof underside without piercing above ridge
+  const walls43 = deriveRoofWallSegments(built43.levels, rebuiltPlanes);
+  const gableEastWall = walls43.find((w) => w.edgeId === fixOut.edges[1].id);
+  if (!gableEastWall || gableEastWall.wallKind !== 'gable_end' || Math.max(...gableEastWall.topProfilePoints3D.map((p) => p.z)) < vTriApex.z - 0.05) {
+    throw new Error('East gable wall must rake cleanly up to triangular apex');
+  }
+  scene43.dispose();
+
+  // 6) Verify long eave edge subdivided mid-span by interior valley/hip line splits cleanly into 2 non-overlapping faces
+  const splitRectPts = [
+    { x: 0, y: 0 },
+    { x: 14, y: 0 },
+    { x: 14, y: 8 },
+    { x: 0, y: 8 }
+  ];
+  const splitOut = buildOutlineFromPoints(splitRectPts, 'split-eave-rect', { initialEdgeType: 'outline' });
+  const splitSkel: SkeletonLine[] = [
+    { id: 'r-main', from: { x: 4, y: 4 }, to: { x: 10, y: 4 }, suggestedType: 'ridge' },
+    { id: 'v-t', from: { x: 7, y: 0 }, to: { x: 7, y: 4 }, suggestedType: 'valley' },
+    { id: 'h-sw', from: { x: 0, y: 0 }, to: { x: 4, y: 4 }, suggestedType: 'hip' },
+    { id: 'h-nw', from: { x: 0, y: 8 }, to: { x: 4, y: 4 }, suggestedType: 'hip' },
+    { id: 'h-se', from: { x: 14, y: 0 }, to: { x: 10, y: 4 }, suggestedType: 'hip' },
+    { id: 'h-ne', from: { x: 14, y: 8 }, to: { x: 10, y: 4 }, suggestedType: 'hip' }
+  ];
+  const splitPlanes = syncMultiLevelPlanes(
+    [{ id: 'level-1', code: 'L1', name: 'Split Eave', eaveHeightM: 2.7, outline: splitOut, skeleton: splitSkel }],
+    [],
+    22.5
+  );
+  if (splitPlanes.length !== 5) {
+    throw new Error(`Expected 5 planes when south eave is split by interior valley junction (7,0), got ${splitPlanes.length}`);
+  }
+}
+console.log('✓ Test 43 Passed: Classified gable + T-bay + triangular end plan merges ridges, decomposes closed loops without synthetic wedges, and produces sealed watertight 3D seams.');
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

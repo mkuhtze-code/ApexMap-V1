@@ -14,7 +14,9 @@ import {
   computeGableDormerGeometry,
   deriveRoofWallSegments,
   isPointInPolygon,
-  resolveEffectivePlanesWithAssets
+  ResolvedLevelSharedVertices,
+  resolveEffectivePlanesWithAssets,
+  resolveLevelSharedVertexElevations
 } from '../../../utils/exactRoofingEngine';
 import {
   ColorsteelSwatch,
@@ -120,6 +122,39 @@ function evalPlaneZ(pt: Point2D, plane: RoofPlane, levelOutline: RoofOutline): n
   const tanPitch = Math.tan(((plane.pitchDeg || 0) * Math.PI) / 180);
   const vDist = Math.max(0, (pt.x - eaveA.x) * fallInward2D.x + (pt.y - eaveA.y) * fallInward2D.y);
   return baseH + vDist * tanPitch;
+}
+
+/** Compute best-fit upward (+Y) 3D plane normal from stitched polygon boundary points */
+function computeNewellPlaneNormal(
+  pts3D: THREE.Vector3[],
+  fallbackNormal: THREE.Vector3
+): THREE.Vector3 {
+  if (pts3D.length < 3) return fallbackNormal.clone().normalize();
+  if (pts3D.length === 3) {
+    const e1 = new THREE.Vector3().subVectors(pts3D[1], pts3D[0]);
+    const e2 = new THREE.Vector3().subVectors(pts3D[2], pts3D[0]);
+    const n = new THREE.Vector3().crossVectors(e1, e2);
+    if (n.lengthSq() > 1e-6) {
+      n.normalize();
+      if (n.y < 0) n.negate();
+      if (n.y >= 0.12) return n;
+    }
+    return fallbackNormal.clone().normalize();
+  }
+  const n = new THREE.Vector3(0, 0, 0);
+  for (let i = 0; i < pts3D.length; i++) {
+    const curr = pts3D[i];
+    const next = pts3D[(i + 1) % pts3D.length];
+    n.x += (curr.y - next.y) * (curr.z + next.z);
+    n.y += (curr.z - next.z) * (curr.x + next.x);
+    n.z += (curr.x - next.x) * (curr.y + next.y);
+  }
+  if (n.lengthSq() > 1e-6) {
+    n.normalize();
+    if (n.y < 0) n.negate();
+    if (n.y >= 0.12) return n;
+  }
+  return fallbackNormal.clone().normalize();
 }
 
 function pointInPoly2D(pt: THREE.Vector2, poly: THREE.Vector2[]): boolean {
@@ -764,6 +799,20 @@ export function buildRoofSceneGroup(params: {
       : resolveEffectivePlanesWithAssets(planes, assets, pitchBreaks);
 
   const structuralPlanes = effectivePlanes.filter((p) => !p.isVirtualAssetPlane);
+  const sharedVerticesByLevel = new Map<string, ResolvedLevelSharedVertices>();
+  allLevels.forEach((lvl) => {
+    const lvlPlanes = structuralPlanes.filter((p) => (p.levelId || 'level-1') === lvl.id);
+    sharedVerticesByLevel.set(
+      lvl.id,
+      resolveLevelSharedVertexElevations(
+        lvlPlanes,
+        lvl.outline,
+        lvl.skeleton,
+        lvl.eaveHeightM ?? 2.7
+      )
+    );
+  });
+
   const rootGroup = new THREE.Group();
   const selectableMeshes: THREE.Mesh[] = [];
   const planeMeshById = new Map<string, THREE.Mesh[]>();
@@ -928,10 +977,16 @@ export function buildRoofSceneGroup(params: {
     })
   );
 
-  // 1. Build Roof Sloped Cladding Slabs with TRUE Cut Openings (Skylights, Chimneys, Dormers)
+  // 1. Build Roof Sloped Cladding Slabs with TRUE Cut Openings & Shared 3D Junction Vertices
   effectivePlanes.forEach((plane) => {
     if (plane.planPolygon.length < 3) return;
-    const levelOutline = allLevels.find((l) => l.id === plane.levelId)?.outline || outline;
+    const levelObj = allLevels.find((l) => l.id === plane.levelId) || allLevels[0];
+    const levelOutline = levelObj?.outline || outline;
+    const isStructural = !plane.parentPlaneId && !plane.isVirtualAssetPlane;
+    const sharedRes = isStructural
+      ? sharedVerticesByLevel.get(plane.levelId || levelObj?.id || 'level-1')
+      : undefined;
+
     const { eaveA, fallInward2D, uvEdgeU2D, uvRunDir2D } = resolvePlaneAxesAndFall(
       plane,
       levelOutline
@@ -941,20 +996,29 @@ export function buildRoofSceneGroup(params: {
     const pitchRad = ((plane.pitchDeg || 0) * Math.PI) / 180;
     const tanPitch = Math.tan(pitchRad);
 
-    const topPts3D = plane.planPolygon.map((pt) => {
+    const renderPoly2D = sharedRes
+      ? sharedRes.getPolygonWithTJunctions(plane)
+      : plane.planPolygon;
+
+    const topPts3D = renderPoly2D.map((pt) => {
       const vDist = Math.max(0, (pt.x - eaveA.x) * fallInward2D.x + (pt.y - eaveA.y) * fallInward2D.y);
-      return toThreeVec(pt.x, pt.y, baseH + vDist * tanPitch, bounds);
+      const localZ = baseH + vDist * tanPitch;
+      const resolvedZ = sharedRes ? sharedRes.getVertexForPoint(pt, localZ).z : localZ;
+      return toThreeVec(pt.x, pt.y, resolvedZ, bounds);
     });
 
-    // Plane surface normal pointing UP (+Y positive)
+    // Plane surface normal pointing UP (+Y positive) fitted to stitched 3D vertices
     const eaveVec3D = new THREE.Vector3(-fallInward2D.y, 0, fallInward2D.x).normalize();
     const fallSlope3D = new THREE.Vector3(
       fallInward2D.x * Math.cos(pitchRad),
       Math.sin(pitchRad),
       fallInward2D.y * Math.cos(pitchRad)
     ).normalize();
-    const planeNormal = new THREE.Vector3().crossVectors(fallSlope3D, eaveVec3D).normalize();
-    if (planeNormal.y < 0) planeNormal.negate();
+    const nominalNormal = new THREE.Vector3().crossVectors(fallSlope3D, eaveVec3D).normalize();
+    if (nominalNormal.y < 0) nominalNormal.negate();
+    const planeNormal = isStructural
+      ? computeNewellPlaneNormal(topPts3D, nominalNormal)
+      : nominalNormal;
 
     // Project UV sheet run direction onto sloped 3D plane (respects plane.sheetRunEdgeId!)
     const ny = Math.max(0.08, planeNormal.y);
@@ -973,8 +1037,17 @@ export function buildRoofSceneGroup(params: {
     const apertureEntries = (plane.apertures || []).filter(
       (app) => app.planPolygon && app.planPolygon.length >= 3
     );
+    const refOrigin3D = topPts3D[0];
     apertureEntries.forEach((app) => {
       const holePts3D = app.planPolygon.map((pt) => {
+        if (isStructural && sharedRes && refOrigin3D) {
+          const wx = pt.x - bounds.midX;
+          const wz = pt.y - bounds.midY;
+          const wy =
+            refOrigin3D.y -
+            (planeNormal.x * (wx - refOrigin3D.x) + planeNormal.z * (wz - refOrigin3D.z)) / ny;
+          return new THREE.Vector3(wx, wy, wz);
+        }
         const vDist = Math.max(0, (pt.x - eaveA.x) * fallInward2D.x + (pt.y - eaveA.y) * fallInward2D.y);
         return toThreeVec(pt.x, pt.y, baseH + vDist * tanPitch, bounds);
       });
@@ -1288,7 +1361,11 @@ export function buildRoofSceneGroup(params: {
   if (showFlashings) {
     allLevels.forEach((lvl) => {
       const levelPlanes = structuralPlanes.filter((p) => (p.levelId || 'level-1') === lvl.id);
+      const sharedRes = sharedVerticesByLevel.get(lvl.id);
       const getPtZ = (pt: Point2D): number => {
+        if (sharedRes) {
+          return sharedRes.getVertexForPoint(pt, lvl.eaveHeightM ?? 2.7).z;
+        }
         const hits = levelPlanes.filter(
           (pl) =>
             pl.planPolygon.length >= 3 &&
@@ -1301,12 +1378,32 @@ export function buildRoofSceneGroup(params: {
         return lvl.eaveHeightM ?? 2.7;
       };
 
+      const splitAtSharedJunctions = (from: Point2D, to: Point2D): Point2D[] => {
+        if (!sharedRes) return [from, to];
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const segLen = Math.hypot(dx, dy);
+        if (segLen < 0.3) return [from, to];
+        const ux = dx / segLen;
+        const uy = dy / segLen;
+        const splits: { proj: number; pt: Point2D }[] = [];
+        sharedRes.vertices.forEach((rv) => {
+          const proj = (rv.x - from.x) * ux + (rv.y - from.y) * uy;
+          if (proj <= 0.15 || proj >= segLen - 0.15) return;
+          const cx = from.x + ux * proj;
+          const cy = from.y + uy * proj;
+          if (Math.hypot(rv.x - cx, rv.y - cy) <= 0.14) {
+            if (!splits.some((s) => Math.abs(s.proj - proj) < 0.15)) {
+              splits.push({ proj, pt: { x: rv.x, y: rv.y } });
+            }
+          }
+        });
+        splits.sort((a, b) => a.proj - b.proj);
+        return [from, ...splits.map((s) => s.pt), to];
+      };
+
       lvl.skeleton.forEach((sk) => {
-        const zA = getPtZ(sk.from);
-        const zB = getPtZ(sk.to);
         const offset = sk.suggestedType === 'valley' ? -0.008 : sk.suggestedType === 'eave' ? -0.012 : 0.028;
-        const pA = toThreeVec(sk.from.x, sk.from.y, zA + offset, bounds);
-        const pB = toThreeVec(sk.to.x, sk.to.y, zB + offset, bounds);
         const stripKind: 'ridge' | 'hip' | 'valley' | 'barge' | 'gutter' | 'apron' =
           sk.suggestedType === 'ridge' || sk.suggestedType === 'hip' || sk.suggestedType === 'valley'
             ? sk.suggestedType
@@ -1321,10 +1418,25 @@ export function buildRoofSceneGroup(params: {
             : stripKind === 'gutter'
             ? gutterMaterial
             : flashingMaterial;
-        const strip = buildFlashingStripMesh(pA, pB, stripKind, mat);
-        if (strip) {
-          trackGeo(strip.geometry);
-          rootGroup.add(strip);
+
+        const wayPts = splitAtSharedJunctions(sk.from, sk.to);
+        for (let wi = 0; wi < wayPts.length - 1; wi++) {
+          const wA = wayPts[wi];
+          const wB = wayPts[wi + 1];
+          const pA = toThreeVec(wA.x, wA.y, getPtZ(wA) + offset, bounds);
+          const pB = toThreeVec(wB.x, wB.y, getPtZ(wB) + offset, bounds);
+          const strip = buildFlashingStripMesh(pA, pB, stripKind, mat);
+          if (strip) {
+            trackGeo(strip.geometry);
+            rootGroup.add(strip);
+          }
+        }
+      });
+
+      const ridgeEndpoints: Point2D[] = [];
+      lvl.skeleton.forEach((sk) => {
+        if (sk.suggestedType === 'ridge') {
+          ridgeEndpoints.push(sk.from, sk.to);
         }
       });
 
@@ -1332,12 +1444,37 @@ export function buildRoofSceneGroup(params: {
         const zA = getPtZ(edge.from);
         const zB = getPtZ(edge.to);
         if (edge.type === 'verge' || edge.type === 'rake') {
-          const pA = toThreeVec(edge.from.x, edge.from.y, zA + 0.01, bounds);
-          const pB = toThreeVec(edge.to.x, edge.to.y, zB + 0.01, bounds);
-          const barge = buildFlashingStripMesh(pA, pB, 'barge', flashingMaterial);
-          if (barge) {
-            trackGeo(barge.geometry);
-            rootGroup.add(barge);
+          const ex = edge.to.x - edge.from.x;
+          const ey = edge.to.y - edge.from.y;
+          const eLen = Math.hypot(ex, ey) || 1;
+          const ux = ex / eLen;
+          const uy = ey / eLen;
+          const splits: { proj: number; pt: Point2D }[] = [];
+
+          ridgeEndpoints.forEach((rp) => {
+            const proj = (rp.x - edge.from.x) * ux + (rp.y - edge.from.y) * uy;
+            if (proj <= 0.15 || proj >= eLen - 0.15) return;
+            const closestX = edge.from.x + ux * proj;
+            const closestY = edge.from.y + uy * proj;
+            if (Math.hypot(rp.x - closestX, rp.y - closestY) <= 0.28) {
+              if (!splits.some((s) => Math.abs(s.proj - proj) < 0.2)) {
+                splits.push({ proj, pt: rp });
+              }
+            }
+          });
+          splits.sort((a, b) => a.proj - b.proj);
+          const wayPts: Point2D[] = [edge.from, ...splits.map((s) => s.pt), edge.to];
+
+          for (let wi = 0; wi < wayPts.length - 1; wi++) {
+            const wA = wayPts[wi];
+            const wB = wayPts[wi + 1];
+            const pA = toThreeVec(wA.x, wA.y, getPtZ(wA) + 0.01, bounds);
+            const pB = toThreeVec(wB.x, wB.y, getPtZ(wB) + 0.01, bounds);
+            const barge = buildFlashingStripMesh(pA, pB, 'barge', flashingMaterial);
+            if (barge) {
+              trackGeo(barge.geometry);
+              rootGroup.add(barge);
+            }
           }
         } else if (edge.type === 'wall' || edge.type === 'apron' || edge.type === 'change-of-pitch') {
           const pA = toThreeVec(edge.from.x, edge.from.y, zA + 0.025, bounds);
@@ -1409,7 +1546,25 @@ export function buildRoofSceneGroup(params: {
         );
         if (linkedRaked) return false;
       }
-      if (wall.wallKind !== 'abutment_wall' && linkedRoofEdgeIds.has(wall.edgeId)) return false;
+      if (linkedRoofEdgeIds.has(wall.edgeId)) return false;
+      // Avoid double Z-fighting when a WallFacet on another tier owns the exact same 2D segment
+      if (wall.wallKind === 'abutment_wall') {
+        const wLen = Math.hypot(wall.wallTo.x - wall.wallFrom.x, wall.wallTo.y - wall.wallFrom.y) || 1;
+        const wux = (wall.wallTo.x - wall.wallFrom.x) / wLen;
+        const wuy = (wall.wallTo.y - wall.wallFrom.y) / wLen;
+        const wMidX = (wall.wallFrom.x + wall.wallTo.x) / 2;
+        const wMidY = (wall.wallFrom.y + wall.wallTo.y) / 2;
+        const ownedCoincident = (wallPlan?.facets || []).some((f) => {
+          const fLen = Math.hypot(f.to.x - f.from.x, f.to.y - f.from.y);
+          if (fLen < 0.2) return false;
+          const fux = (f.to.x - f.from.x) / fLen;
+          const fuy = (f.to.y - f.from.y) / fLen;
+          if (Math.abs(wux * fux + wuy * fuy) < 0.96) return false;
+          const perpD = Math.abs((wMidX - f.from.x) * -fuy + (wMidY - f.from.y) * fux);
+          return perpD <= 0.16 && Math.min(wLen, fLen) > 0.3;
+        });
+        if (ownedCoincident) return false;
+      }
       return true;
     });
 

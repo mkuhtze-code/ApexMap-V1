@@ -295,8 +295,28 @@ export const WallPlanWorkspace: React.FC<Props> = ({
     };
   }, [levels, wallPlan?.points, wallPlan?.bodies, facets, draftPoints, planUnderlay]);
 
-  const svgW = 860;
-  const svgH = 520;
+  const [vpSize, setVpSize] = useState<{ w: number; h: number }>({ w: 860, h: 520 });
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const syncSize = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 80 && rect.height > 80) {
+        setVpSize((prev) =>
+          Math.abs(prev.w - rect.width) > 4 || Math.abs(prev.h - rect.height) > 4
+            ? { w: Math.round(rect.width), h: Math.round(rect.height) }
+            : prev
+        );
+      }
+    };
+    syncSize();
+    const ro = new ResizeObserver(syncSize);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [subView]);
+
+  const svgW = vpSize.w;
+  const svgH = vpSize.h;
   const worldW = Math.max(4, viewBounds.maxX - viewBounds.minX);
   const worldH = Math.max(4, viewBounds.maxY - viewBounds.minY);
   const basePxPerM = Math.min((svgW - 48) / worldW, (svgH - 48) / worldH);
@@ -313,7 +333,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
 
   const gridData = useMemo(
     () => computeMetricGridLines(svgW, svgH, pxPerM, fromSvgX, fromSvgY, toSvgX, toSvgY),
-    [pxPerM, worldCenterX, worldCenterY, pan.x, pan.y]
+    [svgW, svgH, pxPerM, worldCenterX, worldCenterY, pan.x, pan.y]
   );
   const scaleBar = useMemo(() => computeDynamicScaleBar(pxPerM), [pxPerM]);
 
@@ -379,7 +399,7 @@ export const WallPlanWorkspace: React.FC<Props> = ({
 
     viewport.addEventListener('wheel', handleWheel, { passive: false });
     return () => viewport.removeEventListener('wheel', handleWheel);
-  }, []);
+  }, [svgW, svgH, centerX, centerY, subView]);
 
   const getWorldFromClient = (clientX: number, clientY: number): Point2D | null => {
     const svg = svgRef.current;

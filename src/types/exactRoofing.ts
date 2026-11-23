@@ -63,6 +63,8 @@ export interface SkeletonLine {
   to: Point2D;
   suggestedType: SkeletonLineType;
   levelId?: string;
+  /** True if the user explicitly split this ridge so colinear auto-merge should preserve the split */
+  manualSplit?: boolean;
 }
 
 export interface RoofLevel {
@@ -72,6 +74,8 @@ export interface RoofLevel {
   eaveHeightM: number; // Base Z-axis wall height in metres
   outline: RoofOutline;
   skeleton: SkeletonLine[];
+  /** Outline edge IDs whose roof plane was explicitly deleted by the user until explicitly rebuilt */
+  suppressedPlaneEdgeIds?: string[];
 }
 
 export interface RoofWallSegment {

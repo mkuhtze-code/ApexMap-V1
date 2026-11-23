@@ -286,6 +286,19 @@ export function buildAttachedOutlineFromEdge(
   };
 }
 
+export function isGableEdgeType(edgeType?: EdgeType): boolean {
+  return edgeType === 'verge' || edgeType === 'rake';
+}
+
+export function isStationaryEdgeType(edgeType?: EdgeType): boolean {
+  return (
+    edgeType === 'verge' ||
+    edgeType === 'rake' ||
+    edgeType === 'wall' ||
+    edgeType === 'apron'
+  );
+}
+
 export interface RoofLineTypeCatalogItem {
   edgeType: EdgeType;
   lineType: SkeletonLineType;
@@ -764,52 +777,48 @@ export function updateEdgeLength(outline: RoofOutline, edgeId: string, newLength
   const edgeIdx = outline.edges.findIndex((e) => e.id === edgeId);
   if (edgeIdx < 0) return outline;
 
-  const pts = [...outline.points];
+  const pts = outline.points.map((p) => ({ ...p }));
   const n = pts.length;
-  const p0 = pts[edgeIdx];
+  if (n < 3) return outline;
+
+  const prevIdx = (edgeIdx - 1 + n) % n;
   const nextIdx = (edgeIdx + 1) % n;
+  const next2Idx = (edgeIdx + 2) % n;
+  const p0 = pts[edgeIdx];
   const p1 = pts[nextIdx];
 
   const curLen = dist(p0, p1);
   if (curLen < 0.01) return outline;
   const delta = newLengthM - curLen;
+  const ux = (p1.x - p0.x) / curLen;
+  const uy = (p1.y - p0.y) / curLen;
+  const shift = { x: ux * delta, y: uy * delta };
 
-  // Case 1: 4-Corner Rectangle (preserve orthogonal rectangular geometry)
+  const unitVec = (a: Point2D, b: Point2D): Point2D => {
+    const l = dist(a, b) || 1;
+    return { x: (b.x - a.x) / l, y: (b.y - a.y) / l };
+  };
+
+  // Case 1: 4-Corner Orthogonal Rectangle (any rotation, starting vertex, or winding)
   if (n === 4) {
-    const isHorizontal = Math.abs(p1.y - p0.y) < 0.15;
-    const isVertical = Math.abs(p1.x - p0.x) < 0.15;
+    const next3Idx = (edgeIdx + 3) % n;
+    const vPrev = unitVec(pts[prevIdx], p0);
+    const vNext = unitVec(p1, pts[next2Idx]);
+    const vOpp = unitVec(pts[next2Idx], pts[next3Idx]);
+    const isOrthoRect =
+      Math.abs(vPrev.x * ux + vPrev.y * uy) < 0.15 &&
+      Math.abs(ux * vNext.x + uy * vNext.y) < 0.15 &&
+      Math.abs(ux * vOpp.x + uy * vOpp.y) > 0.96;
 
-    if (isHorizontal) {
-      const sign = p1.x >= p0.x ? 1 : -1;
-      const shiftX = sign * delta;
-      if (edgeIdx === 0) {
-        pts[1] = { x: +(pts[1].x + shiftX).toFixed(2), y: pts[1].y };
-        pts[2] = { x: +(pts[2].x + shiftX).toFixed(2), y: pts[2].y };
-      } else if (edgeIdx === 2) {
-        pts[2] = { x: +(pts[2].x - shiftX).toFixed(2), y: pts[2].y };
-        pts[1] = { x: +(pts[1].x - shiftX).toFixed(2), y: pts[1].y };
-      } else {
-        pts[nextIdx] = { x: +(p0.x + sign * newLengthM).toFixed(2), y: p0.y };
-      }
-      return preserveOutlineEdgeMetadata(
-        buildOutlineFromPoints(pts, outline.id, {
-          levelId: outline.levelId,
-          idPrefix: getLevelIdPrefixFromOutline(outline)
-        }),
-        outline
-      );
-    } else if (isVertical) {
-      const sign = p1.y >= p0.y ? 1 : -1;
-      const shiftY = sign * delta;
-      if (edgeIdx === 1) {
-        pts[2] = { x: pts[2].x, y: +(pts[2].y + shiftY).toFixed(2) };
-        pts[3] = { x: pts[3].x, y: +(pts[3].y + shiftY).toFixed(2) };
-      } else if (edgeIdx === 3) {
-        pts[3] = { x: pts[3].x, y: +(pts[3].y - shiftY).toFixed(2) };
-        pts[2] = { x: pts[2].x, y: +(pts[2].y - shiftY).toFixed(2) };
-      } else {
-        pts[nextIdx] = { x: p0.x, y: +(p0.y + sign * newLengthM).toFixed(2) };
-      }
+    if (isOrthoRect) {
+      pts[nextIdx] = {
+        x: +(pts[nextIdx].x + shift.x).toFixed(2),
+        y: +(pts[nextIdx].y + shift.y).toFixed(2)
+      };
+      pts[next2Idx] = {
+        x: +(pts[next2Idx].x + shift.x).toFixed(2),
+        y: +(pts[next2Idx].y + shift.y).toFixed(2)
+      };
       return preserveOutlineEdgeMetadata(
         buildOutlineFromPoints(pts, outline.id, {
           levelId: outline.levelId,
@@ -820,9 +829,75 @@ export function updateEdgeLength(outline: RoofOutline, edgeId: string, newLength
     }
   }
 
-  // Case 2: General polygon - adjust target vertex along line direction
-  const ux = (p1.x - p0.x) / curLen;
-  const uy = (p1.y - p0.y) / curLen;
+  // Case 2: Rectilinear / L / T / Stepped polygon — translate perpendicular corner chain rigidly
+  // so adjacent gable walls & orthogonal corners stay 90 deg instead of turning diagonal.
+  if (n > 4) {
+    const next3Idx = (edgeIdx + 3) % n;
+    const vNext = unitVec(p1, pts[next2Idx]);
+    const vNext2 = unitVec(pts[next2Idx], pts[next3Idx]);
+    const next2Shifted = {
+      x: +(pts[next2Idx].x + shift.x).toFixed(2),
+      y: +(pts[next2Idx].y + shift.y).toFixed(2)
+    };
+    const origSeg2 = { x: pts[next3Idx].x - pts[next2Idx].x, y: pts[next3Idx].y - pts[next2Idx].y };
+    const nextSeg2 = { x: pts[next3Idx].x - next2Shifted.x, y: pts[next3Idx].y - next2Shifted.y };
+    const forwardKeepsSign =
+      origSeg2.x * nextSeg2.x + origSeg2.y * nextSeg2.y > 0 &&
+      Math.hypot(nextSeg2.x, nextSeg2.y) >= 0.35;
+
+    if (
+      Math.abs(ux * vNext.x + uy * vNext.y) < 0.15 &&
+      Math.abs(ux * vNext2.x + uy * vNext2.y) > 0.96 &&
+      forwardKeepsSign
+    ) {
+      pts[nextIdx] = {
+        x: +(pts[nextIdx].x + shift.x).toFixed(2),
+        y: +(pts[nextIdx].y + shift.y).toFixed(2)
+      };
+      pts[next2Idx] = next2Shifted;
+      return preserveOutlineEdgeMetadata(
+        buildOutlineFromPoints(pts, outline.id, {
+          levelId: outline.levelId,
+          idPrefix: getLevelIdPrefixFromOutline(outline)
+        }),
+        outline
+      );
+    }
+
+    const prev2Idx = (edgeIdx - 2 + n) % n;
+    const vPrev = unitVec(pts[prevIdx], p0);
+    const vPrev2 = unitVec(pts[prev2Idx], pts[prevIdx]);
+    const prevShifted = {
+      x: +(pts[prevIdx].x - shift.x).toFixed(2),
+      y: +(pts[prevIdx].y - shift.y).toFixed(2)
+    };
+    const origPrev2 = { x: prevShifted.x - pts[prev2Idx].x, y: prevShifted.y - pts[prev2Idx].y };
+    const basePrev2 = { x: pts[prevIdx].x - pts[prev2Idx].x, y: pts[prevIdx].y - pts[prev2Idx].y };
+    const backKeepsSign =
+      basePrev2.x * origPrev2.x + basePrev2.y * origPrev2.y > 0 &&
+      Math.hypot(origPrev2.x, origPrev2.y) >= 0.35;
+
+    if (
+      Math.abs(ux * vPrev.x + uy * vPrev.y) < 0.15 &&
+      Math.abs(ux * vPrev2.x + uy * vPrev2.y) > 0.96 &&
+      backKeepsSign
+    ) {
+      pts[edgeIdx] = {
+        x: +(pts[edgeIdx].x - shift.x).toFixed(2),
+        y: +(pts[edgeIdx].y - shift.y).toFixed(2)
+      };
+      pts[prevIdx] = prevShifted;
+      return preserveOutlineEdgeMetadata(
+        buildOutlineFromPoints(pts, outline.id, {
+          levelId: outline.levelId,
+          idPrefix: getLevelIdPrefixFromOutline(outline)
+        }),
+        outline
+      );
+    }
+  }
+
+  // Case 3: General polygon - adjust target vertex along line direction
   pts[nextIdx] = {
     x: +(p0.x + ux * newLengthM).toFixed(2),
     y: +(p0.y + uy * newLengthM).toFixed(2)
@@ -835,6 +910,76 @@ export function updateEdgeLength(outline: RoofOutline, edgeId: string, newLength
     }),
     outline
   );
+}
+
+export function remapSkeletonForOutlineResize(
+  prevOutline: RoofOutline,
+  nextOutline: RoofOutline,
+  prevSkeleton: SkeletonLine[]
+): SkeletonLine[] {
+  if (prevSkeleton.length === 0) return [];
+  const allAutoSkel = prevSkeleton.every((s) => s.id.includes('skel-'));
+  if (allAutoSkel && nextOutline.points.length >= 3) {
+    const levelId = prevSkeleton[0]?.levelId ?? nextOutline.levelId ?? prevOutline.levelId;
+    return generateSkeletonLines(nextOutline).map((s) => ({
+      ...s,
+      ...(levelId ? { levelId } : {})
+    }));
+  }
+
+  if (
+    prevOutline.points.length !== nextOutline.points.length ||
+    prevOutline.edges.length !== nextOutline.edges.length ||
+    prevOutline.points.length < 3
+  ) {
+    return prevSkeleton;
+  }
+
+  const mapPoint = (pt: Point2D): Point2D => {
+    // 1. Direct corner match
+    for (let i = 0; i < prevOutline.points.length; i++) {
+      const oldV = prevOutline.points[i];
+      const newV = nextOutline.points[i];
+      if (pointsClose(pt, oldV, 0.25)) {
+        const dx = newV.x - oldV.x;
+        const dy = newV.y - oldV.y;
+        return { x: +(pt.x + dx).toFixed(3), y: +(pt.y + dy).toFixed(3) };
+      }
+    }
+
+    // 2. Boundary edge match (e.g. ridge apex anchored on a gable wall that translated)
+    for (let i = 0; i < prevOutline.edges.length; i++) {
+      const oldE = prevOutline.edges[i];
+      const newE = nextOutline.edges[i];
+      if (distToSegment(pt, oldE.from, oldE.to) <= 0.25) {
+        const oldLen = dist(oldE.from, oldE.to);
+        if (oldLen < 0.05) continue;
+        const ux = (oldE.to.x - oldE.from.x) / oldLen;
+        const uy = (oldE.to.y - oldE.from.y) / oldLen;
+        const t = Math.max(0, Math.min(1, ((pt.x - oldE.from.x) * ux + (pt.y - oldE.from.y) * uy) / oldLen));
+        const projOld = {
+          x: oldE.from.x + (oldE.to.x - oldE.from.x) * t,
+          y: oldE.from.y + (oldE.to.y - oldE.from.y) * t
+        };
+        const projNew = {
+          x: newE.from.x + (newE.to.x - newE.from.x) * t,
+          y: newE.from.y + (newE.to.y - newE.from.y) * t
+        };
+        return {
+          x: +(pt.x + (projNew.x - projOld.x)).toFixed(3),
+          y: +(pt.y + (projNew.y - projOld.y)).toFixed(3)
+        };
+      }
+    }
+
+    return pt;
+  };
+
+  return prevSkeleton.map((line) => ({
+    ...line,
+    from: mapPoint(line.from),
+    to: mapPoint(line.to)
+  }));
 }
 
 export function updateSkeletonLineLength(
@@ -1076,6 +1221,105 @@ function simplifyOutlinePoints(rawPts: Point2D[], edges?: PlanEdge[]): Point2D[]
   return filtered.length >= 3 ? filtered : pts;
 }
 
+/**
+ * Merge colinear ridge segments on the same roof pitch band into continuous logical ridges
+ * (unless explicitly marked with `manualSplit`). Handles touching, overlapping, or small-gap
+ * colinear ridge segments cleanly.
+ */
+export function mergeColinearRidgeLines(
+  rawLines: SkeletonLine[],
+  existingPlanes: RoofPlane[] = []
+): SkeletonLine[] {
+  const result = rawLines.map((l) => ({
+    ...l,
+    from: { x: +l.from.x.toFixed(3), y: +l.from.y.toFixed(3) },
+    to: { x: +l.to.x.toFixed(3), y: +l.to.y.toFixed(3) }
+  }));
+
+  const getPitchBandForLine = (line: SkeletonLine): number | null => {
+    if (!existingPlanes || existingPlanes.length === 0) return null;
+    const mid = { x: (line.from.x + line.to.x) / 2, y: (line.from.y + line.to.y) / 2 };
+    const matched = existingPlanes.filter((p) => {
+      if (line.levelId && p.levelId && line.levelId !== p.levelId) return false;
+      return p.planPolygon.some((v, idx) => {
+        const next = p.planPolygon[(idx + 1) % p.planPolygon.length];
+        return distToSegment(mid, v, next) <= 0.2;
+      });
+    });
+    if (matched.length === 0) return null;
+    return matched.reduce((s, p) => s + (p.pitchDeg || 22.5), 0) / matched.length;
+  };
+
+  let mergedAny = true;
+  let guard = 0;
+  while (mergedAny && guard++ < 150) {
+    mergedAny = false;
+    for (let i = 0; i < result.length; i++) {
+      const l1 = result[i];
+      if (l1.suggestedType !== 'ridge' || l1.manualSplit) continue;
+      const len1 = dist(l1.from, l1.to);
+      if (len1 < 0.04) continue;
+      const u1x = (l1.to.x - l1.from.x) / len1;
+      const u1y = (l1.to.y - l1.from.y) / len1;
+
+      for (let j = i + 1; j < result.length; j++) {
+        const l2 = result[j];
+        if (l2.suggestedType !== 'ridge' || l2.manualSplit) continue;
+        if (l1.levelId && l2.levelId && l1.levelId !== l2.levelId) continue;
+
+        const len2 = dist(l2.from, l2.to);
+        if (len2 < 0.04) continue;
+        const u2x = (l2.to.x - l2.from.x) / len2;
+        const u2y = (l2.to.y - l2.from.y) / len2;
+
+        // Colinear direction check (~ <= 7 deg)
+        if (Math.abs(u1x * u2x + u1y * u2y) < 0.992) continue;
+
+        // Perpendicular offset check relative to infinite line of l1
+        const perpA = Math.abs((l2.from.x - l1.from.x) * -u1y + (l2.from.y - l1.from.y) * u1x);
+        const perpB = Math.abs((l2.to.x - l1.from.x) * -u1y + (l2.to.y - l1.from.y) * u1x);
+        if (perpA > 0.14 || perpB > 0.14) continue;
+
+        // 1D interval overlap / gap check along u1
+        const p2a = (l2.from.x - l1.from.x) * u1x + (l2.from.y - l1.from.y) * u1y;
+        const p2b = (l2.to.x - l1.from.x) * u1x + (l2.to.y - l1.from.y) * u1y;
+        const s2 = Math.min(p2a, p2b);
+        const e2 = Math.max(p2a, p2b);
+        const gap = Math.max(s2 - len1, -e2);
+        if (gap > 0.25) continue;
+
+        // Same pitch band check if abutting roof planes exist
+        const pitch1 = getPitchBandForLine(l1);
+        const pitch2 = getPitchBandForLine(l2);
+        if (pitch1 !== null && pitch2 !== null && Math.abs(pitch1 - pitch2) > 1.5) continue;
+
+        const minT = Math.min(0, s2);
+        const maxT = Math.max(len1, e2);
+        const keepPrimary = len1 >= len2 ? l1 : l2;
+        result[i] = {
+          id: keepPrimary.id,
+          from: {
+            x: +(l1.from.x + u1x * minT).toFixed(3),
+            y: +(l1.from.y + u1y * minT).toFixed(3)
+          },
+          to: {
+            x: +(l1.from.x + u1x * maxT).toFixed(3),
+            y: +(l1.from.y + u1y * maxT).toFixed(3)
+          },
+          suggestedType: 'ridge',
+          ...(keepPrimary.levelId ? { levelId: keepPrimary.levelId } : {})
+        };
+        result.splice(j, 1);
+        mergedAny = true;
+        break;
+      }
+      if (mergedAny) break;
+    }
+  }
+
+  return result;
+}
+
 // Clean-up pass: collapses short interior ridge stubs, deduplicates, and merges collinear ridges
 function cleanupSkeletonLines(
   rawLines: SkeletonLine[],
@@ -1172,56 +1416,7 @@ function cleanupSkeletonLines(
   lines = deduped;
 
   // 3. Merge collinear ridge pieces into single continuous ridges parallel to eaves
-  let mergedAny = true;
-  let mergeGuard = 0;
-  while (mergedAny && mergeGuard++ < 100) {
-    mergedAny = false;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].suggestedType !== 'ridge') continue;
-      for (let j = i + 1; j < lines.length; j++) {
-        if (lines[j].suggestedType !== 'ridge') continue;
-
-        const l1 = lines[i];
-        const l2 = lines[j];
-
-        let sharedPt: Point2D | null = null;
-        let pA: Point2D | null = null;
-        let pB: Point2D | null = null;
-
-        if (pointsClose(l1.to, l2.from, 0.08)) {
-          sharedPt = l1.to; pA = l1.from; pB = l2.to;
-        } else if (pointsClose(l1.from, l2.to, 0.08)) {
-          sharedPt = l1.from; pA = l1.to; pB = l2.from;
-        } else if (pointsClose(l1.to, l2.to, 0.08)) {
-          sharedPt = l1.to; pA = l1.from; pB = l2.from;
-        } else if (pointsClose(l1.from, l2.from, 0.08)) {
-          sharedPt = l1.from; pA = l1.to; pB = l2.to;
-        }
-
-        if (sharedPt && pA && pB) {
-          const v1 = { x: sharedPt.x - pA.x, y: sharedPt.y - pA.y };
-          const v2 = { x: pB.x - sharedPt.x, y: pB.y - sharedPt.y };
-          const len1 = Math.hypot(v1.x, v1.y);
-          const len2 = Math.hypot(v2.x, v2.y);
-          if (len1 > 0.05 && len2 > 0.05) {
-            const dot = (v1.x * v2.x + v1.y * v2.y) / (len1 * len2);
-            if (dot > 0.985) {
-              lines[i] = {
-                id: l1.id,
-                from: pA,
-                to: pB,
-                suggestedType: 'ridge'
-              };
-              lines.splice(j, 1);
-              mergedAny = true;
-              break;
-            }
-          }
-        }
-      }
-      if (mergedAny) break;
-    }
-  }
+  lines = mergeColinearRidgeLines(lines);
 
   // 3b. Snap any non-perimeter junction endpoint within 0.12m of a continuous ridge flush onto it
   lines = lines.map((l) => {
@@ -1289,7 +1484,20 @@ function cleanupSkeletonLines(
     .filter((l) => l.suggestedType === 'hip')
     .map((l, idx) => ({ ...l, id: `${prefix}skel-hip-${idx + 1}`, ...levelProp }));
 
-  return [...ridges, ...valleys, ...hips];
+  const others = lines
+    .filter(
+      (l) =>
+        l.suggestedType !== 'ridge' &&
+        l.suggestedType !== 'valley' &&
+        l.suggestedType !== 'hip'
+    )
+    .map((l, idx) => ({
+      ...l,
+      id: l.id && !l.id.startsWith('skel-raw-') ? l.id : `${prefix}skel-line-${idx + 1}`,
+      ...levelProp
+    }));
+
+  return [...ridges, ...valleys, ...hips, ...others];
 }
 
 interface WaveEdge {
@@ -1364,7 +1572,7 @@ export function classifyOutlineCorners(outline: RoofOutline): ClassifiedOutlineC
     const segLen = dist(a, b) || 1;
     const dir = { x: (b.x - a.x) / segLen, y: (b.y - a.y) / segLen };
     return outline.edges.some((oe) => {
-      if (oe.type !== 'verge' && oe.type !== 'wall') return false;
+      if (!isStationaryEdgeType(oe.type)) return false;
       const oLen = dist(oe.from, oe.to) || 1;
       const oDir = { x: (oe.to.x - oe.from.x) / oLen, y: (oe.to.y - oe.from.y) / oLen };
       const align = Math.abs(dir.x * oDir.x + dir.y * oDir.y);
@@ -1446,7 +1654,7 @@ export function generateSkeletonLines(outline: RoofOutline): SkeletonLine[] {
     const segLen = dist(a, b) || 1;
     const dir = { x: (b.x - a.x) / segLen, y: (b.y - a.y) / segLen };
     return outline.edges.some((oe) => {
-      if (oe.type !== 'verge' && oe.type !== 'wall') return false;
+      if (!isStationaryEdgeType(oe.type)) return false;
       const oLen = dist(oe.from, oe.to) || 1;
       const oDir = { x: (oe.to.x - oe.from.x) / oLen, y: (oe.to.y - oe.from.y) / oLen };
       const align = Math.abs(dir.x * oDir.x + dir.y * oDir.y);
@@ -2104,7 +2312,7 @@ export function setEdgeMode(
   // Ensure at least 1 roof edge remains an eave ('outline') so sloped roof sheets exist
   if (targetMode === 'gable' || targetMode === 'wall') {
     const remainingOutlineCount = outline.edges.filter(
-      (e) => e.id !== edgeId && e.type !== 'verge' && e.type !== 'wall'
+      (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
     ).length;
     if (remainingOutlineCount < 1) {
       return { outline, skeleton, toggledTo: null, edge };
@@ -2182,11 +2390,11 @@ export function toggleEdgeGable(
   }
 
   const targetIsGable =
-    forceMode !== undefined ? forceMode === 'gable' : edge.type !== 'verge';
+    forceMode !== undefined ? forceMode === 'gable' : !isGableEdgeType(edge.type);
 
   // Ensure at least 1 roof edge remains an eave ('outline') so roof slopes exist
   const remainingOutlineCount = outline.edges.filter(
-    (e) => e.id !== edgeId && e.type !== 'verge' && e.type !== 'wall'
+    (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
   ).length;
   if (targetIsGable && remainingOutlineCount < 1) {
     return { outline, skeleton, toggledTo: null, edge };
@@ -2241,7 +2449,7 @@ export function applyRoofStylePreset(
   }
 
   // 'gable' preset: keep edges aligned with the longest primary wall axis as eaves ('outline'),
-  // and turn perpendicular / wing end walls into 'verge' gable ends!
+  // and turn perpendicular / wing end walls into gable ends ('verge' / preserving 'rake' & abutment 'wall'/'apron').
   const longestEdge = [...outline.edges].sort(
     (a, b) => dist(b.from, b.to) - dist(a.from, a.to)
   )[0];
@@ -2257,12 +2465,19 @@ export function applyRoofStylePreset(
     const dot = Math.abs(eDir.x * mainAxis.x + eDir.y * mainAxis.y);
     return {
       ...e,
-      type: e.type === 'wall' ? 'wall' : dot > 0.707 ? 'outline' : 'verge'
+      type:
+        e.type === 'wall' || e.type === 'apron'
+          ? e.type
+          : dot > 0.707
+          ? 'outline'
+          : isGableEdgeType(e.type)
+          ? e.type
+          : 'verge'
     };
   });
 
   // Safety guarantee: keep at least 2 longest eaves non-verge if polygon has degenerate angles
-  if (nextEdges.filter((e) => e.type !== 'verge' && e.type !== 'wall').length < 1) {
+  if (nextEdges.filter((e) => !isStationaryEdgeType(e.type)).length < 1) {
     const topTwoIds = new Set(
       [...outline.edges]
         .sort((a, b) => dist(b.from, b.to) - dist(a.from, a.to))
@@ -2325,6 +2540,512 @@ export function toggleJunctionGable(
   };
 }
 
+interface PlanarGraphEdgeMeta {
+  outlineEdge?: PlanEdge;
+  skeletonLine?: SkeletonLine;
+  edgeType: EdgeType | SkeletonLineType;
+  isOutlineEdge: boolean;
+  isClassified: boolean;
+}
+
+interface PlanarFaceGraph {
+  nodes: Point2D[];
+  adj: Map<number, Set<number>>;
+  edgeMetaByKey: Map<string, PlanarGraphEdgeMeta>;
+  workingSkel: SkeletonLine[];
+  outlineSignedArea: number;
+}
+
+function planarEdgeKey(u: number, v: number): string {
+  return u < v ? `${u}-${v}` : `${v}-${u}`;
+}
+
+function signedPolyArea(pts: Point2D[]): number {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p1 = pts[i];
+    const p2 = pts[(i + 1) % pts.length];
+    a += p1.x * p2.y - p2.x * p1.y;
+  }
+  return a * 0.5;
+}
+
+function buildPlanarFaceGraph(
+  outline: RoofOutline,
+  skeleton: SkeletonLine[]
+): PlanarFaceGraph | null {
+  if (outline.edges.length < 3 || skeleton.length === 0) return null;
+
+  const mergedSkel = mergeColinearRidgeLines(skeleton);
+
+  // Snap near-touching manual skeleton endpoints (<= 0.28m) in strict topological priority:
+  // 1) outline corners -> 2) other skeleton endpoints -> 3) outline edges -> 4) other skeleton segments
+  const snapManualEndpoint = (pt: Point2D, selfIdx: number): Point2D => {
+    for (const v of outline.points) {
+      if (dist(pt, v) <= 0.25) return { ...v };
+    }
+
+    for (let j = 0; j < mergedSkel.length; j++) {
+      if (j === selfIdx) continue;
+      for (const op of [mergedSkel[j].from, mergedSkel[j].to]) {
+        if (dist(pt, op) <= 0.25) return { ...op };
+      }
+    }
+
+    let bestPt: Point2D | null = null;
+    let bestD = 0.28;
+    for (const oe of outline.edges) {
+      const len2 = (oe.to.x - oe.from.x) ** 2 + (oe.to.y - oe.from.y) ** 2;
+      if (len2 < 1e-6) continue;
+      const t = Math.max(
+        0,
+        Math.min(
+          1,
+          ((pt.x - oe.from.x) * (oe.to.x - oe.from.x) +
+            (pt.y - oe.from.y) * (oe.to.y - oe.from.y)) /
+            len2
+        )
+      );
+      const proj = {
+        x: oe.from.x + t * (oe.to.x - oe.from.x),
+        y: oe.from.y + t * (oe.to.y - oe.from.y)
+      };
+      const d = dist(pt, proj);
+      if (d <= bestD) {
+        bestD = d;
+        bestPt = { x: +proj.x.toFixed(3), y: +proj.y.toFixed(3) };
+      }
+    }
+    if (bestPt) return bestPt;
+
+    for (let j = 0; j < mergedSkel.length; j++) {
+      if (j === selfIdx) continue;
+      const other = mergedSkel[j];
+      const len2 = (other.to.x - other.from.x) ** 2 + (other.to.y - other.from.y) ** 2;
+      if (len2 < 1e-6) continue;
+      const t = Math.max(
+        0,
+        Math.min(
+          1,
+          ((pt.x - other.from.x) * (other.to.x - other.from.x) +
+            (pt.y - other.from.y) * (other.to.y - other.from.y)) /
+            len2
+        )
+      );
+      const proj = {
+        x: other.from.x + t * (other.to.x - other.from.x),
+        y: other.from.y + t * (other.to.y - other.from.y)
+      };
+      const d = dist(pt, proj);
+      if (d <= bestD) {
+        bestD = d;
+        bestPt = { x: +proj.x.toFixed(3), y: +proj.y.toFixed(3) };
+      }
+    }
+    return bestPt || pt;
+  };
+
+  const workingSkel = mergedSkel.map((s, idx) => ({
+    ...s,
+    from: snapManualEndpoint(s.from, idx),
+    to: snapManualEndpoint(s.to, idx)
+  }));
+
+  const nodes: Point2D[] = [];
+  const getOrAddNode = (pt: Point2D): number => {
+    const idx = nodes.findIndex((n) => dist(n, pt) < 0.065);
+    if (idx >= 0) return idx;
+    nodes.push({ x: +pt.x.toFixed(3), y: +pt.y.toFixed(3) });
+    return nodes.length - 1;
+  };
+
+  const rawSegs: {
+    a: Point2D;
+    b: Point2D;
+    meta: PlanarGraphEdgeMeta;
+  }[] = [
+    ...outline.edges.map((e) => ({
+      a: e.from,
+      b: e.to,
+      meta: {
+        outlineEdge: e,
+        edgeType: e.type,
+        isOutlineEdge: true,
+        isClassified: e.type !== 'unclassified'
+      }
+    })),
+    ...workingSkel.map((s) => ({
+      a: s.from,
+      b: s.to,
+      meta: {
+        skeletonLine: s,
+        edgeType: s.suggestedType,
+        isOutlineEdge: false,
+        isClassified: s.suggestedType !== 'unclassified'
+      }
+    }))
+  ].filter((seg) => dist(seg.a, seg.b) > 0.05);
+
+  rawSegs.forEach((seg) => {
+    getOrAddNode(seg.a);
+    getOrAddNode(seg.b);
+  });
+
+  // Interior skeleton × skeleton crossing nodes
+  for (let i = 0; i < workingSkel.length; i++) {
+    for (let j = i + 1; j < workingSkel.length; j++) {
+      const s1 = workingSkel[i];
+      const s2 = workingSkel[j];
+      const inter = lineLineIntersection(s1.from, s1.to, s2.from, s2.to);
+      if (
+        inter &&
+        distToSegment(inter, s1.from, s1.to) < 0.06 &&
+        distToSegment(inter, s2.from, s2.to) < 0.06
+      ) {
+        getOrAddNode(inter);
+      }
+    }
+  }
+
+  // Outline edge × skeleton crossing nodes (handles T-junctions & bay valleys hitting eave interior)
+  for (const oe of outline.edges) {
+    for (const sk of workingSkel) {
+      const inter = lineLineIntersection(oe.from, oe.to, sk.from, sk.to);
+      if (
+        inter &&
+        distToSegment(inter, oe.from, oe.to) < 0.08 &&
+        distToSegment(inter, sk.from, sk.to) < 0.08
+      ) {
+        getOrAddNode(inter);
+      }
+    }
+  }
+
+  const adj = new Map<number, Set<number>>();
+  nodes.forEach((_, idx) => adj.set(idx, new Set<number>()));
+  const edgeMetaByKey = new Map<string, PlanarGraphEdgeMeta>();
+
+  rawSegs.forEach((seg) => {
+    const segLen = dist(seg.a, seg.b) || 1;
+    const ux = (seg.b.x - seg.a.x) / segLen;
+    const uy = (seg.b.y - seg.a.y) / segLen;
+
+    const onSeg: { idx: number; proj: number }[] = [];
+    nodes.forEach((pt, idx) => {
+      if (distToSegment(pt, seg.a, seg.b) <= 0.075) {
+        const proj = (pt.x - seg.a.x) * ux + (pt.y - seg.a.y) * uy;
+        onSeg.push({ idx, proj });
+      }
+    });
+    onSeg.sort((x, y) => x.proj - y.proj);
+
+    for (let k = 0; k < onSeg.length - 1; k++) {
+      const u = onSeg[k].idx;
+      const v = onSeg[k + 1].idx;
+      if (u !== v) {
+        adj.get(u)?.add(v);
+        adj.get(v)?.add(u);
+        const key = planarEdgeKey(u, v);
+        const prev = edgeMetaByKey.get(key);
+        if (!prev || (!prev.isOutlineEdge && seg.meta.isOutlineEdge)) {
+          edgeMetaByKey.set(key, seg.meta);
+        }
+      }
+    }
+  });
+
+  // Iteratively prune degree-1 interior stubs not anchored to the outline perimeter
+  const isOnOutline = (pt: Point2D): boolean =>
+    outline.edges.some((oe) => distToSegment(pt, oe.from, oe.to) <= 0.09);
+
+  let pruned = true;
+  while (pruned) {
+    pruned = false;
+    for (let idx = 0; idx < nodes.length; idx++) {
+      const nbrs = adj.get(idx);
+      if (nbrs && nbrs.size === 1 && !isOnOutline(nodes[idx])) {
+        const onlyNb = Array.from(nbrs)[0];
+        adj.get(onlyNb)?.delete(idx);
+        nbrs.clear();
+        pruned = true;
+      }
+    }
+  }
+
+  return {
+    nodes,
+    adj,
+    edgeMetaByKey,
+    workingSkel,
+    outlineSignedArea: signedPolyArea(outline.points)
+  };
+}
+
+function traceMinimalCycleFromDirectedPair(
+  graph: PlanarFaceGraph,
+  outline: RoofOutline,
+  uStart: number,
+  vStart: number,
+  interiorIsLeft: boolean
+): number[] | null {
+  const { nodes, adj } = graph;
+  const cycleIndices: number[] = [uStart, vStart];
+  let prevIdx = uStart;
+  let currIdx = vStart;
+  const TWO_PI = Math.PI * 2;
+  const MAX_STEPS = 48;
+
+  for (let step = 0; step < MAX_STEPS; step++) {
+    const prevPt = nodes[prevIdx];
+    const currPt = nodes[currIdx];
+    const inAngle = Math.atan2(prevPt.y - currPt.y, prevPt.x - currPt.x);
+
+    const neighbors = Array.from(adj.get(currIdx) || []).filter((nb) => nb !== prevIdx);
+    if (neighbors.length === 0) return null;
+
+    let bestNb = -1;
+    let bestDelta = Infinity;
+
+    for (const nb of neighbors) {
+      const nbPt = nodes[nb];
+      const ang = Math.atan2(nbPt.y - currPt.y, nbPt.x - currPt.x);
+      let delta = interiorIsLeft ? inAngle - ang : ang - inAngle;
+      while (delta <= 1e-4) delta += TWO_PI;
+      while (delta > TWO_PI + 1e-4) delta -= TWO_PI;
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestNb = nb;
+      }
+    }
+
+    if (bestNb < 0) return null;
+    if (bestNb === cycleIndices[0]) break;
+    if (cycleIndices.includes(bestNb)) return null;
+
+    cycleIndices.push(bestNb);
+    prevIdx = currIdx;
+    currIdx = bestNb;
+  }
+
+  if (cycleIndices.length < 3) return null;
+  const poly = cycleIndices.map((idx) => nodes[idx]);
+  if (polygonArea(poly) <= 0.05) return null;
+  const c = polygonCentroid(poly);
+  if (!isPointInPolygon(c, outline.points)) return null;
+  return cycleIndices;
+}
+
+function canonicalCycleKey(cycle: number[]): string {
+  const minVal = Math.min(...cycle);
+  const pos = cycle.indexOf(minVal);
+  const rotFwd = [...cycle.slice(pos), ...cycle.slice(0, pos)];
+  const rev = [...cycle].reverse();
+  const rPos = rev.indexOf(minVal);
+  const rotRev = [...rev.slice(rPos), ...rev.slice(0, rPos)];
+  const s1 = rotFwd.join(',');
+  const s2 = rotRev.join(',');
+  return s1 < s2 ? s1 : s2;
+}
+
+function traceSubFacesForDirectedEdge(
+  graph: PlanarFaceGraph,
+  outline: RoofOutline,
+  edgeFrom: Point2D,
+  edgeTo: Point2D
+): { subFrom: Point2D; subTo: Point2D; polygon: Point2D[]; cycleKey: string }[] {
+  const dx = edgeTo.x - edgeFrom.x;
+  const dy = edgeTo.y - edgeFrom.y;
+  const edgeLen = Math.hypot(dx, dy) || 1;
+  const dir = { x: dx / edgeLen, y: dy / edgeLen };
+  const leftNorm = { x: -dir.y, y: dir.x };
+  const mid = { x: (edgeFrom.x + edgeTo.x) / 2, y: (edgeFrom.y + edgeTo.y) / 2 };
+  const interiorIsLeft = isPointInPolygon(
+    { x: mid.x + leftNorm.x * 0.08, y: mid.y + leftNorm.y * 0.08 },
+    outline.points
+  );
+
+  const edgeNodes = graph.nodes
+    .map((pt, idx) => ({
+      idx,
+      pt,
+      proj: (pt.x - edgeFrom.x) * dir.x + (pt.y - edgeFrom.y) * dir.y
+    }))
+    .filter((item) => distToSegment(item.pt, edgeFrom, edgeTo) <= 0.08)
+    .sort((a, b) => a.proj - b.proj);
+
+  if (edgeNodes.length < 2) return [];
+
+  const edgeNodeSet = new Set(edgeNodes.map((n) => n.idx));
+  const seenCycles = new Set<string>();
+  const results: { subFrom: Point2D; subTo: Point2D; polygon: Point2D[]; cycleKey: string }[] = [];
+
+  for (let k = 0; k < edgeNodes.length - 1; k++) {
+    const u = edgeNodes[k].idx;
+    const v = edgeNodes[k + 1].idx;
+    if (!graph.adj.get(u)?.has(v)) continue;
+
+    const cycle = traceMinimalCycleFromDirectedPair(graph, outline, u, v, interiorIsLeft);
+    if (!cycle) continue;
+
+    const key = canonicalCycleKey(cycle);
+    if (seenCycles.has(key)) continue;
+    seenCycles.add(key);
+
+    // Find maximal contiguous span of edgeNodes lying consecutively along this cycle
+    // so an unsplit edge preserves exact [edgeFrom, edgeTo, ...interior] ordering.
+    const posU = cycle.indexOf(u);
+    const n = cycle.length;
+    const rotated = [...cycle.slice(posU), ...cycle.slice(0, posU)];
+
+    let spanStart = 0;
+    while (
+      spanStart + 1 < n &&
+      edgeNodeSet.has(rotated[n - 1 - spanStart])
+    ) {
+      spanStart++;
+    }
+    const finalRot =
+      spanStart > 0
+        ? [...rotated.slice(n - spanStart), ...rotated.slice(0, n - spanStart)]
+        : rotated;
+
+    let runLen = 1;
+    while (runLen < finalRot.length && edgeNodeSet.has(finalRot[runLen])) {
+      runLen++;
+    }
+
+    const subFromIdx = finalRot[0];
+    const subToIdx = finalRot[runLen - 1];
+    const subFrom = pointsClose(graph.nodes[subFromIdx], edgeFrom, 0.08)
+      ? edgeFrom
+      : graph.nodes[subFromIdx];
+    const subTo = pointsClose(graph.nodes[subToIdx], edgeTo, 0.08)
+      ? edgeTo
+      : graph.nodes[subToIdx];
+
+    const interiorPts = finalRot.slice(runLen).map((idx) => graph.nodes[idx]);
+    const poly: Point2D[] = [subFrom, subTo, ...interiorPts];
+    if (poly.length >= 3 && polygonArea(poly) > 0.05) {
+      results.push({ subFrom, subTo, polygon: poly, cycleKey: key });
+    }
+  }
+
+  return results;
+}
+
+function traceFacePolygonPlanar(
+  outline: RoofOutline,
+  skeleton: SkeletonLine[],
+  eaveEdge: PlanEdge
+): Point2D[] | null {
+  const graph = buildPlanarFaceGraph(outline, skeleton);
+  if (!graph) return null;
+  const subFaces = traceSubFacesForDirectedEdge(graph, outline, eaveEdge.from, eaveEdge.to);
+  return subFaces.length > 0 ? subFaces[0].polygon : null;
+}
+
+function findUncoveredClassifiedFaces(
+  graph: PlanarFaceGraph,
+  outline: RoofOutline,
+  alreadyCoveredKeys: Set<string>,
+  alreadyCoveredCentroids: Point2D[],
+  suppressedSet: Set<string> | null
+): { baselineFrom: Point2D; baselineTo: Point2D; polygon: Point2D[]; loopEdgeId: string; cycleKey: string }[] {
+  const results: {
+    baselineFrom: Point2D;
+    baselineTo: Point2D;
+    polygon: Point2D[];
+    loopEdgeId: string;
+    cycleKey: string;
+  }[] = [];
+  const seenKeys = new Set<string>(alreadyCoveredKeys);
+
+  const tryDirectedPair = (u: number, v: number) => {
+    const cycle = traceMinimalCycleFromDirectedPair(graph, outline, u, v, true);
+    if (!cycle || cycle.length < 3) return;
+    const key = canonicalCycleKey(cycle);
+    if (seenKeys.has(key)) return;
+
+    const poly = cycle.map((idx) => graph.nodes[idx]);
+    const cent = polygonCentroid(poly);
+    // Avoid duplicating a face whose centroid is already inside an emitted plane with similar bounds
+    if (
+      alreadyCoveredCentroids.some((c) => dist(c, cent) < 0.15)
+    ) {
+      return;
+    }
+
+    // Verify all boundary segments are classified & check suppression against owning outline edges
+    let allClassified = true;
+    let suppressed = false;
+    let bestBaselineScore = -Infinity;
+    let bestSegIdx = 0;
+
+    for (let i = 0; i < cycle.length; i++) {
+      const a = cycle[i];
+      const b = cycle[(i + 1) % cycle.length];
+      const meta = graph.edgeMetaByKey.get(planarEdgeKey(a, b));
+      if (!meta || !meta.isClassified) {
+        allClassified = false;
+        break;
+      }
+      if (meta.outlineEdge && suppressedSet?.has(meta.outlineEdge.id)) {
+        suppressed = true;
+        break;
+      }
+
+      const len = dist(graph.nodes[a], graph.nodes[b]);
+      // Prioritize lower/eave/verge/wall edge as baseline [0]->[1], NEVER prefer 'ridge' when non-ridge exists
+      const typeWeight =
+        meta.edgeType === 'outline' || meta.edgeType === 'eave'
+          ? 1000
+          : meta.edgeType === 'verge' || meta.edgeType === 'rake' || meta.edgeType === 'barge'
+          ? 500
+          : meta.edgeType === 'wall' || meta.edgeType === 'apron' || meta.edgeType === 'change-of-pitch'
+          ? 400
+          : meta.edgeType === 'ridge'
+          ? -500
+          : 100;
+      const score = typeWeight + len;
+      if (score > bestBaselineScore) {
+        bestBaselineScore = score;
+        bestSegIdx = i;
+      }
+    }
+
+    if (!allClassified || suppressed) return;
+
+    // Canonical deterministic loop ID from rounded vertex coordinates
+    const hashPts = [...poly]
+      .sort((p1, p2) => (Math.abs(p1.x - p2.x) > 0.05 ? p1.x - p2.x : p1.y - p2.y))
+      .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+      .join('|');
+    const loopEdgeId = `loop-${hashPts}`;
+    if (suppressedSet?.has(loopEdgeId)) return;
+
+    const rotatedPoly = [...poly.slice(bestSegIdx), ...poly.slice(0, bestSegIdx)];
+    seenKeys.add(key);
+    results.push({
+      baselineFrom: rotatedPoly[0],
+      baselineTo: rotatedPoly[1],
+      polygon: rotatedPoly,
+      loopEdgeId,
+      cycleKey: key
+    });
+  };
+
+  graph.adj.forEach((nbrs, u) => {
+    nbrs.forEach((v) => {
+      if (u < v) {
+        tryDirectedPair(u, v);
+        tryDirectedPair(v, u);
+      }
+    });
+  });
+
+  return results;
+}
+
 export function syncPlanesWithOutlineAndSkeleton(
   outline: RoofOutline,
   skeleton: SkeletonLine[],
@@ -2336,48 +3057,138 @@ export function syncPlanesWithOutlineAndSkeleton(
     levelName?: string;
     defaultEaveHeightM?: number;
     paletteOffset?: number;
+  },
+  options?: {
+    suppressedEdgeIds?: string[];
+    ignoreSuppressed?: boolean;
   }
 ): RoofPlane[] {
   const prevByEdge = new Map(existingPlanes.map((p) => [p.eaveEdgeId, p]));
+  const suppressedSet =
+    options?.ignoreSuppressed || !options?.suppressedEdgeIds
+      ? null
+      : new Set(options.suppressedEdgeIds);
   const result: RoofPlane[] = [];
 
-  outline.edges.forEach((edge, idx) => {
-    if (edge.type !== 'outline') return; // Only classified Eave ('outline') edges generate automatic slope sheet planes
+  const graph = buildPlanarFaceGraph(outline, skeleton);
+  const coveredCycleKeys = new Set<string>();
+  const coveredCentroids: Point2D[] = [];
+
+  const pushPlaneFromSpec = (
+    edge: PlanEdge,
+    precomputedPoly?: Point2D[],
+    fallbackIdx = 0
+  ) => {
+    if (suppressedSet && suppressedSet.has(edge.id)) return;
     const existing = prevByEdge.get(edge.id);
     const resolvedEaveHeight =
       edge.eaveHeightM ?? existing?.eaveHeightM ?? levelMeta?.defaultEaveHeightM ?? 2.7;
 
-    if (existing) {
-      result.push(
-        createPlaneFromEdge(outline, skeleton, edge, {
-          pitchDeg: existing.pitchDeg,
-          underlapSide: existing.underlapSide,
-          eaveHeightM: resolvedEaveHeight,
-          orderedSheetLengthM: existing.orderedSheetLengthM,
-          sheetRunEdgeId: existing.sheetRunEdgeId,
-          name: existing.name,
-          existingId: existing.id,
-          isStartEdge: existing.isStartEdge,
-          existingPlanesCount: (levelMeta?.paletteOffset || 0) + result.length,
-          levelId: levelMeta?.levelId ?? existing.levelId ?? edge.levelId ?? outline.levelId,
-          levelCode: levelMeta?.levelCode ?? existing.levelCode,
-          levelName: levelMeta?.levelName ?? existing.levelName
-        })
-      );
-    } else {
-      result.push(
-        createPlaneFromEdge(outline, skeleton, edge, {
-          pitchDeg: defaultPitchDeg,
-          underlapSide: idx % 2 === 0 ? 'left' : 'right',
-          eaveHeightM: resolvedEaveHeight,
-          existingPlanesCount: (levelMeta?.paletteOffset || 0) + result.length,
-          levelId: levelMeta?.levelId ?? edge.levelId ?? outline.levelId,
-          levelCode: levelMeta?.levelCode,
-          levelName: levelMeta?.levelName
-        })
-      );
+    const plane = createPlaneFromEdge(outline, skeleton, edge, {
+      pitchDeg: existing?.pitchDeg ?? defaultPitchDeg,
+      underlapSide: existing?.underlapSide ?? (fallbackIdx % 2 === 0 ? 'left' : 'right'),
+      eaveHeightM: resolvedEaveHeight,
+      orderedSheetLengthM: existing?.orderedSheetLengthM,
+      sheetRunEdgeId: existing?.sheetRunEdgeId,
+      name: existing?.name,
+      existingId: existing?.id,
+      isStartEdge: existing?.isStartEdge,
+      existingPlanesCount: (levelMeta?.paletteOffset || 0) + result.length,
+      levelId: levelMeta?.levelId ?? existing?.levelId ?? edge.levelId ?? outline.levelId,
+      levelCode: levelMeta?.levelCode ?? existing?.levelCode,
+      levelName: levelMeta?.levelName ?? existing?.levelName,
+      precomputedPolygon: precomputedPoly
+    });
+
+    if (plane.planPolygon.length >= 3) {
+      coveredCentroids.push(polygonCentroid(plane.planPolygon));
+      result.push(plane);
     }
+  };
+
+  // 1. Primary classified perimeter Eave ('outline') edges — supporting interior T-junction splits cleanly
+  outline.edges.forEach((edge, idx) => {
+    if (edge.type !== 'outline') return;
+    if (suppressedSet && suppressedSet.has(edge.id)) return;
+
+    if (graph && skeleton.length > 0) {
+      const subFaces = traceSubFacesForDirectedEdge(graph, outline, edge.from, edge.to);
+      if (subFaces.length > 0) {
+        subFaces.forEach((sub, subIdx) => {
+          const subEdgeId = subIdx === 0 ? edge.id : `${edge.id}__sub${subIdx}`;
+          if (suppressedSet && suppressedSet.has(subEdgeId)) return;
+          coveredCycleKeys.add(sub.cycleKey);
+          const subEdge: PlanEdge = {
+            ...edge,
+            id: subEdgeId,
+            from: sub.subFrom,
+            to: sub.subTo
+          };
+          pushPlaneFromSpec(subEdge, sub.polygon, idx + subIdx);
+        });
+        return;
+      }
+      // When explicit skeleton lines exist and an edge fails to trace a closed loop, do NOT emit synthetic barge wedges
+      return;
+    }
+
+    pushPlaneFromSpec(edge, undefined, idx);
   });
+
+  // 2. Interior classified Eave skeleton lines (for bays/wings defined inside outline via skeleton 'eave' lines)
+  if (graph && skeleton.length > 0) {
+    skeleton
+      .filter((s) => s.suggestedType === 'eave')
+      .forEach((sk, idx) => {
+        if (suppressedSet && suppressedSet.has(sk.id)) return;
+        const subFaces = traceSubFacesForDirectedEdge(graph, outline, sk.from, sk.to);
+        subFaces.forEach((sub, subIdx) => {
+          if (coveredCycleKeys.has(sub.cycleKey)) return;
+          coveredCycleKeys.add(sub.cycleKey);
+          const vId = subIdx === 0 ? sk.id : `${sk.id}__sub${subIdx}`;
+          const virtualEave: PlanEdge = {
+            id: vId,
+            from: sub.subFrom,
+            to: sub.subTo,
+            type: 'outline',
+            eaveHeightM: levelMeta?.defaultEaveHeightM,
+            levelId: levelMeta?.levelId ?? outline.levelId
+          };
+          pushPlaneFromSpec(virtualEave, sub.polygon, idx + subIdx);
+        });
+      });
+
+    // 3. Remaining uncovered classified minimal loops (e.g. triangular corner panels or closed gable/hip bays)
+    const activeEaveCount = outline.edges.filter((e) => e.type === 'outline').length;
+    const hasStructuralSkel = skeleton.some(
+      (s) =>
+        s.suggestedType === 'eave' ||
+        s.suggestedType === 'ridge' ||
+        s.suggestedType === 'valley' ||
+        s.suggestedType === 'hip'
+    );
+    if (activeEaveCount > 0 || hasStructuralSkel) {
+      const uncovered = findUncoveredClassifiedFaces(
+        graph,
+        outline,
+        coveredCycleKeys,
+        coveredCentroids,
+        suppressedSet
+      );
+      uncovered.forEach((uFace, uIdx) => {
+        const baselineEdge: PlanEdge = {
+          id: uFace.loopEdgeId,
+          from: uFace.baselineFrom,
+          to: uFace.baselineTo,
+          type: 'outline',
+          eaveHeightM: levelMeta?.defaultEaveHeightM,
+          levelId: levelMeta?.levelId ?? outline.levelId
+        };
+        coveredCycleKeys.add(uFace.cycleKey);
+        pushPlaneFromSpec(baselineEdge, uFace.polygon, result.length + uIdx);
+      });
+    }
+  }
 
   return result;
 }
@@ -2399,6 +3210,7 @@ export function createPlaneFromEdge(
     levelId?: string;
     levelCode?: string;
     levelName?: string;
+    precomputedPolygon?: Point2D[];
   }
 ): RoofPlane {
   const pitchDeg = options.pitchDeg ?? 22.5;
@@ -2409,8 +3221,11 @@ export function createPlaneFromEdge(
       ? outline.edges.find((e) => e.id === options.sheetRunEdgeId)
       : undefined) || eaveEdge;
 
-  // Build polygon cycle around eave edge
-  const polygon = traceFacePolygon(outline, skeleton, eaveEdge);
+  // Build polygon cycle around eave edge (either precomputed classified loop or direct trace)
+  const polygon =
+    options.precomputedPolygon && options.precomputedPolygon.length >= 3
+      ? options.precomputedPolygon
+      : traceFacePolygon(outline, skeleton, eaveEdge);
 
   // Developed geometry: unfold along true slope length & chosen sheet run perpendicular edge
   const { developedPolygon, slopeLength, runDirection } = computeDevelopedGeometry(
@@ -2470,160 +3285,6 @@ export function createPlaneFromEdge(
   };
 }
 
-function traceFacePolygonPlanar(
-  outline: RoofOutline,
-  skeleton: SkeletonLine[],
-  eaveEdge: PlanEdge
-): Point2D[] | null {
-  if (outline.edges.length < 3 || skeleton.length === 0) return null;
-
-  const pA = eaveEdge.from;
-  const pB = eaveEdge.to;
-  const dx = pB.x - pA.x;
-  const dy = pB.y - pA.y;
-  const edgeLen = Math.hypot(dx, dy) || 1;
-  const dir = { x: dx / edgeLen, y: dy / edgeLen };
-  const leftNorm = { x: -dir.y, y: dir.x };
-  const mid = { x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2 };
-  const interiorIsLeft = isPointInPolygon(
-    { x: mid.x + leftNorm.x * 0.08, y: mid.y + leftNorm.y * 0.08 },
-    outline.points
-  );
-
-  // Build deduplicated vertex pool
-  const nodes: Point2D[] = [];
-  const getOrAddNode = (pt: Point2D): number => {
-    const idx = nodes.findIndex((n) => dist(n, pt) < 0.08);
-    if (idx >= 0) return idx;
-    nodes.push({ x: +pt.x.toFixed(3), y: +pt.y.toFixed(3) });
-    return nodes.length - 1;
-  };
-
-  const rawSegs: { a: Point2D; b: Point2D }[] = [
-    ...outline.edges.map((e) => ({ a: e.from, b: e.to })),
-    ...skeleton.map((s) => ({ a: s.from, b: s.to }))
-  ].filter((seg) => dist(seg.a, seg.b) > 0.05);
-
-  rawSegs.forEach((seg) => {
-    getOrAddNode(seg.a);
-    getOrAddNode(seg.b);
-  });
-
-  // Also add interior skeleton-skeleton crossing nodes if any exist
-  for (let i = 0; i < skeleton.length; i++) {
-    for (let j = i + 1; j < skeleton.length; j++) {
-      const s1 = skeleton[i];
-      const s2 = skeleton[j];
-      const inter = lineLineIntersection(s1.from, s1.to, s2.from, s2.to);
-      if (
-        inter &&
-        distToSegment(inter, s1.from, s1.to) < 0.06 &&
-        distToSegment(inter, s2.from, s2.to) < 0.06
-      ) {
-        getOrAddNode(inter);
-      }
-    }
-  }
-
-  // Split every segment by any node lying cleanly inside it (handles verge T-junctions & ridges)
-  const adj = new Map<number, Set<number>>();
-  nodes.forEach((_, idx) => adj.set(idx, new Set<number>()));
-
-  rawSegs.forEach((seg) => {
-    const segLen = dist(seg.a, seg.b) || 1;
-    const ux = (seg.b.x - seg.a.x) / segLen;
-    const uy = (seg.b.y - seg.a.y) / segLen;
-
-    const onSeg: { idx: number; proj: number }[] = [];
-    nodes.forEach((pt, idx) => {
-      if (distToSegment(pt, seg.a, seg.b) <= 0.08) {
-        const proj = (pt.x - seg.a.x) * ux + (pt.y - seg.a.y) * uy;
-        onSeg.push({ idx, proj });
-      }
-    });
-    onSeg.sort((x, y) => x.proj - y.proj);
-
-    for (let k = 0; k < onSeg.length - 1; k++) {
-      const u = onSeg[k].idx;
-      const v = onSeg[k + 1].idx;
-      if (u !== v) {
-        adj.get(u)?.add(v);
-        adj.get(v)?.add(u);
-      }
-    }
-  });
-
-  // Order split nodes along eaveEdge from pA to pB
-  const startNodeIdx = nodes.findIndex((n) => dist(n, pA) < 0.08);
-  const endNodeIdx = nodes.findIndex((n) => dist(n, pB) < 0.08);
-  if (startNodeIdx < 0 || endNodeIdx < 0) return null;
-
-  const eaveNodes = nodes
-    .map((pt, idx) => ({
-      idx,
-      pt,
-      proj: (pt.x - pA.x) * dir.x + (pt.y - pA.y) * dir.y
-    }))
-    .filter((item) => distToSegment(item.pt, pA, pB) <= 0.08)
-    .sort((a, b) => a.proj - b.proj);
-
-  if (eaveNodes.length < 2) return null;
-
-  const cycleIndices: number[] = eaveNodes.map((n) => n.idx);
-  let prevIdx = cycleIndices[cycleIndices.length - 2];
-  let currIdx = cycleIndices[cycleIndices.length - 1];
-
-  const MAX_STEPS = 42;
-  for (let step = 0; step < MAX_STEPS; step++) {
-    const prevPt = nodes[prevIdx];
-    const currPt = nodes[currIdx];
-    const inAngle = Math.atan2(prevPt.y - currPt.y, prevPt.x - currPt.x);
-
-    const neighbors = Array.from(adj.get(currIdx) || []).filter((nb) => nb !== prevIdx);
-    if (neighbors.length === 0) return null;
-
-    let bestNb = -1;
-    let bestDelta = Infinity;
-    const TWO_PI = Math.PI * 2;
-
-    for (const nb of neighbors) {
-      const nbPt = nodes[nb];
-      const ang = Math.atan2(nbPt.y - currPt.y, nbPt.x - currPt.x);
-      let delta = interiorIsLeft ? inAngle - ang : ang - inAngle;
-      while (delta <= 1e-4) delta += TWO_PI;
-      while (delta > TWO_PI + 1e-4) delta -= TWO_PI;
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        bestNb = nb;
-      }
-    }
-
-    if (bestNb < 0) return null;
-    if (bestNb === cycleIndices[0]) break;
-    if (cycleIndices.includes(bestNb)) return null;
-
-    cycleIndices.push(bestNb);
-    prevIdx = currIdx;
-    currIdx = bestNb;
-  }
-
-  if (cycleIndices.length < 3) return null;
-
-  // Preserve exact pA -> pB as polygon[0] -> polygon[1] invariant, keeping all interior vertices in order
-  const interiorStartOffset = eaveNodes.length;
-  const poly: Point2D[] = [
-    pA,
-    pB,
-    ...cycleIndices.slice(interiorStartOffset).map((idx) => nodes[idx])
-  ];
-
-  if (poly.length < 3 || polygonArea(poly) <= 0.05) return null;
-  const c = polygonCentroid(poly);
-  if (!isPointInPolygon(c, outline.points)) return null;
-
-  return poly;
-}
-
 function traceFacePolygon(
   outline: RoofOutline,
   skeleton: SkeletonLine[],
@@ -2631,12 +3292,13 @@ function traceFacePolygon(
 ): Point2D[] {
   const activeEavesCount = outline.edges.filter((e) => e.type === 'outline').length;
 
-  // When skeleton lines exist (manual or auto), always trace closed planar faces first
+  // When skeleton lines exist (manual or auto), trace closed planar faces ONLY (zero synthetic barge wedges)
   if (skeleton.length > 0) {
     const planarPoly = traceFacePolygonPlanar(outline, skeleton, eaveEdge);
     if (planarPoly && planarPoly.length >= 3) {
       return planarPoly;
     }
+    return [];
   }
 
   // True single-slope / monopitch sweep across full footprint ONLY when <= 1 eave exists and no skeleton splits it
@@ -2662,82 +3324,35 @@ function traceFacePolygon(
     }
   }
 
+  // When >= 2 active eaves exist without explicit skeleton lines, compute non-destructive local wavefront planes
+  // honoring verge/rake/wall boundaries before falling back to half-span box
+  if (outline.points.length >= 3 && skeleton.length === 0 && activeEavesCount >= 2) {
+    const inferredOutline: RoofOutline = {
+      ...outline,
+      edges: outline.edges.map((e) => ({
+        ...e,
+        type: isStationaryEdgeType(e.type) ? e.type : 'outline'
+      }))
+    };
+    const inferredSkel = generateSkeletonLines(inferredOutline);
+    if (inferredSkel.length > 0) {
+      const planarInferred = traceFacePolygonPlanar(outline, inferredSkel, eaveEdge);
+      if (planarInferred && planarInferred.length >= 3) {
+        return planarInferred;
+      }
+    }
+  }
+
   const pA = eaveEdge.from;
   const pB = eaveEdge.to;
-
   const dx = pB.x - pA.x;
   const dy = pB.y - pA.y;
   const edgeLen = Math.hypot(dx, dy) || 1;
   const normal: Point2D = { x: -dy / edgeLen, y: dx / edgeLen };
-
   const mid: Point2D = { x: (pA.x + pB.x) / 2, y: (pA.y + pB.y) / 2 };
   const testPt: Point2D = { x: mid.x + normal.x * 0.1, y: mid.y + normal.y * 0.1 };
   const isIn = isPointInPolygon(testPt, outline.points);
   const inwardNorm: Point2D = isIn ? normal : { x: -normal.x, y: -normal.y };
-
-  const connectedSkel = skeleton.filter(
-    (s) =>
-      pointsClose(s.from, pA) ||
-      pointsClose(s.to, pA) ||
-      pointsClose(s.from, pB) ||
-      pointsClose(s.to, pB)
-  );
-
-  const topVertices: Point2D[] = [];
-  connectedSkel.forEach((s) => {
-    const opp = pointsClose(s.from, pA) || pointsClose(s.from, pB) ? s.to : s.from;
-    const dot = (opp.x - mid.x) * inwardNorm.x + (opp.y - mid.y) * inwardNorm.y;
-    if (dot > 0 && !topVertices.some((v) => pointsClose(v, opp))) {
-      topVertices.push(opp);
-    }
-  });
-
-  // Also include gable peak ridge endpoints lying along adjacent 'verge' outline edges
-  const adjacentEdges = outline.edges.filter(
-    (e) =>
-      e.id !== eaveEdge.id &&
-      (pointsClose(e.from, pA, 0.15) ||
-        pointsClose(e.to, pA, 0.15) ||
-        pointsClose(e.from, pB, 0.15) ||
-        pointsClose(e.to, pB, 0.15))
-  );
-  const ridges = skeleton.filter((s) => s.suggestedType === 'ridge');
-  adjacentEdges.forEach((adj) => {
-    const hasAttachedHipAtSharedCorner =
-      (pointsClose(adj.from, pA, 0.15) || pointsClose(adj.to, pA, 0.15))
-        ? skeleton.some(
-            (s) =>
-              s.suggestedType === 'hip' &&
-              (pointsClose(s.from, pA, 0.15) || pointsClose(s.to, pA, 0.15))
-          )
-        : skeleton.some(
-            (s) =>
-              s.suggestedType === 'hip' &&
-              (pointsClose(s.from, pB, 0.15) || pointsClose(s.to, pB, 0.15))
-          );
-
-    if (adj.type === 'verge' || !hasAttachedHipAtSharedCorner) {
-      ridges.forEach((r) => {
-        [r.from, r.to].forEach((endPt) => {
-          if (distToSegment(endPt, adj.from, adj.to) < 0.25) {
-            const dot = (endPt.x - mid.x) * inwardNorm.x + (endPt.y - mid.y) * inwardNorm.y;
-            if (dot > 0 && !topVertices.some((v) => pointsClose(v, endPt, 0.1))) {
-              topVertices.push(endPt);
-            }
-          }
-        });
-      });
-    }
-  });
-
-  if (topVertices.length > 0) {
-    topVertices.sort((v1, v2) => {
-      const proj1 = (v1.x - pA.x) * dx + (v1.y - pA.y) * dy;
-      const proj2 = (v2.x - pA.x) * dx + (v2.y - pA.y) * dy;
-      return proj2 - proj1;
-    });
-    return [pA, pB, ...topVertices];
-  }
 
   // Fallback for skeleton-free multi-eave outline: clamp upslope strip to half of outline's span
   const inwardSpans = outline.points.map(
@@ -5778,6 +6393,19 @@ const PARENT_PALETTE = [
 // 6. ROOF FLASHING TRUE SLOPE GEOMETRY & ASSIGNABLE LINES
 // ---------------------------------------------------------------------------
 
+export interface SharedRoofVertex {
+  x: number;
+  y: number;
+  z: number;
+  isEavePinned: boolean;
+}
+
+export interface ResolvedLevelSharedVertices {
+  vertices: SharedRoofVertex[];
+  getVertexForPoint: (pt: Point2D, fallbackZ?: number) => SharedRoofVertex;
+  getPolygonWithTJunctions: (plane: RoofPlane) => Point2D[];
+}
+
 function getPlaneElevationAtPoint(
   pt: Point2D,
   plane: RoofPlane,
@@ -5807,6 +6435,216 @@ function getPlaneElevationAtPoint(
   const baseH = plane.eaveHeightM ?? 2.7;
   const tanPitch = Math.tan(((plane.pitchDeg || 22.5) * Math.PI) / 180);
   return baseH + vDist * tanPitch;
+}
+
+/**
+ * Reconciles 2D vertex clusters and shared 3D vertex heights across all planes & skeleton
+ * junctions within one roof level so adjacent slopes (main gable, T-bay valleys, triangular
+ * corner panels) meet at bit-identical (X, Y, Z) edge coordinates with zero gaps.
+ */
+export function resolveLevelSharedVertexElevations(
+  levelPlanes: RoofPlane[],
+  levelOutline?: RoofOutline,
+  skeleton: SkeletonLine[] = [],
+  defaultEaveHeightM = 2.7
+): ResolvedLevelSharedVertices {
+  const clusters: { x: number; y: number }[] = [];
+  const addClusterPt = (pt: Point2D, snapTol = 0.12) => {
+    if (!clusters.some((c) => dist(c, pt) <= snapTol)) {
+      clusters.push({ x: +pt.x.toFixed(4), y: +pt.y.toFixed(4) });
+    }
+  };
+
+  // Priority order so outline & skeleton junction coordinates stay exact anchors
+  levelOutline?.points.forEach((p) => addClusterPt(p, 0.1));
+  skeleton.forEach((s) => {
+    addClusterPt(s.from, 0.11);
+    addClusterPt(s.to, 0.11);
+  });
+  levelPlanes.forEach((pl) => {
+    pl.planPolygon.forEach((v) => addClusterPt(v, 0.12));
+  });
+
+  const activeEaveEdges: { from: Point2D; to: Point2D; heightM: number }[] = [];
+  levelOutline?.edges.forEach((e) => {
+    if (e.type === 'outline') {
+      const matchedPlane = levelPlanes.find(
+        (p) => p.eaveEdgeId === e.id || p.eaveEdgeId.startsWith(`${e.id}__sub`)
+      );
+      activeEaveEdges.push({
+        from: e.from,
+        to: e.to,
+        heightM: e.eaveHeightM ?? matchedPlane?.eaveHeightM ?? defaultEaveHeightM
+      });
+    }
+  });
+  skeleton.forEach((s) => {
+    if (s.suggestedType === 'eave') {
+      const matchedPlane = levelPlanes.find(
+        (p) => p.eaveEdgeId === s.id || p.eaveEdgeId.startsWith(`${s.id}__sub`)
+      );
+      activeEaveEdges.push({
+        from: s.from,
+        to: s.to,
+        heightM: matchedPlane?.eaveHeightM ?? defaultEaveHeightM
+      });
+    }
+  });
+
+  const ridges = skeleton.filter((s) => s.suggestedType === 'ridge');
+
+  const resolved: SharedRoofVertex[] = clusters.map((c) => {
+    // 1. Eave-pinned perimeter/internal eave boundary vertices stay at eave height
+    const touchingEaves = activeEaveEdges.filter(
+      (ee) => distToSegment(c, ee.from, ee.to) <= 0.14
+    );
+    if (touchingEaves.length > 0) {
+      const avgEaveH =
+        touchingEaves.reduce((sum, ee) => sum + ee.heightM, 0) / touchingEaves.length;
+      return { x: c.x, y: c.y, z: +avgEaveH.toFixed(4), isEavePinned: true };
+    }
+
+    // 2. Interior / junction / verge / triangular apex vertices: reconcile incident plane Zs
+    const touchingPlanes = levelPlanes.filter((pl) => {
+      if (pl.planPolygon.length < 3) return false;
+      return (
+        pl.planPolygon.some((v) => dist(v, c) <= 0.16) ||
+        pl.planPolygon.some((v, idx) =>
+          distToSegment(c, v, pl.planPolygon[(idx + 1) % pl.planPolygon.length]) <= 0.14
+        )
+      );
+    });
+
+    const candidates =
+      touchingPlanes.length > 0
+        ? touchingPlanes
+        : levelPlanes.filter((pl) => pl.planPolygon.length >= 3 && isPointInPolygon(c, pl.planPolygon));
+
+    if (candidates.length === 0) {
+      return { x: c.x, y: c.y, z: defaultEaveHeightM, isEavePinned: false };
+    }
+
+    // Main quad/multi-edge faces govern height; 3-vertex triangular panels conform seamlessly
+    const nonTri = candidates.filter((p) => p.planPolygon.length >= 4);
+    const governing = nonTri.length > 0 ? nonTri : candidates;
+
+    // If a ridge line passes through C and 2+ opposing non-triangular planes run parallel to that ridge,
+    // use those ridge-parallel primary slopes so tributary wing/valley junctions never cause a V-dip in the ridge
+    const ridgeAtC = ridges.find((r) => distToSegment(c, r.from, r.to) <= 0.16);
+    if (ridgeAtC && governing.length >= 2) {
+      const rLen = dist(ridgeAtC.from, ridgeAtC.to) || 1;
+      const rDir = {
+        x: (ridgeAtC.to.x - ridgeAtC.from.x) / rLen,
+        y: (ridgeAtC.to.y - ridgeAtC.from.y) / rLen
+      };
+      const ridgeParallelPlanes = governing.filter((pl) => {
+        const p0 = pl.planPolygon[0];
+        const p1 = pl.planPolygon[1];
+        const eLen = dist(p0, p1) || 1;
+        const dot = Math.abs(((p1.x - p0.x) / eLen) * rDir.x + ((p1.y - p0.y) / eLen) * rDir.y);
+        return dot >= 0.92;
+      });
+      if (ridgeParallelPlanes.length >= 2) {
+        const zs = ridgeParallelPlanes.map((pl) => getPlaneElevationAtPoint(c, pl, levelOutline));
+        const meanZ = zs.reduce((s, z) => s + z, 0) / zs.length;
+        return { x: c.x, y: c.y, z: +meanZ.toFixed(4), isEavePinned: false };
+      }
+    }
+
+    const zs = governing.map((pl) => ({
+      z: getPlaneElevationAtPoint(c, pl, levelOutline),
+      w: Math.sqrt(Math.max(0.5, pl.area || 1))
+    }));
+    const weightSum = zs.reduce((s, item) => s + item.w, 0) || 1;
+    const weightedZ = zs.reduce((s, item) => s + item.z * item.w, 0) / weightSum;
+    return { x: c.x, y: c.y, z: +weightedZ.toFixed(4), isEavePinned: false };
+  });
+
+  const getVertexForPoint = (pt: Point2D, fallbackZ = defaultEaveHeightM): SharedRoofVertex => {
+    let best: SharedRoofVertex | null = null;
+    let bestD = 0.16;
+    for (const v of resolved) {
+      const d = Math.hypot(v.x - pt.x, v.y - pt.y);
+      if (d <= bestD) {
+        bestD = d;
+        best = v;
+      }
+    }
+    if (best) return best;
+
+    // Linear interpolation if point lies along an edge connecting two resolved vertices on any plane boundary
+    for (const pl of levelPlanes) {
+      const poly = pl.planPolygon;
+      for (let i = 0; i < poly.length; i++) {
+        const p1 = poly[i];
+        const p2 = poly[(i + 1) % poly.length];
+        if (distToSegment(pt, p1, p2) <= 0.14) {
+          const v1 = resolved.find((rv) => dist(rv, p1) <= 0.16);
+          const v2 = resolved.find((rv) => dist(rv, p2) <= 0.16);
+          if (v1 && v2) {
+            const segLen = dist(p1, p2) || 1;
+            const t = Math.max(
+              0,
+              Math.min(1, ((pt.x - p1.x) * (p2.x - p1.x) + (pt.y - p1.y) * (p2.y - p1.y)) / (segLen * segLen))
+            );
+            return {
+              x: pt.x,
+              y: pt.y,
+              z: +(v1.z + t * (v2.z - v1.z)).toFixed(4),
+              isEavePinned: v1.isEavePinned && v2.isEavePinned
+            };
+          }
+        }
+      }
+    }
+
+    const matching = levelPlanes.filter(
+      (pl) => pl.planPolygon.length >= 3 && isPointInPolygon(pt, pl.planPolygon)
+    );
+    if (matching.length > 0) {
+      const zMean =
+        matching.reduce((s, pl) => s + getPlaneElevationAtPoint(pt, pl, levelOutline), 0) /
+        matching.length;
+      return { x: pt.x, y: pt.y, z: +zMean.toFixed(4), isEavePinned: false };
+    }
+    return { x: pt.x, y: pt.y, z: fallbackZ, isEavePinned: false };
+  };
+
+  // Splice shared T-junction vertices lying interior to a plane's edge so shared 3D triangles match edge-to-edge
+  const getPolygonWithTJunctions = (plane: RoofPlane): Point2D[] => {
+    const poly = plane.planPolygon;
+    if (poly.length < 3) return poly;
+    const out: Point2D[] = [];
+    for (let i = 0; i < poly.length; i++) {
+      const p1 = poly[i];
+      const p2 = poly[(i + 1) % poly.length];
+      const v1 = getVertexForPoint(p1, plane.eaveHeightM ?? defaultEaveHeightM);
+      out.push({ x: v1.x, y: v1.y });
+
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const segLen = Math.hypot(dx, dy);
+      if (segLen < 0.25) continue;
+      const ux = dx / segLen;
+      const uy = dy / segLen;
+
+      const mids: { proj: number; pt: Point2D }[] = [];
+      for (const rv of resolved) {
+        if (dist(rv, p1) <= 0.14 || dist(rv, p2) <= 0.14) continue;
+        if (distToSegment(rv, p1, p2) <= 0.08) {
+          const proj = (rv.x - p1.x) * ux + (rv.y - p1.y) * uy;
+          if (proj > 0.12 && proj < segLen - 0.12) {
+            mids.push({ proj, pt: { x: rv.x, y: rv.y } });
+          }
+        }
+      }
+      mids.sort((a, b) => a.proj - b.proj);
+      mids.forEach((m) => out.push(m.pt));
+    }
+    return out;
+  };
+
+  return { vertices: resolved, getVertexForPoint, getPolygonWithTJunctions };
 }
 
 export function getPointElevationFromPlanes(
@@ -6296,7 +7134,8 @@ export function createRoofLevel(
 export function syncMultiLevelPlanes(
   levels: RoofLevel[],
   existingPlanes: RoofPlane[],
-  defaultPitchDeg = 22.5
+  defaultPitchDeg = 22.5,
+  options?: { ignoreSuppressed?: boolean }
 ): RoofPlane[] {
   const allPlanes: RoofPlane[] = [];
   let paletteOffset = 0;
@@ -6313,6 +7152,10 @@ export function syncMultiLevelPlanes(
         levelName: lvl.name,
         defaultEaveHeightM: lvl.eaveHeightM,
         paletteOffset
+      },
+      {
+        suppressedEdgeIds: lvl.suppressedPlaneEdgeIds,
+        ignoreSuppressed: options?.ignoreSuppressed
       }
     );
     paletteOffset += levelPlanes.length;
@@ -6320,6 +7163,142 @@ export function syncMultiLevelPlanes(
   });
 
   return allPlanes;
+}
+
+export function deleteRoofPlanes(
+  levels: RoofLevel[],
+  planes: RoofPlane[],
+  planeIds: string[]
+): { levels: RoofLevel[]; planes: RoofPlane[] } {
+  const targetPlaneSet = new Set(planeIds);
+  if (targetPlaneSet.size === 0) return { levels, planes };
+
+  const removedByLevel = new Map<string, string[]>();
+  const removedAllEdgeIds: string[] = [];
+
+  planes.forEach((p) => {
+    if (!targetPlaneSet.has(p.id) || !p.eaveEdgeId) return;
+    removedAllEdgeIds.push(p.eaveEdgeId);
+    const owningLvl =
+      levels.find((l) => l.id === p.levelId) ||
+      levels.find((l) => l.outline.edges.some((e) => e.id === p.eaveEdgeId));
+    if (owningLvl) {
+      const list = removedByLevel.get(owningLvl.id) || [];
+      list.push(p.eaveEdgeId);
+      removedByLevel.set(owningLvl.id, list);
+    }
+  });
+
+  const nextLevels = levels.map((lvl) => {
+    const levelMatched = lvl.outline.edges
+      .filter((e) => removedAllEdgeIds.includes(e.id))
+      .map((e) => e.id);
+    const extra = removedByLevel.get(lvl.id) || [];
+    const additions = [...levelMatched, ...extra];
+    if (additions.length === 0) return lvl;
+    const nextSuppressed = Array.from(
+      new Set([...(lvl.suppressedPlaneEdgeIds || []), ...additions])
+    );
+    return {
+      ...lvl,
+      suppressedPlaneEdgeIds: nextSuppressed
+    };
+  });
+
+  return {
+    levels: nextLevels,
+    planes: planes.filter((p) => !targetPlaneSet.has(p.id))
+  };
+}
+
+export function unsuppressOutlineEdges(
+  levels: RoofLevel[],
+  edgeIds: string[]
+): RoofLevel[] {
+  if (edgeIds.length === 0) return levels;
+  const clearSet = new Set(edgeIds);
+  return levels.map((lvl) => {
+    if (!lvl.suppressedPlaneEdgeIds || lvl.suppressedPlaneEdgeIds.length === 0) {
+      return lvl;
+    }
+    const filtered = lvl.suppressedPlaneEdgeIds.filter((id) => !clearSet.has(id));
+    if (filtered.length === lvl.suppressedPlaneEdgeIds.length) return lvl;
+    return {
+      ...lvl,
+      suppressedPlaneEdgeIds: filtered.length > 0 ? filtered : undefined
+    };
+  });
+}
+
+export function buildFacesFromClassification(
+  levels: RoofLevel[],
+  existingPlanes: RoofPlane[],
+  defaultPitchDeg = 22.5
+): { levels: RoofLevel[]; planes: RoofPlane[]; createdCount: number } {
+  const nextLevels = levels.map((lvl) => {
+    if (lvl.outline.points.length < 3) {
+      return { ...lvl, suppressedPlaneEdgeIds: undefined };
+    }
+
+    const hasClassifiedEave = lvl.outline.edges.some((e) => e.type === 'outline');
+    const nextEdges = hasClassifiedEave
+      ? lvl.outline.edges
+      : lvl.outline.edges.map((e) =>
+          e.type === 'unclassified' ? { ...e, type: 'outline' as const } : e
+        );
+    const nextOutline: RoofOutline = { ...lvl.outline, edges: nextEdges };
+
+    const activeEaveCount = nextOutline.edges.filter((e) => e.type === 'outline').length;
+    const hasInteriorStructuralSkel = lvl.skeleton.some(
+      (s) =>
+        s.suggestedType === 'ridge' ||
+        s.suggestedType === 'hip' ||
+        s.suggestedType === 'valley' ||
+        s.suggestedType === 'eave'
+    );
+
+    const levelExistingPlanes = existingPlanes.filter(
+      (p) => !p.levelId || p.levelId === lvl.id
+    );
+    let nextSkeleton = mergeColinearRidgeLines(lvl.skeleton, levelExistingPlanes);
+
+    if (!hasInteriorStructuralSkel && activeEaveCount >= 2) {
+      const waveOutline: RoofOutline = {
+        ...nextOutline,
+        edges: nextOutline.edges.map((e) => ({
+          ...e,
+          type: isStationaryEdgeType(e.type) ? e.type : 'outline'
+        }))
+      };
+      const generated = generateSkeletonLines(waveOutline).map((s) => ({
+        ...s,
+        levelId: s.levelId ?? lvl.id
+      }));
+      nextSkeleton = mergeColinearRidgeLines([...generated, ...nextSkeleton], levelExistingPlanes);
+    }
+
+    return {
+      ...lvl,
+      outline: nextOutline,
+      skeleton: nextSkeleton,
+      suppressedPlaneEdgeIds: undefined
+    };
+  });
+
+  // Replace planes cleanly for rebuilt levels while carrying over pitch/sheet preferences for still-present loops
+  const validLevelIds = new Set(nextLevels.map((l) => l.id));
+  const preservedPrefs = existingPlanes.filter((p) => !p.levelId || validLevelIds.has(p.levelId));
+  const rebuiltPlanes = syncMultiLevelPlanes(nextLevels, preservedPrefs, defaultPitchDeg, {
+    ignoreSuppressed: true
+  });
+  const existingIds = new Set(existingPlanes.map((p) => p.id));
+  const createdCount = rebuiltPlanes.filter((p) => !existingIds.has(p.id)).length;
+
+  return {
+    levels: nextLevels,
+    planes: rebuiltPlanes,
+    createdCount
+  };
 }
 
 export function getMultiLevelPreset(
@@ -6461,7 +7440,7 @@ export function getDefaultEdgeSetbackM(edge: PlanEdge): number {
 export function isEdgeWallEnabled(edge: PlanEdge): boolean {
   if (edge.hasWall === true) return true;
   if (edge.hasWall === false) return false;
-  return edge.type === 'outline' || edge.type === 'verge' || edge.type === 'wall';
+  return edge.type === 'outline' || isGableEdgeType(edge.type) || edge.type === 'wall';
 }
 
 function getEdgeInwardNormal(edge: PlanEdge, outlinePoints: Point2D[]): Point2D {
@@ -6611,11 +7590,22 @@ export function deriveRoofWallSegments(
 
       const matchedPlane = levelPlanes.find((p) => p.eaveEdgeId === edge.id);
       const fallbackZ = edge.eaveHeightM ?? matchedPlane?.eaveHeightM ?? lvl.eaveHeightM ?? 2.7;
+      const sharedLevelVertices =
+        levelPlanes.length > 0
+          ? resolveLevelSharedVertexElevations(levelPlanes, lvl.outline, lvl.skeleton, fallbackZ)
+          : null;
 
       // Evaluate exact overlying roof Z directly above each sample point along [wallFrom -> wallTo].
       // A wall ALWAYS sits strictly below/flush with the roof plane — never extends above it.
       const evalRoofZAtWallPoint = (pt: Point2D, t: number): number => {
         if (levelPlanes.length === 0) return fallbackZ;
+        if (sharedLevelVertices) {
+          const snapped = sharedLevelVertices.vertices.find((rv) => dist(rv, pt) <= 0.16);
+          if (snapped) {
+            return +snapped.z.toFixed(3);
+          }
+        }
+
         // Nudge imperceptibly inward along normal and toward segment center at endpoints so polygon test hits exact facet
         const nudgeIn = eaveSetbackM < 0.05 ? 0.03 : 0.01;
         const tNudge = t < 0.02 ? 0.02 : t > 0.98 ? -0.02 : 0;
@@ -6623,6 +7613,20 @@ export function deriveRoofWallSegments(
           x: pt.x + inwardNormal.x * nudgeIn + ux * tNudge,
           y: pt.y + inwardNormal.y * nudgeIn + uy * tNudge
         };
+
+        if (sharedLevelVertices) {
+          // Interpolate along shared vertex heights when resting on a facet boundary
+          const sv = sharedLevelVertices.getVertexForPoint(pt, fallbackZ);
+          if (
+            levelPlanes.some((pl) =>
+              pl.planPolygon.some((v, idx) =>
+                distToSegment(pt, v, pl.planPolygon[(idx + 1) % pl.planPolygon.length]) <= 0.14
+              )
+            )
+          ) {
+            return +sv.z.toFixed(3);
+          }
+        }
 
         const strictContaining = levelPlanes.filter((pl) =>
           pl.planPolygon.length >= 3 && isPointInPolygon(evalPt, pl.planPolygon)
@@ -6635,6 +7639,15 @@ export function deriveRoofWallSegments(
         const direct = getPointElevationFromPlanes(evalPt, levelPlanes, lvl.outline);
         if (direct.matchedPlaneIds.length > 0) {
           const zs = direct.matchedPlaneIds
+            .map((id) => levelPlanes.find((pl) => pl.id === id))
+            .filter((pl): pl is RoofPlane => Boolean(pl))
+            .map((pl) => getPlaneElevationAtPoint(pt, pl, lvl.outline));
+          return +Math.min(...zs).toFixed(3);
+        }
+
+        const directAtPt = getPointElevationFromPlanes(pt, levelPlanes, lvl.outline);
+        if (directAtPt.matchedPlaneIds.length > 0) {
+          const zs = directAtPt.matchedPlaneIds
             .map((id) => levelPlanes.find((pl) => pl.id === id))
             .filter((pl): pl is RoofPlane => Boolean(pl))
             .map((pl) => getPlaneElevationAtPoint(pt, pl, lvl.outline));
@@ -6674,9 +7687,9 @@ export function deriveRoofWallSegments(
       }));
 
       const wallKind: RoofWallSegment['wallKind'] =
-        edge.type === 'wall'
+        edge.type === 'wall' || edge.type === 'apron'
           ? 'abutment_wall'
-          : edge.type === 'verge'
+          : isGableEdgeType(edge.type)
           ? 'gable_end'
           : 'exterior_eave';
 

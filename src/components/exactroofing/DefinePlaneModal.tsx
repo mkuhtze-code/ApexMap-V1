@@ -455,7 +455,7 @@ export const DefinePlaneModal: React.FC<Props> = ({
               <div>
                 <div className="text-[11px] font-bold text-white">Wall Below Roof</div>
                 <div className="text-[10px] text-slate-400">
-                  Sits underneath slope · Set back by eave width
+                  Sits underneath slope · Gutter runs on eaves only and stops at gable barges
                 </div>
               </div>
               <button

@@ -14,7 +14,12 @@ import {
   PitchBreakLine,
   RoofFlashingAssignment,
   AssignableRoofLine,
-  RoofPlanUnderlay
+  RoofPlanUnderlay,
+  WallPlan,
+  WallFacet,
+  WallCladdingType,
+  WallFacetKind,
+  WallHeightSource
 } from '../../types/exactRoofing';
 import { ArchitecturalPlan } from '../../types/crm';
 import {
@@ -83,8 +88,19 @@ import {
   Crosshair,
   Link2,
   GitBranch,
-  Square
+  Square,
+  Building2
 } from 'lucide-react';
+import {
+  WALL_CLADDING_OPTIONS,
+  WALL_FACET_KIND_OPTIONS,
+  getWallCladdingMeta,
+  getFacetPrimaryDisplayCladding,
+  getWallFacetKindMeta,
+  getWallFacetKind,
+  isWallFacetUndetailed,
+  computeWallFacetMetrics
+} from '../../utils/wallCladdingEngine';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
   computeMetricGridLines,
@@ -140,7 +156,9 @@ interface Props {
   onUpdateSkeleton: (skeleton: SkeletonLine[]) => void;
   onSelectEdgeToDefine: (edge: PlanEdge) => void;
   onDeletePlane: (planeId: string) => void;
+  onDeletePlanes?: (planeIds: string[]) => void;
   onRunSkeletonKey: () => void;
+  onBuildFacesFromClassification?: () => void;
   onClearToBlank?: () => void;
   onToggleJunctionGable?: (junctionId: string) => void;
   onToggleEdgeGable?: (edgeId: string, forceMode?: 'hipped' | 'gable') => void;
@@ -175,6 +193,22 @@ interface Props {
   onBatchUpdateSkeletonType?: (lineIds: string[], lineType: SkeletonLineType) => void;
   onUndo?: () => void;
   canUndo?: boolean;
+  wallPlan?: WallPlan | null;
+  selectedWallFacetId?: string | null;
+  selectedWallFacetIds?: string[];
+  onSelectWallFacet?: (facetId: string | null) => void;
+  onChangeSelectedWallFacetIds?: (ids: string[]) => void;
+  onOpenWallElevation?: (facetId: string) => void;
+  onBuildWallFaces?: () => void;
+  onBatchWallUpdate?: (
+    facetIds: string[],
+    updates: {
+      claddingType?: WallCladdingType;
+      kind?: WallFacetKind;
+      heightSource?: WallHeightSource;
+      heightM?: number;
+    }
+  ) => void;
 }
 
 export const ExactRoofingCanvas: React.FC<Props> = ({
@@ -202,7 +236,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   onUpdateSkeleton,
   onSelectEdgeToDefine,
   onDeletePlane,
+  onDeletePlanes,
   onRunSkeletonKey,
+  onBuildFacesFromClassification,
   onToggleJunctionGable,
   onToggleEdgeGable,
   onAddAsset,
@@ -235,7 +271,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   onBatchClassifyEdges,
   onBatchUpdateSkeletonType,
   onUndo,
-  canUndo = false
+  canUndo = false,
+  wallPlan = null,
+  selectedWallFacetId = null,
+  selectedWallFacetIds: propSelectedWallFacetIds,
+  onSelectWallFacet,
+  onChangeSelectedWallFacetIds,
+  onOpenWallElevation,
+  onBuildWallFaces: _onBuildWallFaces,
+  onBatchWallUpdate
 }) => {
   const { isMobile, isTouchDevice } = useDeviceDetection();
 
@@ -250,6 +294,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const [localSelectedPlaneIds, setLocalSelectedPlaneIds] = useState<string[]>([]);
   const [localSelectedEdgeIds, setLocalSelectedEdgeIds] = useState<string[]>([]);
   const [localSelectedSkeletonLineIds, setLocalSelectedSkeletonLineIds] = useState<string[]>([]);
+  const [localSelectedWallFacetIds, setLocalSelectedWallFacetIds] = useState<string[]>([]);
 
   const selectedPlaneIds = propSelectedPlaneIds ?? localSelectedPlaneIds;
   const setSelectedPlaneIds = (ids: string[]) => {
@@ -266,10 +311,18 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     setLocalSelectedSkeletonLineIds(ids);
     onChangeSelectedSkeletonLineIds?.(ids);
   };
+  const selectedWallFacetIds = propSelectedWallFacetIds ?? localSelectedWallFacetIds;
+  const setSelectedWallFacetIds = (ids: string[]) => {
+    setLocalSelectedWallFacetIds(ids);
+    onChangeSelectedWallFacetIds?.(ids);
+  };
   const toggleMultiId = (list: string[], id: string) =>
     list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
   const totalMultiSelectedCount =
-    selectedPlaneIds.length + selectedEdgeIds.length + selectedSkeletonLineIds.length;
+    selectedPlaneIds.length +
+    selectedEdgeIds.length +
+    selectedSkeletonLineIds.length +
+    selectedWallFacetIds.length;
   const hasMultiSelectionBar =
     !readOnlyGeometry &&
     activeTool === 'set_pitch' &&
@@ -463,6 +516,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     [planes, selectedPlaneId]
   );
 
+  const selectedWallFacetObj = useMemo(
+    () => wallPlan?.facets.find((f) => f.id === selectedWallFacetId) || null,
+    [wallPlan, selectedWallFacetId]
+  );
+
   const [faceSheetDraftMm, setFaceSheetDraftMm] = useState<string>('');
   useEffect(() => {
     if (!selectedPlaneObj) {
@@ -554,8 +612,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       levels && levels.length > 0
         ? levels.flatMap((l) => l.outline.points)
         : outline.points;
+    const wallPts = wallPlan?.facets ? wallPlan.facets.flatMap((f) => [f.from, f.to]) : [];
 
-    const allPts: Point2D[] = [...levelPts];
+    const allPts: Point2D[] = [...levelPts, ...wallPts];
     if (planUnderlay && planUnderlay.visible !== false) {
       allPts.push(
         { x: planUnderlay.worldX, y: planUnderlay.worldY },
@@ -578,11 +637,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     const width = Math.max(maxX - minX, 2);
     const height = Math.max(maxY - minY, 2);
     return { minX, maxX, minY, maxY, width, height };
-  }, [outline, levels, planUnderlay, lockedDraftBounds, draftPoints.length, scalePoints.length, activeTool]);
+  }, [outline, levels, wallPlan, planUnderlay, lockedDraftBounds, draftPoints.length, scalePoints.length, activeTool]);
 
-  const padding = isMobile ? 26 : 55;
-  const svgWidth = isMobile ? vpSize.w : 860;
-  const svgHeight = isMobile ? vpSize.h : 560;
+  const padding = isMobile ? 26 : 52;
+  const svgWidth = vpSize.w;
+  const svgHeight = vpSize.h;
   const drawWidth = Math.max(80, svgWidth - padding * 2);
   const drawHeight = Math.max(80, svgHeight - padding * 2);
   const baseScale = Math.min(drawWidth / bounds.width, drawHeight / bounds.height);
@@ -979,6 +1038,32 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
         }
       }
 
+      if (
+        (e.key === 'Delete' || e.key === 'Backspace') &&
+        !readOnlyGeometry &&
+        !hasActiveTypedSegment
+      ) {
+        const targetPlaneIds =
+          selectedPlaneIds.length > 0
+            ? selectedPlaneIds
+            : selectedPlaneId
+            ? [selectedPlaneId]
+            : [];
+        if (targetPlaneIds.length > 0) {
+          e.preventDefault();
+          if (onDeletePlanes) onDeletePlanes(targetPlaneIds);
+          else targetPlaneIds.forEach((pid) => onDeletePlane(pid));
+          setSelectedPlaneIds([]);
+          return;
+        }
+        if (selectedSkeletonLineIds.length > 0) {
+          e.preventDefault();
+          onUpdateSkeleton(skeleton.filter((s) => !selectedSkeletonLineIds.includes(s.id)));
+          setSelectedSkeletonLineIds([]);
+          return;
+        }
+      }
+
       const key = e.key.toLowerCase();
       if (key === 'r' && !readOnlyGeometry && activeTool === 'draw_roof' && squareClosedPoints) {
         e.preventDefault();
@@ -1044,7 +1129,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     typedLengthBuffer,
     squareClosedPoints,
     mousePos,
-    orthoSnap
+    orthoSnap,
+    selectedPlaneId,
+    selectedPlaneIds,
+    selectedSkeletonLineIds,
+    skeleton,
+    onDeletePlane,
+    onDeletePlanes,
+    onUpdateSkeleton
   ]);
 
   // Helper: place feature (skylight, chimney, dormers, pitch break) at point or drag box on host plane
@@ -1507,8 +1599,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       return;
     }
     if (!readOnlyGeometry && activeTool === 'delete_line') {
-      const attached = planes.find((p) => p.eaveEdgeId === edge.id);
-      if (attached) onDeletePlane(attached.id);
+      const attached = planes.filter((p) => p.eaveEdgeId === edge.id);
+      if (attached.length > 0) {
+        if (onDeletePlanes) onDeletePlanes(attached.map((p) => p.id));
+        else attached.forEach((p) => onDeletePlane(p.id));
+      }
       return;
     }
     if (!readOnlyGeometry && activeTool === 'set_pitch' && (e.shiftKey || multiSelectMode)) {
@@ -1525,6 +1620,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
     // Select / Inspect mode -> display line info card with length, flashing, pitch & hip/gable actions
     setEditingMeasurement(null);
     onSelectPlane(null);
+    onSelectWallFacet?.(null);
+    setSelectedWallFacetIds([]);
     setSelectedEdgeIds([edge.id]);
     setInspectedLine({ kind: 'edge', id: edge.id });
   };
@@ -1842,6 +1939,19 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       isAction: true,
       onClick: onRunSkeletonKey
     },
+    ...(onBuildFacesFromClassification
+      ? [
+          {
+            id: 'build_faces' as const,
+            label: 'Build Faces from Edges',
+            shortLabel: 'Build Faces',
+            icon: Square,
+            activeClass: 'bg-emerald-600 text-white',
+            isAction: true,
+            onClick: onBuildFacesFromClassification
+          }
+        ]
+      : []),
     {
       id: 'adjust_shape' as const,
       label: 'Adjust Points',
@@ -1907,8 +2017,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   return (
     <div
-      className={`w-full h-full flex-1 bg-[#070b14] relative select-none overflow-hidden flex flex-col text-white shadow-2xl ${
-        isMobile ? 'rounded-xl border-0 min-h-[300px]' : 'rounded-3xl border border-slate-800/90 min-h-[500px]'
+      className={`w-full h-full flex-1 min-w-0 min-h-0 bg-[#070b14] relative select-none overflow-hidden flex flex-col text-white shadow-2xl ${
+        isMobile ? 'rounded-xl border-0 min-h-[300px]' : 'rounded-xl border border-slate-800/80 min-h-[300px]'
       }`}
     >
       {/* 1. FLOATING CAD TOOL DOCK (Mobile tools integrated into unified Ruler/Zoom bar; Vertical Rail on Desktop) */}
@@ -2359,6 +2469,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     ? `${btn.activeClass} ring-1 ring-white/25`
                     : btn.id === 'auto_lines'
                     ? 'text-sky-400 hover:bg-sky-950/60'
+                    : btn.id === 'build_faces'
+                    ? 'text-emerald-400 hover:bg-emerald-950/60'
                     : 'text-slate-400 hover:text-white hover:bg-slate-800/90'
                 }`}
                 title={shortcut ? `${btn.label} (${shortcut})` : btn.label}
@@ -3122,9 +3234,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             }
             if (!e.shiftKey && !multiSelectMode && activeTool === 'set_pitch') {
               if (selectedPlaneId) onSelectPlane(null);
+              if (selectedWallFacetId) onSelectWallFacet?.(null);
               if (selectedPlaneIds.length > 0) setSelectedPlaneIds([]);
               if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
               if (selectedSkeletonLineIds.length > 0) setSelectedSkeletonLineIds([]);
+              if (selectedWallFacetIds.length > 0) setSelectedWallFacetIds([]);
             }
             handleCanvasClick(e);
           }}
@@ -3334,9 +3448,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       y1={toSvgY(ge.from.y)}
                       x2={toSvgX(ge.to.x)}
                       y2={toSvgY(ge.to.y)}
-                      stroke={ge.type === 'wall' ? '#f59e0b' : '#94a3b8'}
+                      stroke={ge.type === 'wall' || ge.type === 'apron' ? '#f59e0b' : '#94a3b8'}
                       strokeWidth="2"
-                      strokeDasharray={ge.type === 'wall' || ge.type === 'verge' ? '6 4' : undefined}
+                      strokeDasharray={ge.type === 'wall' || ge.type === 'apron' || ge.type === 'verge' || ge.type === 'rake' ? '6 4' : undefined}
                     />
                   ))}
                   {lvl.skeleton.map((gs) => (
@@ -3391,8 +3505,17 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             return (
               <g
                 key={plane.id}
-                pointerEvents={isDrawingOrGeometryTool ? 'none' : undefined}
+                pointerEvents={isDrawingOrGeometryTool && activeTool !== 'delete_line' ? 'none' : undefined}
                 onClick={(e) => {
+                  if (!readOnlyGeometry && activeTool === 'delete_line') {
+                    e.stopPropagation();
+                    setInspectedLine(null);
+                    setEditingMeasurement(null);
+                    if (onDeletePlanes) onDeletePlanes([plane.id]);
+                    else onDeletePlane(plane.id);
+                    setSelectedPlaneIds([]);
+                    return;
+                  }
                   if (isDrawingOrGeometryTool) return;
                   e.stopPropagation();
                   setInspectedLine(null);
@@ -3403,13 +3526,16 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     return;
                   }
                   setSelectedPlaneIds([plane.id]);
+                  setSelectedWallFacetIds([]);
                   onSelectPlane(plane.id);
                   if (readOnlyGeometry) {
                     onInstallSelectPlane?.(plane.id);
                   }
                 }}
                 className={
-                  isCanvasTapTool
+                  activeTool === 'delete_line' && !readOnlyGeometry
+                    ? 'cursor-pointer group'
+                    : isCanvasTapTool
                     ? 'cursor-crosshair group'
                     : isDrawingOrGeometryTool
                     ? 'pointer-events-none'
@@ -4091,6 +4217,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 return;
               }
               setSelectedSkeletonLineIds([s.id]);
+              setSelectedWallFacetIds([]);
+              onSelectWallFacet?.(null);
               setInspectedLine({ kind: 'skeleton', id: s.id });
             };
 
@@ -4203,8 +4331,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const midY = (y1 + y2) / 2;
             const edgeLenM = +dist(e.from, e.to).toFixed(2);
             const edgeMeta = getRoofEdgeTypeMeta(e.type);
-            const isGableVerge = e.type === 'verge';
-            const isWall = e.type === 'wall';
+            const isGableVerge = e.type === 'verge' || e.type === 'rake';
+            const isWall = e.type === 'wall' || e.type === 'apron';
             const isDefined = planes.some((p) => p.eaveEdgeId === e.id);
             const assignedFlashing = assignmentByLineId.get(e.id);
             const isInspected = inspectedLine?.kind === 'edge' && inspectedLine.id === e.id;
@@ -4331,7 +4459,25 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         />
                         <circle cx={dx1} cy={dy1} r="2.2" fill={dimColor} pointerEvents="none" />
                         <circle cx={dx2} cy={dy2} r="2.2" fill={dimColor} pointerEvents="none" />
-                        <g transform={`translate(${lx}, ${ly})`}>
+                        <g
+                          transform={`translate(${lx}, ${ly})`}
+                          className={!readOnlyGeometry && activeTool === 'set_pitch' && !multiSelectMode ? 'cursor-pointer' : undefined}
+                          onClick={
+                            !readOnlyGeometry && activeTool === 'set_pitch' && !multiSelectMode
+                              ? (ev) => {
+                                  ev.stopPropagation();
+                                  handleOpenMeasurementEditor(
+                                    'edge',
+                                    e.id,
+                                    edgeLenM,
+                                    edgeMeta.label,
+                                    { x: lx, y: ly },
+                                    ev
+                                  );
+                                }
+                              : undefined
+                          }
+                        >
                           <rect
                             x="-26"
                             y="-9.5"
@@ -4411,6 +4557,215 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               </g>
             );
           })}
+
+          {/* UNIFIED SITE PLAN WALL RINGS, STEP RISERS, OPENINGS & INWARD SELECT TAGS */}
+          {wallPlan &&
+            wallPlan.facets.length > 0 &&
+            wallPlan.facets.map((facet: WallFacet) => {
+              const fx1 = toSvgX(facet.from.x);
+              const fy1 = toSvgY(facet.from.y);
+              const fx2 = toSvgX(facet.to.x);
+              const fy2 = toSvgY(facet.to.y);
+              const wallSpanSvg = Math.hypot(fx2 - fx1, fy2 - fy1);
+              if (wallSpanSvg < 2) return null;
+
+              const ux = (fx2 - fx1) / wallSpanSvg;
+              const uy = (fy2 - fy1) / wallSpanSvg;
+
+              // Orient tag inward toward owning body centroid if available
+              const owningOutline =
+                (levels && (facet.levelId || facet.bodyId)
+                  ? levels.find((l) => l.id === (facet.levelId || facet.bodyId))?.outline
+                  : undefined) || outline;
+              let nx = -uy;
+              let ny = ux;
+              if (owningOutline.points.length >= 3) {
+                const cx =
+                  owningOutline.points.reduce((a, p) => a + p.x, 0) / owningOutline.points.length;
+                const cy =
+                  owningOutline.points.reduce((a, p) => a + p.y, 0) / owningOutline.points.length;
+                const toCdx = toSvgX(cx) - (fx1 + fx2) / 2;
+                const toCdy = toSvgY(cy) - (fy1 + fy2) / 2;
+                if (toCdx * nx + toCdy * ny < 0) {
+                  nx = -nx;
+                  ny = -ny;
+                }
+              }
+
+              const isWallSelected = selectedWallFacetId === facet.id;
+              const isWallMulti = selectedWallFacetIds.includes(facet.id);
+              const isUndetailed = isWallFacetUndetailed(facet);
+              const isStepRiser = (facet.bottomZ ?? 0) > 0.08;
+              const isDimmedByLevel =
+                Boolean(levels && levels.length > 1 && activeLevelId && activeLevelId !== 'all') &&
+                Boolean(facet.levelId) &&
+                facet.levelId !== activeLevelId;
+
+              const primClad = getFacetPrimaryDisplayCladding(facet);
+              const cladHex = getWallCladdingMeta(primClad).hex;
+              const kind = getWallFacetKind(facet);
+              const badgeDistPx = Math.min(20, Math.max(13, wallSpanSvg * 0.22));
+              const tagX = (fx1 + fx2) / 2 + nx * badgeDistPx;
+              const tagY = (fy1 + fy2) / 2 + ny * badgeDistPx;
+              const tagText = isStepRiser ? `W${facet.code}↑` : `W${facet.code}`;
+              const tagW = tagText.length > 3 ? 34 : 26;
+              const wallInteractive =
+                !isDrawingOrGeometryTool && activeTool !== 'assign_flashing';
+
+              return (
+                <g
+                  key={facet.id}
+                  opacity={isDimmedByLevel ? 0.28 : 1}
+                  pointerEvents={wallInteractive ? undefined : 'none'}
+                  onClick={(ev) => {
+                    if (!wallInteractive) return;
+                    ev.stopPropagation();
+                    setInspectedLine(null);
+                    setEditingMeasurement(null);
+                    if (!readOnlyGeometry && activeTool === 'set_pitch' && (ev.shiftKey || multiSelectMode)) {
+                      const nextIds = toggleMultiId(selectedWallFacetIds, facet.id);
+                      setSelectedWallFacetIds(nextIds);
+                      onSelectWallFacet?.(nextIds.length >= 1 ? nextIds[nextIds.length - 1] : null);
+                      return;
+                    }
+                    setSelectedPlaneIds([]);
+                    setSelectedEdgeIds([]);
+                    setSelectedSkeletonLineIds([]);
+                    setSelectedWallFacetIds([facet.id]);
+                    onSelectWallFacet?.(facet.id);
+                  }}
+                  className={wallInteractive ? 'cursor-pointer group/wall' : 'pointer-events-none'}
+                >
+                  {/* Slightly inward transparent hit corridor so even flush eaves allow wall clicking */}
+                  <line
+                    x1={fx1 + nx * 4}
+                    y1={fy1 + ny * 4}
+                    x2={fx2 + nx * 4}
+                    y2={fy2 + ny * 4}
+                    stroke="transparent"
+                    strokeWidth={isTouchDevice ? 18 : 12}
+                  />
+
+                  {(isWallSelected || isWallMulti) && (
+                    <line
+                      x1={fx1}
+                      y1={fy1}
+                      x2={fx2}
+                      y2={fy2}
+                      stroke={isWallMulti ? '#38bdf8' : '#f59e0b'}
+                      strokeOpacity="0.65"
+                      strokeWidth="10"
+                      strokeLinecap="round"
+                    />
+                  )}
+
+                  {/* Cladding body stroke */}
+                  <line
+                    x1={fx1}
+                    y1={fy1}
+                    x2={fx2}
+                    y2={fy2}
+                    stroke={isUndetailed ? '#f59e0b' : cladHex}
+                    strokeWidth={isWallSelected || isWallMulti ? 6 : 4.2}
+                    strokeDasharray={
+                      isStepRiser ? '7 3' : kind === 'parapet' || kind === 'wing' ? '5 2.5' : undefined
+                    }
+                    strokeLinecap="round"
+                    className="transition-all group-hover/wall:stroke-amber-300"
+                  />
+
+                  {/* Architectural center grain / riser line */}
+                  <line
+                    x1={fx1}
+                    y1={fy1}
+                    x2={fx2}
+                    y2={fy2}
+                    stroke={isStepRiser ? '#fde68a' : '#f8fafc'}
+                    strokeOpacity={isStepRiser ? 0.9 : 0.45}
+                    strokeWidth="1.2"
+                    strokeDasharray={isStepRiser ? '3 3' : undefined}
+                    pointerEvents="none"
+                  />
+
+                  {/* Plan openings along wall tangent */}
+                  {facet.openings.map((op) => {
+                    if (facet.lengthM <= 0.05) return null;
+                    const t0 = Math.max(0, Math.min(1, op.distFromStartM / facet.lengthM));
+                    const t1 = Math.max(
+                      t0,
+                      Math.min(1, (op.distFromStartM + op.widthM) / facet.lengthM)
+                    );
+                    if (t1 - t0 < 0.01) return null;
+                    const ox1 = fx1 + (fx2 - fx1) * t0;
+                    const oy1 = fy1 + (fy2 - fy1) * t0;
+                    const ox2 = fx1 + (fx2 - fx1) * t1;
+                    const oy2 = fy1 + (fy2 - fy1) * t1;
+                    const opStroke =
+                      op.type === 'window'
+                        ? '#38bdf8'
+                        : op.type === 'void'
+                        ? '#94a3b8'
+                        : '#fbbf24';
+                    return (
+                      <line
+                        key={op.id}
+                        x1={ox1}
+                        y1={oy1}
+                        x2={ox2}
+                        y2={oy2}
+                        stroke={opStroke}
+                        strokeWidth="5.2"
+                        strokeDasharray={op.type === 'void' ? '3 2' : undefined}
+                        pointerEvents="none"
+                      />
+                    );
+                  })}
+
+                  {/* Inward CAD tag for crisp single/multi-selection */}
+                  <g transform={`translate(${tagX}, ${tagY})`}>
+                    <rect
+                      x={-tagW / 2}
+                      y="-8.5"
+                      width={tagW}
+                      height="17"
+                      rx="4.5"
+                      fill={
+                        isWallMulti
+                          ? '#0369a1'
+                          : isWallSelected
+                          ? '#b45309'
+                          : isStepRiser
+                          ? '#451a03'
+                          : '#0b1220'
+                      }
+                      fillOpacity="0.94"
+                      stroke={
+                        isWallMulti
+                          ? '#38bdf8'
+                          : isWallSelected
+                          ? '#fbbf24'
+                          : isUndetailed
+                          ? '#f59e0b'
+                          : cladHex
+                      }
+                      strokeWidth={isWallSelected || isWallMulti ? '1.8' : '1.2'}
+                    />
+                    <text
+                      x="0"
+                      y="3"
+                      textAnchor="middle"
+                      fill={isWallSelected ? '#fef3c7' : isStepRiser ? '#fcd34d' : '#e2e8f0'}
+                      fontSize="8.5"
+                      fontWeight="900"
+                      fontFamily="monospace"
+                      pointerEvents="none"
+                    >
+                      {tagText}
+                    </text>
+                  </g>
+                </g>
+              );
+            })}
 
           {/* INTERACTIVE RIDGE / HIP JUNCTION HANDLES (1-Click Toggle Hip <-> Gable End) */}
           {!readOnlyGeometry &&
@@ -5063,8 +5418,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               levels?.find((l) => l.id === (edgeObj?.levelId || outline.levelId))?.eaveHeightM ??
               2.7;
 
-            const isVerge = edgeObj?.type === 'verge';
-            const isWall = edgeObj?.type === 'wall';
+            const isVerge = edgeObj?.type === 'verge' || edgeObj?.type === 'rake';
+            const isWall = edgeObj?.type === 'wall' || edgeObj?.type === 'apron';
             const meta = edgeObj
               ? getRoofEdgeTypeMeta(edgeObj.type)
               : getSkeletonLineTypeMeta(skelObj!.suggestedType);
@@ -5361,7 +5716,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     : [
                         selectedPlaneIds.length > 0 ? `${selectedPlaneIds.length} faces` : null,
                         selectedEdgeIds.length > 0 ? `${selectedEdgeIds.length} edges` : null,
-                        selectedSkeletonLineIds.length > 0 ? `${selectedSkeletonLineIds.length} lines` : null
+                        selectedSkeletonLineIds.length > 0 ? `${selectedSkeletonLineIds.length} lines` : null,
+                        selectedWallFacetIds.length > 0 ? `${selectedWallFacetIds.length} walls` : null
                       ]
                         .filter(Boolean)
                         .join(' · ')}
@@ -5421,6 +5777,30 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 >
                   Unclassified
                 </button>
+                {wallPlan && wallPlan.facets.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedWallFacetIds(wallPlan.facets.map((f) => f.id))}
+                      className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-amber-200 cursor-pointer whitespace-nowrap"
+                    >
+                      All Walls ({wallPlan.facets.length})
+                    </button>
+                    {wallPlan.facets.some(isWallFacetUndetailed) && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedWallFacetIds(
+                            wallPlan.facets.filter(isWallFacetUndetailed).map((f) => f.id)
+                          )
+                        }
+                        className="px-2 py-1 rounded-lg bg-amber-950/60 hover:bg-amber-900/60 border border-amber-500/40 text-[10px] font-bold text-amber-300 cursor-pointer whitespace-nowrap"
+                      >
+                        Undetailed Walls
+                      </button>
+                    )}
+                  </>
+                )}
                 {totalMultiSelectedCount >= 2 && onOpenInspector && (
                   <button
                     type="button"
@@ -5446,6 +5826,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     setSelectedPlaneIds([]);
                     setSelectedEdgeIds([]);
                     setSelectedSkeletonLineIds([]);
+                    setSelectedWallFacetIds([]);
+                    onSelectWallFacet?.(null);
                     setMultiSelectMode(false);
                   }}
                   className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer whitespace-nowrap"
@@ -5513,6 +5895,66 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     </option>
                   ))}
                 </select>
+              )}
+
+              {selectedWallFacetIds.length >= 1 && onBatchWallUpdate && (
+                <>
+                  <select
+                    defaultValue=""
+                    onChange={(ev) => {
+                      if (ev.target.value) {
+                        onBatchWallUpdate(selectedWallFacetIds, {
+                          claddingType: ev.target.value as WallCladdingType
+                        });
+                        ev.target.value = '';
+                      }
+                    }}
+                    className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1 text-[11px] font-bold text-white cursor-pointer"
+                  >
+                    <option value="">Set {selectedWallFacetIds.length} Walls Cladding...</option>
+                    {WALL_CLADDING_OPTIONS.map((opt) => (
+                      <option key={`bwc-${opt.type}`} value={opt.type}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    defaultValue=""
+                    onChange={(ev) => {
+                      if (ev.target.value) {
+                        onBatchWallUpdate(selectedWallFacetIds, {
+                          kind: ev.target.value as WallFacetKind
+                        });
+                        ev.target.value = '';
+                      }
+                    }}
+                    className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1 text-[11px] font-bold text-white cursor-pointer"
+                  >
+                    <option value="">Set {selectedWallFacetIds.length} Walls Role...</option>
+                    {WALL_FACET_KIND_OPTIONS.map((opt) => (
+                      <option key={`bwk-${opt.kind}`} value={opt.kind}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+
+              {!readOnlyGeometry && selectedPlaneIds.length >= 1 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onDeletePlanes) onDeletePlanes(selectedPlaneIds);
+                    else selectedPlaneIds.forEach((pid) => onDeletePlane(pid));
+                    setSelectedPlaneIds([]);
+                  }}
+                  className="px-3 py-1 rounded-xl bg-rose-600/25 hover:bg-rose-600/45 border border-rose-500/50 text-rose-200 font-extrabold text-[11px] flex items-center gap-1 cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>
+                    Delete {selectedPlaneIds.length} {selectedPlaneIds.length === 1 ? 'Face' : 'Faces'}
+                  </span>
+                </button>
               )}
 
               {onOpenInspector && totalMultiSelectedCount >= 2 && (
@@ -5657,8 +6099,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     </div>
                   )}
 
-                  {(isMobile || (!readOnlyGeometry && onSetStartPlane && !isStart)) && (
-                    <div className="flex items-center gap-1.5">
+                  {(isMobile || !readOnlyGeometry) && (
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {isMobile && onOpenInspector && (
                         <button
                           type="button"
@@ -5680,6 +6122,20 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                           <span>Make Start Face</span>
                         </button>
                       )}
+
+                      {!readOnlyGeometry && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (onDeletePlanes) onDeletePlanes([selectedPlaneObj.id]);
+                            else onDeletePlane(selectedPlaneObj.id);
+                          }}
+                          className="min-h-[38px] px-3 rounded-xl bg-rose-600/20 hover:bg-rose-600/40 border border-rose-500/45 text-rose-200 text-xs font-extrabold flex items-center gap-1 cursor-pointer ml-auto"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Delete Face</span>
+                        </button>
+                      )}
                     </div>
                   )}
                 </>
@@ -5687,6 +6143,83 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             })()}
           </div>
         )}
+
+        {/* 5C. CLICK-TO-INSPECT WALL FACET QUICK CARD (Plan View Wall Click -> Summary + Elevation Shortcut) */}
+        {selectedWallFacetObj &&
+          !selectedPlaneObj &&
+          !inspectedLine &&
+          !hasMultiSelectionBar &&
+          !editingMeasurement && (() => {
+            const wallM = computeWallFacetMetrics(selectedWallFacetObj);
+            const primClad = getFacetPrimaryDisplayCladding(selectedWallFacetObj);
+            const cladMeta = getWallCladdingMeta(primClad);
+            const kindMeta = getWallFacetKindMeta(getWallFacetKind(selectedWallFacetObj));
+            const isStepRiser = (selectedWallFacetObj.bottomZ ?? 0) > 0.08;
+            return (
+              <div
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-30 w-[calc(100%-20px)] max-w-md bg-[#0b101d]/96 backdrop-blur-md border border-amber-500/45 text-white rounded-2xl p-3 shadow-2xl space-y-2.5 animate-in fade-in slide-in-from-bottom-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="w-7 h-7 rounded-xl flex items-center justify-center font-mono font-black text-xs text-white shrink-0 border border-white/25"
+                      style={{ backgroundColor: cladMeta.hex }}
+                    >
+                      W{selectedWallFacetObj.code}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="text-xs font-black text-white truncate">
+                        Wall {selectedWallFacetObj.code} · {kindMeta.shortLabel} · {cladMeta.shortLabel}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-300 tabular-nums">
+                        {selectedWallFacetObj.lengthM.toFixed(2)}m L × {selectedWallFacetObj.heightM.toFixed(2)}m H ·{' '}
+                        {wallM.netCladdingAreaM2.toFixed(1)}m² net
+                        {isStepRiser
+                          ? ` · Step ${(selectedWallFacetObj.bottomZ ?? 0).toFixed(2)}m→${selectedWallFacetObj.topZ.toFixed(2)}m`
+                          : ''}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSelectWallFacet?.(null);
+                      setSelectedWallFacetIds([]);
+                    }}
+                    className="w-8 h-8 rounded-xl bg-slate-900 hover:bg-slate-800 flex items-center justify-center text-slate-400 hover:text-white cursor-pointer shrink-0"
+                    aria-label="Close Wall Info"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  {onOpenWallElevation && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenWallElevation(selectedWallFacetObj.id)}
+                      className="flex-1 min-h-[38px] px-3 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Building2 className="w-3.5 h-3.5" />
+                      <span>Openings &amp; Elevation ({selectedWallFacetObj.openings.length})</span>
+                    </button>
+                  )}
+                  {isMobile && onOpenInspector && (
+                    <button
+                      type="button"
+                      onClick={onOpenInspector}
+                      className="min-h-[38px] px-3 rounded-xl bg-sky-600/25 hover:bg-sky-600/40 border border-sky-500/40 text-sky-200 text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Sliders className="w-3.5 h-3.5" />
+                      <span>Wall Details</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
         {/* 6. SMALL ANCHORED / CENTERED NUMERICAL INPUT OVERLAY (INSTANT GEOMETRY UPDATE) */}
         {editingMeasurement && (
@@ -5802,7 +6335,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               (() => {
                 const targetEdge = outline.edges.find((e) => e.id === editingMeasurement.id);
                 if (!targetEdge) return null;
-                const isEdgeGable = targetEdge.type === 'verge';
+                const isEdgeGable = targetEdge.type === 'verge' || targetEdge.type === 'rake';
                 return (
                   <div className="grid grid-cols-2 gap-1 p-0.5 bg-slate-950 rounded-lg border border-slate-800">
                     <button

@@ -41,7 +41,12 @@ import {
   groupFlashingScheduleLines,
   resolveFlashingProductCode
 } from './exactRoofingFlashingBridge';
-import { computeAssetPlacementMetrics } from './exactRoofingEngine';
+import {
+  computeAssetPlacementMetrics,
+  deduplicateRoofPlanes,
+  getOutlineFootprintAreaM2,
+  polygonArea
+} from './exactRoofingEngine';
 import { evaluateTakeoffCompleteness } from './takeoffCompleteness';
 import {
   analyzeWallPlanTopology,
@@ -51,10 +56,9 @@ import {
 } from './wallCladdingEngine';
 
 function getDisplayPlanes(planes: RoofPlane[], layout?: LayoutResult | null): RoofPlane[] {
-  if (layout?.effectivePlanes && layout.effectivePlanes.length > 0) {
-    return layout.effectivePlanes;
-  }
-  return planes;
+  const source =
+    layout?.effectivePlanes && layout.effectivePlanes.length > 0 ? layout.effectivePlanes : planes;
+  return deduplicateRoofPlanes(source);
 }
 
 function toExactMm(lengthM: number): { lengthMm: number; lengthM: number } {
@@ -117,6 +121,7 @@ export function getSheetOrderAssumptionText(mode: SheetOrderMode = 'practical'):
 
 export function buildRoofBillOfMaterials(params: {
   planes: RoofPlane[];
+  levels?: RoofLevel[];
   layout: LayoutResult | null;
   assignments: RoofFlashingAssignment[];
   assignableLines?: AssignableRoofLine[];
@@ -126,6 +131,7 @@ export function buildRoofBillOfMaterials(params: {
 }): RoofBomSummary {
   const {
     planes,
+    levels = [],
     layout,
     assignments,
     assignableLines = [],
@@ -135,6 +141,7 @@ export function buildRoofBillOfMaterials(params: {
   } = params;
   const resolvedOrderMode: SheetOrderMode = sheetOrderMode ?? layout?.sheetOrderMode ?? 'practical';
   const displayPlanes = getDisplayPlanes(planes, layout);
+  const structuralDisplayPlanes = displayPlanes.filter((p) => !p.isVirtualAssetPlane);
   const planeById = new Map<string, RoofPlane>();
   displayPlanes.forEach((p) => planeById.set(p.id, p));
 
@@ -227,8 +234,30 @@ export function buildRoofBillOfMaterials(params: {
     }))
     .sort((a, b) => b.lengthMm - a.lengthMm);
 
-  const fallbackAreaM2 = displayPlanes.reduce((s, p) => s + (p.area || 0), 0);
+  const fallbackAreaM2 = structuralDisplayPlanes.reduce((s, p) => s + (p.area || 0), 0);
   const totalRoofAreaM2 = +(layout?.totalRoofArea ?? fallbackAreaM2).toFixed(2);
+
+  let areaSanityWarning: string | undefined;
+  const footprintAreaM2 = levels.reduce((s, l) => s + getOutlineFootprintAreaM2(l.outline), 0);
+  if (footprintAreaM2 > 0.1 && structuralDisplayPlanes.length > 0) {
+    const rawStructuralCount = planes.filter((p) => !p.isVirtualAssetPlane).length;
+    const planAreaSum = structuralDisplayPlanes.reduce(
+      (s, p) => s + (p.planPolygon.length >= 3 ? polygonArea(p.planPolygon) : 0),
+      0
+    );
+    const maxPitch = Math.min(
+      72,
+      Math.max(1, ...structuralDisplayPlanes.map((p) => p.pitchDeg || 22.5))
+    );
+    const expectedMax = (footprintAreaM2 / Math.max(0.3, Math.cos((maxPitch * Math.PI) / 180))) * 1.38 + 6;
+    if (
+      rawStructuralCount > structuralDisplayPlanes.length ||
+      planAreaSum > footprintAreaM2 * 1.35 + 4 ||
+      totalRoofAreaM2 > expectedMax
+    ) {
+      areaSanityWarning = `Area sanity check: modeled roof (${totalRoofAreaM2.toFixed(1)}m²) exceeds expected net footprint band (${footprintAreaM2.toFixed(1)}m² plan) — verify overlapping or duplicate faces.`;
+    }
+  }
   const totalSheetsCount = sheetGroups.reduce((s, g) => s + g.count, 0) || layout?.parents.length || 0;
   const totalOrderedMm = sheetGroups.reduce((s, g) => s + g.count * g.lengthMm, 0);
   const totalOrderedLm = +(totalOrderedMm / 1000).toFixed(3);
@@ -271,6 +300,7 @@ export function buildRoofBillOfMaterials(params: {
     sheetOrderAssumption: getSheetOrderAssumptionText(resolvedOrderMode),
     ...(comparisonSummary ? { comparisonSummary } : {}),
     totalRoofAreaM2,
+    ...(areaSanityWarning ? { areaSanityWarning } : {}),
     totalSheetsCount,
     totalOrderedLm,
     totalNetRoofLm,
@@ -1121,6 +1151,7 @@ export function buildOrderPack(params: {
     params.bom ||
     buildRoofBillOfMaterials({
       planes,
+      levels,
       layout,
       assignments,
       assignableLines,
@@ -1367,6 +1398,7 @@ export function buildOrderPack(params: {
     },
     totals: {
       roofAreaM2: bom.totalRoofAreaM2,
+      ...(bom.areaSanityWarning ? { areaSanityWarning: bom.areaSanityWarning } : {}),
       totalSheets: sheets.reduce((s, sh) => s + sh.qty, 0),
       totalOrderedLm: totalOrderedLmExact,
       totalNetRoofLm: bom.totalNetRoofLm,

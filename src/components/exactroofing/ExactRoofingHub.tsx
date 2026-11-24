@@ -63,11 +63,19 @@ import {
   applyOrderedSheetLengthToPlanes,
   deleteRoofPlanes,
   unsuppressOutlineEdges,
-  buildFacesFromClassification,
   remapSkeletonForOutlineResize,
   isStationaryEdgeType,
+  getAllOutlineEdges,
+  addCourtyardHoleToOutline,
+  removeCourtyardHoleFromOutline,
   dist
 } from '../../utils/exactRoofingEngine';
+import {
+  checkRoofAreaSanity,
+  createRoofPipelineState,
+  ensureLayout,
+  runRoofPipelineBuildAsync
+} from '../../utils/roofPipeline';
 import {
   batchUpdateWallFacetsInPlan,
   deriveRoofOutlineFromWallPlan,
@@ -510,6 +518,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
     existingLineCount: number;
     existingPlaneCount: number;
   } | null>(null);
+  const pipelineBuildAbortRef = useRef<AbortController | null>(null);
+  const [pipelineBuildStatus, setPipelineBuildStatus] = useState<{
+    label: string;
+    pct: number;
+  } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      pipelineBuildAbortRef.current?.abort();
+    };
+  }, []);
 
   // Hydrate saved snapshot whenever the scoped Project or Quote switches
   const lastHydratedKeyRef = useRef<string>('');
@@ -650,7 +669,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   const findLevelForEdge = (edgeId: string): RoofLevel => {
     return (
-      levels.find((l) => l.outline.edges.some((e) => e.id === edgeId)) ||
+      levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === edgeId)) ||
       focusedLevel
     );
   };
@@ -766,7 +785,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         const edgeTypeVal = patch.valueString as EdgeType;
         const targetSet = new Set(patch.targetIds);
         const nextLevels = levels.map((lvl) => {
-          const matched = lvl.outline.edges.filter((e) => targetSet.has(e.id)).map((e) => e.id);
+          const matched = getAllOutlineEdges(lvl.outline).filter((e) => targetSet.has(e.id)).map((e) => e.id);
           return matched.length > 0
             ? { ...lvl, outline: applyEdgeType(lvl.outline, matched, edgeTypeVal) }
             : lvl;
@@ -802,9 +821,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
           if (nextPitch === plane.pitchDeg && nextDir === plane.underlapSide) return plane;
           const owningLvl =
             levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
-            levels.find((l) => l.outline.edges.some((e) => e.id === plane.eaveEdgeId)) ||
+            levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
             focusedLevel;
-          const edge = owningLvl.outline.edges.find((e) => e.id === plane.eaveEdgeId);
+          const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
           if (!edge) return { ...plane, pitchDeg: nextPitch, underlapSide: nextDir };
           return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
             pitchDeg: nextPitch,
@@ -1043,7 +1062,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       options?.mode === 'replace'
         ? focusedLevel
         : newOutline.edges.length > 0
-        ? levels.find((l) => l.outline.edges.some((e) => e.id === newOutline.edges[0].id)) || focusedLevel
+        ? levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === newOutline.edges[0].id)) || focusedLevel
         : focusedLevel;
 
     const normalizedOutline: RoofOutline = {
@@ -1214,7 +1233,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // Toggle ANY perimeter edge / facet between Hipped Slope ('outline') and Gable End ('verge')
   const handleToggleEdgeGable = (edgeId: string, forceMode?: 'hipped' | 'gable') => {
     const owningLvl = findLevelForEdge(edgeId);
-    const edge = owningLvl.outline.edges.find((e) => e.id === edgeId);
+    const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === edgeId);
     const targetMode: 'hipped' | 'gable' =
       forceMode ?? (edge?.type === 'verge' || edge?.type === 'rake' ? 'hipped' : 'gable');
     handleSetEdgeMode(edgeId, targetMode);
@@ -1248,12 +1267,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       if (lvl.id !== owningLvl.id) return lvl;
       return {
         ...lvl,
-        outline: {
-          ...lvl.outline,
-          edges: lvl.outline.edges.map((e) =>
-            e.id === edgeId ? { ...e, eaveHeightM: clampedZ } : e
-          )
-        }
+        outline: applyEaveHeightToEdges(lvl.outline, [edgeId], clampedZ)
       };
     });
     setLevels(nextLevels);
@@ -1318,9 +1332,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       if (plane.id !== planeId) return plane;
       const owningLvl =
         levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
-        levels.find((l) => l.outline.edges.some((e) => e.id === plane.eaveEdgeId)) ||
+        levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
         focusedLevel;
-      const edge = owningLvl.outline.edges.find((e) => e.id === plane.eaveEdgeId);
+      const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
       if (!edge) return { ...plane, pitchDeg };
       return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
         pitchDeg,
@@ -1346,9 +1360,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
         if (plane.id !== planeId) return plane;
         const owningLvl =
           levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
-          levels.find((l) => l.outline.edges.some((e) => e.id === plane.eaveEdgeId)) ||
+          levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
           focusedLevel;
-        const edge = owningLvl.outline.edges.find((e) => e.id === plane.eaveEdgeId);
+        const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
         if (!edge) return { ...plane, underlapSide };
         return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
           pitchDeg: plane.pitchDeg,
@@ -1721,67 +1735,176 @@ export const ExactRoofingHub: React.FC<Props> = ({
     );
   };
 
-  // Explicit user action: build/rebuild roof planes from classified eaves, gables & walls
-  const handleBuildFacesFromClassification = () => {
+  const handleCancelPipelineBuild = () => {
+    pipelineBuildAbortRef.current?.abort();
+    pipelineBuildAbortRef.current = null;
+    setPipelineBuildStatus(null);
+    triggerNotice('Build cancelled');
+  };
+
+  // First-class Courtyard / Void Ring Addition & Removal
+  const handleAddCourtyardHole = (levelId: string, holePoints: Point2D[]) => {
+    if (isReadOnlyGeometry) return;
+    const targetLvl = levels.find((l) => l.id === levelId) || focusedLevel;
+    if (!targetLvl || targetLvl.outline.points.length < 3) {
+      triggerNotice('Draw an outer roof footprint first');
+      return;
+    }
+    const nextOutline = addCourtyardHoleToOutline(targetLvl.outline, holePoints, {
+      eaveHeightM: targetLvl.eaveHeightM,
+      initialEdgeType: 'outline',
+      hasWall: true
+    });
+    if ((nextOutline.holes?.length || 0) === (targetLvl.outline.holes?.length || 0)) {
+      triggerNotice('Draw the Courtyard Void completely inside the roof footprint');
+      return;
+    }
+    pushUndoSnapshot();
+    const nextLevels = levels.map((l) =>
+      l.id === targetLvl.id ? { ...l, outline: nextOutline } : l
+    );
+    setLayoutResult(null);
+    applyLevelsUpdate(nextLevels, planes, 22.5, targetLvl.id);
+    triggerNotice('✓ Added Courtyard Void (no roof inside cutout — walls & perimeter trims linked)');
+  };
+
+  const handleRemoveCourtyardHole = (levelId: string, holeId: string) => {
+    if (isReadOnlyGeometry) return;
+    const targetLvl = levels.find((l) => l.id === levelId) || focusedLevel;
+    const removedHole = (targetLvl.outline.holes || []).find((h) => h.id === holeId);
+    if (!removedHole) return;
+    pushUndoSnapshot();
+    const removedEdgeIds = new Set(removedHole.edges.map((e) => e.id));
+    const nextLevels = levels.map((l) =>
+      l.id === targetLvl.id
+        ? { ...l, outline: removeCourtyardHoleFromOutline(l.outline, holeId) }
+        : l
+    );
+    const prunedPlanes = planes.filter((p) => !removedEdgeIds.has(p.eaveEdgeId));
+    setLayoutResult(null);
+    applyLevelsUpdate(nextLevels, prunedPlanes, 22.5, targetLvl.id);
+    triggerNotice('Courtyard Void removed');
+  };
+
+  // Explicit user action: build/rebuild roof planes through single RoofPipeline CPU
+  const handleBuildFacesFromClassification = async () => {
     if (isReadOnlyGeometry) return;
     if (!levels.some((l) => l.outline.points.length >= 3)) {
       triggerNotice('Draw or load a roof outline first');
       return;
     }
-    pushUndoSnapshot();
-    const res = buildFacesFromClassification(levels, planes, 22.5);
-    const rebuiltIdSet = new Set(res.planes.map((p) => p.id));
-    setLevels(res.levels);
-    const focusLvl = res.levels.find((l) => l.id === focusedLevel.id) || res.levels[0];
-    if (focusLvl) {
-      setOutline(focusLvl.outline);
-      setSkeleton(focusLvl.skeleton);
-    }
-    setPlanes(res.planes);
-    setAssets((prev) => prev.filter((a) => rebuiltIdSet.has(a.planeId)));
-    setPitchBreaks((prev) => prev.filter((pb) => rebuiltIdSet.has(pb.planeId)));
-    if (selectedPlaneId && !rebuiltIdSet.has(selectedPlaneId)) {
-      setSelectedPlaneId(null);
-    }
-    setSelectedPlaneIds((prev) => prev.filter((id) => rebuiltIdSet.has(id)));
-    if (startPlaneId && !rebuiltIdSet.has(startPlaneId)) {
-      setStartPlaneId(null);
-    }
-    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, res.levels, res.planes) : prev));
-    if (res.planes.length === 0) {
-      triggerNotice('Classify at least 1 edge as Eave to build roof faces');
-    } else {
-      triggerNotice(`✓ Built ${res.planes.length} roof face${res.planes.length === 1 ? '' : 's'} from classification`);
+
+    pipelineBuildAbortRef.current?.abort();
+    const ac = new AbortController();
+    pipelineBuildAbortRef.current = ac;
+
+    try {
+      const pipelineState = createRoofPipelineState({
+        levels,
+        planes,
+        layout: layoutResult
+      });
+      const res = await runRoofPipelineBuildAsync({
+        state: pipelineState,
+        action: 'build_faces',
+        defaultPitchDeg: 22.5,
+        signal: ac.signal,
+        onProgress: (label, pct) => setPipelineBuildStatus({ label, pct })
+      });
+      if (ac.signal.aborted) return;
+
+      pushUndoSnapshot();
+      const rebuiltIdSet = new Set(res.state.planes.map((p) => p.id));
+      setLevels(res.state.levels);
+      const focusLvl =
+        res.state.levels.find((l) => l.id === focusedLevel.id) || res.state.levels[0];
+      if (focusLvl) {
+        setOutline(focusLvl.outline);
+        setSkeleton(focusLvl.skeleton);
+      }
+      setPlanes(res.state.planes);
+      setLayoutResult(null);
+      setAssets((prev) => prev.filter((a) => rebuiltIdSet.has(a.planeId)));
+      setPitchBreaks((prev) => prev.filter((pb) => rebuiltIdSet.has(pb.planeId)));
+      if (selectedPlaneId && !rebuiltIdSet.has(selectedPlaneId)) {
+        setSelectedPlaneId(null);
+      }
+      setSelectedPlaneIds((prev) => prev.filter((id) => rebuiltIdSet.has(id)));
+      if (startPlaneId && !rebuiltIdSet.has(startPlaneId)) {
+        setStartPlaneId(null);
+      }
+      setWallPlan((prev) =>
+        prev ? syncWallPlanWithRoof(prev, res.state.levels, res.state.planes) : prev
+      );
+      if (res.state.planes.length === 0) {
+        triggerNotice('Classify at least 1 edge as Eave to build roof faces');
+      } else if (!res.areaSanity.ok && res.areaSanity.warning) {
+        triggerNotice(res.areaSanity.warning);
+      } else {
+        triggerNotice(
+          `✓ Built ${res.state.planes.length} roof face${res.state.planes.length === 1 ? '' : 's'} from classification`
+        );
+      }
+    } catch (err) {
+      if (!ac.signal.aborted) {
+        triggerNotice(err instanceof Error ? err.message : 'Unable to build roof faces');
+      }
+    } finally {
+      if (pipelineBuildAbortRef.current === ac) {
+        pipelineBuildAbortRef.current = null;
+        setPipelineBuildStatus(null);
+      }
     }
   };
 
-  const executeAutoLines = (targetIds: string[]) => {
-    pushUndoSnapshot();
-    let totalLines = 0;
-    const nextLevels = levels.map((l) => {
-      if (!targetIds.includes(l.id)) return l;
-      const preparedOutline: RoofOutline = {
-        ...l.outline,
-        edges: l.outline.edges.map((e) => ({
-          ...e,
-          type: isStationaryEdgeType(e.type) ? e.type : 'outline'
-        }))
-      };
-      const generated = generateSkeletonLines(preparedOutline).map((s) => ({
-        ...s,
-        levelId: s.levelId ?? l.id
-      }));
-      totalLines += generated.length;
-      return {
-        ...l,
-        outline: preparedOutline,
-        skeleton: generated,
-        suppressedPlaneEdgeIds: undefined
-      };
-    });
-    applyLevelsUpdate(nextLevels, planes);
-    setPendingAutoLinesConfirm(null);
-    triggerNotice(`✓ Generated ${totalLines} roof lines`);
+  const executeAutoLines = async (targetIds: string[]) => {
+    pipelineBuildAbortRef.current?.abort();
+    const ac = new AbortController();
+    pipelineBuildAbortRef.current = ac;
+
+    try {
+      const pipelineState = createRoofPipelineState({
+        levels,
+        planes,
+        layout: layoutResult
+      });
+      setPendingAutoLinesConfirm(null);
+      const res = await runRoofPipelineBuildAsync({
+        state: pipelineState,
+        action: 'auto_skeleton',
+        targetLevelIds: targetIds,
+        defaultPitchDeg: 22.5,
+        signal: ac.signal,
+        onProgress: (label, pct) => setPipelineBuildStatus({ label, pct })
+      });
+      if (ac.signal.aborted) return;
+
+      pushUndoSnapshot();
+      setLevels(res.state.levels);
+      const focusLvl =
+        res.state.levels.find((l) => l.id === focusedLevel.id) || res.state.levels[0];
+      if (focusLvl) {
+        setOutline(focusLvl.outline);
+        setSkeleton(focusLvl.skeleton);
+      }
+      setPlanes(res.state.planes);
+      setLayoutResult(null);
+      setWallPlan((prev) =>
+        prev ? syncWallPlanWithRoof(prev, res.state.levels, res.state.planes) : prev
+      );
+      triggerNotice(
+        `✓ Generated ${res.generatedLinesCount} roof lines · ${res.state.planes.length} faces`
+      );
+    } catch (err) {
+      if (!ac.signal.aborted) {
+        triggerNotice(err instanceof Error ? err.message : 'Unable to solve auto roof lines');
+      }
+    } finally {
+      if (pipelineBuildAbortRef.current === ac) {
+        pipelineBuildAbortRef.current = null;
+        setPipelineBuildStatus(null);
+      }
+    }
   };
 
   // Auto Generate Roof Lines (ONLY on explicit user button click; confirms before replacing existing lines/faces)
@@ -1896,7 +2019,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     pushUndoSnapshot();
     const targetSet = new Set(edgeIds);
     let nextLevels = levels.map((lvl) => {
-      const matched = lvl.outline.edges.filter((e) => targetSet.has(e.id)).map((e) => e.id);
+      const matched = getAllOutlineEdges(lvl.outline).filter((e) => targetSet.has(e.id)).map((e) => e.id);
       return matched.length > 0
         ? { ...lvl, outline: applyEdgeType(lvl.outline, matched, edgeType) }
         : lvl;
@@ -1916,7 +2039,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     pushUndoSnapshot();
     const targetSet = new Set(edgeIds);
     const nextLevels = levels.map((lvl) => {
-      const matched = lvl.outline.edges.filter((e) => targetSet.has(e.id)).map((e) => e.id);
+      const matched = getAllOutlineEdges(lvl.outline).filter((e) => targetSet.has(e.id)).map((e) => e.id);
       if (matched.length === 0) return lvl;
       let nextOut = lvl.outline;
       if (updates.eaveSetbackM !== undefined) {
@@ -1944,7 +2067,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
     const targetSet = new Set(edgeIds);
     const nextLevels = levels.map((lvl) => {
-      const matched = lvl.outline.edges.filter((e) => targetSet.has(e.id)).map((e) => e.id);
+      const matched = getAllOutlineEdges(lvl.outline).filter((e) => targetSet.has(e.id)).map((e) => e.id);
       return matched.length > 0
         ? { ...lvl, outline: applyEaveHeightToEdges(lvl.outline, matched, clampedZ) }
         : lvl;
@@ -1975,7 +2098,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     pushUndoSnapshot();
     const targetSet = new Set(edgeIds);
     let nextLevels = levels.map((lvl) => {
-      const matched = lvl.outline.edges.filter((e) => targetSet.has(e.id)).map((e) => e.id);
+      const matched = getAllOutlineEdges(lvl.outline).filter((e) => targetSet.has(e.id)).map((e) => e.id);
       if (matched.length === 0) return lvl;
       let nextOut = lvl.outline;
       if (updates.edgeType) {
@@ -2151,39 +2274,46 @@ export const ExactRoofingHub: React.FC<Props> = ({
     triggerNotice(`✓ ${customPlane.name} · ${options.pitchDeg}° @ Z:${clampedZ}m`);
   };
 
-  // Generate Layout Button
+  // Generate Layout Button (via single RoofPipeline CPU ensureLayout)
   const handleGenerateLayoutClick = () => {
-    if (planes.length === 0) {
-      if (outline.edges.length >= 3) {
-        const autoPlanes = syncMultiLevelPlanes(levels, []);
-        setPlanes(autoPlanes);
-        const res = generateCuttingLayout(autoPlanes, sheetSpec, {
-          startPlaneId: startPlaneId || undefined,
-          assets,
-          pitchBreaks,
-          sheetOrderMode
-        });
-        setLayoutResult(res);
-        setActiveTab('layout_results');
-        triggerNotice(
-          `✓ ${res.parents.length} sheets · ${res.totalOrderedMetres.toFixed(1)}m ordered (${res.totalOffcutsReused} offcuts saved ${res.savedMetres}m)`
-        );
-        return;
-      }
+    if (!levels.some((l) => l.outline.edges.length >= 3) && planes.length === 0) {
       triggerNotice('Draw outline & set pitch first');
       return;
     }
-    const res = generateCuttingLayout(planes, sheetSpec, {
-      startPlaneId: startPlaneId || undefined,
-      assets,
-      pitchBreaks,
-      sheetOrderMode
-    });
-    setLayoutResult(res);
-    setActiveTab('layout_results');
-    triggerNotice(
-      `✓ ${res.parents.length} sheets · ${res.totalOrderedMetres.toFixed(1)}m ordered (${res.totalOffcutsReused} offcuts saved ${res.savedMetres}m)`
-    );
+    try {
+      const pipelineState = createRoofPipelineState({
+        levels,
+        planes,
+        layout: layoutResult,
+        dirty: { faces: planes.length === 0 }
+      });
+      const ensured = ensureLayout(pipelineState, {
+        sheetSpec,
+        sheetOrderMode,
+        startPlaneId: startPlaneId || undefined,
+        assets,
+        pitchBreaks,
+        defaultPitchDeg: 22.5,
+        preserveUserDeleted: true
+      });
+      if (ensured.state.planes.length === 0 || !ensured.layout) {
+        triggerNotice('Draw outline & set pitch first');
+        return;
+      }
+      setLevels(ensured.state.levels);
+      setPlanes(ensured.state.planes);
+      setLayoutResult(ensured.layout);
+      setActiveTab('layout_results');
+      if (!ensured.areaSanity.ok && ensured.areaSanity.warning) {
+        triggerNotice(ensured.areaSanity.warning);
+      } else {
+        triggerNotice(
+          `✓ ${ensured.layout.parents.length} sheets · ${ensured.layout.totalOrderedMetres.toFixed(1)}m ordered (${ensured.layout.totalOffcutsReused} offcuts saved ${ensured.layout.savedMetres}m)`
+        );
+      }
+    } catch (err) {
+      triggerNotice(err instanceof Error ? err.message : 'Unable to generate cutting layout');
+    }
   };
 
   // Enumerate all assignable roof lines across all roof levels with accurate 3D sloped lengths
@@ -2243,11 +2373,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
     };
   }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks, layoutResult]);
 
+  const areaSanity = useMemo(
+    () => checkRoofAreaSanity(levels, planes),
+    [levels, planes]
+  );
+
   // Computed BOM & Site Roofing Packs
   const roofBom = useMemo(
     () =>
       buildRoofBillOfMaterials({
         planes,
+        levels,
         layout: layoutResult,
         assignments: flashingAssignments,
         assignableLines,
@@ -2255,7 +2391,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         sheetOrderMode,
         comparisonSummary: sheetOrderComparison
       }),
-    [planes, layoutResult, flashingAssignments, assignableLines, assets, sheetOrderMode, sheetOrderComparison]
+    [planes, levels, layoutResult, flashingAssignments, assignableLines, assets, sheetOrderMode, sheetOrderComparison]
   );
 
   const roofingPacks = useMemo(
@@ -3562,6 +3698,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 onOpenWallElevation={handleOpenWallElevation}
                 onBuildWallFaces={handleBuildWallFaces}
                 onBatchWallUpdate={handleBatchWallUpdate}
+                onAddCourtyardHole={handleAddCourtyardHole}
+                onRemoveCourtyardHole={handleRemoveCourtyardHole}
+                buildProgress={pipelineBuildStatus}
+                onCancelBuild={handleCancelPipelineBuild}
               />
           )}
 
@@ -4658,6 +4798,10 @@ export const ExactRoofingHub: React.FC<Props> = ({
       onOpenWallElevation={handleOpenWallElevation}
       onBuildWallFaces={handleBuildWallFaces}
       onBatchWallUpdate={handleBatchWallUpdate}
+      onAddCourtyardHole={handleAddCourtyardHole}
+      onRemoveCourtyardHole={handleRemoveCourtyardHole}
+      buildProgress={pipelineBuildStatus}
+      onCancelBuild={handleCancelPipelineBuild}
     />
   );
 
@@ -5635,6 +5779,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 {sheetOrderMode === 'practical' ? 'Practical cuts' : 'Optimized cuts'} (
                 {roofBom.totalOrderedLm.toFixed(1)} m)
               </span>
+              {!areaSanity.ok && (
+                <span
+                  className="ml-1 px-2 py-0.5 rounded bg-amber-950/70 border border-amber-500/45 text-amber-300 font-bold"
+                  title={areaSanity.warning}
+                >
+                  Area check: {areaSanity.modeledAreaM2.toFixed(1)}m² vs {areaSanity.footprintAreaM2.toFixed(1)}m² plan
+                </span>
+              )}
             </div>
 
             <div className="flex items-center gap-2 shrink-0">

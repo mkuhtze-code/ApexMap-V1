@@ -30,8 +30,29 @@ import {
   remapSkeletonForOutlineResize,
   unsuppressOutlineEdges,
   mergeColinearRidgeLines,
-  resolveLevelSharedVertexElevations
+  resolveLevelSharedVertexElevations,
+  MAX_ROOF_DOMAIN_VERTICES,
+  getAllOutlineEdges,
+  getOutlineFootprintAreaM2,
+  addCourtyardHoleToOutline,
+  removeCourtyardHoleFromOutline,
+  polygonCentroid
 } from '../exactRoofingEngine';
+import {
+  assertRoofDomainComplexity,
+  checkRoofAreaSanity,
+  computeTruthfulRoofAreaM2,
+  createRoofPipelineState,
+  ensureBom,
+  ensureFaces,
+  ensureLayout,
+  ensureSkeleton,
+  invalidateFaces,
+  invalidateLayout,
+  invalidateOutline,
+  invalidateSkeleton,
+  runRoofPipelineBuildAsync
+} from '../roofPipeline';
 import { buildRoofSceneGroup } from '../../components/exactroofing/three/roofMeshBuilder';
 import type { PlanEdge, RoofLevel, RoofOutline, RoofPlane, SheetSpec, SkeletonLine } from '../../types/exactRoofing';
 
@@ -2866,11 +2887,21 @@ console.log('✓ Test 42 Passed: Post-eaveHeight updateEdgeLength extends/trims 
     }
   });
 
-  // Verify walls meet raked roof underside without piercing above ridge
+  // Verify gable walls rake cleanly up to true ridge apex without piercing above roof planes
   const walls43 = deriveRoofWallSegments(built43.levels, rebuiltPlanes);
-  const gableEastWall = walls43.find((w) => w.edgeId === fixOut.edges[1].id);
-  if (!gableEastWall || gableEastWall.wallKind !== 'gable_end' || Math.max(...gableEastWall.topProfilePoints3D.map((p) => p.z)) < vTriApex.z - 0.05) {
-    throw new Error('East gable wall must rake cleanly up to triangular apex');
+  const vWestApex = sharedRes43.getVertexForPoint({ x: 0, y: 4 });
+  const vBayApex = sharedRes43.getVertexForPoint({ x: 7, y: 13 });
+  const gableWestWall = walls43.find((w) => w.edgeId === fixOut.edges[7].id);
+  const gableBayWall = walls43.find((w) => w.edgeId === fixOut.edges[4].id);
+  const eastEndWall = walls43.find((w) => w.edgeId === fixOut.edges[1].id);
+  if (!gableWestWall || gableWestWall.wallKind !== 'gable_end' || Math.max(...gableWestWall.topProfilePoints3D.map((p) => p.z)) < vWestApex.z - 0.05) {
+    throw new Error('West gable wall must rake cleanly up to main ridge apex');
+  }
+  if (!gableBayWall || gableBayWall.wallKind !== 'gable_end' || Math.max(...gableBayWall.topProfilePoints3D.map((p) => p.z)) < vBayApex.z - 0.05) {
+    throw new Error('T-bay north gable wall must rake cleanly up to bay ridge apex');
+  }
+  if (!eastEndWall || Math.max(...eastEndWall.topProfilePoints3D.map((p) => p.z)) > 2.75) {
+    throw new Error('Wall along sloped east triangular corner baseline must stay flush at eave height without piercing Face E');
   }
   scene43.dispose();
 
@@ -2900,5 +2931,391 @@ console.log('✓ Test 42 Passed: Post-eaveHeight updateEdgeLength extends/trims 
   }
 }
 console.log('✓ Test 43 Passed: Classified gable + T-bay + triangular end plan merges ridges, decomposes closed loops without synthetic wedges, and produces sealed watertight 3D seams.');
+
+// 44. TEST 44: RoofPipeline CPU — Invalidation Cascades, Strict Dirty-Flag Guard, Manual Skeleton Preservation & Area Sanity Check
+{
+  const rectOut44 = getPresetOutline('rectangle_14x10');
+  const rectLvl44: RoofLevel = {
+    id: 'lvl-44',
+    code: 'L1',
+    name: 'Rect 14x10',
+    eaveHeightM: 2.7,
+    outline: rectOut44,
+    skeleton: generateSkeletonLines(rectOut44).map((s) => ({ ...s, levelId: 'lvl-44' }))
+  };
+  const sheet44: SheetSpec = { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 };
+
+  // 1) Invalidation cascades + strictDirtyCheck enforcement
+  let pipe44 = createRoofPipelineState({ levels: [rectLvl44], planes: [] });
+  if (!pipe44.dirty.faces) {
+    throw new Error('Pipeline should mark faces dirty when outline has geometry and planes are empty');
+  }
+  let strictThrew = false;
+  try {
+    ensureLayout(pipe44, { sheetSpec: sheet44, strictDirtyCheck: true });
+  } catch (err) {
+    strictThrew = err instanceof Error && err.message.includes('faces are dirty');
+  }
+  if (!strictThrew) {
+    throw new Error('ensureLayout with strictDirtyCheck: true must throw when faces are dirty');
+  }
+
+  const facesRes1 = ensureFaces(pipe44, { defaultPitchDeg: 22.5 });
+  pipe44 = facesRes1.state;
+  if (pipe44.dirty.faces || !pipe44.dirty.layout || !pipe44.dirty.bom || pipe44.planes.length !== 4) {
+    throw new Error(`Expected 4 faces with clean faces / dirty layout & bom, got planes=${pipe44.planes.length}`);
+  }
+  const truthful1 = computeTruthfulRoofAreaM2(pipe44.planes);
+
+  // Calling ensureFaces again is idempotent (no duplicate faces or ~2x area inflation)
+  const facesRes2 = ensureFaces(pipe44, { defaultPitchDeg: 22.5 });
+  const truthful2 = computeTruthfulRoofAreaM2(facesRes2.state.planes);
+  if (facesRes2.state.planes.length !== 4 || Math.abs(truthful1 - truthful2) > 0.01) {
+    throw new Error(`ensureFaces must be idempotent: count ${facesRes2.state.planes.length}, area ${truthful1} vs ${truthful2}`);
+  }
+
+  // Invalidating outline marks faces/layout/bom dirty cleanly; invalidating layout clears layout dirty but keeps bom dirty
+  const invOut = invalidateOutline(facesRes2.state, facesRes2.state.levels, { markSkeletonDirty: true });
+  if (!invOut.dirty.skeleton || !invOut.dirty.faces || !invOut.dirty.layout || !invOut.dirty.bom) {
+    throw new Error('invalidateOutline cascade failed');
+  }
+  const invSkel = invalidateSkeleton(invOut);
+  if (invSkel.dirty.skeleton || !invSkel.dirty.faces || !invSkel.dirty.layout || !invSkel.dirty.bom) {
+    throw new Error('invalidateSkeleton cascade failed');
+  }
+  const invFaces = invalidateFaces(invSkel);
+  if (invFaces.dirty.faces || !invFaces.dirty.layout || !invFaces.dirty.bom) {
+    throw new Error('invalidateFaces cascade failed');
+  }
+  const layRes44 = ensureLayout(facesRes2.state, { sheetSpec: sheet44, strictDirtyCheck: true });
+  if (layRes44.state.dirty.layout || !layRes44.state.dirty.bom || !layRes44.layout) {
+    throw new Error('ensureLayout should clear layout dirty flag while keeping bom dirty');
+  }
+  const invLay = invalidateLayout(layRes44.state);
+  if (invLay.dirty.layout || !invLay.dirty.bom) {
+    throw new Error('invalidateLayout cascade failed');
+  }
+
+  // 2) Manual skeleton preservation guarantee: ensureFaces + buildFacesFromClassification must NEVER overwrite manual ridges/hips
+  const gableOut44 = applyEdgeType(
+    buildOutlineFromPoints(
+      [
+        { x: 0, y: 0 },
+        { x: 12, y: 0 },
+        { x: 12, y: 8 },
+        { x: 0, y: 8 }
+      ],
+      'manual-gable-44',
+      { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+    ),
+    [],
+    'verge'
+  );
+  const manualSkel44: SkeletonLine[] = [
+    { id: 'man-ridge-offset', levelId: 'lvl-man-44', from: { x: 4, y: 3.5 }, to: { x: 8, y: 3.5 }, suggestedType: 'ridge' },
+    { id: 'man-hip-sw', levelId: 'lvl-man-44', from: { x: 0, y: 0 }, to: { x: 4, y: 3.5 }, suggestedType: 'hip' },
+    { id: 'man-hip-nw', levelId: 'lvl-man-44', from: { x: 0, y: 8 }, to: { x: 4, y: 3.5 }, suggestedType: 'hip' },
+    { id: 'man-hip-se', levelId: 'lvl-man-44', from: { x: 12, y: 0 }, to: { x: 8, y: 3.5 }, suggestedType: 'hip' },
+    { id: 'man-hip-ne', levelId: 'lvl-man-44', from: { x: 12, y: 8 }, to: { x: 8, y: 3.5 }, suggestedType: 'hip' }
+  ];
+  const manLvl44: RoofLevel = {
+    id: 'lvl-man-44',
+    code: 'L1',
+    name: 'Offset Ridge Manual',
+    eaveHeightM: 2.7,
+    outline: gableOut44,
+    skeleton: manualSkel44
+  };
+  let manPipe = createRoofPipelineState({ levels: [manLvl44], planes: [] });
+  manPipe = ensureSkeleton(manPipe, { mode: 'manual' }).state;
+  manPipe = ensureFaces(manPipe, { defaultPitchDeg: 22.5 }).state;
+  const preservedRidge = manPipe.levels[0].skeleton.find((s) => s.suggestedType === 'ridge');
+  if (!preservedRidge || Math.abs(preservedRidge.from.y - 3.5) > 0.01) {
+    throw new Error('Manual offset ridge (y=3.5) was overwritten during ensureSkeleton(manual)/ensureFaces');
+  }
+
+  // 3) Area sanity detector flags artificially doubled (~2x) planes and surfaces warning in BOM
+  const doubledPlanes: RoofPlane[] = [
+    ...facesRes1.state.planes,
+    ...facesRes1.state.planes.map((p, idx) => ({ ...p, id: `${p.id}-dup-${idx}` }))
+  ];
+  const badSanity = checkRoofAreaSanity([rectLvl44], doubledPlanes);
+  if (badSanity.ok || !badSanity.warning) {
+    throw new Error('checkRoofAreaSanity must flag ~2x duplicated roof planes');
+  }
+  const bomPipe44 = ensureBom(
+    {
+      ...layRes44.state,
+      planes: doubledPlanes,
+      dirty: { ...layRes44.state.dirty, faces: false, layout: false, bom: true }
+    },
+    { sheetSpec: sheet44 }
+  );
+  if (!bomPipe44.bom.areaSanityWarning) {
+    throw new Error('ensureBom must surface areaSanityWarning when duplicated planes exceed footprint band');
+  }
+}
+console.log('✓ Test 44 Passed: RoofPipeline invalidation cascades, strict dirty-flag check, manual skeleton preservation, idempotency, and ~2x area sanity guard verified.');
+
+// 45. TEST 45: Courtyard / Void Donut Roof — Open Interior Ring, Skeleton, Closed Faces, Inner Walls, 3D Plinth Cutout & BOM
+{
+  const outerPts45 = [
+    { x: 0, y: 0 },
+    { x: 20, y: 0 },
+    { x: 20, y: 16 },
+    { x: 0, y: 16 }
+  ];
+  let donutOut = buildOutlineFromPoints(outerPts45, 'courtyard-donut-45', {
+    initialEdgeType: 'outline',
+    defaultEaveHeightM: 2.7
+  });
+  donutOut = addCourtyardHoleToOutline(
+    donutOut,
+    [
+      { x: 7, y: 5 },
+      { x: 13, y: 5 },
+      { x: 13, y: 11 },
+      { x: 7, y: 11 }
+    ],
+    { initialEdgeType: 'outline', eaveHeightM: 2.7 }
+  );
+
+  // Outer 20x16 (320m²) minus 6x6 courtyard (36m²) = 284m² net footprint; 8 perimeter edges total
+  const netArea45 = getOutlineFootprintAreaM2(donutOut);
+  const allEdges45 = getAllOutlineEdges(donutOut);
+  if (Math.abs(netArea45 - 284) > 0.05 || allEdges45.length !== 8 || (donutOut.holes || []).length !== 1) {
+    throw new Error(`Expected 284m² net area and 8 boundary edges for donut plan, got area=${netArea45}, edges=${allEdges45.length}`);
+  }
+
+  const donutSkel = generateSkeletonLines(donutOut);
+  if (donutSkel.length < 8) {
+    throw new Error(`Expected skeleton ridges/hips/valleys around courtyard ring, got ${donutSkel.length}`);
+  }
+
+  const donutLvl: RoofLevel = {
+    id: 'lvl-donut-45',
+    code: 'L1',
+    name: 'Courtyard Residence',
+    eaveHeightM: 2.7,
+    outline: donutOut,
+    skeleton: donutSkel.map((s) => ({ ...s, levelId: 'lvl-donut-45' }))
+  };
+
+  const built45 = buildFacesFromClassification([donutLvl], [], 22.5);
+  const planes45 = built45.planes;
+  if (planes45.length < 6) {
+    throw new Error(`Expected closed ring faces around courtyard (got ${planes45.length})`);
+  }
+
+  // Ensure ZERO faces fall inside courtyard hole interior [7..13, 5..11]
+  for (const pl of planes45) {
+    const c = polygonCentroid(pl.planPolygon);
+    if (c.x > 7.1 && c.x < 12.9 && c.y > 5.1 && c.y < 10.9) {
+      throw new Error(`Courtyard void must remain open; plane ${pl.id} centroid (${c.x.toFixed(2)},${c.y.toFixed(2)}) landed inside hole`);
+    }
+  }
+
+  // Truthful plan coverage (~284m²) and sloped pitch area (~284 / cos(22.5°) ≈ 307.4m²), strictly excluding 36m² hole
+  const planSum45 = planes45.reduce((s, p) => {
+    let a = 0;
+    for (let i = 0; i < p.planPolygon.length; i++) {
+      const p1 = p.planPolygon[i];
+      const p2 = p.planPolygon[(i + 1) % p.planPolygon.length];
+      a += p1.x * p2.y - p2.x * p1.y;
+    }
+    return s + Math.abs(a) / 2;
+  }, 0);
+  const expectedSloped45 = 284 / Math.cos((22.5 * Math.PI) / 180);
+  const modeledSloped45 = computeTruthfulRoofAreaM2(planes45);
+  if (Math.abs(planSum45 - 284) > 2.5) {
+    throw new Error(`Expected ~284m² donut plan coverage (hole excluded), got ${planSum45.toFixed(2)}m²`);
+  }
+  if (Math.abs(modeledSloped45 - expectedSloped45) > 4.0) {
+    throw new Error(`Expected ~${expectedSloped45.toFixed(1)}m² sloped roof area, got ${modeledSloped45.toFixed(1)}m²`);
+  }
+
+  const sheet45: SheetSpec = { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 };
+  const bom45 = ensureBom(
+    createRoofPipelineState({ levels: built45.levels, planes: planes45 }),
+    { sheetSpec: sheet45 }
+  );
+  if (!bom45.areaSanity.ok || bom45.bom.totalRoofAreaM2 > expectedSloped45 + 10) {
+    throw new Error(`BOM area must match courtyard donut roof (~${expectedSloped45.toFixed(1)}m²), got ${bom45.bom.totalRoofAreaM2}`);
+  }
+
+  // Verify inner courtyard perimeter produces wall segments set back INTO roof domain (away from open void)
+  const holeEdgeIds = new Set(donutOut.holes![0].edges.map((e) => e.id));
+  const setbackDonutOut = applyEaveSetback(built45.levels[0].outline, Array.from(holeEdgeIds), 0.45);
+  const setbackLevels = built45.levels.map((l, idx) => (idx === 0 ? { ...l, outline: setbackDonutOut } : l));
+  const donutWalls = deriveRoofWallSegments(setbackLevels, planes45);
+  const courtyardWalls = donutWalls.filter((w) => holeEdgeIds.has(w.edgeId));
+  if (courtyardWalls.length !== 4) {
+    throw new Error(`Expected 4 inner courtyard perimeter wall segments, got ${courtyardWalls.length}`);
+  }
+  for (const cw of courtyardWalls) {
+    const midSetbackX = (cw.wallFrom.x + cw.wallTo.x) / 2;
+    const midSetbackY = (cw.wallFrom.y + cw.wallTo.y) / 2;
+    if (midSetbackX > 7.05 && midSetbackX < 12.95 && midSetbackY > 5.05 && midSetbackY < 10.95) {
+      throw new Error(`Courtyard wall ${cw.edgeId} setback shifted INTO open courtyard void instead of under roof domain (${midSetbackX.toFixed(2)},${midSetbackY.toFixed(2)})`);
+    }
+  }
+
+  // Build 3D scene and verify plinth exists, has clean finite geometry with courtyard hole punchout, and disposes cleanly
+  const stubTex45 = { normalMap: null, roughnessMap: null, bumpMap: null, dispose: () => {} } as any;
+  const stubWallTex45 = {
+    getEntry: () => null,
+    weatherboard: { normalMap: null },
+    fibre_cement: { normalMap: null },
+    brick: { map: null, normalMap: null },
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null
+  } as any;
+  const scene45 = buildRoofSceneGroup({
+    outline: built45.levels[0].outline,
+    skeleton: built45.levels[0].skeleton,
+    planes: planes45,
+    levels: built45.levels,
+    shadingMode: 'facet_zones',
+    swatch: { name: 'Ebony', hex: '#1e293b', metalness: 0.45, roughness: 0.35 } as any,
+    textures: stubTex45,
+    wallTextures: stubWallTex45,
+    showFlashings: true,
+    showWalls: true,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+  let plinthFound45 = false;
+  scene45.rootGroup.traverse((obj: any) => {
+    if (obj?.isMesh && obj.geometry) {
+      const pos = obj.geometry.getAttribute('position');
+      if (pos) {
+        for (let i = 0; i < pos.count; i++) {
+          if (!Number.isFinite(pos.getX(i)) || !Number.isFinite(pos.getY(i)) || !Number.isFinite(pos.getZ(i))) {
+            throw new Error('Non-finite vertex found in courtyard 3D roof scene');
+          }
+        }
+      }
+      if (obj.material?.color?.getHex?.() === 0x283244 && pos) {
+        plinthFound45 = true;
+        // Verify no extruded plinth triangle centroid lies inside open courtyard interior
+        const idxAttr = obj.geometry.getIndex();
+        const triCount = idxAttr ? Math.floor(idxAttr.count / 3) : Math.floor(pos.count / 3);
+        for (let t = 0; t < triCount; t++) {
+          const i0 = idxAttr ? idxAttr.getX(t * 3) : t * 3;
+          const i1 = idxAttr ? idxAttr.getX(t * 3 + 1) : t * 3 + 1;
+          const i2 = idxAttr ? idxAttr.getX(t * 3 + 2) : t * 3 + 2;
+          const cx = (pos.getX(i0) + pos.getX(i1) + pos.getX(i2)) / 3 + scene45.bounds.midX;
+          const cy = (pos.getZ(i0) + pos.getZ(i1) + pos.getZ(i2)) / 3 + scene45.bounds.midY;
+          if (cx > 7.1 && cx < 12.9 && cy > 5.1 && cy < 10.9) {
+            throw new Error(`Plinth triangle centroid (${cx.toFixed(2)},${cy.toFixed(2)}) filled inside courtyard void`);
+          }
+        }
+      }
+    }
+  });
+  if (!plinthFound45) {
+    throw new Error('Expected ground slab plinth mesh with courtyard cutout in 3D scene');
+  }
+  scene45.dispose();
+
+  // Removing courtyard hole restores solid 320m² footprint cleanly
+  const holeId = donutOut.holes![0].id;
+  const restoredOut = removeCourtyardHoleFromOutline(donutOut, holeId);
+  if ((restoredOut.holes || []).length !== 0 || Math.abs(getOutlineFootprintAreaM2(restoredOut) - 320) > 0.05) {
+    throw new Error('removeCourtyardHoleFromOutline failed to restore clean solid 320m² footprint');
+  }
+}
+console.log('✓ Test 45 Passed: Courtyard/void donut plan builds perimeter skeleton, open courtyard faces, inner walls, 3D plinth cutout, and truthful BOM.');
+
+// 46. TEST 46: Vertex Complexity Guard (MAX_ROOF_DOMAIN_VERTICES) & Abortable Async RoofPipeline Runner
+await (async () => {
+  // 1) Guard rejects > MAX_ROOF_DOMAIN_VERTICES (280) polygon cleanly instead of hanging
+  const manyPts: { x: number; y: number }[] = [];
+  const overLimitCount = MAX_ROOF_DOMAIN_VERTICES + 10;
+  for (let i = 0; i < overLimitCount; i++) {
+    const a = (i / overLimitCount) * Math.PI * 2;
+    manyPts.push({ x: +(10 + Math.cos(a) * 8).toFixed(3), y: +(10 + Math.sin(a) * 8).toFixed(3) });
+  }
+  const bigOut = buildOutlineFromPoints(manyPts, 'too-many-verts', { initialEdgeType: 'outline' });
+  const bigLvl: RoofLevel = {
+    id: 'lvl-big-46',
+    code: 'L1',
+    name: 'Oversized Polygon',
+    eaveHeightM: 2.7,
+    outline: bigOut,
+    skeleton: []
+  };
+
+  let guardThrewSync = false;
+  try {
+    assertRoofDomainComplexity([bigLvl]);
+  } catch (err) {
+    guardThrewSync = err instanceof Error && err.message.includes(String(MAX_ROOF_DOMAIN_VERTICES));
+  }
+  if (!guardThrewSync) {
+    throw new Error(`assertRoofDomainComplexity must reject ${overLimitCount} vertices > ${MAX_ROOF_DOMAIN_VERTICES}`);
+  }
+
+  let skelGuarded = false;
+  try {
+    generateSkeletonLines(bigOut);
+  } catch (err) {
+    skelGuarded = err instanceof Error && err.message.includes(String(MAX_ROOF_DOMAIN_VERTICES));
+  }
+  if (!skelGuarded) {
+    throw new Error('generateSkeletonLines must reject oversized vertex count cleanly');
+  }
+
+  // 2) Abortable async build runner rejects cleanly on AbortSignal without mutating caller state
+  const okOut46 = getPresetOutline('l_shape_standard');
+  const okLvl46: RoofLevel = {
+    id: 'lvl-46',
+    code: 'L1',
+    name: 'L-Shape Async',
+    eaveHeightM: 2.7,
+    outline: okOut46,
+    skeleton: []
+  };
+  const initState46 = createRoofPipelineState({ levels: [okLvl46], planes: [] });
+  const ac = new AbortController();
+  ac.abort();
+  let abortedCleanly = false;
+  try {
+    await runRoofPipelineBuildAsync({
+      state: initState46,
+      action: 'auto_skeleton',
+      signal: ac.signal
+    });
+  } catch (err) {
+    abortedCleanly = err instanceof Error && err.message === 'Roof build cancelled';
+  }
+  if (!abortedCleanly || initState46.planes.length !== 0 || initState46.levels[0].skeleton.length !== 0) {
+    throw new Error('runRoofPipelineBuildAsync must reject cleanly on AbortSignal without mutating caller state');
+  }
+
+  // 3) Full non-aborted async sequence (auto_skeleton -> full_layout) completes with progress reaching 100% and valid planes
+  const skelDone46 = await runRoofPipelineBuildAsync({
+    state: initState46,
+    action: 'auto_skeleton'
+  });
+  const progressLog: number[] = [];
+  const doneRes = await runRoofPipelineBuildAsync({
+    state: skelDone46.state,
+    action: 'full_layout',
+    sheetSpec: { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 },
+    onProgress: (_stage, pct) => progressLog.push(pct)
+  });
+  if (
+    progressLog[progressLog.length - 1] !== 100 ||
+    doneRes.state.planes.length < 4 ||
+    Math.abs(doneRes.areaSanity.planCoverageAreaM2 - doneRes.areaSanity.footprintAreaM2) > 1.0 ||
+    !doneRes.state.layout ||
+    !doneRes.areaSanity.ok
+  ) {
+    throw new Error('runRoofPipelineBuildAsync full_layout did not complete cleanly to 100%');
+  }
+})();
+console.log('✓ Test 46 Passed: MAX_ROOF_DOMAIN_VERTICES guard & abortable async RoofPipeline runner verified.');
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

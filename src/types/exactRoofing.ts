@@ -50,10 +50,18 @@ export interface PlanEdge {
   wallFacetId?: string;
 }
 
+export interface RoofHoleRing {
+  id: string;
+  name?: string;
+  points: Point2D[];
+  edges: PlanEdge[];
+}
+
 export interface RoofOutline {
   id: string;
   points: Point2D[];
   edges: PlanEdge[];
+  holes?: RoofHoleRing[];
   levelId?: string;
 }
 
@@ -526,6 +534,7 @@ export interface RoofBomSummary {
   estimatedUnderlayRolls: number;
   estimatedFoamClosureM: number;
   penetrationKitCount: number;
+  areaSanityWarning?: string;
 }
 
 export interface RoofPlanUnderlay {
@@ -824,6 +833,7 @@ export interface OrderPack {
     penetrationCount: number;
     wallNetAreaM2?: number;
     wallOpeningsCount?: number;
+    areaSanityWarning?: string;
   };
   sheets: OrderPackSheetLine[];
   flashings: OrderPackFlashingLine[];

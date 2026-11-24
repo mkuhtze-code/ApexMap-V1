@@ -54,6 +54,8 @@ import {
   ROOF_LINE_TYPE_CATALOG,
   getRoofEdgeTypeMeta,
   getSkeletonLineTypeMeta,
+  getAllOutlineEdges,
+  polygonCentroid,
   PlanViewportBounds,
   dist
 } from '../../utils/exactRoofingEngine';
@@ -209,6 +211,10 @@ interface Props {
       heightM?: number;
     }
   ) => void;
+  onAddCourtyardHole?: (levelId: string, holePoints: Point2D[]) => void;
+  onRemoveCourtyardHole?: (levelId: string, holeId: string) => void;
+  buildProgress?: { label: string; pct: number } | null;
+  onCancelBuild?: () => void;
 }
 
 export const ExactRoofingCanvas: React.FC<Props> = ({
@@ -279,7 +285,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   onChangeSelectedWallFacetIds,
   onOpenWallElevation,
   onBuildWallFaces: _onBuildWallFaces,
-  onBatchWallUpdate
+  onBatchWallUpdate,
+  onAddCourtyardHole,
+  onRemoveCourtyardHole,
+  buildProgress = null,
+  onCancelBuild
 }) => {
   const { isMobile, isTouchDevice } = useDeviceDetection();
 
@@ -330,7 +340,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   // Freehand drawing, attach-to-edge & scaling state
   const [draftPoints, setDraftPoints] = useState<Point2D[]>([]);
-  const [drawSubMode, setDrawSubMode] = useState<'free' | 'attach_edge'>('free');
+  const [drawSubMode, setDrawSubMode] = useState<'free' | 'attach_edge' | 'courtyard_void'>('free');
   const [attachedEdge, setAttachedEdge] = useState<PlanEdge | null>(null);
   const [lockedDraftBounds, setLockedDraftBounds] = useState<PlanViewportBounds | null>(null);
   const [draftScaleReady, setDraftScaleReady] = useState<boolean>(false);
@@ -356,17 +366,20 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const allDisplayEdges = useMemo(
     () =>
       levels && levels.length > 0
-        ? levels.flatMap((l) => l.outline.edges)
-        : outline.edges,
-    [levels, outline.edges]
+        ? levels.flatMap((l) => getAllOutlineEdges(l.outline))
+        : getAllOutlineEdges(outline),
+    [levels, outline]
   );
 
   const allDisplayOutlinePoints = useMemo(
     () =>
       levels && levels.length > 0
-        ? levels.flatMap((l) => l.outline.points)
-        : outline.points,
-    [levels, outline.points]
+        ? levels.flatMap((l) => [
+            ...l.outline.points,
+            ...(l.outline.holes || []).flatMap((h) => h.points)
+          ])
+        : [...outline.points, ...(outline.holes || []).flatMap((h) => h.points)],
+    [levels, outline]
   );
 
   const displaySkeleton = useMemo(
@@ -1471,6 +1484,30 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const finishCustomOutline = (overridePoints?: Point2D[]) => {
     const pts = overridePoints || draftPoints;
     if (pts.length >= 3) {
+      if (drawSubMode === 'courtyard_void' && onAddCourtyardHole) {
+        const centroid = polygonCentroid(pts);
+        const enclosingLvl =
+          (levels &&
+            levels.find(
+              (l) => l.outline.points.length >= 3 && isPointInPolygon(centroid, l.outline.points)
+            )) ||
+          (activeLevelId !== 'all' ? levels?.find((l) => l.id === activeLevelId) : undefined) ||
+          levels?.[0];
+        const targetLvlId = enclosingLvl?.id || outline.levelId || 'level-1';
+        onAddCourtyardHole(targetLvlId, pts);
+        setDraftPoints([]);
+        setAttachedEdge(null);
+        setDrawSubMode('free');
+        setLockedDraftBounds(null);
+        setTypedLengthBuffer('');
+        lastAimPosRef.current = null;
+        setDraftScaleReady(true);
+        setZoom(1);
+        setPan({ x: 0, y: 0 });
+        setActiveTool('set_pitch');
+        return;
+      }
+
       const customId = `roof-custom-${Date.now()}`;
       const newOutline = attachedEdge
         ? buildAttachedOutlineFromEdge(attachedEdge, pts, customId, {
@@ -1532,7 +1569,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
     const targetOutline =
       (type === 'edge' && levels
-        ? levels.find((l) => l.outline.edges.some((ed) => ed.id === id))?.outline
+        ? levels.find((l) => getAllOutlineEdges(l.outline).some((ed) => ed.id === id))?.outline
         : undefined) || outline;
 
     setEditingMeasurement({
@@ -2235,7 +2272,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                 {activeTool === 'draw_roof' && (
                   <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-emerald-500/45 shadow-xl text-[11px] max-w-full">
                     {hasExistingFootprint && draftPoints.length === 0 && (
-                      <div className="w-full flex items-center justify-center gap-1 pb-1 border-b border-slate-800">
+                      <div className="w-full flex flex-wrap items-center justify-center gap-1 pb-1 border-b border-slate-800">
                         <button
                           type="button"
                           onClick={() => {
@@ -2264,11 +2301,29 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         >
                           From Wall / Eave
                         </button>
+                        {onAddCourtyardHole && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDrawSubMode('courtyard_void');
+                              setAttachedEdge(null);
+                            }}
+                            className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                              drawSubMode === 'courtyard_void'
+                                ? 'bg-rose-600 text-white'
+                                : 'bg-slate-800 text-rose-300'
+                            }`}
+                          >
+                            Courtyard Void
+                          </button>
+                        )}
                       </div>
                     )}
                     <Crosshair className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                     <span className="text-emerald-200 font-bold truncate">
-                      {drawSubMode === 'attach_edge' && !attachedEdge
+                      {drawSubMode === 'courtyard_void' && draftPoints.length === 0
+                        ? 'Tap corner 1 inside roof for Courtyard Void'
+                        : drawSubMode === 'attach_edge' && !attachedEdge
                         ? 'Tap an existing wall or eave edge'
                         : draftPoints.length === 0 && attachedEdge
                         ? 'Host wall set — tap start (snaps to line)'
@@ -2294,13 +2349,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     <button
                       type="button"
                       onClick={() => setOrthoSnap((v) => !v)}
+                      title="Grid Ortho Snap: locks drawing to 45°/90° global axes"
                       className={`px-2 py-0.5 rounded-lg font-bold cursor-pointer shrink-0 border ${
                         orthoSnap
                           ? 'bg-sky-600/30 border-sky-500/50 text-sky-200'
                           : 'bg-slate-800 border-slate-700 text-slate-400'
                       }`}
                     >
-                      Ortho {orthoSnap ? 'ON' : 'OFF'}
+                      Grid Ortho {orthoSnap ? 'ON' : 'OFF'}
                     </button>
                     {draftPoints.length >= 1 && (
                       <form
@@ -2399,10 +2455,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                               autoGenerateSkeleton: false
                             })
                           }
+                          title="Local 90° Corner: squares selected corner relative to adjacent wall without shifting neighbors"
                           className="px-2.5 py-1 rounded-lg bg-amber-500 text-slate-950 font-extrabold flex items-center gap-1 cursor-pointer"
                         >
                           <Square className="w-3 h-3" />
-                          <span>Square 90°</span>
+                          <span>Local 90° Corner</span>
                         </button>
                         {outline.points.length > 3 && (
                           <button
@@ -2421,7 +2478,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                       </>
                     ) : (
                       <span className="text-amber-200 font-semibold">
-                        Drag corner or tap corner to Square 90°
+                        Drag corner or tap corner for Local 90° Corner
                       </span>
                     )}
                   </div>
@@ -2990,11 +3047,29 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               >
                 From Wall / Eave
               </button>
+              {onAddCourtyardHole && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawSubMode('courtyard_void');
+                    setAttachedEdge(null);
+                  }}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                    drawSubMode === 'courtyard_void'
+                      ? 'bg-rose-600 text-white'
+                      : 'text-rose-300 hover:text-white'
+                  }`}
+                >
+                  Courtyard Void
+                </button>
+              )}
             </div>
           )}
           <Crosshair className="w-4 h-4 text-emerald-400 shrink-0" />
           <span className="text-emerald-200 font-bold">
-            {drawSubMode === 'attach_edge' && !attachedEdge
+            {drawSubMode === 'courtyard_void' && draftPoints.length === 0
+              ? 'Click inside an existing roof outline to punch an open Courtyard Void (no roof inside hole)'
+              : drawSubMode === 'attach_edge' && !attachedEdge
               ? 'Click an existing wall or eave edge to set host reference line'
               : draftPoints.length === 0 && attachedEdge
               ? 'Host wall reference set — click start anywhere (snaps to wall line)'
@@ -3047,13 +3122,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           <button
             type="button"
             onClick={() => setOrthoSnap((v) => !v)}
+            title="Grid Ortho Snap: locks drawing segments to 45°/90° global axes (zoom-independent)"
             className={`px-2.5 py-1 rounded-xl text-xs font-bold border cursor-pointer ${
               orthoSnap
                 ? 'bg-sky-600/30 border-sky-500/50 text-sky-200'
                 : 'bg-slate-800 border-slate-700 text-slate-400'
             }`}
           >
-            Ortho {orthoSnap ? 'ON' : 'OFF'}
+            Grid Ortho {orthoSnap ? 'ON' : 'OFF'}
           </button>
           {draftPoints.length > 0 && (
             <button
@@ -3185,10 +3261,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   })
                 }
                 className="px-3 py-1 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs flex items-center gap-1.5 cursor-pointer"
-                title="Force selected corner to 90 degrees without moving neighbors"
+                title="Local 90° Corner: forces selected corner to 90° relative to adjacent wall without moving neighbors"
               >
                 <Square className="w-3.5 h-3.5" />
-                <span>Square Corner (90°)</span>
+                <span>Local 90° Corner</span>
               </button>
               {outline.points.length > 3 && (
                 <button
@@ -3207,7 +3283,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             </>
           ) : (
             <span className="text-amber-200 font-semibold">
-              Drag corner points · Click a corner to Square 90° · Click an edge to insert corner
+              Drag corner points · Click a corner for Local 90° Corner · Click an edge to insert corner
             </span>
           )}
         </div>
@@ -3441,7 +3517,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   }}
                   className={isDrawingOrGeometryTool ? 'pointer-events-none' : 'cursor-pointer'}
                 >
-                  {lvl.outline.edges.map((ge) => (
+                  {getAllOutlineEdges(lvl.outline).map((ge) => (
                     <line
                       key={ge.id}
                       x1={toSvgX(ge.from.x)}
@@ -3694,6 +3770,87 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         fontFamily="monospace"
                       >
                         {Math.round(plane.orderedSheetLengthM! * 1000)}mm
+                      </text>
+                    </g>
+                  )}
+                </g>
+              </g>
+            );
+          })}
+
+          {/* COURTYARD VOIDS (Inner Hole Rings — Open Sky Cutouts, Zero Roof Inside) */}
+          {(activeLevelId === 'all' && levels && levels.length > 1
+            ? levels.flatMap((l) =>
+                (l.outline.holes || []).map((hole) => ({
+                  levelId: l.id,
+                  hole
+                }))
+              )
+            : (outline.holes || []).map((hole) => ({
+                levelId: outline.levelId || levels?.[0]?.id || 'level-1',
+                hole
+              }))
+          ).map(({ levelId, hole }) => {
+            if (hole.points.length < 3) return null;
+            const holePtsStr = hole.points.map((p) => `${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ');
+            const c = polygonCentroid(hole.points);
+            const cx = toSvgX(c.x);
+            const cy = toSvgY(c.y);
+            return (
+              <g key={`void-ring-${hole.id}`}>
+                <polygon
+                  points={holePtsStr}
+                  fill="#040812"
+                  fillOpacity="0.88"
+                  stroke="#f43f5e"
+                  strokeWidth="1.8"
+                  strokeDasharray="6 4"
+                  pointerEvents="none"
+                />
+                <g transform={`translate(${cx}, ${cy})`}>
+                  <rect
+                    x="-46"
+                    y="-10"
+                    width={!readOnlyGeometry && onRemoveCourtyardHole ? 92 : 76}
+                    height="20"
+                    rx="10"
+                    fill="#1e0a14"
+                    fillOpacity="0.94"
+                    stroke="#f43f5e"
+                    strokeOpacity="0.65"
+                    strokeWidth="1"
+                  />
+                  <text
+                    x={!readOnlyGeometry && onRemoveCourtyardHole ? -7 : 0}
+                    y="3.5"
+                    textAnchor="middle"
+                    fill="#fda4af"
+                    fontSize="8.5"
+                    fontWeight="800"
+                    fontFamily="monospace"
+                    pointerEvents="none"
+                  >
+                    VOID (OPEN)
+                  </text>
+                  {!readOnlyGeometry && onRemoveCourtyardHole && (
+                    <g
+                      transform="translate(35, 0)"
+                      className="cursor-pointer"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        onRemoveCourtyardHole(levelId, hole.id);
+                      }}
+                    >
+                      <circle r="7.5" fill="#9f1239" />
+                      <text
+                        x="0"
+                        y="3.2"
+                        textAnchor="middle"
+                        fill="#ffffff"
+                        fontSize="10"
+                        fontWeight="900"
+                      >
+                        ×
                       </text>
                     </g>
                   )}
@@ -4315,12 +4472,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             );
           })}
 
-          {/* OUTLINE EDGES (ALL 10 CLASSIFICATIONS) */}
+          {/* OUTLINE EDGES (ALL 10 CLASSIFICATIONS — OUTER + COURTYARD VOIDS) */}
           {(() => {
             const displayEdges =
               activeLevelId === 'all' && levels && levels.length > 1
-                ? levels.flatMap((l) => l.outline.edges)
-                : outline.edges;
+                ? levels.flatMap((l) => getAllOutlineEdges(l.outline))
+                : getAllOutlineEdges(outline);
             return displayEdges;
           })().map((e) => {
             const x1 = toSvgX(e.from.x);
@@ -5355,13 +5512,30 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             <div className="flex items-center gap-1.5 tabular-nums">
               <span className="w-2 h-2 rounded-full bg-emerald-400" />
               <span>
-                Faces <strong className="text-white">{planes.length}</strong>/{outline.edges.length}
+                Faces <strong className="text-white">{planes.length}</strong>/{getAllOutlineEdges(outline).length}
               </span>
             </div>
             {mousePos && (
               <span className="text-[10px] font-mono text-slate-300 border-l border-slate-800 pl-2.5 tabular-nums">
                 X {mousePos.x.toFixed(2)}m · Y {mousePos.y.toFixed(2)}m
               </span>
+            )}
+          </div>
+        )}
+
+        {buildProgress && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 px-3.5 py-1.5 rounded-xl bg-[#080d18]/96 border border-sky-500/50 text-xs text-sky-200 shadow-2xl">
+            <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse" />
+            <span className="font-bold">{buildProgress.label}</span>
+            <span className="font-mono text-[10px] text-sky-300 tabular-nums">{buildProgress.pct}%</span>
+            {onCancelBuild && (
+              <button
+                type="button"
+                onClick={onCancelBuild}
+                className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-rose-600/40 text-slate-200 text-[10px] font-bold cursor-pointer"
+              >
+                Cancel
+              </button>
             )}
           </div>
         )}
@@ -5399,8 +5573,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           (() => {
             const isEdge = inspectedLine.kind === 'edge';
             const edgeObj = isEdge
-              ? outline.edges.find((e) => e.id === inspectedLine.id) ||
-                levels?.flatMap((l) => l.outline.edges).find((e) => e.id === inspectedLine.id)
+              ? getAllOutlineEdges(outline).find((e) => e.id === inspectedLine.id) ||
+                levels?.flatMap((l) => getAllOutlineEdges(l.outline)).find((e) => e.id === inspectedLine.id)
               : undefined;
             const skelObj = !isEdge ? displaySkeleton.find((s) => s.id === inspectedLine.id) : undefined;
             if (!edgeObj && !skelObj) return null;
@@ -6333,7 +6507,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             {editingMeasurement.type === 'edge' &&
               onToggleEdgeGable &&
               (() => {
-                const targetEdge = outline.edges.find((e) => e.id === editingMeasurement.id);
+                const targetEdge =
+                  getAllOutlineEdges(outline).find((e) => e.id === editingMeasurement.id) ||
+                  levels?.flatMap((l) => getAllOutlineEdges(l.outline)).find((e) => e.id === editingMeasurement.id);
                 if (!targetEdge) return null;
                 const isEdgeGable = targetEdge.type === 'verge' || targetEdge.type === 'rake';
                 return (

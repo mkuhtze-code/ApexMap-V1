@@ -13,6 +13,7 @@ import {
 import {
   computeGableDormerGeometry,
   deriveRoofWallSegments,
+  getAllOutlineEdges,
   isPointInPolygon,
   ResolvedLevelSharedVertices,
   resolveEffectivePlanesWithAssets,
@@ -54,7 +55,8 @@ function toThreeVec(x: number, y: number, z: number, bounds: Roof3DBounds): THRE
 
 /** Resolve structural Z fall frame (strictly perpendicular to eave) vs UV sheet-run axes */
 function resolvePlaneAxesAndFall(plane: RoofPlane, levelOutline: RoofOutline) {
-  const eaveEdge = levelOutline.edges.find((e) => e.id === plane.eaveEdgeId);
+  const allEdges = getAllOutlineEdges(levelOutline);
+  const eaveEdge = allEdges.find((e) => e.id === plane.eaveEdgeId);
   const isChild = Boolean(plane.parentPlaneId || plane.isVirtualAssetPlane);
 
   const eaveA = isChild
@@ -87,7 +89,7 @@ function resolvePlaneAxesAndFall(plane: RoofPlane, levelOutline: RoofOutline) {
   // Sheet UV orientation follows explicit sheetRunEdgeId when set, otherwise falls back to eaveEdge
   const sheetRefEdge =
     !isChild && plane.sheetRunEdgeId
-      ? levelOutline.edges.find((e) => e.id === plane.sheetRunEdgeId) || eaveEdge
+      ? allEdges.find((e) => e.id === plane.sheetRunEdgeId) || eaveEdge
       : eaveEdge;
 
   let uvEdgeU2D = eaveU2D;
@@ -1440,7 +1442,7 @@ export function buildRoofSceneGroup(params: {
         }
       });
 
-      lvl.outline.edges.forEach((edge) => {
+      getAllOutlineEdges(lvl.outline).forEach((edge) => {
         const zA = getPtZ(edge.from);
         const zB = getPtZ(edge.to);
         if (edge.type === 'verge' || edge.type === 'rake') {
@@ -1601,10 +1603,31 @@ export function buildRoofSceneGroup(params: {
       baseLevel &&
       baseLevel.outline.points.length >= 3
     ) {
-      const shapePts = baseLevel.outline.points.map(
+      const basePts = baseLevel.outline.points;
+      const shapePts = basePts.map(
         (pt) => new THREE.Vector2(pt.x - bounds.midX, pt.y - bounds.midY)
       );
       const shape = new THREE.Shape(shapePts);
+      if (baseLevel.outline.holes && baseLevel.outline.holes.length > 0) {
+        const signedArea2D = (pts: Point2D[]) =>
+          pts.reduce((s, p, idx) => {
+            const q = pts[(idx + 1) % pts.length];
+            return s + (p.x * q.y - q.x * p.y);
+          }, 0);
+        const outerCcw = signedArea2D(basePts) >= 0;
+        baseLevel.outline.holes.forEach((h) => {
+          if (h.points.length < 3) return;
+          const holeCcw = signedArea2D(h.points) >= 0;
+          const orderedHole = holeCcw === outerCcw ? [...h.points].reverse() : h.points;
+          shape.holes.push(
+            new THREE.Path(
+              orderedHole.map(
+                (pt) => new THREE.Vector2(pt.x - bounds.midX, pt.y - bounds.midY)
+              )
+            )
+          );
+        });
+      }
       const padGeo = trackGeo(
         new THREE.ExtrudeGeometry(shape, { depth: 0.14, bevelEnabled: false })
       );

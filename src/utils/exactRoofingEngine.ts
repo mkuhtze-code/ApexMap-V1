@@ -277,6 +277,8 @@ export function canonicalPlanePolygonKey(poly: Point2D[]): string {
     .join('|');
 }
 
+export const DEFAULT_MAX_AREA_INFLATION_RATIO = 1.45;
+
 export function deduplicateRoofPlanes(planes: RoofPlane[]): RoofPlane[] {
   const seenIds = new Set<string>();
   const seenGeom = new Set<string>();
@@ -292,6 +294,28 @@ export function deduplicateRoofPlanes(planes: RoofPlane[]): RoofPlane[] {
     result.push(pl);
   }
   return result;
+}
+
+/**
+ * Truthful modeled roof area (m²) = sum of non-virtual, deduplicated structural planes minus aperture openings.
+ */
+export function computeTruthfulRoofAreaM2(planes: RoofPlane[]): number {
+  const clean = deduplicateRoofPlanes(planes).filter((p) => !p.isVirtualAssetPlane);
+  return +clean
+    .reduce((acc, p) => {
+      const devArea =
+        p.developedPolygon && p.developedPolygon.length >= 3
+          ? polygonArea(p.developedPolygon)
+          : p.area || 0;
+      const appArea = (p.apertures || []).reduce((apAcc, app) => {
+        if (app.developedPolygon && app.developedPolygon.length >= 3) {
+          return apAcc + polygonArea(app.developedPolygon);
+        }
+        return apAcc + Math.max(0, (app.uMax - app.uMin) * (app.vMax - app.vMin));
+      }, 0);
+      return acc + Math.max(0, devArea - appArea);
+    }, 0)
+    .toFixed(2);
 }
 
 /**
@@ -6641,20 +6665,8 @@ export function generateCuttingLayout(
   const totalRoofMetres = +allNeededPieces.reduce((sum, p) => sum + p.midLength, 0).toFixed(2);
   const totalOrderedMetres = +parentSheets.reduce((sum, s) => sum + s.length, 0).toFixed(2);
 
-  // Compute net developed roof area from unfolded planes minus apertures (exact physical roof m²)
-  const netRoofAreaM2 = orderedPlanes.reduce((acc, p) => {
-    const devArea =
-      p.developedPolygon && p.developedPolygon.length >= 3
-        ? polygonArea(p.developedPolygon)
-        : p.area || 0;
-    const appArea = (p.apertures || []).reduce((apAcc, app) => {
-      if (app.developedPolygon && app.developedPolygon.length >= 3) {
-        return apAcc + polygonArea(app.developedPolygon);
-      }
-      return apAcc + Math.max(0, (app.uMax - app.uMin) * (app.vMax - app.vMin));
-    }, 0);
-    return acc + Math.max(0, devArea - appArea);
-  }, 0);
+  // Compute net developed roof area strictly over deduplicated non-virtual structural planes minus apertures
+  const netRoofAreaM2 = computeTruthfulRoofAreaM2(orderedPlanes);
   const totalRoofArea = +(netRoofAreaM2 > 0 ? netRoofAreaM2 : totalRoofMetres * cover).toFixed(2);
   const totalOrderedArea = +(totalOrderedMetres * cover).toFixed(2);
 
@@ -7920,8 +7932,10 @@ export function unsuppressOutlineEdges(
 export function buildFacesFromClassification(
   levels: RoofLevel[],
   existingPlanes: RoofPlane[],
-  defaultPitchDeg = 22.5
+  defaultPitchDeg = 22.5,
+  options?: { allowAutoSkeletonWhenEmpty?: boolean }
 ): { levels: RoofLevel[]; planes: RoofPlane[]; createdCount: number } {
+  const allowAutoWhenEmpty = options?.allowAutoSkeletonWhenEmpty ?? true;
   const nextLevels = levels.map((lvl) => {
     if (lvl.outline.points.length < 3) {
       return { ...lvl, suppressedPlaneEdgeIds: undefined };
@@ -7967,7 +7981,7 @@ export function buildFacesFromClassification(
     );
     let nextSkeleton = mergeColinearRidgeLines(lvl.skeleton, levelExistingPlanes);
 
-    if (!hasManualStructuralSkel && activeEaveCount >= 2) {
+    if (allowAutoWhenEmpty && !hasManualStructuralSkel && activeEaveCount >= 2) {
       const waveOutline: RoofOutline = {
         ...nextOutline,
         edges: nextOutline.edges.map((e) => ({

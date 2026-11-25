@@ -12,6 +12,7 @@ import {
 } from '../../../types/exactRoofing';
 import {
   computeGableDormerGeometry,
+  deduplicateRoofPlanes,
   deriveRoofWallSegments,
   getAllOutlineEdges,
   isPointInPolygon,
@@ -794,11 +795,12 @@ export function buildRoofSceneGroup(params: {
           }
         ];
 
-  const bounds = computeRoof3DBounds(allLevels, planes, wallPlan);
+  const committedPlanes = deduplicateRoofPlanes(planes);
+  const bounds = computeRoof3DBounds(allLevels, committedPlanes, wallPlan);
   const effectivePlanes =
     assets.length === 0 && pitchBreaks.length === 0
-      ? planes
-      : resolveEffectivePlanesWithAssets(planes, assets, pitchBreaks);
+      ? committedPlanes
+      : resolveEffectivePlanesWithAssets(committedPlanes, assets, pitchBreaks);
 
   const structuralPlanes = effectivePlanes.filter((p) => !p.isVirtualAssetPlane);
   const sharedVerticesByLevel = new Map<string, ResolvedLevelSharedVertices>();
@@ -1005,8 +1007,8 @@ export function buildRoofSceneGroup(params: {
     const topPts3D = renderPoly2D.map((pt) => {
       const vDist = Math.max(0, (pt.x - eaveA.x) * fallInward2D.x + (pt.y - eaveA.y) * fallInward2D.y);
       const localZ = baseH + vDist * tanPitch;
-      const resolvedZ = sharedRes ? sharedRes.getVertexForPoint(pt, localZ).z : localZ;
-      return toThreeVec(pt.x, pt.y, resolvedZ, bounds);
+      const sv = sharedRes ? sharedRes.getVertexForPoint(pt, localZ) : null;
+      return toThreeVec(sv ? sv.x : pt.x, sv ? sv.y : pt.y, sv ? sv.z : localZ, bounds);
     });
 
     // Plane surface normal pointing UP (+Y positive) fitted to stitched 3D vertices

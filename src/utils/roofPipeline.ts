@@ -3,11 +3,13 @@ import {
   LayoutResult,
   OrderPack,
   PitchBreakLine,
+  PlanEdge,
   RoofAsset,
   RoofBomSummary,
   RoofFlashingAssignment,
   RoofLevel,
   RoofOutline,
+  RoofOutlinePresetKey,
   RoofPlane,
   SheetOrderComparisonSummary,
   SheetOrderMode,
@@ -17,19 +19,31 @@ import {
 } from '../types/exactRoofing';
 import { Project, FlashingProfile } from '../types/crm';
 import {
+  DEFAULT_MAX_AREA_INFLATION_RATIO,
   MAX_ROOF_DOMAIN_VERTICES,
+  applyDirectionToPlanes,
+  applyOrderedSheetLengthToPlanes,
+  applyPitchToPlanes,
   buildFacesFromClassification,
+  computeTruthfulRoofAreaM2,
+  createPlaneFromEdge,
   deduplicateRoofPlanes,
+  deleteRoofPlanes,
   generateCuttingLayout,
   generateSkeletonLines,
   getAllOutlineEdges,
+  getMultiLevelPreset,
   getOutlineFootprintAreaM2,
+  getPresetOutline,
   isStationaryEdgeType,
   mergeColinearRidgeLines,
   polygonArea,
-  syncMultiLevelPlanes
+  syncMultiLevelPlanes,
+  toggleJunctionGable
 } from './exactRoofingEngine';
 import { buildOrderPack, buildRoofBillOfMaterials } from './exactRoofingBomBridge';
+
+export { DEFAULT_MAX_AREA_INFLATION_RATIO, computeTruthfulRoofAreaM2 };
 
 export interface RoofPipelineDirtyFlags {
   skeleton: boolean;
@@ -44,7 +58,9 @@ export interface RoofAreaSanityResult {
   planCoverageAreaM2: number;
   modeledAreaM2: number;
   expectedMaxAreaM2: number;
+  maxInflationRatio: number;
   inflationRatio: number;
+  hardBlockBomPush: boolean;
   warning?: string;
 }
 
@@ -80,21 +96,19 @@ export function assertRoofDomainComplexity(
 }
 
 /**
- * Truthful modeled roof area (m²) = sum of non-virtual, deduplicated structural planes only.
- */
-export function computeTruthfulRoofAreaM2(planes: RoofPlane[]): number {
-  const clean = deduplicateRoofPlanes(planes).filter((p) => !p.isVirtualAssetPlane);
-  return +clean.reduce((sum, p) => sum + Math.max(0, p.area || 0), 0).toFixed(2);
-}
-
-/**
  * Compares deduplicated structural planes against net outer-minus-hole footprint area
- * so ~2x duplicate plane inflation is caught deterministically before BOM trust/export.
+ * so ~2x duplicate plane inflation is caught deterministically before BOM trust/export/quote push.
  */
 export function checkRoofAreaSanity(
   levels: RoofLevel[],
-  planes: RoofPlane[]
+  planes: RoofPlane[],
+  options?: { maxInflationRatio?: number }
 ): RoofAreaSanityResult {
+  const maxInflationRatio = Math.max(
+    1.05,
+    options?.maxInflationRatio ?? DEFAULT_MAX_AREA_INFLATION_RATIO
+  );
+
   const footprintAreaM2 = +levels
     .reduce((sum, l) => sum + getOutlineFootprintAreaM2(l.outline), 0)
     .toFixed(2);
@@ -112,7 +126,9 @@ export function checkRoofAreaSanity(
       planCoverageAreaM2,
       modeledAreaM2,
       expectedMaxAreaM2: footprintAreaM2,
-      inflationRatio: 1
+      maxInflationRatio,
+      inflationRatio: 1,
+      hardBlockBomPush: false
     };
   }
 
@@ -121,32 +137,46 @@ export function checkRoofAreaSanity(
     Math.max(1, ...structuralPlanes.map((p) => (Number.isFinite(p.pitchDeg) ? p.pitchDeg : 22.5)))
   );
   const cosMin = Math.max(0.3, Math.cos((maxPitchDeg * Math.PI) / 180));
-  const expectedMaxAreaM2 = +((footprintAreaM2 / cosMin) * 1.38 + 6).toFixed(2);
-  const expectedMaxPlanM2 = +(footprintAreaM2 * 1.35 + 4).toFixed(2);
-  const inflationRatio = +(modeledAreaM2 / Math.max(0.1, footprintAreaM2 / cosMin)).toFixed(2);
+  const tolArea = Math.min(4, footprintAreaM2 * 0.08);
+  const expectedMaxAreaM2 = +((footprintAreaM2 / cosMin) * maxInflationRatio + tolArea).toFixed(2);
+  const expectedMaxPlanM2 = +(footprintAreaM2 * maxInflationRatio + tolArea).toFixed(2);
 
-  const rawPlanSum = planes
-    .filter((p) => !p.isVirtualAssetPlane)
-    .reduce((sum, p) => sum + (p.planPolygon.length >= 3 ? polygonArea(p.planPolygon) : 0), 0);
-  const rawModeledSum = planes
-    .filter((p) => !p.isVirtualAssetPlane)
-    .reduce((sum, p) => sum + Math.max(0, p.area || 0), 0);
+  const rawStructuralPlanes = planes.filter((p) => !p.isVirtualAssetPlane);
+  const rawPlanSum = rawStructuralPlanes.reduce(
+    (sum, p) => sum + (p.planPolygon.length >= 3 ? polygonArea(p.planPolygon) : 0),
+    0
+  );
+  const rawModeledSum = rawStructuralPlanes.reduce(
+    (sum, p) => sum + Math.max(0, p.area || 0),
+    0
+  );
 
   const duplicateDetected =
-    planes.filter((p) => !p.isVirtualAssetPlane).length > structuralPlanes.length ||
+    rawStructuralPlanes.length > structuralPlanes.length ||
     rawPlanSum > planCoverageAreaM2 + 1.0 ||
     rawModeledSum > modeledAreaM2 + 1.0;
 
-  if (duplicateDetected || planCoverageAreaM2 > expectedMaxPlanM2 || modeledAreaM2 > expectedMaxAreaM2) {
-    const reportedModeled = Math.max(modeledAreaM2, +rawModeledSum.toFixed(2));
-    const warning = `Area sanity warning: modeled roof (${reportedModeled.toFixed(1)}m²) exceeds expected pitch-adjusted footprint band (max ${expectedMaxAreaM2.toFixed(1)}m² on ${footprintAreaM2.toFixed(1)}m² net footprint). Check for overlapping faces.`;
+  const reportedModeled = Math.max(modeledAreaM2, +rawModeledSum.toFixed(2));
+  const inflationRatio = +(
+    reportedModeled / Math.max(0.1, footprintAreaM2 / cosMin)
+  ).toFixed(2);
+
+  if (
+    duplicateDetected ||
+    planCoverageAreaM2 > expectedMaxPlanM2 ||
+    modeledAreaM2 > expectedMaxAreaM2 ||
+    inflationRatio > maxInflationRatio
+  ) {
+    const warning = `Area sanity warning: modeled roof (${reportedModeled.toFixed(1)}m²) exceeds expected pitch-adjusted footprint band (max ${expectedMaxAreaM2.toFixed(1)}m² on ${footprintAreaM2.toFixed(1)}m² net footprint). Check for overlapping or duplicate faces.`;
     return {
       ok: false,
       footprintAreaM2,
       planCoverageAreaM2,
       modeledAreaM2: reportedModeled,
       expectedMaxAreaM2,
-      inflationRatio: +(reportedModeled / Math.max(0.1, footprintAreaM2 / cosMin)).toFixed(2),
+      maxInflationRatio,
+      inflationRatio,
+      hardBlockBomPush: true,
       warning
     };
   }
@@ -157,7 +187,9 @@ export function checkRoofAreaSanity(
     planCoverageAreaM2,
     modeledAreaM2,
     expectedMaxAreaM2,
-    inflationRatio
+    maxInflationRatio,
+    inflationRatio,
+    hardBlockBomPush: false
   };
 }
 
@@ -168,6 +200,7 @@ export function createRoofPipelineState(params?: {
   bom?: RoofBomSummary | null;
   orderPack?: OrderPack | null;
   dirty?: Partial<RoofPipelineDirtyFlags>;
+  maxInflationRatio?: number;
 }): RoofPipelineState {
   const levels = params?.levels || [];
   const planes = deduplicateRoofPlanes(params?.planes || []);
@@ -182,11 +215,15 @@ export function createRoofPipelineState(params?: {
     orderPack,
     dirty: {
       skeleton: params?.dirty?.skeleton ?? false,
-      faces: params?.dirty?.faces ?? (levels.some((l) => l.outline.points.length >= 3) && planes.length === 0),
+      faces:
+        params?.dirty?.faces ??
+        (levels.some((l) => l.outline.points.length >= 3) && planes.length === 0),
       layout: params?.dirty?.layout ?? (!layout && planes.length > 0),
       bom: params?.dirty?.bom ?? !bom
     },
-    areaSanity: checkRoofAreaSanity(levels, planes),
+    areaSanity: checkRoofAreaSanity(levels, planes, {
+      maxInflationRatio: params?.maxInflationRatio
+    }),
     lastBuildError: null
   };
 }
@@ -194,7 +231,7 @@ export function createRoofPipelineState(params?: {
 export function invalidateOutline(
   state: RoofPipelineState,
   nextLevels?: RoofLevel[],
-  options?: { markSkeletonDirty?: boolean }
+  options?: { markSkeletonDirty?: boolean; maxInflationRatio?: number }
 ): RoofPipelineState {
   const levels = nextLevels ?? state.levels;
   return {
@@ -206,7 +243,9 @@ export function invalidateOutline(
       layout: true,
       bom: true
     },
-    areaSanity: checkRoofAreaSanity(levels, state.planes),
+    areaSanity: checkRoofAreaSanity(levels, state.planes, {
+      maxInflationRatio: options?.maxInflationRatio
+    }),
     lastBuildError: null
   };
 }
@@ -231,7 +270,8 @@ export function invalidateSkeleton(
 
 export function invalidateFaces(
   state: RoofPipelineState,
-  nextPlanes?: RoofPlane[]
+  nextPlanes?: RoofPlane[],
+  options?: { maxInflationRatio?: number }
 ): RoofPipelineState {
   const planes = deduplicateRoofPlanes(nextPlanes ?? state.planes);
   return {
@@ -243,7 +283,9 @@ export function invalidateFaces(
       layout: true,
       bom: true
     },
-    areaSanity: checkRoofAreaSanity(state.levels, planes),
+    areaSanity: checkRoofAreaSanity(state.levels, planes, {
+      maxInflationRatio: options?.maxInflationRatio
+    }),
     lastBuildError: null
   };
 }
@@ -367,7 +409,9 @@ export function ensureFaces(
   options?: {
     defaultPitchDeg?: number;
     preserveUserDeleted?: boolean;
+    allowAutoSkeletonWhenEmpty?: boolean;
     maxVertices?: number;
+    maxInflationRatio?: number;
   }
 ): {
   state: RoofPipelineState;
@@ -384,7 +428,9 @@ export function ensureFaces(
     );
     const existingIds = new Set(state.planes.map((p) => p.id));
     const createdCount = synced.filter((p) => !existingIds.has(p.id)).length;
-    const areaSanity = checkRoofAreaSanity(state.levels, synced);
+    const areaSanity = checkRoofAreaSanity(state.levels, synced, {
+      maxInflationRatio: options?.maxInflationRatio
+    });
     return {
       state: {
         ...state,
@@ -403,9 +449,13 @@ export function ensureFaces(
     };
   }
 
-  const built = buildFacesFromClassification(state.levels, state.planes, defaultPitch);
+  const built = buildFacesFromClassification(state.levels, state.planes, defaultPitch, {
+    allowAutoSkeletonWhenEmpty: options?.allowAutoSkeletonWhenEmpty
+  });
   const dedupedPlanes = deduplicateRoofPlanes(built.planes);
-  const areaSanity = checkRoofAreaSanity(built.levels, dedupedPlanes);
+  const areaSanity = checkRoofAreaSanity(built.levels, dedupedPlanes, {
+    maxInflationRatio: options?.maxInflationRatio
+  });
 
   return {
     state: {
@@ -427,6 +477,197 @@ export function ensureFaces(
 }
 
 /**
+ * Single-writer helper to update or add a single plane for an eave edge (pitch/direction/setup edit)
+ * through RoofPipeline without letting UI components call createPlaneFromEdge directly.
+ */
+export function upsertSinglePlaneViaPipeline(params: {
+  levels: RoofLevel[];
+  planes: RoofPlane[];
+  owningLevelId: string;
+  eaveEdge: PlanEdge;
+  pitchDeg: number;
+  underlapSide: 'left' | 'right';
+  eaveHeightM?: number;
+  sheetRunEdgeId?: string;
+  orderedSheetLengthM?: number;
+  name?: string;
+  existingId?: string;
+  matchBy?: 'planeId' | 'eaveEdgeId';
+}): { state: RoofPipelineState; plane: RoofPlane } {
+  const owningLvl =
+    params.levels.find((l) => l.id === params.owningLevelId) ||
+    params.levels.find((l) =>
+      getAllOutlineEdges(l.outline).some((e) => e.id === params.eaveEdge.id)
+    ) ||
+    params.levels[0];
+
+  const builtPlane = createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, params.eaveEdge, {
+    pitchDeg: params.pitchDeg,
+    underlapSide: params.underlapSide,
+    eaveHeightM: params.eaveHeightM,
+    sheetRunEdgeId: params.sheetRunEdgeId,
+    orderedSheetLengthM: params.orderedSheetLengthM,
+    name: params.name,
+    existingId: params.existingId,
+    levelId: owningLvl.id,
+    levelCode: owningLvl.code,
+    levelName: owningLvl.name
+  });
+
+  const baseState = createRoofPipelineState({
+    levels: params.levels,
+    planes: params.planes,
+    dirty: { faces: false }
+  });
+
+  let replaced = false;
+  const nextPlanes = params.planes.map((p) => {
+    const isMatch =
+      params.matchBy === 'planeId' && params.existingId
+        ? p.id === params.existingId
+        : p.eaveEdgeId === params.eaveEdge.id;
+    if (!isMatch) return p;
+    replaced = true;
+    return builtPlane;
+  });
+
+  if (!replaced) {
+    nextPlanes.push(builtPlane);
+  }
+
+  return {
+    state: invalidateFaces(baseState, nextPlanes),
+    plane: builtPlane
+  };
+}
+
+/**
+ * Single-writer helper to delete committed roof planes while keeping outline/lines & suppressions intact.
+ */
+export function deletePlanesViaPipeline(
+  state: RoofPipelineState,
+  planeIds: string[],
+  options?: { maxInflationRatio?: number }
+): RoofPipelineState {
+  const res = deleteRoofPlanes(state.levels, state.planes, planeIds);
+  const planes = deduplicateRoofPlanes(res.planes);
+  return {
+    ...state,
+    levels: res.levels,
+    planes,
+    layout: null,
+    dirty: {
+      skeleton: state.dirty.skeleton,
+      faces: false,
+      layout: true,
+      bom: true
+    },
+    areaSanity: checkRoofAreaSanity(res.levels, planes, {
+      maxInflationRatio: options?.maxInflationRatio
+    }),
+    lastBuildError: null
+  };
+}
+
+/**
+ * Single-writer helper to batch update pitch, underlap direction, or ordered sheet length on committed planes.
+ */
+export function updatePlanesBatchViaPipeline(
+  state: RoofPipelineState,
+  params: {
+    planeIds: string[];
+    pitchDeg?: number;
+    underlapSide?: 'left' | 'right';
+    orderedSheetLengthM?: number | null;
+    maxInflationRatio?: number;
+  }
+): RoofPipelineState {
+  let nextPlanes = state.planes;
+  if (params.pitchDeg !== undefined) {
+    nextPlanes = applyPitchToPlanes(nextPlanes, params.planeIds, params.pitchDeg, state.levels);
+  }
+  if (params.underlapSide !== undefined) {
+    nextPlanes = applyDirectionToPlanes(nextPlanes, params.planeIds, params.underlapSide);
+  }
+  if (params.orderedSheetLengthM !== undefined) {
+    nextPlanes = applyOrderedSheetLengthToPlanes(
+      nextPlanes,
+      params.planeIds,
+      params.orderedSheetLengthM === null ? undefined : params.orderedSheetLengthM
+    );
+  }
+  const cleanPlanes = deduplicateRoofPlanes(nextPlanes);
+  return invalidateFaces(state, cleanPlanes, {
+    maxInflationRatio: params.maxInflationRatio
+  });
+}
+
+/**
+ * Single-writer helper to initialize a preset roof state strictly through RoofPipeline.
+ */
+export function buildPresetPipelineState(
+  presetKey: RoofOutlinePresetKey,
+  defaultPitchDeg = 22.5
+): RoofPipelineState {
+  if (presetKey === 'two_storey_split' || presetKey === 'cascading_terrace') {
+    const multi = getMultiLevelPreset(presetKey, defaultPitchDeg);
+    return createRoofPipelineState({
+      levels: multi.levels,
+      planes: multi.planes,
+      dirty: { skeleton: false, faces: false, layout: true, bom: true }
+    });
+  }
+
+  const baseOutline = getPresetOutline(presetKey);
+  const initLvl: RoofLevel = {
+    id: 'level-1',
+    code: 'L1',
+    name: 'Main Roof',
+    eaveHeightM: +(baseOutline.edges[0]?.eaveHeightM ?? 2.7).toFixed(2),
+    outline: {
+      ...baseOutline,
+      levelId: 'level-1',
+      edges: baseOutline.edges.map((e) => ({
+        ...e,
+        levelId: e.levelId ?? 'level-1',
+        eaveHeightM: e.eaveHeightM ?? 2.7
+      }))
+    },
+    skeleton: []
+  };
+
+  let pipe = createRoofPipelineState({ levels: [initLvl], planes: [] });
+  pipe = ensureSkeleton(pipe, { mode: 'auto' }).state;
+
+  if (presetKey === 'straight_gable') {
+    let gableOut = pipe.levels[0].outline;
+    let gableSkel = pipe.levels[0].skeleton;
+    const res1 = toggleJunctionGable(gableOut, gableSkel, 'junction-edge-out-2');
+    if (res1.toggledTo) {
+      gableOut = res1.outline;
+      gableSkel = res1.skeleton;
+    }
+    const res2 = toggleJunctionGable(gableOut, gableSkel, 'junction-edge-out-4');
+    if (res2.toggledTo) {
+      gableOut = res2.outline;
+      gableSkel = res2.skeleton;
+    }
+    pipe = invalidateSkeleton(pipe, [
+      {
+        ...pipe.levels[0],
+        outline: gableOut,
+        skeleton: gableSkel
+      }
+    ]);
+  }
+
+  return ensureFaces(pipe, {
+    defaultPitchDeg,
+    preserveUserDeleted: true
+  }).state;
+}
+
+/**
  * Ensures practical or optimized cutting layout from committed, deduplicated faces only.
  * If facesDirty is true and strictDirtyCheck === true, throws instead of computing stale BOM.
  */
@@ -442,6 +683,7 @@ export function ensureLayout(
     strictDirtyCheck?: boolean;
     defaultPitchDeg?: number;
     preserveUserDeleted?: boolean;
+    maxInflationRatio?: number;
   }
 ): {
   state: RoofPipelineState;
@@ -455,13 +697,16 @@ export function ensureLayout(
     }
     const rebuilt = ensureFaces(working, {
       defaultPitchDeg: params.defaultPitchDeg,
-      preserveUserDeleted: params.preserveUserDeleted
+      preserveUserDeleted: params.preserveUserDeleted,
+      maxInflationRatio: params.maxInflationRatio
     });
     working = rebuilt.state;
   }
 
   const cleanPlanes = deduplicateRoofPlanes(working.planes);
-  const areaSanity = checkRoofAreaSanity(working.levels, cleanPlanes);
+  const areaSanity = checkRoofAreaSanity(working.levels, cleanPlanes, {
+    maxInflationRatio: params.maxInflationRatio
+  });
 
   if (cleanPlanes.length === 0) {
     return {
@@ -506,6 +751,65 @@ export function ensureLayout(
 }
 
 /**
+ * Computes Practical vs Optimized sheet-order comparison strictly through RoofPipeline ensureLayout().
+ */
+export function computeSheetOrderComparisonViaPipeline(params: {
+  levels: RoofLevel[];
+  planes: RoofPlane[];
+  sheetSpec: SheetSpec;
+  currentLayout?: LayoutResult | null;
+  startPlaneId?: string;
+  assets?: RoofAsset[];
+  pitchBreaks?: PitchBreakLine[];
+}): SheetOrderComparisonSummary | undefined {
+  const cleanPlanes = deduplicateRoofPlanes(params.planes);
+  if (cleanPlanes.length === 0) return undefined;
+
+  const baseState = createRoofPipelineState({
+    levels: params.levels,
+    planes: cleanPlanes,
+    dirty: { faces: false, layout: true, bom: true }
+  });
+
+  const prac =
+    params.currentLayout && (params.currentLayout.sheetOrderMode || 'practical') === 'practical'
+      ? params.currentLayout
+      : ensureLayout(baseState, {
+          sheetSpec: params.sheetSpec,
+          startPlaneId: params.startPlaneId,
+          assets: params.assets,
+          pitchBreaks: params.pitchBreaks,
+          sheetOrderMode: 'practical',
+          strictDirtyCheck: true
+        }).layout;
+
+  const opt =
+    params.currentLayout && params.currentLayout.sheetOrderMode === 'optimized'
+      ? params.currentLayout
+      : ensureLayout(baseState, {
+          sheetSpec: params.sheetSpec,
+          startPlaneId: params.startPlaneId,
+          assets: params.assets,
+          pitchBreaks: params.pitchBreaks,
+          sheetOrderMode: 'optimized',
+          strictDirtyCheck: true
+        }).layout;
+
+  if (!prac || !opt) return undefined;
+  const countDistinctMm = (parents: LayoutResult['parents']) =>
+    new Set(parents.map((p) => Math.round(p.length * 1000))).size;
+
+  return {
+    practicalOrderedLm: +prac.totalOrderedMetres.toFixed(2),
+    practicalSheetsCount: prac.parents.length,
+    practicalDistinctLengths: countDistinctMm(prac.parents),
+    optimizedOrderedLm: +opt.totalOrderedMetres.toFixed(2),
+    optimizedSheetsCount: opt.parents.length,
+    optimizedDistinctLengths: countDistinctMm(opt.parents)
+  };
+}
+
+/**
  * Ensures BOM & optional OrderPack strictly after faces + layout are clean and area-sanity checked.
  */
 export function ensureBom(
@@ -521,6 +825,8 @@ export function ensureBom(
     assignments?: RoofFlashingAssignment[];
     assignableLines?: AssignableRoofLine[];
     strictDirtyCheck?: boolean;
+    strictAreaSanity?: boolean;
+    maxInflationRatio?: number;
     project?: Project | null;
     libraryProfiles?: FlashingProfile[];
     wallPlan?: WallPlan | null;
@@ -536,7 +842,7 @@ export function ensureBom(
   areaSanity: RoofAreaSanityResult;
 } {
   let working = state;
-  if (working.dirty.faces || working.dirty.layout || !working.layout) {
+  if (working.dirty.faces || working.dirty.layout || (working.planes.length > 0 && !working.layout)) {
     const ensured = ensureLayout(working, {
       sheetSpec: params.sheetSpec,
       sheetOrderMode: params.sheetOrderMode,
@@ -544,12 +850,22 @@ export function ensureBom(
       startEdgeId: params.startEdgeId,
       assets: params.assets,
       pitchBreaks: params.pitchBreaks,
-      strictDirtyCheck: params.strictDirtyCheck
+      strictDirtyCheck: params.strictDirtyCheck,
+      maxInflationRatio: params.maxInflationRatio
     });
     working = ensured.state;
   }
 
-  const areaSanity = checkRoofAreaSanity(working.levels, working.planes);
+  const areaSanity = checkRoofAreaSanity(working.levels, working.planes, {
+    maxInflationRatio: params.maxInflationRatio
+  });
+  if (params.strictAreaSanity && !areaSanity.ok) {
+    throw new Error(
+      areaSanity.warning ||
+        'RoofPipeline: area sanity check failed — resolve overlapping or duplicate roof faces before BOM lock/push.'
+    );
+  }
+
   const bom = buildRoofBillOfMaterials({
     planes: working.planes,
     levels: working.levels,
@@ -558,7 +874,8 @@ export function ensureBom(
     assignableLines: params.assignableLines || [],
     assets: params.assets || [],
     sheetOrderMode: params.sheetOrderMode,
-    comparisonSummary: params.comparisonSummary
+    comparisonSummary: params.comparisonSummary,
+    maxInflationRatio: params.maxInflationRatio
   });
 
   if (areaSanity.warning && !bom.areaSanityWarning) {
@@ -605,6 +922,48 @@ export function ensureBom(
   };
 }
 
+/**
+ * Safe OrderPack read/build wrapper via RoofPipeline so UI components never import buildOrderPack directly.
+ */
+export function buildOrderPackViaPipeline(params: {
+  project?: Project | null;
+  planes: RoofPlane[];
+  levels?: RoofLevel[];
+  layout: LayoutResult | null;
+  bom: RoofBomSummary;
+  assignableLines: AssignableRoofLine[];
+  assignments: RoofFlashingAssignment[];
+  libraryProfiles: FlashingProfile[];
+  assets?: RoofAsset[];
+  wallPlan?: WallPlan | null;
+  completenessReport?: TakeoffCompletenessReport;
+  locked?: boolean;
+  confirmedAt?: string;
+  confirmedBy?: string;
+  sheetOrderMode?: SheetOrderMode;
+  comparisonSummary?: SheetOrderComparisonSummary;
+}): OrderPack {
+  const cleanPlanes = deduplicateRoofPlanes(params.planes);
+  return buildOrderPack({
+    project: params.project ?? undefined,
+    planes: cleanPlanes,
+    levels: params.levels,
+    layout: params.layout,
+    bom: params.bom,
+    assignableLines: params.assignableLines,
+    assignments: params.assignments,
+    libraryProfiles: params.libraryProfiles,
+    assets: params.assets,
+    wallPlan: params.wallPlan,
+    completenessReport: params.completenessReport,
+    locked: params.locked,
+    confirmedAt: params.confirmedAt,
+    confirmedBy: params.confirmedBy,
+    sheetOrderMode: params.sheetOrderMode,
+    comparisonSummary: params.comparisonSummary
+  });
+}
+
 const yieldEventLoopTick = (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -623,6 +982,7 @@ export async function runRoofPipelineBuildAsync(params: {
   pitchBreaks?: PitchBreakLine[];
   defaultPitchDeg?: number;
   preserveUserDeleted?: boolean;
+  allowAutoSkeletonWhenEmpty?: boolean;
   signal?: AbortSignal;
   onProgress?: (stage: string, pct: number) => void;
 }): Promise<{
@@ -656,7 +1016,10 @@ export async function runRoofPipelineBuildAsync(params: {
     for (let idx = 0; idx < targetIds.length; idx++) {
       checkAborted();
       const lid = targetIds[idx];
-      onProgress?.(`Solving roof lines (${idx + 1}/${targetIds.length})…`, 25 + Math.round(((idx + 1) / Math.max(1, targetIds.length)) * 35));
+      onProgress?.(
+        `Solving roof lines (${idx + 1}/${targetIds.length})…`,
+        25 + Math.round(((idx + 1) / Math.max(1, targetIds.length)) * 35)
+      );
       const skelRes = ensureSkeleton(working, {
         mode: 'auto',
         targetLevelIds: [lid]
@@ -672,7 +1035,8 @@ export async function runRoofPipelineBuildAsync(params: {
   const facesRes = ensureFaces(working, {
     defaultPitchDeg: params.defaultPitchDeg ?? 22.5,
     preserveUserDeleted:
-      params.action === 'build_faces' ? false : params.preserveUserDeleted
+      params.action === 'build_faces' ? false : params.preserveUserDeleted,
+    allowAutoSkeletonWhenEmpty: params.allowAutoSkeletonWhenEmpty
   });
   working = facesRes.state;
   createdCount = facesRes.createdCount;

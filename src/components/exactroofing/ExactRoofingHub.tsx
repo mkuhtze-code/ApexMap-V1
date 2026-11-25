@@ -34,9 +34,6 @@ import {
 } from '../../types/exactRoofing';
 import {
   getPresetOutline,
-  generateSkeletonLines,
-  createPlaneFromEdge,
-  generateCuttingLayout,
   buildOutlineFromPoints,
   classifyOutlineEdge,
   scaleSkeletonUniformly,
@@ -47,10 +44,7 @@ import {
   setEdgeWall,
   updateEdgeLength,
   applyRoofStylePreset,
-  syncPlanesWithOutlineAndSkeleton,
   createRoofLevel,
-  syncMultiLevelPlanes,
-  getMultiLevelPreset,
   getAssignableRoofLinesMultiLevel,
   computeFlashingPieceBreakdown,
   getRoofEdgeTypeMeta,
@@ -58,10 +52,6 @@ import {
   applySkeletonLineType,
   applyEaveSetback,
   applyEaveHeightToEdges,
-  applyPitchToPlanes,
-  applyDirectionToPlanes,
-  applyOrderedSheetLengthToPlanes,
-  deleteRoofPlanes,
   unsuppressOutlineEdges,
   remapSkeletonForOutlineResize,
   isStationaryEdgeType,
@@ -71,10 +61,19 @@ import {
   dist
 } from '../../utils/exactRoofingEngine';
 import {
+  buildOrderPackViaPipeline,
+  buildPresetPipelineState,
   checkRoofAreaSanity,
+  computeSheetOrderComparisonViaPipeline,
   createRoofPipelineState,
+  deletePlanesViaPipeline,
+  ensureBom,
+  ensureFaces,
   ensureLayout,
-  runRoofPipelineBuildAsync
+  ensureSkeleton,
+  runRoofPipelineBuildAsync,
+  updatePlanesBatchViaPipeline,
+  upsertSinglePlaneViaPipeline
 } from '../../utils/roofPipeline';
 import {
   batchUpdateWallFacetsInPlan,
@@ -92,8 +91,6 @@ import {
   saveProfileToSharedFlashingLibrary
 } from '../../utils/exactRoofingFlashingBridge';
 import {
-  buildOrderPack,
-  buildRoofBillOfMaterials,
   computeRoofingPacks,
   convertExactLayoutToRoofFacets
 } from '../../utils/exactRoofingBomBridge';
@@ -264,10 +261,9 @@ function getInitialRoofState(): SavedRoofState {
     // ignore storage parse failure
   }
 
-  const initOutline = getPresetOutline('rectangle_14x10');
-  const initSkel = generateSkeletonLines(initOutline);
-  const initLevels = normalizeLevelsFromState(initOutline, initSkel, []);
-  const initPlanes = syncMultiLevelPlanes(initLevels, [], 22.5).map((p, idx) => ({
+  const initPipe = buildPresetPipelineState('rectangle_14x10', 22.5);
+  const initLvl = initPipe.levels[0];
+  const initPlanes = initPipe.planes.map((p, idx) => ({
     ...p,
     underlapSide: idx % 2 === 0 ? ('left' as const) : ('right' as const),
     name:
@@ -282,10 +278,10 @@ function getInitialRoofState(): SavedRoofState {
 
   return {
     selectedPreset: 'rectangle_14x10',
-    outline: initOutline,
-    skeleton: initSkel,
+    outline: initLvl.outline,
+    skeleton: initLvl.skeleton,
     planes: initPlanes,
-    levels: initLevels,
+    levels: initPipe.levels,
     activeLevelId: 'level-1',
     startPlaneId: null,
     stage: 'measuring',
@@ -687,7 +683,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setOutline(focusLvl.outline);
       setSkeleton(focusLvl.skeleton);
     }
-    const synced = syncMultiLevelPlanes(nextLevels, prevPlanes, defaultPitchDeg);
+    const ensured = ensureFaces(
+      createRoofPipelineState({
+        levels: nextLevels,
+        planes: prevPlanes,
+        dirty: { faces: true }
+      }),
+      { defaultPitchDeg, preserveUserDeleted: true }
+    );
+    const synced = ensured.state.planes;
     setPlanes(synced);
     setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, nextLevels, synced) : prev));
     return synced;
@@ -717,12 +721,19 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
 
     const singleLevels = normalizeLevelsFromState(newOutline, newSkel, []);
-    setLevels(singleLevels);
+    const ensured = ensureFaces(
+      createRoofPipelineState({
+        levels: singleLevels,
+        planes: [],
+        dirty: { faces: true }
+      }),
+      { defaultPitchDeg: verified.pitchDeg, preserveUserDeleted: true }
+    );
+    setLevels(ensured.state.levels);
     setActiveLevelId('level-1');
-    setOutline(singleLevels[0].outline);
-    setSkeleton(singleLevels[0].skeleton);
-    const newPlanes = syncMultiLevelPlanes(singleLevels, [], verified.pitchDeg);
-    setPlanes(newPlanes);
+    setOutline(ensured.state.levels[0].outline);
+    setSkeleton(ensured.state.levels[0].skeleton);
+    setPlanes(ensured.state.planes);
     setAssets([]);
     setPitchBreaks([]);
     setFlashingAssignments([]);
@@ -815,27 +826,37 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
     if (pitchUpdates.size > 0 || dirUpdates.size > 0) {
       setPlanes((prev) => {
-        const nextPlanes = prev.map((plane) => {
+        let nextPlanes = [...prev];
+        prev.forEach((plane) => {
           const nextPitch = pitchUpdates.get(plane.id) ?? plane.pitchDeg;
           const nextDir = dirUpdates.get(plane.id) ?? plane.underlapSide;
-          if (nextPitch === plane.pitchDeg && nextDir === plane.underlapSide) return plane;
+          if (nextPitch === plane.pitchDeg && nextDir === plane.underlapSide) return;
           const owningLvl =
             levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
             levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
             focusedLevel;
           const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
-          if (!edge) return { ...plane, pitchDeg: nextPitch, underlapSide: nextDir };
-          return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
+          if (!edge) {
+            nextPlanes = nextPlanes.map((p) =>
+              p.id === plane.id ? { ...p, pitchDeg: nextPitch, underlapSide: nextDir } : p
+            );
+            return;
+          }
+          const upserted = upsertSinglePlaneViaPipeline({
+            levels,
+            planes: nextPlanes,
+            owningLevelId: owningLvl.id,
+            eaveEdge: edge,
             pitchDeg: nextPitch,
             underlapSide: nextDir,
             eaveHeightM: plane.eaveHeightM,
             sheetRunEdgeId: plane.sheetRunEdgeId,
             orderedSheetLengthM: plane.orderedSheetLengthM,
             name: plane.name,
-            levelId: plane.levelId || owningLvl.id,
-            levelCode: plane.levelCode || owningLvl.code,
-            levelName: plane.levelName || owningLvl.name
+            existingId: plane.id,
+            matchBy: 'planeId'
           });
+          nextPlanes = upserted.state.planes;
         });
         setWallPlan((wPrev) => (wPrev ? syncWallPlanWithRoof(wPrev, levels, nextPlanes) : wPrev));
         return nextPlanes;
@@ -879,20 +900,27 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
   };
 
-  // Recompute layout whenever roof areas, specs, assets, pitch breaks, start edge, or ordering mode change
+  // Recompute layout whenever roof areas, specs, assets, pitch breaks, start edge, or ordering mode change via RoofPipeline
   useEffect(() => {
     if (planes.length > 0) {
-      const res = generateCuttingLayout(planes, sheetSpec, {
+      const pipe = createRoofPipelineState({
+        levels,
+        planes,
+        dirty: { faces: false, layout: true }
+      });
+      const ensured = ensureLayout(pipe, {
+        sheetSpec,
         startPlaneId: startPlaneId || undefined,
         assets,
         pitchBreaks,
-        sheetOrderMode
+        sheetOrderMode,
+        strictDirtyCheck: true
       });
-      setLayoutResult(res);
+      setLayoutResult(ensured.layout);
     } else {
       setLayoutResult(null);
     }
-  }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks, sheetOrderMode]);
+  }, [levels, planes, sheetSpec, startPlaneId, assets, pitchBreaks, sheetOrderMode]);
 
   const handleSetStartPlane = (planeId: string) => {
     setStartPlaneId(planeId);
@@ -1030,26 +1058,30 @@ export const ExactRoofingHub: React.FC<Props> = ({
           eaveHeightM: e.eaveHeightM ?? baseZ
         }))
       };
-      const nextSkel = options?.autoGenerateSkeleton
-        ? generateSkeletonLines(normalizedNewOutline).map((s) => ({
-            ...s,
-            levelId: s.levelId ?? levelId
-          }))
-        : [];
-      const newLvl: RoofLevel = {
+      const newLvlBase: RoofLevel = {
         id: levelId,
         code: `L${nextIdx}`,
         name: `Roof ${nextIdx} (${baseZ}m)`,
         eaveHeightM: baseZ,
         outline: normalizedNewOutline,
-        skeleton: nextSkel
+        skeleton: []
       };
+      const newLvl = options?.autoGenerateSkeleton
+        ? ensureSkeleton(createRoofPipelineState({ levels: [newLvlBase], planes: [] }), {
+            mode: 'auto'
+          }).state.levels[0]
+        : newLvlBase;
       const nextLevels = [...levels, newLvl];
       setLevels(nextLevels);
       setActiveLevelId('all');
       setOutline(newLvl.outline);
       setSkeleton(newLvl.skeleton);
-      setPlanes((prev) => syncMultiLevelPlanes(nextLevels, prev));
+      setPlanes((prev) =>
+        ensureFaces(
+          createRoofPipelineState({ levels: nextLevels, planes: prev, dirty: { faces: true } }),
+          { preserveUserDeleted: true }
+        ).state.planes
+      );
       triggerNotice(
         options.attachedEdgeId
           ? `✓ Attached ${newLvl.code} roof section (click an edge to set Eave & Sheet direction)`
@@ -1079,10 +1111,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
       normalizedOutline.edges.length === 0
         ? []
         : options?.autoGenerateSkeleton && normalizedOutline.points.length >= 3
-        ? generateSkeletonLines(normalizedOutline).map((s) => ({
-            ...s,
-            levelId: s.levelId ?? targetLvl.id
-          }))
+        ? ensureSkeleton(
+            createRoofPipelineState({
+              levels: [{ ...targetLvl, outline: normalizedOutline, skeleton: [] }],
+              planes: []
+            }),
+            { mode: 'auto' }
+          ).state.levels[0].skeleton
         : options?.scaleFactor && options?.scaleAnchor
         ? scaleSkeletonUniformly(targetLvl.skeleton, options.scaleFactor, options.scaleAnchor).map(
             (s) => ({ ...s, levelId: s.levelId ?? targetLvl.id })
@@ -1104,7 +1139,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setSkeleton(nextSkel);
     }
     if (normalizedOutline.edges.length > 0) {
-      setPlanes((prev) => syncMultiLevelPlanes(nextLevels, prev));
+      setPlanes((prev) =>
+        ensureFaces(
+          createRoofPipelineState({ levels: nextLevels, planes: prev, dirty: { faces: true } }),
+          { preserveUserDeleted: true }
+        ).state.planes
+      );
     } else if (nextLevels.length === 1) {
       setPlanes([]);
       setAssets([]);
@@ -1129,27 +1169,45 @@ export const ExactRoofingHub: React.FC<Props> = ({
         grouped.get(resolvedId)?.push({ ...s, levelId: resolvedId });
       });
 
-      const nextLevels = levels.map((l) => ({
+      const rawNextLevels = levels.map((l) => ({
         ...l,
         skeleton: grouped.get(l.id) || []
       }));
-      setLevels(nextLevels);
-      setSkeleton(grouped.get(focusedLevel.id) || []);
-      if (nextLevels.some((l) => l.outline.edges.length > 0)) {
-        setPlanes((prev) => syncMultiLevelPlanes(nextLevels, prev));
+      const manPipe = ensureSkeleton(
+        createRoofPipelineState({ levels: rawNextLevels, planes }),
+        { mode: 'manual' }
+      ).state;
+      setLevels(manPipe.levels);
+      setSkeleton(manPipe.levels.find((l) => l.id === focusedLevel.id)?.skeleton || []);
+      if (manPipe.levels.some((l) => l.outline.edges.length > 0)) {
+        setPlanes((prev) =>
+          ensureFaces(
+            createRoofPipelineState({ levels: manPipe.levels, planes: prev, dirty: { faces: true } }),
+            { preserveUserDeleted: true }
+          ).state.planes
+        );
       }
       return;
     }
 
     const targetLvl = focusedLevel;
     const normalizedSkel = newSkel.map((s) => ({ ...s, levelId: s.levelId ?? targetLvl.id }));
-    const nextLevels = levels.map((l) =>
+    const rawNextLevels = levels.map((l) =>
       l.id === targetLvl.id ? { ...l, skeleton: normalizedSkel } : l
     );
-    setLevels(nextLevels);
-    setSkeleton(normalizedSkel);
+    const manPipe = ensureSkeleton(
+      createRoofPipelineState({ levels: rawNextLevels, planes }),
+      { mode: 'manual', targetLevelIds: [targetLvl.id] }
+    ).state;
+    setLevels(manPipe.levels);
+    setSkeleton(manPipe.levels.find((l) => l.id === targetLvl.id)?.skeleton || normalizedSkel);
     if (targetLvl.outline.edges.length > 0) {
-      setPlanes((prev) => syncMultiLevelPlanes(nextLevels, prev));
+      setPlanes((prev) =>
+        ensureFaces(
+          createRoofPipelineState({ levels: manPipe.levels, planes: prev, dirty: { faces: true } }),
+          { preserveUserDeleted: true }
+        ).state.planes
+      );
     }
   };
 
@@ -1328,26 +1386,29 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // Live Pitch Adjustment
   const handleUpdatePlanePitch = (planeId: string, pitchDeg: number) => {
     if (isReadOnlyGeometry) return;
-    const nextPlanes = planes.map((plane) => {
-      if (plane.id !== planeId) return plane;
-      const owningLvl =
-        levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
-        levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
-        focusedLevel;
-      const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
-      if (!edge) return { ...plane, pitchDeg };
-      return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
-        pitchDeg,
-        underlapSide: plane.underlapSide,
-        eaveHeightM: plane.eaveHeightM,
-        sheetRunEdgeId: plane.sheetRunEdgeId,
-        orderedSheetLengthM: plane.orderedSheetLengthM,
-        name: plane.name,
-        levelId: plane.levelId || owningLvl.id,
-        levelCode: plane.levelCode || owningLvl.code,
-        levelName: plane.levelName || owningLvl.name
-      });
-    });
+    const plane = planes.find((p) => p.id === planeId);
+    if (!plane) return;
+    const owningLvl =
+      levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
+      levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
+      focusedLevel;
+    const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
+    const nextPlanes = !edge
+      ? planes.map((p) => (p.id === planeId ? { ...p, pitchDeg } : p))
+      : upsertSinglePlaneViaPipeline({
+          levels,
+          planes,
+          owningLevelId: owningLvl.id,
+          eaveEdge: edge,
+          pitchDeg,
+          underlapSide: plane.underlapSide,
+          eaveHeightM: plane.eaveHeightM,
+          sheetRunEdgeId: plane.sheetRunEdgeId,
+          orderedSheetLengthM: plane.orderedSheetLengthM,
+          name: plane.name,
+          existingId: plane.id,
+          matchBy: 'planeId'
+        }).state.planes;
     setPlanes(nextPlanes);
     setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, levels, nextPlanes) : prev));
   };
@@ -1355,28 +1416,32 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // Live Lay Direction Adjustment
   const handleUpdatePlaneDirection = (planeId: string, underlapSide: 'left' | 'right') => {
     if (isReadOnlyGeometry) return;
-    setPlanes((prev) =>
-      prev.map((plane) => {
-        if (plane.id !== planeId) return plane;
-        const owningLvl =
-          levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
-          levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
-          focusedLevel;
-        const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
-        if (!edge) return { ...plane, underlapSide };
-        return createPlaneFromEdge(owningLvl.outline, owningLvl.skeleton, edge, {
-          pitchDeg: plane.pitchDeg,
-          underlapSide,
-          eaveHeightM: plane.eaveHeightM,
-          sheetRunEdgeId: plane.sheetRunEdgeId,
-          orderedSheetLengthM: plane.orderedSheetLengthM,
-          name: plane.name,
-          levelId: plane.levelId || owningLvl.id,
-          levelCode: plane.levelCode || owningLvl.code,
-          levelName: plane.levelName || owningLvl.name
-        });
-      })
-    );
+    setPlanes((prev) => {
+      const plane = prev.find((p) => p.id === planeId);
+      if (!plane) return prev;
+      const owningLvl =
+        levels.find((l) => l.id === (plane.levelId || 'level-1')) ||
+        levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === plane.eaveEdgeId)) ||
+        focusedLevel;
+      const edge = getAllOutlineEdges(owningLvl.outline).find((e) => e.id === plane.eaveEdgeId);
+      if (!edge) {
+        return prev.map((p) => (p.id === planeId ? { ...p, underlapSide } : p));
+      }
+      return upsertSinglePlaneViaPipeline({
+        levels,
+        planes: prev,
+        owningLevelId: owningLvl.id,
+        eaveEdge: edge,
+        pitchDeg: plane.pitchDeg,
+        underlapSide,
+        eaveHeightM: plane.eaveHeightM,
+        sheetRunEdgeId: plane.sheetRunEdgeId,
+        orderedSheetLengthM: plane.orderedSheetLengthM,
+        name: plane.name,
+        existingId: plane.id,
+        matchBy: 'planeId'
+      }).state.planes;
+    });
   };
 
   // Site-Measured / Actual Sheet Length to Order Override (Does NOT alter plan geometry)
@@ -1541,7 +1606,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
     const cleanedPrevPlanes = planes.filter(
       (p) => (p.levelId || 'level-1') !== targetLvl.id
     );
-    const nextPlanes = syncMultiLevelPlanes(nextLevels, cleanedPrevPlanes);
+    const ensured = ensureFaces(
+      createRoofPipelineState({
+        levels: nextLevels,
+        planes: cleanedPrevPlanes,
+        dirty: { faces: true }
+      }),
+      { preserveUserDeleted: true }
+    );
+    const nextPlanes = ensured.state.planes;
 
     setLevels(nextLevels);
     setOutline(seeded.outline);
@@ -1596,53 +1669,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedPreset(key);
     setIsTemplateDropdownOpen(false);
 
-    if (key === 'two_storey_split' || key === 'cascading_terrace') {
-      const multi = getMultiLevelPreset(key, 22.5);
-      setLevels(multi.levels);
-      setActiveLevelId('all');
-      setOutline(multi.levels[0].outline);
-      setSkeleton(multi.levels[0].skeleton);
-      setPlanes(multi.planes);
-      setAssets([]);
-      setPitchBreaks([]);
-      setFlashingAssignments([]);
-      setSelectedPlaneId(null);
-      setSelectedAssetId(null);
-      setSelectedPitchBreakId(null);
-      clearMultiSelections();
-      resetUndoHistory();
-      triggerNotice(
-        key === 'two_storey_split'
-          ? '✓ Loaded 2-Storey Split Roof (2.7m & 5.4m Z)'
-          : '✓ Loaded 3-Tier Cascading Terraced Roof'
-      );
-      return;
-    }
+    const pipe = buildPresetPipelineState(key, 22.5);
+    const isMultiTier = key === 'two_storey_split' || key === 'cascading_terrace';
 
-    let newOutline = getPresetOutline(key);
-    let newSkel = generateSkeletonLines(newOutline);
-
-    // Classic Duo-Pitch Gable loads with actual Gable Ends ready on left & right walls
-    if (key === 'straight_gable') {
-      const res1 = toggleJunctionGable(newOutline, newSkel, 'junction-edge-out-2');
-      if (res1.toggledTo) {
-        newOutline = res1.outline;
-        newSkel = res1.skeleton;
-      }
-      const res2 = toggleJunctionGable(newOutline, newSkel, 'junction-edge-out-4');
-      if (res2.toggledTo) {
-        newOutline = res2.outline;
-        newSkel = res2.skeleton;
-      }
-    }
-
-    const singleLevels = normalizeLevelsFromState(newOutline, newSkel, []);
-    setLevels(singleLevels);
-    setActiveLevelId('level-1');
-    setOutline(singleLevels[0].outline);
-    setSkeleton(singleLevels[0].skeleton);
-    const newPlanes = syncMultiLevelPlanes(singleLevels, []);
-    setPlanes(newPlanes);
+    setLevels(pipe.levels);
+    setActiveLevelId(isMultiTier ? 'all' : 'level-1');
+    setOutline(pipe.levels[0].outline);
+    setSkeleton(pipe.levels[0].skeleton);
+    setPlanes(pipe.planes);
     setAssets([]);
     setPitchBreaks([]);
     setFlashingAssignments([]);
@@ -1651,7 +1685,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedPitchBreakId(null);
     clearMultiSelections();
     resetUndoHistory();
-    triggerNotice(`✓ Loaded ${key.replace(/_/g, ' ')}`);
+    triggerNotice(
+      key === 'two_storey_split'
+        ? '✓ Loaded 2-Storey Split Roof (2.7m & 5.4m Z)'
+        : key === 'cascading_terrace'
+        ? '✓ Loaded 3-Tier Cascading Terraced Roof'
+        : `✓ Loaded ${key.replace(/_/g, ' ')}`
+    );
   };
 
   // Clear Canvas to Start Blank
@@ -1688,14 +1728,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const handleImportOutline = (newOutline: RoofOutline) => {
     setSelectedPreset('custom');
     setIsTemplateDropdownOpen(false);
-    const newSkel = generateSkeletonLines(newOutline);
-    const singleLevels = normalizeLevelsFromState(newOutline, newSkel, []);
-    setLevels(singleLevels);
+    const singleLevels = normalizeLevelsFromState(newOutline, [], []);
+    let pipe = createRoofPipelineState({ levels: singleLevels, planes: [] });
+    pipe = ensureSkeleton(pipe, { mode: 'auto' }).state;
+    pipe = ensureFaces(pipe, { defaultPitchDeg: 22.5, preserveUserDeleted: true }).state;
+    setLevels(pipe.levels);
     setActiveLevelId('level-1');
-    setOutline(singleLevels[0].outline);
-    setSkeleton(singleLevels[0].skeleton);
-    const newPlanes = syncMultiLevelPlanes(singleLevels, []);
-    setPlanes(newPlanes);
+    setOutline(pipe.levels[0].outline);
+    setSkeleton(pipe.levels[0].skeleton);
+    setPlanes(pipe.planes);
     setAssets([]);
     setPitchBreaks([]);
     setFlashingAssignments([]);
@@ -1710,14 +1751,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
     if (isReadOnlyGeometry || planeIds.length === 0) return;
     pushUndoSnapshot();
     const idSet = new Set(planeIds);
-    const res = deleteRoofPlanes(levels, planes, planeIds);
-    setLevels(res.levels);
-    const focusLvl = res.levels.find((l) => l.id === focusedLevel.id) || res.levels[0];
+    const pipeRes = deletePlanesViaPipeline(
+      createRoofPipelineState({ levels, planes, dirty: { faces: false } }),
+      planeIds
+    );
+    setLevels(pipeRes.levels);
+    const focusLvl = pipeRes.levels.find((l) => l.id === focusedLevel.id) || pipeRes.levels[0];
     if (focusLvl) {
       setOutline(focusLvl.outline);
       setSkeleton(focusLvl.skeleton);
     }
-    setPlanes(res.planes);
+    setPlanes(pipeRes.planes);
+    setLayoutResult(null);
     setAssets((prev) => prev.filter((a) => !idSet.has(a.planeId)));
     setPitchBreaks((prev) => prev.filter((pb) => !idSet.has(pb.planeId)));
     if (selectedPlaneId && idSet.has(selectedPlaneId)) {
@@ -1727,7 +1772,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
     if (startPlaneId && idSet.has(startPlaneId)) {
       setStartPlaneId(null);
     }
-    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, res.levels, res.planes) : prev));
+    setWallPlan((prev) =>
+      prev ? syncWallPlanWithRoof(prev, pipeRes.levels, pipeRes.planes) : prev
+    );
     triggerNotice(
       planeIds.length === 1
         ? 'Roof face removed (outline & roof lines kept)'
@@ -1963,23 +2010,34 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const handleBatchPlanePitch = (planeIds: string[], pitchDeg: number) => {
     if (isReadOnlyGeometry || planeIds.length === 0) return;
     pushUndoSnapshot();
-    const nextPlanes = applyPitchToPlanes(planes, planeIds, pitchDeg, levels);
-    setPlanes(nextPlanes);
-    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, levels, nextPlanes) : prev));
+    const pipeRes = updatePlanesBatchViaPipeline(
+      createRoofPipelineState({ levels, planes, dirty: { faces: false } }),
+      { planeIds, pitchDeg }
+    );
+    setPlanes(pipeRes.planes);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, levels, pipeRes.planes) : prev));
     triggerNotice(`✓ Applied ${pitchDeg}° pitch to ${planeIds.length} faces`);
   };
 
   const handleBatchPlaneDirection = (planeIds: string[], dir: 'left' | 'right') => {
     if (isReadOnlyGeometry || planeIds.length === 0) return;
     pushUndoSnapshot();
-    setPlanes((prev) => applyDirectionToPlanes(prev, planeIds, dir));
+    const pipeRes = updatePlanesBatchViaPipeline(
+      createRoofPipelineState({ levels, planes, dirty: { faces: false } }),
+      { planeIds, underlapSide: dir }
+    );
+    setPlanes(pipeRes.planes);
     triggerNotice(`✓ Set lay direction (${dir === 'left' ? 'L→R' : 'R→L'}) on ${planeIds.length} faces`);
   };
 
   const handleBatchPlaneOrderedSheetLength = (planeIds: string[], lenM: number | undefined) => {
     if (isReadOnlyGeometry || planeIds.length === 0) return;
     pushUndoSnapshot();
-    setPlanes((prev) => applyOrderedSheetLengthToPlanes(prev, planeIds, lenM));
+    const pipeRes = updatePlanesBatchViaPipeline(
+      createRoofPipelineState({ levels, planes, dirty: { faces: false } }),
+      { planeIds, orderedSheetLengthM: lenM === undefined ? null : lenM }
+    );
+    setPlanes(pipeRes.planes);
     triggerNotice(
       lenM !== undefined
         ? `✓ Ordered sheet length set to ${Math.round(lenM * 1000)}mm on ${planeIds.length} faces`
@@ -2118,16 +2176,28 @@ export const ExactRoofingHub: React.FC<Props> = ({
     });
 
     const pitchDefault = updates.pitchDeg ?? 22.5;
-    let syncedPlanes = syncMultiLevelPlanes(nextLevels, planes, pitchDefault);
-    const matchedPlaneIds = syncedPlanes
+    let pipeState = ensureFaces(
+      createRoofPipelineState({
+        levels: nextLevels,
+        planes,
+        dirty: { faces: true }
+      }),
+      { defaultPitchDeg: pitchDefault, preserveUserDeleted: true }
+    ).state;
+    const matchedPlaneIds = pipeState.planes
       .filter((p) => targetSet.has(p.eaveEdgeId))
       .map((p) => p.id);
-    if (matchedPlaneIds.length > 0 && updates.pitchDeg !== undefined) {
-      syncedPlanes = applyPitchToPlanes(syncedPlanes, matchedPlaneIds, updates.pitchDeg, nextLevels);
+    if (
+      matchedPlaneIds.length > 0 &&
+      (updates.pitchDeg !== undefined || updates.underlapSide !== undefined)
+    ) {
+      pipeState = updatePlanesBatchViaPipeline(pipeState, {
+        planeIds: matchedPlaneIds,
+        pitchDeg: updates.pitchDeg,
+        underlapSide: updates.underlapSide
+      });
     }
-    if (matchedPlaneIds.length > 0 && updates.underlapSide !== undefined) {
-      syncedPlanes = applyDirectionToPlanes(syncedPlanes, matchedPlaneIds, updates.underlapSide);
-    }
+    const syncedPlanes = pipeState.planes;
 
     setLevels(nextLevels);
     const updatedFocus = nextLevels.find((l) => l.id === focusedLevel.id);
@@ -2253,25 +2323,24 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
 
     const existingPlane = planes.find((p) => p.eaveEdgeId === targetEaveId);
-    const customPlane = createPlaneFromEdge(nextOutline, nextSkel, updatedEdge, {
+    const upserted = upsertSinglePlaneViaPipeline({
+      levels: nextLevels,
+      planes,
+      owningLevelId: owningLvl.id,
+      eaveEdge: updatedEdge,
       pitchDeg: options.pitchDeg,
       underlapSide: options.underlapSide,
       eaveHeightM: clampedZ,
       sheetRunEdgeId: options.sheetRunEdgeId || targetEaveId,
       orderedSheetLengthM: existingPlane?.orderedSheetLengthM,
       name: options.name,
-      levelId: owningLvl.id,
-      levelCode: owningLvl.code,
-      levelName: owningLvl.name
+      existingId: existingPlane?.id,
+      matchBy: 'eaveEdgeId'
     });
 
-    const seedPlanes = [
-      ...planes.filter((p) => p.eaveEdgeId !== targetEaveId),
-      customPlane
-    ];
-    applyLevelsUpdate(nextLevels, seedPlanes, options.pitchDeg);
-    setSelectedPlaneId(customPlane.id);
-    triggerNotice(`✓ ${customPlane.name} · ${options.pitchDeg}° @ Z:${clampedZ}m`);
+    applyLevelsUpdate(nextLevels, upserted.state.planes, options.pitchDeg);
+    setSelectedPlaneId(upserted.plane.id);
+    triggerNotice(`✓ ${upserted.plane.name} · ${options.pitchDeg}° @ Z:${clampedZ}m`);
   };
 
   // Generate Layout Button (via single RoofPipeline CPU ensureLayout)
@@ -2328,6 +2397,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
     [assignableLines, flashingAssignments]
   );
 
+  const areaSanity = useMemo(
+    () => checkRoofAreaSanity(levels, planes),
+    [levels, planes]
+  );
+
   const completenessReport = useMemo(
     () =>
       evaluateTakeoffCompleteness({
@@ -2336,62 +2410,64 @@ export const ExactRoofingHub: React.FC<Props> = ({
         assignableLines,
         flashingAssignments,
         wallPlan,
-        assets
+        assets,
+        areaSanity
       }),
-    [levels, planes, assignableLines, flashingAssignments, wallPlan, assets]
+    [levels, planes, assignableLines, flashingAssignments, wallPlan, assets, areaSanity]
   );
 
-  const sheetOrderComparison = useMemo<SheetOrderComparisonSummary | undefined>(() => {
-    if (planes.length === 0) return undefined;
-    const prac =
-      layoutResult && (layoutResult.sheetOrderMode || 'practical') === 'practical'
-        ? layoutResult
-        : generateCuttingLayout(planes, sheetSpec, {
-            startPlaneId: startPlaneId || undefined,
-            assets,
-            pitchBreaks,
-            sheetOrderMode: 'practical'
-          });
-    const opt =
-      layoutResult && layoutResult.sheetOrderMode === 'optimized'
-        ? layoutResult
-        : generateCuttingLayout(planes, sheetSpec, {
-            startPlaneId: startPlaneId || undefined,
-            assets,
-            pitchBreaks,
-            sheetOrderMode: 'optimized'
-          });
-    const countDistinctMm = (parents: LayoutResult['parents']) =>
-      new Set(parents.map((p) => Math.round(p.length * 1000))).size;
-    return {
-      practicalOrderedLm: +prac.totalOrderedMetres.toFixed(2),
-      practicalSheetsCount: prac.parents.length,
-      practicalDistinctLengths: countDistinctMm(prac.parents),
-      optimizedOrderedLm: +opt.totalOrderedMetres.toFixed(2),
-      optimizedSheetsCount: opt.parents.length,
-      optimizedDistinctLengths: countDistinctMm(opt.parents)
-    };
-  }, [planes, sheetSpec, startPlaneId, assets, pitchBreaks, layoutResult]);
-
-  const areaSanity = useMemo(
-    () => checkRoofAreaSanity(levels, planes),
-    [levels, planes]
+  const sheetOrderComparison = useMemo<SheetOrderComparisonSummary | undefined>(
+    () =>
+      computeSheetOrderComparisonViaPipeline({
+        levels,
+        planes,
+        sheetSpec,
+        currentLayout: layoutResult,
+        startPlaneId: startPlaneId || undefined,
+        assets,
+        pitchBreaks
+      }),
+    [levels, planes, sheetSpec, startPlaneId, assets, pitchBreaks, layoutResult]
   );
 
-  // Computed BOM & Site Roofing Packs
+  // Computed BOM & Site Roofing Packs strictly via RoofPipeline
   const roofBom = useMemo(
     () =>
-      buildRoofBillOfMaterials({
-        planes,
-        levels,
-        layout: layoutResult,
-        assignments: flashingAssignments,
-        assignableLines,
-        assets,
-        sheetOrderMode,
-        comparisonSummary: sheetOrderComparison
-      }),
-    [planes, levels, layoutResult, flashingAssignments, assignableLines, assets, sheetOrderMode, sheetOrderComparison]
+      ensureBom(
+        createRoofPipelineState({
+          levels,
+          planes,
+          layout: layoutResult,
+          dirty: {
+            faces: false,
+            layout: !layoutResult && planes.length > 0,
+            bom: true
+          }
+        }),
+        {
+          sheetSpec,
+          sheetOrderMode,
+          comparisonSummary: sheetOrderComparison,
+          startPlaneId: startPlaneId || undefined,
+          assets,
+          pitchBreaks,
+          assignments: flashingAssignments,
+          assignableLines
+        }
+      ).bom,
+    [
+      planes,
+      levels,
+      layoutResult,
+      sheetSpec,
+      startPlaneId,
+      flashingAssignments,
+      assignableLines,
+      assets,
+      pitchBreaks,
+      sheetOrderMode,
+      sheetOrderComparison
+    ]
   );
 
   const roofingPacks = useMemo(
@@ -2417,7 +2493,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   const liveOrderPack = useMemo(() => {
     if (measureLocked && frozenOrderPack) return frozenOrderPack;
-    return buildOrderPack({
+    return buildOrderPackViaPipeline({
       project,
       planes,
       levels,
@@ -2615,74 +2691,79 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleConfirmLockMeasure = () => {
-    if (!completenessReport.canLockMeasure) {
+    if (!completenessReport.canLockMeasure || !areaSanity.ok) {
       setIsMeasureLockGateOpen(true);
-      triggerNotice(`Resolve ${completenessReport.blockersCount} blocker(s) before locking measure`);
+      triggerNotice(
+        !areaSanity.ok && areaSanity.warning
+          ? areaSanity.warning
+          : `Resolve ${completenessReport.blockersCount} blocker(s) before locking measure`
+      );
       return;
     }
     const confirmedAt = new Date().toISOString();
     const confirmedBy = activeMemberName || 'Site Lead';
-    const nextLayout =
-      layoutResult ||
-      (planes.length > 0
-        ? generateCuttingLayout(planes, sheetSpec, {
-            startPlaneId: startPlaneId || undefined,
-            assets,
-            pitchBreaks,
-            sheetOrderMode
-          })
-        : null);
-    if (nextLayout && !layoutResult) {
-      setLayoutResult(nextLayout);
+    try {
+      const pipeRes = ensureBom(
+        createRoofPipelineState({
+          levels,
+          planes,
+          layout: layoutResult,
+          dirty: {
+            faces: false,
+            layout: !layoutResult && planes.length > 0,
+            bom: true
+          }
+        }),
+        {
+          sheetSpec,
+          sheetOrderMode,
+          comparisonSummary: sheetOrderComparison,
+          startPlaneId: startPlaneId || undefined,
+          assets,
+          pitchBreaks,
+          assignments: flashingAssignments,
+          assignableLines,
+          strictDirtyCheck: true,
+          strictAreaSanity: true,
+          project,
+          libraryProfiles,
+          wallPlan,
+          completenessReport,
+          locked: true,
+          confirmedAt,
+          confirmedBy
+        }
+      );
+      if (pipeRes.state.layout && !layoutResult) {
+        setLayoutResult(pipeRes.state.layout);
+      }
+      const emittedOrderPack = pipeRes.orderPack!;
+      const nextSnap = buildCurrentSnapshot({
+        stage: 'installing',
+        measureLocked: true,
+        measureConfirmedAt: confirmedAt,
+        measureConfirmedBy: confirmedBy,
+        layout: pipeRes.state.layout || layoutResult || undefined,
+        bom: pipeRes.bom,
+        orderPack: emittedOrderPack
+      });
+      setFrozenOrderPack(emittedOrderPack);
+      setIsMeasureLockGateOpen(false);
+      setMeasureLocked(true);
+      setLifecycleStage('installing');
+      setActiveTab('layout_results');
+      setIsToolsDockOpen(false);
+      setIsInspectorOpen(false);
+      persistSnapshotToProject(nextSnap);
+      triggerNotice('Measure confirmed & locked · Order Pack emitted for site & yard');
+    } catch (err) {
+      setIsMeasureLockGateOpen(true);
+      triggerNotice(err instanceof Error ? err.message : 'Unable to lock measure');
     }
-    const nextBom = buildRoofBillOfMaterials({
-      planes,
-      layout: nextLayout,
-      assignments: flashingAssignments,
-      assignableLines,
-      assets,
-      sheetOrderMode,
-      comparisonSummary: sheetOrderComparison
-    });
-    const emittedOrderPack = buildOrderPack({
-      project,
-      planes,
-      levels,
-      layout: nextLayout,
-      bom: nextBom,
-      assignableLines,
-      assignments: flashingAssignments,
-      libraryProfiles,
-      assets,
-      wallPlan,
-      completenessReport,
-      locked: true,
-      confirmedAt,
-      confirmedBy,
-      sheetOrderMode,
-      comparisonSummary: sheetOrderComparison
-    });
-
-    const nextSnap = buildCurrentSnapshot({
-      stage: 'installing',
-      measureLocked: true,
-      measureConfirmedAt: confirmedAt,
-      measureConfirmedBy: confirmedBy,
-      orderPack: emittedOrderPack
-    });
-    setFrozenOrderPack(emittedOrderPack);
-    setIsMeasureLockGateOpen(false);
-    setMeasureLocked(true);
-    setLifecycleStage('installing');
-    setActiveTab('layout_results');
-    setIsToolsDockOpen(false);
-    setIsInspectorOpen(false);
-    persistSnapshotToProject(nextSnap);
-    triggerNotice('Measure confirmed & locked · Order Pack emitted for site & yard');
   };
 
   const handleRequestLockMeasure = () => {
-    if (!completenessReport.canLockMeasure || completenessReport.warningsCount > 0) {
+    if (!completenessReport.canLockMeasure || !areaSanity.ok || completenessReport.warningsCount > 0) {
       setIsMeasureLockGateOpen(true);
       return;
     }
@@ -2691,6 +2772,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   const handleJumpToCompletenessIssue = (issue: TakeoffCompletenessIssue) => {
     setIsMeasureLockGateOpen(false);
+    if (issue.category === 'area_sanity') {
+      setActiveTab('canvas_plan');
+      setIsToolsDockOpen(true);
+      return;
+    }
     if (issue.category === 'undetailed_return') {
       setWallFilterMode('returns');
       if (issue.targetId) {
@@ -4498,6 +4584,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
           assets={assets}
           wallPlan={wallPlan}
           completenessReport={completenessReport}
+          areaSanity={areaSanity}
           orderPack={liveOrderPack}
           sheetOrderMode={sheetOrderMode}
           onChangeSheetOrderMode={handleChangeSheetOrderMode}
@@ -6218,6 +6305,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         assets={assets}
         wallPlan={wallPlan}
         completenessReport={completenessReport}
+        areaSanity={areaSanity}
         orderPack={liveOrderPack}
         sheetOrderMode={sheetOrderMode}
         onChangeSheetOrderMode={handleChangeSheetOrderMode}

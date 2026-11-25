@@ -42,7 +42,9 @@ import {
   resolveFlashingProductCode
 } from './exactRoofingFlashingBridge';
 import {
+  DEFAULT_MAX_AREA_INFLATION_RATIO,
   computeAssetPlacementMetrics,
+  computeTruthfulRoofAreaM2,
   deduplicateRoofPlanes,
   getOutlineFootprintAreaM2,
   polygonArea
@@ -128,6 +130,7 @@ export function buildRoofBillOfMaterials(params: {
   assets?: RoofAsset[];
   sheetOrderMode?: SheetOrderMode;
   comparisonSummary?: SheetOrderComparisonSummary;
+  maxInflationRatio?: number;
 }): RoofBomSummary {
   const {
     planes,
@@ -137,7 +140,8 @@ export function buildRoofBillOfMaterials(params: {
     assignableLines = [],
     assets = [],
     sheetOrderMode,
-    comparisonSummary
+    comparisonSummary,
+    maxInflationRatio = DEFAULT_MAX_AREA_INFLATION_RATIO
   } = params;
   const resolvedOrderMode: SheetOrderMode = sheetOrderMode ?? layout?.sheetOrderMode ?? 'practical';
   const displayPlanes = getDisplayPlanes(planes, layout);
@@ -234,13 +238,17 @@ export function buildRoofBillOfMaterials(params: {
     }))
     .sort((a, b) => b.lengthMm - a.lengthMm);
 
-  const fallbackAreaM2 = structuralDisplayPlanes.reduce((s, p) => s + (p.area || 0), 0);
-  const totalRoofAreaM2 = +(layout?.totalRoofArea ?? fallbackAreaM2).toFixed(2);
+  const truthfulAreaM2 = computeTruthfulRoofAreaM2(structuralDisplayPlanes);
+  const totalRoofAreaM2 = +(
+    truthfulAreaM2 > 0 ? truthfulAreaM2 : (layout?.totalRoofArea ?? 0)
+  ).toFixed(2);
 
   let areaSanityWarning: string | undefined;
   const footprintAreaM2 = levels.reduce((s, l) => s + getOutlineFootprintAreaM2(l.outline), 0);
   if (footprintAreaM2 > 0.1 && structuralDisplayPlanes.length > 0) {
-    const rawStructuralCount = planes.filter((p) => !p.isVirtualAssetPlane).length;
+    const rawStructuralPlanes = planes.filter((p) => !p.isVirtualAssetPlane);
+    const rawStructuralCount = rawStructuralPlanes.length;
+    const rawAreaSum = rawStructuralPlanes.reduce((s, p) => s + Math.max(0, p.area || 0), 0);
     const planAreaSum = structuralDisplayPlanes.reduce(
       (s, p) => s + (p.planPolygon.length >= 3 ? polygonArea(p.planPolygon) : 0),
       0
@@ -249,13 +257,18 @@ export function buildRoofBillOfMaterials(params: {
       72,
       Math.max(1, ...structuralDisplayPlanes.map((p) => p.pitchDeg || 22.5))
     );
-    const expectedMax = (footprintAreaM2 / Math.max(0.3, Math.cos((maxPitch * Math.PI) / 180))) * 1.38 + 6;
+    const cosMin = Math.max(0.3, Math.cos((maxPitch * Math.PI) / 180));
+    const ratio = Math.max(1.05, maxInflationRatio);
+    const tolArea = Math.min(4, footprintAreaM2 * 0.08);
+    const expectedMax = (footprintAreaM2 / cosMin) * ratio + tolArea;
     if (
       rawStructuralCount > structuralDisplayPlanes.length ||
-      planAreaSum > footprintAreaM2 * 1.35 + 4 ||
+      rawAreaSum > totalRoofAreaM2 + 1.0 ||
+      planAreaSum > footprintAreaM2 * ratio + tolArea ||
       totalRoofAreaM2 > expectedMax
     ) {
-      areaSanityWarning = `Area sanity check: modeled roof (${totalRoofAreaM2.toFixed(1)}m²) exceeds expected net footprint band (${footprintAreaM2.toFixed(1)}m² plan) — verify overlapping or duplicate faces.`;
+      const reportedM2 = Math.max(totalRoofAreaM2, rawAreaSum);
+      areaSanityWarning = `Area sanity check: modeled roof (${reportedM2.toFixed(1)}m²) exceeds expected net footprint band (${footprintAreaM2.toFixed(1)}m² plan) — verify overlapping or duplicate faces.`;
     }
   }
   const totalSheetsCount = sheetGroups.reduce((s, g) => s + g.count, 0) || layout?.parents.length || 0;

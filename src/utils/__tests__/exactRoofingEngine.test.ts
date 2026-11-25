@@ -38,9 +38,13 @@ import {
   removeCourtyardHoleFromOutline,
   polygonCentroid
 } from '../exactRoofingEngine';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   assertRoofDomainComplexity,
+  DEFAULT_MAX_AREA_INFLATION_RATIO,
   checkRoofAreaSanity,
+  computeSheetOrderComparisonViaPipeline,
   computeTruthfulRoofAreaM2,
   createRoofPipelineState,
   ensureBom,
@@ -53,6 +57,7 @@ import {
   invalidateSkeleton,
   runRoofPipelineBuildAsync
 } from '../roofPipeline';
+import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
 import { buildRoofSceneGroup } from '../../components/exactroofing/three/roofMeshBuilder';
 import type { PlanEdge, RoofLevel, RoofOutline, RoofPlane, SheetSpec, SkeletonLine } from '../../types/exactRoofing';
 
@@ -2033,7 +2038,6 @@ import {
   repositionAssetToPlane,
   resolveEffectivePlanesWithAssets
 } from '../exactRoofingEngine';
-import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
 import { deriveWallPlanFromRoofLevels } from '../wallCladdingEngine';
 
 const gablePreset34 = getMultiLevelPreset('straight_gable', 22.5);
@@ -3317,5 +3321,343 @@ await (async () => {
   }
 })();
 console.log('✓ Test 46 Passed: MAX_ROOF_DOMAIN_VERTICES guard & abortable async RoofPipeline runner verified.');
+
+// 47. TEST 47: Golden Simple Gable Rectangle + Pipeline-Only UI Contract + Rebuild x2 Idempotency
+{
+  // 1) Static contract: UI components must NEVER bypass RoofPipeline with direct engine geometry/BOM writers
+  const uiFiles = [
+    path.resolve(process.cwd(), 'src/components/exactroofing/ExactRoofingHub.tsx'),
+    path.resolve(process.cwd(), 'src/components/exactroofing/ExactRoofingOrderModal.tsx'),
+    path.resolve(process.cwd(), 'src/components/exactroofing/ExactRoofingCanvas.tsx')
+  ];
+  const forbiddenDirectTokens = [
+    /\bgenerateSkeletonLines\b/,
+    /\bsyncMultiLevelPlanes\b/,
+    /\bsyncPlanesWithOutlineAndSkeleton\b/,
+    /\bbuildFacesFromClassification\b/,
+    /\bgenerateCuttingLayout\b/,
+    /\bbuildRoofBillOfMaterials\b/,
+    /\bbuildOrderPack\b/,
+    /\bcreatePlaneFromEdge\b/,
+    /\bdeleteRoofPlanes\b/,
+    /\bapplyPitchToPlanes\b/,
+    /\bapplyDirectionToPlanes\b/,
+    /\bapplyOrderedSheetLengthToPlanes\b/
+  ];
+  uiFiles.forEach((filePath) => {
+    const src = fs.readFileSync(filePath, 'utf8');
+    forbiddenDirectTokens.forEach((re) => {
+      if (re.test(src)) {
+        throw new Error(`UI bypass detected: ${path.basename(filePath)} references forbidden engine writer ${re}`);
+      }
+    });
+  });
+
+  // 2) Simple 12x8 gable via RoofPipeline: 2 faces, pitch-aware area band, idempotent rebuild x2
+  const gOut = applyEdgeType(
+    buildOutlineFromPoints(
+      [
+        { x: 0, y: 0 },
+        { x: 12, y: 0 },
+        { x: 12, y: 8 },
+        { x: 0, y: 8 }
+      ],
+      'golden-gable-47',
+      { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+    ),
+    [],
+    'verge'
+  );
+  const gOutTyped = applyEdgeType(gOut, [gOut.edges[1].id, gOut.edges[3].id], 'verge');
+  const gLvl: RoofLevel = {
+    id: 'lvl-47',
+    code: 'L1',
+    name: 'Golden Gable 12x8',
+    eaveHeightM: 2.7,
+    outline: gOutTyped,
+    skeleton: []
+  };
+  const sheet47: SheetSpec = { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 };
+
+  let p47 = createRoofPipelineState({ levels: [gLvl], planes: [] });
+  p47 = ensureSkeleton(p47, { mode: 'auto' }).state;
+  const f1 = ensureFaces(p47, { defaultPitchDeg: 22.5 });
+  const f2 = ensureFaces(f1.state, { defaultPitchDeg: 22.5 });
+  const expectedPitchArea = 96 / Math.cos((22.5 * Math.PI) / 180);
+  const area1 = computeTruthfulRoofAreaM2(f1.state.planes);
+  const area2 = computeTruthfulRoofAreaM2(f2.state.planes);
+  if (
+    f1.state.planes.length !== 2 ||
+    f2.state.planes.length !== 2 ||
+    Math.abs(area1 - expectedPitchArea) > 0.3 ||
+    Math.abs(area1 - area2) > 0.01
+  ) {
+    throw new Error(`Golden gable area/idempotency failed: count=${f2.state.planes.length}, area1=${area1}, area2=${area2}, expected=${expectedPitchArea.toFixed(2)}`);
+  }
+
+  const bomRes47 = ensureBom(f2.state, {
+    sheetSpec: sheet47,
+    comparisonSummary: computeSheetOrderComparisonViaPipeline({
+      levels: f2.state.levels,
+      planes: f2.state.planes,
+      sheetSpec: sheet47
+    })
+  });
+  if (
+    Math.abs(bomRes47.bom.totalRoofAreaM2 - area2) > 0.05 ||
+    !bomRes47.areaSanity.ok ||
+    bomRes47.areaSanity.hardBlockBomPush
+  ) {
+    throw new Error(`Golden gable BOM truthful area mismatch: bom=${bomRes47.bom.totalRoofAreaM2}, truthful=${area2}`);
+  }
+}
+console.log('✓ Test 47 Passed: Pipeline-only UI boundary & simple gable golden area truth + rebuild x2 idempotency verified.');
+
+// 48. TEST 48: Golden Rectangle + Courtyard Hole Area Truth & Open Center via RoofPipeline
+{
+  let holeOut48 = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 14 },
+      { x: 0, y: 14 }
+    ],
+    'golden-courtyard-48',
+    { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  holeOut48 = addCourtyardHoleToOutline(
+    holeOut48,
+    [
+      { x: 7, y: 5 },
+      { x: 13, y: 5 },
+      { x: 13, y: 9 },
+      { x: 7, y: 9 }
+    ],
+    { initialEdgeType: 'outline', eaveHeightM: 2.7 }
+  );
+  // 20x14 = 280m² minus 6x4 = 24m² => 256m² net footprint
+  const netFootprint48 = getOutlineFootprintAreaM2(holeOut48);
+  if (Math.abs(netFootprint48 - 256) > 0.05) {
+    throw new Error(`Expected 256m² net footprint for courtyard fixture, got ${netFootprint48}`);
+  }
+
+  const holeLvl48: RoofLevel = {
+    id: 'lvl-48',
+    code: 'L1',
+    name: 'Courtyard Golden',
+    eaveHeightM: 2.7,
+    outline: holeOut48,
+    skeleton: []
+  };
+  const sheet48: SheetSpec = { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 };
+  let p48 = createRoofPipelineState({ levels: [holeLvl48], planes: [] });
+  p48 = ensureSkeleton(p48, { mode: 'auto' }).state;
+  p48 = ensureFaces(p48, { defaultPitchDeg: 22.5 }).state;
+  const lay48 = ensureLayout(p48, { sheetSpec: sheet48, strictDirtyCheck: true });
+  const bom48 = ensureBom(lay48.state, { sheetSpec: sheet48, strictAreaSanity: true });
+
+  const holeRing48 = holeOut48.holes![0].points;
+  const anyCentroidInHole = bom48.state.planes.some((pl) => {
+    const c = polygonCentroid(pl.planPolygon);
+    return c.x > 7.2 && c.x < 12.8 && c.y > 5.2 && c.y < 8.8;
+  });
+  const expectedPitchNet48 = 256 / Math.cos((22.5 * Math.PI) / 180);
+  const truthful48 = computeTruthfulRoofAreaM2(bom48.state.planes);
+  if (
+    anyCentroidInHole ||
+    Math.abs(bom48.bom.totalRoofAreaM2 - truthful48) > 0.05 ||
+    Math.abs(truthful48 - expectedPitchNet48) > expectedPitchNet48 * 0.05 ||
+    holeRing48.length !== 4
+  ) {
+    throw new Error(
+      `Courtyard golden area failed: inHole=${anyCentroidInHole}, bomArea=${bom48.bom.totalRoofAreaM2}, truthful=${truthful48}, expected=${expectedPitchNet48.toFixed(2)}`
+    );
+  }
+}
+console.log('✓ Test 48 Passed: Courtyard hole golden area excludes void and matches BOM & cutting layout.');
+
+// 49. TEST 49: Configurable Area Sanity Ratio (1.45 default) Hard-Blocks BOM Push & Measure Lock
+{
+  if (DEFAULT_MAX_AREA_INFLATION_RATIO !== 1.45) {
+    throw new Error(`Expected DEFAULT_MAX_AREA_INFLATION_RATIO === 1.45, got ${DEFAULT_MAX_AREA_INFLATION_RATIO}`);
+  }
+  const rect49 = getPresetOutline('rectangle_14x10');
+  const lvl49: RoofLevel = {
+    id: 'lvl-49',
+    code: 'L1',
+    name: 'Sanity Block Fixture',
+    eaveHeightM: 2.7,
+    outline: rect49,
+    skeleton: []
+  };
+  const sheet49: SheetSpec = { coverWidth: 0.762, maxLength: 6.3, endLap: 0.15, overhang: 0.05 };
+  let p49 = createRoofPipelineState({ levels: [lvl49], planes: [] });
+  p49 = ensureSkeleton(p49, { mode: 'auto' }).state;
+  p49 = ensureFaces(p49, { defaultPitchDeg: 22.5 }).state;
+  p49 = ensureLayout(p49, { sheetSpec: sheet49 }).state;
+
+  // Duplicate planes (~2x) -> strictAreaSanity throws, completeness blocks Measure lock, OrderModal blocked
+  const dupPlanes49: RoofPlane[] = [
+    ...p49.planes,
+    ...p49.planes.map((pl, i) => ({ ...pl, id: `${pl.id}-dup49-${i}` }))
+  ];
+  const sanity49 = checkRoofAreaSanity(p49.levels, dupPlanes49);
+  if (sanity49.ok || !sanity49.hardBlockBomPush || sanity49.maxInflationRatio !== 1.45) {
+    throw new Error('Expected duplicated planes to trigger hardBlockBomPush with ratio 1.45');
+  }
+
+  let strictBomThrew = false;
+  try {
+    ensureBom(
+      {
+        ...p49,
+        planes: dupPlanes49,
+        dirty: { ...p49.dirty, faces: false, layout: false, bom: true }
+      },
+      { sheetSpec: sheet49, strictAreaSanity: true }
+    );
+  } catch (err) {
+    strictBomThrew = err instanceof Error && err.message.includes('Area sanity');
+  }
+  if (!strictBomThrew) {
+    throw new Error('ensureBom with strictAreaSanity: true must throw when area sanity fails');
+  }
+
+  const comp49 = evaluateTakeoffCompleteness({
+    levels: p49.levels,
+    planes: dupPlanes49,
+    assignableLines: [],
+    flashingAssignments: [],
+    wallPlan: null,
+    assets: [],
+    areaSanity: sanity49
+  });
+  if (comp49.canLockMeasure || !comp49.issues.some((i) => i.category === 'area_sanity' && i.severity === 'blocker')) {
+    throw new Error('evaluateTakeoffCompleteness must block Measure lock when areaSanity fails');
+  }
+
+  // Configurable threshold check: 1.25x single-set inflation passes default 1.45, fails custom 1.15
+  const slightlyInflated = p49.planes.map((pl) => ({
+    ...pl,
+    developedPolygon: undefined,
+    area: +((pl.area ?? 0) * 1.25).toFixed(2)
+  }));
+  const passDefault = checkRoofAreaSanity(p49.levels, slightlyInflated);
+  const failStrict = checkRoofAreaSanity(p49.levels, slightlyInflated, { maxInflationRatio: 1.15 });
+  if (!passDefault.ok || failStrict.ok || !failStrict.hardBlockBomPush) {
+    throw new Error(`Expected custom maxInflationRatio=1.15 to catch 1.25x inflation cleanly`);
+  }
+}
+console.log('✓ Test 49 Passed: Configurable area sanity guard hard-blocks BOM/Quote push and Measure lock.');
+
+// 50. TEST 50: Long Gable + Side Bay + Triangular End Sealed 3D Pipeline Smoke Check
+{
+  let out50 = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 16, y: 0 },
+      { x: 20, y: 4 },
+      { x: 16, y: 8 },
+      { x: 11, y: 8 },
+      { x: 11, y: 13 },
+      { x: 5, y: 13 },
+      { x: 5, y: 8 },
+      { x: 0, y: 8 }
+    ],
+    'golden-branch-tri-50',
+    { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  // Left wall (8 -> 0) and side bay end (11,13 -> 5,13) as gable verges
+  out50 = applyEdgeType(out50, [out50.edges[5].id, out50.edges[8].id], 'verge');
+
+  const skel50: SkeletonLine[] = [
+    { id: 'r50-main-w', levelId: 'lvl-50', from: { x: 0, y: 4 }, to: { x: 8, y: 4 }, suggestedType: 'ridge' },
+    { id: 'r50-main-e', levelId: 'lvl-50', from: { x: 8, y: 4 }, to: { x: 16, y: 4 }, suggestedType: 'ridge' },
+    { id: 'r50-bay', levelId: 'lvl-50', from: { x: 8, y: 4 }, to: { x: 8, y: 13 }, suggestedType: 'ridge' },
+    { id: 'v50-w', levelId: 'lvl-50', from: { x: 5, y: 8 }, to: { x: 8, y: 4 }, suggestedType: 'valley' },
+    { id: 'v50-e', levelId: 'lvl-50', from: { x: 11, y: 8 }, to: { x: 8, y: 4 }, suggestedType: 'valley' },
+    { id: 'h50-ne', levelId: 'lvl-50', from: { x: 16, y: 8 }, to: { x: 16, y: 4 }, suggestedType: 'hip' },
+    { id: 'h50-e', levelId: 'lvl-50', from: { x: 20, y: 4 }, to: { x: 16, y: 4 }, suggestedType: 'hip' },
+    { id: 'h50-se', levelId: 'lvl-50', from: { x: 16, y: 0 }, to: { x: 16, y: 4 }, suggestedType: 'hip' }
+  ];
+
+  const lvl50: RoofLevel = {
+    id: 'lvl-50',
+    code: 'L1',
+    name: 'Branch + Tri Corner 50',
+    eaveHeightM: 2.7,
+    outline: out50,
+    skeleton: skel50
+  };
+  let pipe50 = createRoofPipelineState({ levels: [lvl50], planes: [] });
+  pipe50 = ensureSkeleton(pipe50, { mode: 'manual' }).state;
+  // Colinear ridge segments r50-main-w & r50-main-e should merge cleanly unless manualSplit
+  const mergedRidges50 = pipe50.levels[0].skeleton.filter((s) => s.suggestedType === 'ridge');
+  if (mergedRidges50.length !== 2) {
+    throw new Error(`Expected colinear main ridge merge -> 2 ridges (main + bay), got ${mergedRidges50.length}`);
+  }
+  pipe50 = ensureFaces(pipe50, { defaultPitchDeg: 22.5 }).state;
+  const triFaces50 = pipe50.planes.filter((p) => p.planPolygon.length === 3);
+  if (pipe50.planes.length < 6 || triFaces50.length < 2) {
+    throw new Error(`Expected >=6 closed faces including >=2 triangular corner panels, got total=${pipe50.planes.length}, tri=${triFaces50.length}`);
+  }
+
+  // Sealed 3D verification via buildRoofSceneGroup + resource disposal
+  const dummyWallTexEntry = {
+    normalMap: null as any,
+    roughnessMap: null as any,
+    bumpMap: null as any,
+    normalScale: 1,
+    bumpScale: 0.02
+  };
+  const scene50 = buildRoofSceneGroup({
+    outline: pipe50.levels[0].outline,
+    skeleton: pipe50.levels[0].skeleton,
+    planes: pipe50.planes,
+    levels: pipe50.levels,
+    shadingMode: 'studio_finish',
+    swatch: { id: 'flaxpod', name: 'FlaxPod', hex: '#343635', metalness: 0.36, roughness: 0.42 },
+    textures: {
+      normalMap: null as any,
+      roughnessMap: null as any,
+      bumpMap: null as any,
+      dispose: () => {}
+    },
+    wallTextures: {
+      weatherboard: dummyWallTexEntry,
+      profiled_metal: dummyWallTexEntry,
+      brick: dummyWallTexEntry,
+      fibre_cement: dummyWallTexEntry,
+      plaster: dummyWallTexEntry,
+      stone: dummyWallTexEntry,
+      garageDoor: null as any,
+      garageDoorRoughness: null as any,
+      garageDoorBump: null as any,
+      getEntry: () => dummyWallTexEntry,
+      dispose: () => {}
+    },
+    showFlashings: false,
+    showWalls: false,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+
+  if (scene50.selectableMeshes.length !== pipe50.planes.length) {
+    scene50.dispose();
+    throw new Error(`Expected 1 3D mesh per committed plane (${pipe50.planes.length}), got ${scene50.selectableMeshes.length}`);
+  }
+  scene50.rootGroup.traverse((obj: any) => {
+    if (obj.isMesh && obj.geometry?.attributes?.position) {
+      const arr = obj.geometry.attributes.position.array as Float32Array;
+      for (let i = 0; i < arr.length; i++) {
+        if (!Number.isFinite(arr[i])) {
+          throw new Error('Non-finite 3D vertex coordinate detected in sealed branch/triangle mesh');
+        }
+      }
+    }
+  });
+  scene50.dispose();
+}
+console.log('✓ Test 50 Passed: Long gable + side bay + triangular end builds sealed 3D meshes through RoofPipeline cleanly.');
 
 console.log('ALL EXACT ROOFING ENGINE TESTS PASSED DETERMINISTICALLY! ✓');

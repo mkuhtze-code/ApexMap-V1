@@ -22,13 +22,32 @@ export interface EvaluateTakeoffCompletenessParams {
   flashingAssignments: RoofFlashingAssignment[];
   wallPlan: WallPlan | null;
   assets: RoofAsset[];
+  areaSanity?: {
+    ok: boolean;
+    warning?: string;
+    modeledAreaM2?: number;
+    footprintAreaM2?: number;
+    inflationRatio?: number;
+  };
 }
 
 export function evaluateTakeoffCompleteness(
   params: EvaluateTakeoffCompletenessParams
 ): TakeoffCompletenessReport {
-  const { levels, planes, assignableLines, flashingAssignments, wallPlan, assets } = params;
+  const { levels, planes, assignableLines, flashingAssignments, wallPlan, assets, areaSanity } = params;
   const issues: TakeoffCompletenessIssue[] = [];
+
+  if (areaSanity && !areaSanity.ok) {
+    issues.push({
+      id: 'issue-area-sanity-blocker',
+      category: 'area_sanity',
+      severity: 'blocker',
+      title: `Roof area sanity failed (${(areaSanity.modeledAreaM2 ?? 0).toFixed(1)}m² vs ${(areaSanity.footprintAreaM2 ?? 0).toFixed(1)}m² footprint)`,
+      detail:
+        areaSanity.warning ||
+        'Modeled roof area exceeds expected pitch-adjusted footprint band. Rebuild faces from classification or remove overlapping faces before locking or pushing BOM.'
+    });
+  }
 
   // 1. Wall faces, internal notch returns & overlapping openings
   let undetailedWallsCount = 0;

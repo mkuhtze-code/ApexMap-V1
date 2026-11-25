@@ -31,19 +31,20 @@ import {
 } from '../../utils/exactRoofingFlashingBridge';
 import {
   buildCompleteBomMaterialOrder,
-  buildOrderPack,
   buildQuoteSpreadsheetFromRoofBom,
   exportOrderPackToCsv,
   exportOrderPackToJson,
   exportRoofBomToCsv,
   getSheetOrderAssumptionText
 } from '../../utils/exactRoofingBomBridge';
+import { buildOrderPackViaPipeline } from '../../utils/roofPipeline';
 import {
   MODULAR_COIL_MATERIALS,
   MODULAR_TRAY_PROFILES
 } from '../../utils/pricingMatrix';
 import { formatNZDWithDecimals } from '../../utils/formatters';
 import {
+  AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -79,6 +80,14 @@ interface Props {
   assets?: RoofAsset[];
   wallPlan?: WallPlan | null;
   completenessReport?: TakeoffCompletenessReport;
+  areaSanity?: {
+    ok: boolean;
+    warning?: string;
+    inflationRatio?: number;
+    modeledAreaM2?: number;
+    footprintAreaM2?: number;
+    hardBlockBomPush?: boolean;
+  };
   orderPack?: OrderPack | null;
   sheetOrderMode?: SheetOrderMode;
   onChangeSheetOrderMode?: (mode: SheetOrderMode) => void;
@@ -122,6 +131,7 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   assets = [],
   wallPlan = null,
   completenessReport,
+  areaSanity,
   orderPack: propOrderPack = null,
   sheetOrderMode,
   onChangeSheetOrderMode,
@@ -237,7 +247,7 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   const resolvedOrderPack = useMemo(
     () =>
       propOrderPack ||
-      buildOrderPack({
+      buildOrderPackViaPipeline({
         project,
         planes,
         levels,
@@ -289,6 +299,11 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
 
   const isInstalling = lifecycleStage === 'installing';
   const showQuoteTab = lifecycleStage === 'quoting' && Boolean(onPushBomToQuote);
+  const isBomAreaBlocked = Boolean(bom.areaSanityWarning) || areaSanity?.ok === false;
+  const bomAreaBlockMessage =
+    areaSanity?.warning ||
+    bom.areaSanityWarning ||
+    'Modeled roof area exceeds pitch-adjusted footprint band. Rebuild faces from classification before pushing BOM or Quote.';
 
   const triggerDownload = (content: string, filename: string, mime: string) => {
     const blob = new Blob([content], { type: mime });
@@ -346,7 +361,7 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   };
 
   const handleDispatchCompleteOrder = () => {
-    if (isInstalling) return;
+    if (isInstalling || isBomAreaBlocked) return;
     const hasSheets = includeSheets && bom.sheetGroups.length > 0;
     const hasFlash = includeFlashings && bom.flashingAssignments.length > 0;
     const hasHw = includeHardware && bom.estimatedScrewBoxes > 0;
@@ -389,7 +404,7 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   };
 
   const handlePushToQuoteClick = () => {
-    if (!onPushBomToQuote || !showQuoteTab) return;
+    if (!onPushBomToQuote || !showQuoteTab || isBomAreaBlocked) return;
     onPushBomToQuote({
       targetQuoteId,
       profile: quoteProfile,
@@ -519,6 +534,18 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-5">
+          {isBomAreaBlocked && (
+            <div className="p-3.5 rounded-2xl bg-rose-950/85 border border-rose-500/60 text-rose-100 text-xs flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <div className="font-extrabold uppercase tracking-wider text-rose-300">
+                  BOM / Quote Push Blocked — Area Sanity Check Failed
+                </div>
+                <div className="text-rose-100/90 leading-relaxed">{bomAreaBlockMessage}</div>
+              </div>
+            </div>
+          )}
+
           {dispatchedNotice && (
             <div className="p-3.5 rounded-2xl bg-emerald-950/80 border border-emerald-500/50 text-emerald-200 text-xs font-bold flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -1643,25 +1670,27 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                 <button
                   type="button"
                   onClick={handlePushToQuoteClick}
-                  className="px-5 py-2.5 min-h-[42px] rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-extrabold flex items-center gap-1.5 shadow-lg cursor-pointer"
+                  disabled={isBomAreaBlocked}
+                  className="px-5 py-2.5 min-h-[42px] rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-extrabold flex items-center gap-1.5 shadow-lg cursor-pointer"
                 >
                   <FileSpreadsheet className="w-4 h-4" />
-                  <span>Push BOM to Quote</span>
+                  <span>{isBomAreaBlocked ? 'Blocked by Area Check' : 'Push BOM to Quote'}</span>
                 </button>
               ) : (
                 <button
                   type="button"
                   onClick={handleDispatchCompleteOrder}
                   disabled={
-                    (!includeSheets || bom.sheetGroups.length === 0) &&
-                    (!includeFlashings || assignments.length === 0) &&
-                    (!includeHardware || bom.estimatedScrewBoxes === 0) &&
-                    (!includeUnderlay || bom.estimatedUnderlayRolls === 0)
+                    isBomAreaBlocked ||
+                    ((!includeSheets || bom.sheetGroups.length === 0) &&
+                      (!includeFlashings || assignments.length === 0) &&
+                      (!includeHardware || bom.estimatedScrewBoxes === 0) &&
+                      (!includeUnderlay || bom.estimatedUnderlayRolls === 0))
                   }
-                  className="px-5 py-2.5 min-h-[42px] rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-white text-xs font-extrabold flex items-center gap-1.5 shadow-lg cursor-pointer"
+                  className="px-5 py-2.5 min-h-[42px] rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-extrabold flex items-center gap-1.5 shadow-lg cursor-pointer"
                 >
                   <ShoppingCart className="w-4 h-4" />
-                  <span>Place Material Order</span>
+                  <span>{isBomAreaBlocked ? 'Blocked by Area Check' : 'Place Material Order'}</span>
                 </button>
               )
             )}

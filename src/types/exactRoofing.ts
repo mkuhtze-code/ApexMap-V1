@@ -895,7 +895,8 @@ export type TakeoffCompletenessCategory =
   | 'missing_flashing'
   | 'incomplete_plane'
   | 'mixed_pitch'
-  | 'incomplete_penetration';
+  | 'incomplete_penetration'
+  | 'area_sanity';
 
 export interface TakeoffCompletenessIssue {
   id: string;

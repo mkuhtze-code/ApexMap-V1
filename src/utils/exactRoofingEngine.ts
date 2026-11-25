@@ -1093,15 +1093,6 @@ export function remapSkeletonForOutlineResize(
   prevSkeleton: SkeletonLine[]
 ): SkeletonLine[] {
   if (prevSkeleton.length === 0) return [];
-  const allAutoSkel = prevSkeleton.every((s) => s.id.includes('skel-'));
-  if (allAutoSkel && nextOutline.points.length >= 3) {
-    const levelId = prevSkeleton[0]?.levelId ?? nextOutline.levelId ?? prevOutline.levelId;
-    return generateSkeletonLines(nextOutline).map((s) => ({
-      ...s,
-      ...(levelId ? { levelId } : {})
-    }));
-  }
-
   if (
     prevOutline.points.length !== nextOutline.points.length ||
     prevOutline.edges.length !== nextOutline.edges.length ||
@@ -2922,53 +2913,6 @@ export function getRoofJunctionNodes(
   return nodes;
 }
 
-export function setEdgeMode(
-  outline: RoofOutline,
-  skeleton: SkeletonLine[],
-  edgeId: string,
-  targetMode: 'hipped' | 'gable' | 'wall'
-): {
-  outline: RoofOutline;
-  skeleton: SkeletonLine[];
-  toggledTo: 'hipped' | 'gable' | 'wall' | null;
-  edge?: PlanEdge;
-} {
-  const edge = outline.edges.find((e) => e.id === edgeId);
-  if (!edge) {
-    return { outline, skeleton, toggledTo: null };
-  }
-
-  // Ensure at least 1 roof edge remains an eave ('outline') so sloped roof sheets exist
-  if (targetMode === 'gable' || targetMode === 'wall') {
-    const remainingOutlineCount = outline.edges.filter(
-      (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
-    ).length;
-    if (remainingOutlineCount < 1) {
-      return { outline, skeleton, toggledTo: null, edge };
-    }
-  }
-
-  const nextEdgeType: PlanEdge['type'] =
-    targetMode === 'gable' ? 'verge' : targetMode === 'wall' ? 'wall' : 'outline';
-
-  if (edge.type === nextEdgeType) {
-    return { outline, skeleton, toggledTo: targetMode, edge };
-  }
-
-  const nextOutline: RoofOutline = {
-    ...outline,
-    edges: outline.edges.map((e) => (e.id === edgeId ? { ...e, type: nextEdgeType } : e))
-  };
-  const nextSkeleton = generateSkeletonLines(nextOutline);
-
-  return {
-    outline: nextOutline,
-    skeleton: nextSkeleton,
-    toggledTo: targetMode,
-    edge: { ...edge, type: nextEdgeType }
-  };
-}
-
 export function setEdgeWall(
   outline: RoofOutline,
   edgeId: string,
@@ -3012,172 +2956,6 @@ export function setEdgeWall(
   };
 }
 
-export function toggleEdgeGable(
-  outline: RoofOutline,
-  skeleton: SkeletonLine[],
-  edgeId: string,
-  forceMode?: 'hipped' | 'gable'
-): {
-  outline: RoofOutline;
-  skeleton: SkeletonLine[];
-  toggledTo: 'gable' | 'hipped' | null;
-  edge?: PlanEdge;
-} {
-  const edge = outline.edges.find((e) => e.id === edgeId);
-  if (!edge) {
-    return { outline, skeleton, toggledTo: null };
-  }
-
-  const targetIsGable =
-    forceMode !== undefined ? forceMode === 'gable' : !isGableEdgeType(edge.type);
-
-  // Ensure at least 1 roof edge remains an eave ('outline') so roof slopes exist
-  const remainingOutlineCount = outline.edges.filter(
-    (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
-  ).length;
-  if (targetIsGable && remainingOutlineCount < 1) {
-    return { outline, skeleton, toggledTo: null, edge };
-  }
-
-  const nextEdgeType: PlanEdge['type'] = targetIsGable ? 'verge' : 'outline';
-  if (edge.type === nextEdgeType) {
-    return {
-      outline,
-      skeleton,
-      toggledTo: targetIsGable ? 'gable' : 'hipped',
-      edge
-    };
-  }
-
-  const nextOutline: RoofOutline = {
-    ...outline,
-    edges: outline.edges.map((e) =>
-      e.id === edgeId ? { ...e, type: nextEdgeType } : e
-    )
-  };
-  const nextSkeleton = generateSkeletonLines(nextOutline);
-
-  return {
-    outline: nextOutline,
-    skeleton: nextSkeleton,
-    toggledTo: targetIsGable ? 'gable' : 'hipped',
-    edge: { ...edge, type: nextEdgeType }
-  };
-}
-
-export function applyRoofStylePreset(
-  outline: RoofOutline,
-  mode: 'hipped' | 'gable'
-): {
-  outline: RoofOutline;
-  skeleton: SkeletonLine[];
-} {
-  if (outline.edges.length === 0) {
-    return { outline, skeleton: [] };
-  }
-
-  if (mode === 'hipped') {
-    const nextOutline: RoofOutline = {
-      ...outline,
-      edges: outline.edges.map((e) => ({ ...e, type: 'outline' }))
-    };
-    return {
-      outline: nextOutline,
-      skeleton: generateSkeletonLines(nextOutline)
-    };
-  }
-
-  // 'gable' preset: keep edges aligned with the longest primary wall axis as eaves ('outline'),
-  // and turn perpendicular / wing end walls into gable ends ('verge' / preserving 'rake' & abutment 'wall'/'apron').
-  const longestEdge = [...outline.edges].sort(
-    (a, b) => dist(b.from, b.to) - dist(a.from, a.to)
-  )[0];
-  const lLen = dist(longestEdge.from, longestEdge.to) || 1;
-  const mainAxis = {
-    x: (longestEdge.to.x - longestEdge.from.x) / lLen,
-    y: (longestEdge.to.y - longestEdge.from.y) / lLen
-  };
-
-  let nextEdges: PlanEdge[] = outline.edges.map((e) => {
-    const eLen = dist(e.from, e.to) || 1;
-    const eDir = { x: (e.to.x - e.from.x) / eLen, y: (e.to.y - e.from.y) / eLen };
-    const dot = Math.abs(eDir.x * mainAxis.x + eDir.y * mainAxis.y);
-    return {
-      ...e,
-      type:
-        e.type === 'wall' || e.type === 'apron'
-          ? e.type
-          : dot > 0.707
-          ? 'outline'
-          : isGableEdgeType(e.type)
-          ? e.type
-          : 'verge'
-    };
-  });
-
-  // Safety guarantee: keep at least 2 longest eaves non-verge if polygon has degenerate angles
-  if (nextEdges.filter((e) => !isStationaryEdgeType(e.type)).length < 1) {
-    const topTwoIds = new Set(
-      [...outline.edges]
-        .sort((a, b) => dist(b.from, b.to) - dist(a.from, a.to))
-        .slice(0, 2)
-        .map((e) => e.id)
-    );
-    nextEdges = outline.edges.map((e) => ({
-      ...e,
-      type: topTwoIds.has(e.id) ? 'outline' : 'verge'
-    }));
-  }
-
-  const nextOutline: RoofOutline = {
-    ...outline,
-    edges: nextEdges
-  };
-  return {
-    outline: nextOutline,
-    skeleton: generateSkeletonLines(nextOutline)
-  };
-}
-
-export function toggleJunctionGable(
-  outline: RoofOutline,
-  skeleton: SkeletonLine[],
-  targetIdOrPoint: string | Point2D
-): {
-  outline: RoofOutline;
-  skeleton: SkeletonLine[];
-  toggledTo: 'gable' | 'hipped' | null;
-  junction?: RoofJunctionNode;
-} {
-  const nodes = getRoofJunctionNodes(outline, skeleton);
-  const target =
-    typeof targetIdOrPoint === 'string'
-      ? nodes.find((n) => n.id === targetIdOrPoint)
-      : nodes.find((n) => pointsClose(n.point, targetIdOrPoint, 0.75));
-
-  if (!target) {
-    // Allow direct 'junction-<edgeId>' lookup even if junction wasn't in ridge+2-hips pattern
-    if (typeof targetIdOrPoint === 'string' && targetIdOrPoint.startsWith('junction-')) {
-      const edgeId = targetIdOrPoint.replace(/^junction-/, '');
-      const res = toggleEdgeGable(outline, skeleton, edgeId);
-      return {
-        outline: res.outline,
-        skeleton: res.skeleton,
-        toggledTo: res.toggledTo
-      };
-    }
-    return { outline, skeleton, toggledTo: null };
-  }
-
-  const forceMode: 'gable' | 'hipped' = target.mode === 'hipped' ? 'gable' : 'hipped';
-  const res = toggleEdgeGable(outline, skeleton, target.eaveEdgeId, forceMode);
-  return {
-    outline: res.outline,
-    skeleton: res.skeleton,
-    toggledTo: res.toggledTo,
-    junction: target
-  };
-}
 
 interface PlanarGraphEdgeMeta {
   outlineEdge?: PlanEdge;
@@ -4017,36 +3795,6 @@ function traceFacePolygon(
       const revIdx = rev.findIndex((pt) => pointsClose(pt, eaveEdge.from, 0.08));
       if (revIdx >= 0) {
         return [...rev.slice(revIdx), ...rev.slice(0, revIdx)];
-      }
-    }
-  }
-
-  // When >= 2 active eaves exist without explicit skeleton lines, compute non-destructive local wavefront planes
-  // honoring verge/rake/wall boundaries before falling back to half-span box
-  if (outline.points.length >= 3 && skeleton.length === 0 && activeEavesCount >= 2) {
-    const inferredOutline: RoofOutline = {
-      ...outline,
-      edges: outline.edges.map((e) => ({
-        ...e,
-        type: isStationaryEdgeType(e.type) ? e.type : 'outline'
-      })),
-      ...(outline.holes
-        ? {
-            holes: outline.holes.map((h) => ({
-              ...h,
-              edges: h.edges.map((e) => ({
-                ...e,
-                type: isStationaryEdgeType(e.type) ? e.type : 'outline'
-              }))
-            }))
-          }
-        : {})
-    };
-    const inferredSkel = generateSkeletonLines(inferredOutline);
-    if (inferredSkel.length > 0) {
-      const planarInferred = traceFacePolygonPlanar(outline, inferredSkel, eaveEdge);
-      if (planarInferred && planarInferred.length >= 3) {
-        return planarInferred;
       }
     }
   }
@@ -7796,7 +7544,7 @@ export function createRoofLevel(
     { x: 0, y: 5 }
   ],
   edgeTypes?: EdgeType[],
-  options?: { autoGenerateSkeleton?: boolean; initialEdgeType?: EdgeType }
+  options?: { skeleton?: SkeletonLine[]; initialEdgeType?: EdgeType }
 ): RoofLevel {
   const levelId = `level-${index}`;
   const code = `L${index}`;
@@ -7818,8 +7566,10 @@ export function createRoofLevel(
       }
     : rawOutline;
 
-  const skeleton =
-    options?.autoGenerateSkeleton === false ? [] : generateSkeletonLines(outline);
+  const skeleton = (options?.skeleton || []).map((s) => ({
+    ...s,
+    levelId: s.levelId ?? levelId
+  }));
   return {
     id: levelId,
     code,
@@ -7932,10 +7682,8 @@ export function unsuppressOutlineEdges(
 export function buildFacesFromClassification(
   levels: RoofLevel[],
   existingPlanes: RoofPlane[],
-  defaultPitchDeg = 22.5,
-  options?: { allowAutoSkeletonWhenEmpty?: boolean }
+  defaultPitchDeg = 22.5
 ): { levels: RoofLevel[]; planes: RoofPlane[]; createdCount: number } {
-  const allowAutoWhenEmpty = options?.allowAutoSkeletonWhenEmpty ?? true;
   const nextLevels = levels.map((lvl) => {
     if (lvl.outline.points.length < 3) {
       return { ...lvl, suppressedPlaneEdgeIds: undefined };
@@ -7959,53 +7707,10 @@ export function buildFacesFromClassification(
         : {})
     };
 
-    const allNextEdges = getAllOutlineEdges(nextOutline);
-    const activeEaveCount = allNextEdges.filter((e) => e.type === 'outline').length;
-
-    // Preserve manual lines strictly — Build Faces must NEVER call generateSkeletonLines when structural lines already exist
-    const hasManualStructuralSkel = lvl.skeleton.some(
-      (s) =>
-        s.suggestedType === 'ridge' ||
-        s.suggestedType === 'hip' ||
-        s.suggestedType === 'valley' ||
-        s.suggestedType === 'eave' ||
-        s.suggestedType === 'barge' ||
-        s.suggestedType === 'rake' ||
-        s.suggestedType === 'apron' ||
-        s.suggestedType === 'wall' ||
-        s.suggestedType === 'change-of-pitch'
-    );
-
     const levelExistingPlanes = existingPlanes.filter(
       (p) => !p.levelId || p.levelId === lvl.id
     );
-    let nextSkeleton = mergeColinearRidgeLines(lvl.skeleton, levelExistingPlanes);
-
-    if (allowAutoWhenEmpty && !hasManualStructuralSkel && activeEaveCount >= 2) {
-      const waveOutline: RoofOutline = {
-        ...nextOutline,
-        edges: nextOutline.edges.map((e) => ({
-          ...e,
-          type: isStationaryEdgeType(e.type) ? e.type : 'outline'
-        })),
-        ...(nextOutline.holes
-          ? {
-              holes: nextOutline.holes.map((h) => ({
-                ...h,
-                edges: h.edges.map((e) => ({
-                  ...e,
-                  type: isStationaryEdgeType(e.type) ? e.type : 'outline'
-                }))
-              }))
-            }
-          : {})
-      };
-      const generated = generateSkeletonLines(waveOutline).map((s) => ({
-        ...s,
-        levelId: s.levelId ?? lvl.id
-      }));
-      nextSkeleton = mergeColinearRidgeLines([...generated, ...nextSkeleton], levelExistingPlanes);
-    }
+    const nextSkeleton = mergeColinearRidgeLines(lvl.skeleton, levelExistingPlanes);
 
     return {
       ...lvl,
@@ -8031,97 +7736,6 @@ export function buildFacesFromClassification(
     planes: rebuiltPlanes,
     createdCount
   };
-}
-
-export function getMultiLevelPreset(
-  preset: RoofOutlinePresetKey,
-  defaultPitchDeg = 22.5
-): { levels: RoofLevel[]; planes: RoofPlane[] } {
-  let levels: RoofLevel[] = [];
-
-  if (preset === 'two_storey_split') {
-    // 2-Storey Split: Lower skillion verandah/garage apron @ Z=2.7m against upper wall + Upper 2F Hipped Roof @ Z=5.4m
-    const lowerLevel = createRoofLevel(
-      1,
-      'Lower Roof (1F)',
-      2.7,
-      [
-        { x: 0, y: 5.5 },
-        { x: 14, y: 5.5 },
-        { x: 14, y: 10 },
-        { x: 0, y: 10 }
-      ],
-      ['wall', 'verge', 'outline', 'verge']
-    );
-    const upperLevel = createRoofLevel(
-      2,
-      'Upper Storey (2F)',
-      5.4,
-      [
-        { x: 0, y: 0 },
-        { x: 14, y: 0 },
-        { x: 14, y: 6.2 },
-        { x: 0, y: 6.2 }
-      ],
-      ['outline', 'outline', 'outline', 'outline']
-    );
-    levels = [lowerLevel, upperLevel];
-  } else if (preset === 'cascading_terrace') {
-    // Cascading 3-Tier Terraced Roofs stepping up in Z (2.7m -> 4.1m -> 5.5m)
-    const tier1 = createRoofLevel(
-      1,
-      'Lower Terrace',
-      2.7,
-      [
-        { x: 0, y: 8 },
-        { x: 14, y: 8 },
-        { x: 14, y: 12 },
-        { x: 0, y: 12 }
-      ],
-      ['wall', 'verge', 'outline', 'verge']
-    );
-    const tier2 = createRoofLevel(
-      2,
-      'Mid Terrace',
-      4.1,
-      [
-        { x: 0, y: 4 },
-        { x: 14, y: 4 },
-        { x: 14, y: 8 },
-        { x: 0, y: 8 }
-      ],
-      ['wall', 'verge', 'outline', 'verge']
-    );
-    const tier3 = createRoofLevel(
-      3,
-      'Upper Terrace',
-      5.5,
-      [
-        { x: 0, y: 0 },
-        { x: 14, y: 0 },
-        { x: 14, y: 4 },
-        { x: 0, y: 4 }
-      ],
-      ['wall', 'verge', 'outline', 'verge']
-    );
-    levels = [tier1, tier2, tier3];
-  } else {
-    const outline = getPresetOutline(preset);
-    const skeleton = generateSkeletonLines(outline);
-    levels = [
-      {
-        id: 'level-1',
-        code: 'L1',
-        name: 'Main Roof',
-        eaveHeightM: 2.7,
-        outline: { ...outline, levelId: 'level-1' },
-        skeleton: skeleton.map((s) => ({ ...s, levelId: 'level-1' }))
-      }
-    ];
-  }
-
-  const planes = syncMultiLevelPlanes(levels, [], defaultPitchDeg);
-  return { levels, planes };
 }
 
 export function getAssignableRoofLinesMultiLevel(

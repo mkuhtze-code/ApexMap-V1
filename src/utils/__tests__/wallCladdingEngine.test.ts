@@ -41,16 +41,19 @@ import {
 } from '../wallCladdingEngine';
 import {
   applyEdgeType,
-  applyRoofStylePreset,
   buildOutlineFromPoints,
   createRoofLevel,
   deriveRoofWallSegments,
   generateCuttingLayout,
   generateSkeletonLines,
-  getMultiLevelPreset,
   getPresetOutline,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
+import {
+  applyRoofStylePreset,
+  createRoofLevelWithSkeleton,
+  getMultiLevelPreset
+} from '../roofPipeline';
 import type { WallPlan } from '../../types/exactRoofing';
 import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
 import { buildOrderPack, exportOrderPackToCsv } from '../exactRoofingBomBridge';
@@ -861,7 +864,7 @@ console.log('✓ Test 19 Passed: Perimeter rebuild preserves wing & secondary fa
 // 20. Batch Multi-Apply Helpers (applyCladdingToFacets, applyKindToFacets, applyHeightToFacets) & Zero-Pricing Order Pack
 {
   const baseOutline20 = getPresetOutline('rectangle_14x10');
-  const lvl20 = createRoofLevel(1, 'Main Roof', 2.7, baseOutline20.points);
+  const lvl20 = createRoofLevelWithSkeleton(1, 'Main Roof', 2.7, baseOutline20.points);
   const planes20 = syncMultiLevelPlanes([lvl20], [], 22.5);
   const derivedPlan20 = deriveWallPlanFromRoofLevels([lvl20], 2.7, undefined, planes20);
   assert.ok(derivedPlan20, 'deriveWallPlanFromRoofLevels returns a non-null WallPlan');
@@ -895,7 +898,7 @@ console.log('✓ Test 19 Passed: Perimeter rebuild preserves wing & secondary fa
     assert.equal(f?.heightM, 3.45);
   });
 
-  const raisedLvl20 = createRoofLevel(1, 'Main Roof', 3.8, baseOutline20.points);
+  const raisedLvl20 = createRoofLevelWithSkeleton(1, 'Main Roof', 3.8, baseOutline20.points);
   const raisedPlanes20 = syncMultiLevelPlanes([raisedLvl20], [], 22.5);
   // Parapet facets protect their manual upstand height when syncing roof heights
   wallPlan20 = applyHeightToFacets(wallPlan20, targetIds20, 3.8, {
@@ -993,7 +996,7 @@ console.log('✓ Test 21 Passed: Batch height update preserves stacked dado regi
 // 22. Overlapping openings block measure lock in evaluateTakeoffCompleteness; stacked vertical openings pass cleanly
 {
   const baseOutline22 = getPresetOutline('rectangle_14x10');
-  const lvl22 = createRoofLevel(1, 'Main Roof', 3.4, baseOutline22.points);
+  const lvl22 = createRoofLevelWithSkeleton(1, 'Main Roof', 3.4, baseOutline22.points);
   const planes22 = syncMultiLevelPlanes([lvl22], [], 22.5);
   const wp22 = deriveWallPlanFromRoofLevels([lvl22], 3.4, undefined, planes22)!;
   const detailedPlan22 = applyCladdingToFacets(
@@ -1124,7 +1127,7 @@ console.log('✓ Test 22 Passed: Overlapping openings completeness blocker & sta
     facets: [fWithBands, ...batched.facets.slice(1)]
   };
   const base23 = getPresetOutline('rectangle_14x10');
-  const lvl23 = createRoofLevel(1, 'Main Roof', 2.7, base23.points);
+  const lvl23 = createRoofLevelWithSkeleton(1, 'Main Roof', 2.7, base23.points);
   const planes23 = syncMultiLevelPlanes([lvl23], [], 22.5);
   const layout23 = generateCuttingLayout(planes23, { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 });
   const pack23 = buildOrderPack({

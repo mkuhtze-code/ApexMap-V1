@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import {
-  applyRoofStylePreset,
   buildAttachedOutlineFromEdge,
   buildOutlineFromPoints,
   createPlaneFromEdge,
@@ -8,10 +7,13 @@ import {
   generateCuttingLayout,
   generateSkeletonLines,
   getAssignableRoofLinesMultiLevel,
-  getMultiLevelPreset,
   getPresetOutline,
   syncMultiLevelPlanes
 } from '../exactRoofingEngine';
+import {
+  applyRoofStylePreset,
+  getMultiLevelPreset
+} from '../roofPipeline';
 import {
   buildOrderPack,
   buildRoofBillOfMaterials,

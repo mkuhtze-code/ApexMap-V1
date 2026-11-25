@@ -1035,15 +1035,23 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                         <tr>
                           <th className="py-2 px-3">Code</th>
                           <th className="py-2 px-3">Profile &amp; Bends</th>
+                          <th className="py-2 px-3 text-right">Cover</th>
                           <th className="py-2 px-3 text-right">Qty × Stick</th>
                           <th className="py-2 px-3 text-right">Total lm</th>
-                          <th className="py-2 px-3">Runs &amp; Notes</th>
+                          <th className="py-2 px-3">Runs &amp; Shop Notes</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
                         {resolvedOrderPack.flashings.map((fl, idx) => (
-                          <tr key={`${fl.code}-${fl.length_mm}-${idx}`}>
-                            <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">{fl.code}</td>
+                          <tr key={`${fl.code}-${fl.length_mm}-${fl.cover_mm ?? 0}-${idx}`}>
+                            <td className="py-2 px-3 font-bold text-sky-300 whitespace-nowrap">
+                              {fl.code}
+                              {fl.source === 'rule' && (
+                                <span className="ml-1.5 text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-sans uppercase">
+                                  Rule
+                                </span>
+                              )}
+                            </td>
                             <td className="py-2 px-3 font-sans">
                               <div className="font-bold text-white">{fl.description}</div>
                               <div className="text-[11px] font-mono text-slate-400">
@@ -1053,13 +1061,21 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                                   : ''}
                               </div>
                             </td>
+                            <td className="py-2 px-3 text-right font-mono text-slate-300 whitespace-nowrap">
+                              {fl.cover_mm ? `${fl.cover_mm}mm` : '—'}
+                            </td>
                             <td className="py-2 px-3 text-right font-bold text-white whitespace-nowrap">
                               {fl.qty} × {fl.length_mm}mm
                             </td>
                             <td className="py-2 px-3 text-right font-bold text-emerald-400 whitespace-nowrap">
                               {fl.total_lm.toFixed(2)}
                             </td>
-                            <td className="py-2 px-3 font-sans text-slate-300">{fl.notes}</td>
+                            <td className="py-2 px-3 font-sans text-slate-300">
+                              <div>{fl.notes}</div>
+                              {fl.shop_notes && (
+                                <div className="text-[11px] text-amber-300 mt-0.5">{fl.shop_notes}</div>
+                              )}
+                            </td>
                           </tr>
                         ))}
                       </tbody>

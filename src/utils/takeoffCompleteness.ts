@@ -3,6 +3,7 @@ import {
   RoofAsset,
   RoofFlashingAssignment,
   RoofLevel,
+  RoofLineFlashingKind,
   RoofPlane,
   TakeoffCompletenessIssue,
   TakeoffCompletenessReport,
@@ -29,12 +30,24 @@ export interface EvaluateTakeoffCompletenessParams {
     footprintAreaM2?: number;
     inflationRatio?: number;
   };
+  outOfScopeLineIds?: string[];
+  outOfScopeKinds?: RoofLineFlashingKind[];
 }
 
 export function evaluateTakeoffCompleteness(
   params: EvaluateTakeoffCompletenessParams
 ): TakeoffCompletenessReport {
-  const { levels, planes, assignableLines, flashingAssignments, wallPlan, assets, areaSanity } = params;
+  const {
+    levels,
+    planes,
+    assignableLines,
+    flashingAssignments,
+    wallPlan,
+    assets,
+    areaSanity,
+    outOfScopeLineIds = [],
+    outOfScopeKinds = []
+  } = params;
   const issues: TakeoffCompletenessIssue[] = [];
 
   if (areaSanity && !areaSanity.ok) {
@@ -126,11 +139,14 @@ export function evaluateTakeoffCompleteness(
 
   // 2. Roof flashings: structural lines block lock; optional eave drips warn only
   const assignedLineIds = new Set(flashingAssignments.map((a) => a.lineId));
+  const excludedLineIds = new Set(outOfScopeLineIds);
+  const excludedKinds = new Set(outOfScopeKinds);
   let unassignedFlashingsCount = 0;
   let optionalUnassignedEavesCount = 0;
 
   assignableLines.forEach((line) => {
     if (assignedLineIds.has(line.lineId)) return;
+    if (excludedLineIds.has(line.lineId) || excludedKinds.has(line.flashingKind)) return;
     if (line.flashingKind === 'eave') {
       optionalUnassignedEavesCount += 1;
       issues.push({

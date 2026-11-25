@@ -397,6 +397,46 @@ export interface AssignableRoofLine {
     | 'Window & Penetration';
 }
 
+export type WindZoneCode = 'L' | 'M' | 'H' | 'VH' | 'EH';
+export type RoofProfileFamily = 'corrugate' | 'trapezoidal' | 'standing_seam' | '*';
+export type VentedRidgeOption = 'none' | 'RV10P';
+
+export interface FlashingRule {
+  id: string;
+  enabled: boolean;
+  profileFamily: RoofProfileFamily;
+  lineKind: RoofLineFlashingKind | '*';
+  windMin: WindZoneCode;
+  windMax: WindZoneCode;
+  ventedRidge: VentedRidgeOption | '*';
+  libraryProfileId: string;
+  productCode: string;
+  coverMm: number;
+  priority: number;
+  preferredStickMm: number;
+  maxStickMm: number;
+  joinAllowanceMm: number;
+  endAllowanceMm: number;
+  shopNotes: string;
+  label?: string;
+}
+
+export interface FlashingRuleSet {
+  version: number;
+  updatedAt: string;
+  rules: FlashingRule[];
+}
+
+export interface FlashingRuleContext {
+  roofProfileFamily: RoofProfileFamily;
+  windZone: WindZoneCode | string;
+  ventedRidge: VentedRidgeOption;
+  material?: string;
+  colorName?: string;
+  outOfScopeLineIds?: string[];
+  outOfScopeKinds?: RoofLineFlashingKind[];
+}
+
 export interface RoofFlashingAssignment {
   id: string;
   lineId: string;
@@ -422,6 +462,14 @@ export interface RoofFlashingAssignment {
   assignedAt: string;
   orderedToWorkshop?: boolean;
   orderedToCrm?: boolean;
+  source?: 'rule' | 'user';
+  ruleId?: string;
+  coverMm?: number;
+  preferredStickMm?: number;
+  maxStickMm?: number;
+  joinAllowanceMm?: number;
+  endAllowanceMm?: number;
+  shopNotes?: string;
 }
 
 export type CanvasToolMode =
@@ -734,6 +782,7 @@ export interface OrderPackFlashingLine {
   flashing_kind: RoofLineFlashingKind;
   girth_mm: number;
   girth_tier: string;
+  cover_mm?: number;
   bend_count: number;
   key_angles_deg: number[];
   has_hem_crush: boolean;
@@ -744,6 +793,9 @@ export interface OrderPackFlashingLine {
   color: string;
   line_labels: string[];
   notes: string;
+  shop_notes?: string;
+  rule_id?: string;
+  source?: 'rule' | 'user';
 }
 
 export interface OrderPackPenetrationLine {
@@ -807,10 +859,14 @@ export interface OrderPack {
   commercialNeutral: true;
   assumptions: {
     profile: string;
+    roofProfileFamily?: RoofProfileFamily;
     material: string;
     color: string;
     windZone?: string;
     exposureZone?: string;
+    ventedRidge?: VentedRidgeOption;
+    ruleSetVersion?: number;
+    ruleSetCapturedAt?: string;
     coverWidthMm: number;
     endLapMm: number;
     overhangMm: number;
@@ -876,6 +932,14 @@ export interface ExactRoofModelSnapshot {
   assets: RoofAsset[];
   pitchBreaks: PitchBreakLine[];
   flashingAssignments: RoofFlashingAssignment[];
+  ventedRidge?: VentedRidgeOption;
+  windZoneCode?: WindZoneCode;
+  roofProfileFamily?: RoofProfileFamily;
+  ruleSetVersion?: number;
+  ruleSetCapturedAt?: string;
+  appliedRulesSnapshot?: FlashingRuleSet;
+  outOfScopeLineIds?: string[];
+  outOfScopeKinds?: RoofLineFlashingKind[];
   installProgress: RoofInstallProgress;
   planUnderlay?: RoofPlanUnderlay | null;
   wallPlan?: WallPlan | null;

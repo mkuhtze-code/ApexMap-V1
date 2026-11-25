@@ -207,6 +207,10 @@ export interface GroupedFlashingScheduleItem {
   colorName: string;
   lineLabels: string[];
   notes: string;
+  coverMm?: number;
+  shopNotes?: string;
+  ruleId?: string;
+  source?: 'rule' | 'user';
 }
 
 /**
@@ -249,8 +253,11 @@ export function groupFlashingScheduleLines(
     const pieceLengthMm = assign.pieceLengthMm || Math.max(100, Math.round(assign.pieceLengthLm * 1000));
     const pieceLengthLm = +(pieceLengthMm / 1000).toFixed(3);
     const colorName = (assign.colorName || defaultColor).trim();
+    const coverMm = assign.coverMm;
+    const shopNotes = assign.shopNotes;
+    const sourceKey = assign.source || '';
 
-    const groupKey = `${productCode}::${assign.profileId}::${pieceLengthMm}::${colorName.toLowerCase()}`;
+    const groupKey = `${productCode}::${assign.profileId}::${coverMm ?? 0}::${pieceLengthMm}::${colorName.toLowerCase()}::${sourceKey}`;
     const existing = map.get(groupKey);
     const qty = Math.max(1, Math.round(assign.quantity || 1));
     const lineLm = +(qty * pieceLengthLm).toFixed(3);
@@ -263,6 +270,9 @@ export function groupFlashingScheduleLines(
       }
       if (assign.notes && !existing.notes.includes(assign.notes)) {
         existing.notes = existing.notes ? `${existing.notes}; ${assign.notes}` : assign.notes;
+      }
+      if (shopNotes && !existing.shopNotes?.includes(shopNotes)) {
+        existing.shopNotes = existing.shopNotes ? `${existing.shopNotes}; ${shopNotes}` : shopNotes;
       }
     } else {
       map.set(groupKey, {
@@ -282,7 +292,11 @@ export function groupFlashingScheduleLines(
         totalLinearMetres: lineLm,
         colorName,
         lineLabels: [assign.lineLabel],
-        notes: assign.notes || getDefaultMitreNotes(assign.flashingKind)
+        notes: assign.notes || getDefaultMitreNotes(assign.flashingKind),
+        ...(coverMm !== undefined ? { coverMm } : {}),
+        ...(shopNotes ? { shopNotes } : {}),
+        ...(assign.ruleId ? { ruleId: assign.ruleId } : {}),
+        ...(assign.source ? { source: assign.source } : {})
       });
     }
   });

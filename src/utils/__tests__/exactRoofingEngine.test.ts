@@ -41,21 +41,27 @@ import {
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  applyRoofStylePreset,
   assertRoofDomainComplexity,
   DEFAULT_MAX_AREA_INFLATION_RATIO,
   checkRoofAreaSanity,
   computeSheetOrderComparisonViaPipeline,
   computeTruthfulRoofAreaM2,
+  createRoofLevelWithSkeleton,
   createRoofPipelineState,
   ensureBom,
   ensureFaces,
   ensureLayout,
   ensureSkeleton,
+  getMultiLevelPreset,
   invalidateFaces,
   invalidateLayout,
   invalidateOutline,
   invalidateSkeleton,
-  runRoofPipelineBuildAsync
+  runRoofPipelineBuildAsync,
+  setEdgeMode,
+  toggleEdgeGable,
+  toggleJunctionGable
 } from '../roofPipeline';
 import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
 import { buildRoofSceneGroup } from '../../components/exactroofing/three/roofMeshBuilder';
@@ -523,7 +529,6 @@ console.log('✓ Test 12 Passed: Opposite-hip offcut handoff & hip/valley/ridge 
 // 13. TEST 13: Hip <-> Gable Junction Toggling & Verge Edge Sync
 import {
   getRoofJunctionNodes,
-  toggleJunctionGable,
   syncPlanesWithOutlineAndSkeleton
 } from '../exactRoofingEngine';
 
@@ -795,7 +800,6 @@ if (topHostSplitSheets.length < 3 || topHostSplitSheets[topHostSplitSheets.lengt
 console.log(`✓ Test 17 Passed: Pitch-matched gable dormer valleys (${equalGeom.valleyAngleDeg}° @ 22.5°/22.5°, ${steepGeom.valleyAngleDeg}° @ 35°/15°, ${flatGeom.valleyAngleDeg}° @ 12°/30°) & tapered valley host sheets verified.`);
 
 // 18. TEST 18: Arbitrary Hip <-> Gable Edge Toggling, Stepped 13.5m x 9.5m Gable & Style Presets
-import { toggleEdgeGable, applyRoofStylePreset } from '../exactRoofingEngine';
 
 const steppedOutline = buildOutlineFromPoints([
   { x: 0, y: 0 },
@@ -967,10 +971,8 @@ console.log(
 
 // 20. TEST 20: Cascading Terraced Roofs (Multi-Tier Z-Heights, Eave Wall Lengths, Aprons & Unchanged Laying/Offcuts)
 import {
-  getMultiLevelPreset,
   deriveRoofWallSegments,
   getAssignableRoofLinesMultiLevel,
-  setEdgeMode,
   arePlanesAdjacentAtHip
 } from '../exactRoofingEngine';
 import { computeRoofingPacks, buildRoofBillOfMaterials } from '../exactRoofingBomBridge';
@@ -1550,7 +1552,7 @@ console.log(
 );
 
 // 27. TEST 27: Additive Multi-Body Drawing & Draw-From-Wall/Eave Edge (Zero Auto-Skeleton)
-const mbLvl1Blank = createRoofLevel(
+const mbLvl1Blank = createRoofLevelWithSkeleton(
   1,
   'Main House',
   2.7,
@@ -2321,7 +2323,7 @@ skelIdsToBatch.forEach((sid) => {
   }
 });
 
-const batchLvl = createRoofLevel(1, 'Main Roof', 2.7, batchOutline0.points);
+const batchLvl = createRoofLevelWithSkeleton(1, 'Main Roof', 2.7, batchOutline0.points);
 const mixedPitchPlanes0 = syncMultiLevelPlanes([batchLvl], [], 22.5);
 const twoPlaneIds = [mixedPitchPlanes0[0].id, mixedPitchPlanes0[2].id];
 const mixedPitchPlanes = applyPitchToPlanes(mixedPitchPlanes0, [mixedPitchPlanes0[0].id], 15, [batchLvl]);
@@ -2556,13 +2558,26 @@ console.log('✓ Test 39 Passed: Multi-wing L-shape & T-shape gable topologies s
   classified = applyEdgeType(classified, [classified.edges[1].id], 'verge');
   classified = applyEdgeType(classified, [classified.edges[3].id], 'rake');
 
-  const emptyBuild = buildFacesFromClassification(
+  // buildFacesFromClassification never silently auto-generates skeleton on empty skeleton
+  const directEmptyBuild = buildFacesFromClassification(
     [{ id: 'level-1', code: 'L1', name: 'Main', eaveHeightM: 2.7, outline: classified, skeleton: [] }],
     [],
     22.5
   );
-  if (emptyBuild.planes.length !== 2) {
-    throw new Error(`Expected buildFacesFromClassification to generate 2 gable planes cleanly, got ${emptyBuild.planes.length}`);
+  if (directEmptyBuild.levels[0].skeleton.length !== 0) {
+    throw new Error(`Expected buildFacesFromClassification on empty skeleton NOT to invoke auto-skeleton`);
+  }
+
+  // Explicit ensureFaces({ allowAutoSkeletonWhenEmpty: true }) generates skeleton & 2 gable planes cleanly
+  const emptyBuild = ensureFaces(
+    createRoofPipelineState({
+      levels: [{ id: 'level-1', code: 'L1', name: 'Main', eaveHeightM: 2.7, outline: classified, skeleton: [] }],
+      planes: []
+    }),
+    { defaultPitchDeg: 22.5, allowAutoSkeletonWhenEmpty: true }
+  ).state;
+  if (emptyBuild.planes.length !== 2 || emptyBuild.levels[0].skeleton.length === 0) {
+    throw new Error(`Expected ensureFaces(allowAutoSkeletonWhenEmpty) to generate skeleton and 2 gable planes cleanly, got planes=${emptyBuild.planes.length}`);
   }
 
   // Test manual ridge stopping 0.2m short of both gable walls (x=0.2..9.8) -> planar snapper closes cleanly
@@ -2752,7 +2767,7 @@ console.log('✓ Test 42 Passed: Post-eaveHeight updateEdgeLength extends/trims 
 
   // Stale ghost plane pre-existing in state must be completely replaced by Build Faces from Classification
   const staleGhostPlane: RoofPlane = {
-    ...syncMultiLevelPlanes([createRoofLevel(1, 'Ghost', 2.7, [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }, { x: 0, y: 2 }])], [])[0],
+    ...syncMultiLevelPlanes([createRoofLevelWithSkeleton(1, 'Ghost', 2.7, [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }, { x: 0, y: 2 }])], [])[0],
     id: 'plane-ghost-stale',
     eaveEdgeId: 'ghost-edge-999'
   };

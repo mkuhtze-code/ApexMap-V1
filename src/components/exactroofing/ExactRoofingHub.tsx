@@ -30,7 +30,13 @@ import {
   WallPlan,
   OrderPack,
   SheetOrderComparisonSummary,
-  SheetOrderMode
+  SheetOrderMode,
+  WindZoneCode,
+  RoofProfileFamily,
+  VentedRidgeOption,
+  FlashingRuleSet,
+  FlashingRuleContext,
+  RoofLineFlashingKind
 } from '../../types/exactRoofing';
 import {
   getPresetOutline,
@@ -38,13 +44,8 @@ import {
   classifyOutlineEdge,
   scaleSkeletonUniformly,
   isPointInPolygon,
-  toggleJunctionGable,
-  toggleEdgeGable,
-  setEdgeMode,
   setEdgeWall,
   updateEdgeLength,
-  applyRoofStylePreset,
-  createRoofLevel,
   getAssignableRoofLinesMultiLevel,
   computeFlashingPieceBreakdown,
   getRoofEdgeTypeMeta,
@@ -61,10 +62,12 @@ import {
   dist
 } from '../../utils/exactRoofingEngine';
 import {
+  applyRoofStylePreset,
   buildOrderPackViaPipeline,
   buildPresetPipelineState,
   checkRoofAreaSanity,
   computeSheetOrderComparisonViaPipeline,
+  createRoofLevelWithSkeleton,
   createRoofPipelineState,
   deletePlanesViaPipeline,
   ensureBom,
@@ -72,9 +75,21 @@ import {
   ensureLayout,
   ensureSkeleton,
   runRoofPipelineBuildAsync,
+  runTakeoffPlaybook,
+  setEdgeMode,
+  toggleEdgeGable,
+  toggleJunctionGable,
   updatePlanesBatchViaPipeline,
   upsertSinglePlaneViaPipeline
 } from '../../utils/roofPipeline';
+import {
+  assignStandardFlashings,
+  loadFlashingRuleSet,
+  normalizeProfileFamily,
+  normalizeWindZoneCode,
+  resetFlashingRuleSetToSeeds,
+  saveFlashingRuleSet
+} from '../../utils/flashingRules';
 import {
   batchUpdateWallFacetsInPlan,
   deriveRoofOutlineFromWallPlan,
@@ -116,6 +131,7 @@ import { SiteMeasureCheckView } from './SiteMeasureCheckView';
 import { ContractorFlashingGuide } from './ContractorFlashingGuide';
 import { FlashingDesigner } from '../FlashingDesigner';
 import { FlashingWorkshop } from '../FlashingWorkshop';
+import { FlashingRulesModal } from './FlashingRulesModal';
 import { PWAInstallButton } from '../PWAInstallButton';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
@@ -141,6 +157,7 @@ import {
   Unlock,
   FileImage,
   Package,
+  Play,
   Undo2,
   PanelLeft,
   AlertTriangle
@@ -209,6 +226,14 @@ interface SavedRoofState {
   planUnderlay?: RoofPlanUnderlay | null;
   wallPlan?: WallPlan | null;
   sheetOrderMode?: SheetOrderMode;
+  ventedRidge?: VentedRidgeOption;
+  windZoneCode?: WindZoneCode;
+  roofProfileFamily?: RoofProfileFamily;
+  ruleSetVersion?: number;
+  ruleSetCapturedAt?: string;
+  appliedRulesSnapshot?: FlashingRuleSet;
+  outOfScopeLineIds?: string[];
+  outOfScopeKinds?: RoofLineFlashingKind[];
 }
 
 const DEFAULT_INSTALL_PROGRESS: RoofInstallProgress = {
@@ -397,6 +422,58 @@ export const ExactRoofingHub: React.FC<Props> = ({
       initialState.sheetOrderMode ||
       'practical'
   );
+  const [ruleSet, setRuleSet] = useState<FlashingRuleSet>(() => loadFlashingRuleSet());
+  const [appliedRulesSnapshot, setAppliedRulesSnapshot] = useState<FlashingRuleSet | null>(
+    activeQuote?.roofPlanModel?.appliedRulesSnapshot ||
+      project?.roofPlanModel?.appliedRulesSnapshot ||
+      initialState.appliedRulesSnapshot ||
+      null
+  );
+  const [ruleSetVersion, setRuleSetVersion] = useState<number | undefined>(
+    activeQuote?.roofPlanModel?.ruleSetVersion ??
+      project?.roofPlanModel?.ruleSetVersion ??
+      initialState.ruleSetVersion
+  );
+  const [ruleSetCapturedAt, setRuleSetCapturedAt] = useState<string | undefined>(
+    activeQuote?.roofPlanModel?.ruleSetCapturedAt ||
+      project?.roofPlanModel?.ruleSetCapturedAt ||
+      initialState.ruleSetCapturedAt
+  );
+  const [windZoneCode, setWindZoneCode] = useState<WindZoneCode>(() =>
+    normalizeWindZoneCode(
+      activeQuote?.roofPlanModel?.windZoneCode ||
+        project?.roofPlanModel?.windZoneCode ||
+        initialState.windZoneCode ||
+        project?.windZone
+    )
+  );
+  const [roofProfileFamily, setRoofProfileFamily] = useState<Exclude<RoofProfileFamily, '*'>>(() =>
+    normalizeProfileFamily(
+      activeQuote?.roofPlanModel?.roofProfileFamily ||
+        project?.roofPlanModel?.roofProfileFamily ||
+        initialState.roofProfileFamily ||
+        project?.profile
+    )
+  );
+  const [ventedRidge, setVentedRidge] = useState<VentedRidgeOption>(
+    activeQuote?.roofPlanModel?.ventedRidge ||
+      project?.roofPlanModel?.ventedRidge ||
+      initialState.ventedRidge ||
+      'none'
+  );
+  const [outOfScopeLineIds, setOutOfScopeLineIds] = useState<string[]>(
+    activeQuote?.roofPlanModel?.outOfScopeLineIds ||
+      project?.roofPlanModel?.outOfScopeLineIds ||
+      initialState.outOfScopeLineIds ||
+      []
+  );
+  const [outOfScopeKinds, setOutOfScopeKinds] = useState<RoofLineFlashingKind[]>(
+    activeQuote?.roofPlanModel?.outOfScopeKinds ||
+      project?.roofPlanModel?.outOfScopeKinds ||
+      initialState.outOfScopeKinds ||
+      []
+  );
+  const [isFlashingRulesModalOpen, setIsFlashingRulesModalOpen] = useState<boolean>(false);
   const [selectedWallFacetId, setSelectedWallFacetId] = useState<string | null>(null);
   const [wallSubView, setWallSubView] = useState<'plan' | 'elevation'>('plan');
   const [wallViewKey, setWallViewKey] = useState<number>(0);
@@ -567,6 +644,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setMeasureLocked(Boolean(snap.measureLocked));
       setSheetOrderMode(snap.sheetOrderMode || 'practical');
       setInstallProgress(snap.installProgress || DEFAULT_INSTALL_PROGRESS);
+      setAppliedRulesSnapshot(snap.appliedRulesSnapshot || null);
+      setRuleSetVersion(snap.ruleSetVersion);
+      setRuleSetCapturedAt(snap.ruleSetCapturedAt);
+      setWindZoneCode(normalizeWindZoneCode(snap.windZoneCode || project?.windZone));
+      setRoofProfileFamily(normalizeProfileFamily(snap.roofProfileFamily || project?.profile));
+      setVentedRidge(snap.ventedRidge || 'none');
+      setOutOfScopeLineIds(snap.outOfScopeLineIds || []);
+      setOutOfScopeKinds(snap.outOfScopeKinds || []);
       const hydratedStage: RoofLifecycleStage = initialStage
         ? initialStage
         : snap.stage
@@ -607,7 +692,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
         installProgress,
         planUnderlay,
         wallPlan,
-        sheetOrderMode
+        sheetOrderMode,
+        ventedRidge,
+        windZoneCode,
+        roofProfileFamily,
+        ruleSetVersion,
+        ruleSetCapturedAt,
+        appliedRulesSnapshot: appliedRulesSnapshot || undefined,
+        outOfScopeLineIds,
+        outOfScopeKinds
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {
@@ -629,7 +722,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
     installProgress,
     planUnderlay,
     wallPlan,
-    sheetOrderMode
+    sheetOrderMode,
+    ventedRidge,
+    windZoneCode,
+    roofProfileFamily,
+    ruleSetVersion,
+    ruleSetCapturedAt,
+    appliedRulesSnapshot,
+    outOfScopeLineIds,
+    outOfScopeKinds
   ]);
 
   // Close dropdowns on outside click
@@ -953,7 +1054,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     const maxZ = levels.length > 0 ? Math.max(...levels.map((l) => l.eaveHeightM)) : 2.7;
     const nextZ = +(maxZ + 1.5).toFixed(2);
     const yOffset = Math.max(0, (levels.length - 1) * -4.2);
-    const newLvl = createRoofLevel(
+    const newLvl = createRoofLevelWithSkeleton(
       nextIdx,
       `Level ${nextIdx} (${nextZ}m)`,
       nextZ,
@@ -2402,6 +2503,27 @@ export const ExactRoofingHub: React.FC<Props> = ({
     [levels, planes]
   );
 
+  const effectiveRuleSet = useMemo<FlashingRuleSet>(
+    () =>
+      (measureLocked || lifecycleStage === 'installing') && appliedRulesSnapshot
+        ? appliedRulesSnapshot
+        : ruleSet,
+    [measureLocked, lifecycleStage, appliedRulesSnapshot, ruleSet]
+  );
+
+  const flashingRuleContext = useMemo<FlashingRuleContext>(
+    () => ({
+      windZone: windZoneCode,
+      roofProfileFamily,
+      ventedRidge,
+      colorName: project?.colorName,
+      materialName: project?.material,
+      outOfScopeLineIds,
+      outOfScopeKinds
+    }),
+    [windZoneCode, roofProfileFamily, ventedRidge, project?.colorName, project?.material, outOfScopeLineIds, outOfScopeKinds]
+  );
+
   const completenessReport = useMemo(
     () =>
       evaluateTakeoffCompleteness({
@@ -2411,9 +2533,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
         flashingAssignments,
         wallPlan,
         assets,
-        areaSanity
+        areaSanity,
+        outOfScopeLineIds,
+        outOfScopeKinds
       }),
-    [levels, planes, assignableLines, flashingAssignments, wallPlan, assets, areaSanity]
+    [levels, planes, assignableLines, flashingAssignments, wallPlan, assets, areaSanity, outOfScopeLineIds, outOfScopeKinds]
   );
 
   const sheetOrderComparison = useMemo<SheetOrderComparisonSummary | undefined>(
@@ -2509,7 +2633,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
       confirmedAt: project?.roofPlanModel?.measureConfirmedAt,
       confirmedBy: project?.roofPlanModel?.measureConfirmedBy,
       sheetOrderMode,
-      comparisonSummary: sheetOrderComparison
+      comparisonSummary: sheetOrderComparison,
+      roofProfileFamily,
+      ventedRidge,
+      ruleSetVersion: ruleSetVersion ?? effectiveRuleSet.version,
+      ruleSetCapturedAt
     });
   }, [
     measureLocked,
@@ -2526,7 +2654,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
     wallPlan,
     completenessReport,
     sheetOrderMode,
-    sheetOrderComparison
+    sheetOrderComparison,
+    roofProfileFamily,
+    ventedRidge,
+    ruleSetVersion,
+    effectiveRuleSet.version,
+    ruleSetCapturedAt
   ]);
 
   const deterministicAuditReport = useMemo<DeterministicRoofAuditReport>(
@@ -2631,6 +2764,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
     assets,
     pitchBreaks,
     flashingAssignments,
+    ventedRidge,
+    windZoneCode,
+    roofProfileFamily,
+    ruleSetVersion: overrides?.ruleSetVersion ?? ruleSetVersion ?? effectiveRuleSet.version,
+    ruleSetCapturedAt: overrides?.ruleSetCapturedAt ?? ruleSetCapturedAt,
+    appliedRulesSnapshot:
+      overrides?.appliedRulesSnapshot !== undefined
+        ? overrides.appliedRulesSnapshot
+        : appliedRulesSnapshot || effectiveRuleSet,
+    outOfScopeLineIds,
+    outOfScopeKinds,
     installProgress: overrides?.installProgress ?? installProgress,
     planUnderlay: overrides?.planUnderlay !== undefined ? overrides.planUnderlay : planUnderlay,
     wallPlan: overrides?.wallPlan !== undefined ? overrides.wallPlan : wallPlan,
@@ -2645,6 +2789,108 @@ export const ExactRoofingHub: React.FC<Props> = ({
     lastUpdatedAt: new Date().toISOString(),
     updatedBy: activeMemberName || 'ApexMap User'
   });
+
+  const handleAssignStandardFlashings = (
+    overrideRuleSet?: FlashingRuleSet,
+    overrideContext?: Partial<FlashingRuleContext>
+  ) => {
+    if (isReadOnlyGeometry) return;
+    if (assignableLines.length === 0) {
+      triggerNotice('Build roof faces first to enumerate ridge, hip, valley, barge, and apron runs');
+      return;
+    }
+    const activeRules = overrideRuleSet || effectiveRuleSet;
+    const ctx: FlashingRuleContext = { ...flashingRuleContext, ...(overrideContext || {}) };
+    const res = assignStandardFlashings(
+      assignableLines,
+      ctx,
+      libraryProfiles,
+      activeRules,
+      flashingAssignments
+    );
+    const nowIso = new Date().toISOString();
+    setFlashingAssignments(res.assignments);
+    setAppliedRulesSnapshot(res.ruleSet);
+    setRuleSetVersion(res.ruleSet.version);
+    setRuleSetCapturedAt(nowIso);
+    const ruleCount = res.assignments.filter((a) => a.source === 'rule').length;
+    const manualCount = res.assignments.filter((a) => a.source === 'user').length;
+    triggerNotice(
+      `✓ Assigned ${ruleCount} rule flashing${ruleCount === 1 ? '' : 's'}${
+        manualCount > 0 ? ` · ${manualCount} manual kept` : ''
+      }${res.unresolvedLineIds.length > 0 ? ` · ${res.unresolvedLineIds.length} unmatched` : ''}`
+    );
+  };
+
+  const handleRunTakeoffPlaybook = () => {
+    if (isReadOnlyGeometry) return;
+    if (!levels.some((l) => l.outline.points.length >= 3)) {
+      triggerNotice('Draw or load a roof outline first');
+      return;
+    }
+    try {
+      const pipeState = createRoofPipelineState({
+        levels,
+        planes,
+        layout: layoutResult
+      });
+      const res = runTakeoffPlaybook(pipeState, {
+        sheetSpec,
+        sheetOrderMode,
+        defaultPitchDeg: 22.5,
+        preserveUserDeleted: true,
+        startPlaneId: startPlaneId || undefined,
+        assets,
+        pitchBreaks,
+        wallPlan,
+        project,
+        flashingContext: flashingRuleContext,
+        libraryProfiles,
+        ruleSet: effectiveRuleSet,
+        existingAssignments: flashingAssignments,
+        locked: measureLocked
+      });
+
+      if (!res.ok) {
+        setLevels(res.state.levels);
+        const focusLvl = res.state.levels.find((l) => l.id === focusedLevel.id) || res.state.levels[0];
+        if (focusLvl) {
+          setOutline(focusLvl.outline);
+          setSkeleton(focusLvl.skeleton);
+        }
+        setPlanes(res.state.planes);
+        setLayoutResult(null);
+        triggerNotice(res.areaSanity.warning || 'Area sanity check failed — takeoff aborted');
+        return;
+      }
+
+      pushUndoSnapshot();
+      setLevels(res.state.levels);
+      const focusLvl = res.state.levels.find((l) => l.id === focusedLevel.id) || res.state.levels[0];
+      if (focusLvl) {
+        setOutline(focusLvl.outline);
+        setSkeleton(focusLvl.skeleton);
+      }
+      setPlanes(res.state.planes);
+      setLayoutResult(res.layout);
+      setFlashingAssignments(res.assignments);
+      if (res.ruleSnapshot) {
+        setAppliedRulesSnapshot(res.ruleSnapshot.appliedRulesSnapshot);
+        setRuleSetVersion(res.ruleSnapshot.ruleSetVersion);
+        setRuleSetCapturedAt(res.ruleSnapshot.ruleSetCapturedAt);
+      }
+      setWallPlan((prev) =>
+        prev ? syncWallPlanWithRoof(prev, res.state.levels, res.state.planes) : prev
+      );
+      triggerNotice(
+        `✓ Takeoff complete: ${res.state.planes.length} faces · ${(
+          res.layout?.totalOrderedMetres || 0
+        ).toFixed(1)}m sheets · ${res.assignments.length} flashings`
+      );
+    } catch (err) {
+      triggerNotice(err instanceof Error ? err.message : 'Unable to run takeoff playbook');
+    }
+  };
 
   const projectPlans = useMemo(() => {
     const combined = [
@@ -2731,13 +2977,20 @@ export const ExactRoofingHub: React.FC<Props> = ({
           completenessReport,
           locked: true,
           confirmedAt,
-          confirmedBy
+          confirmedBy,
+          roofProfileFamily,
+          ventedRidge,
+          ruleSetVersion: ruleSetVersion ?? effectiveRuleSet.version,
+          ruleSetCapturedAt: ruleSetCapturedAt || confirmedAt
         }
       );
       if (pipeRes.state.layout && !layoutResult) {
         setLayoutResult(pipeRes.state.layout);
       }
       const emittedOrderPack = pipeRes.orderPack!;
+      const frozenRulesSnap = appliedRulesSnapshot || effectiveRuleSet;
+      const frozenRuleVer = ruleSetVersion ?? frozenRulesSnap.version;
+      const frozenRuleCaptured = ruleSetCapturedAt || confirmedAt;
       const nextSnap = buildCurrentSnapshot({
         stage: 'installing',
         measureLocked: true,
@@ -2745,8 +2998,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
         measureConfirmedBy: confirmedBy,
         layout: pipeRes.state.layout || layoutResult || undefined,
         bom: pipeRes.bom,
-        orderPack: emittedOrderPack
+        orderPack: emittedOrderPack,
+        appliedRulesSnapshot: frozenRulesSnap,
+        ruleSetVersion: frozenRuleVer,
+        ruleSetCapturedAt: frozenRuleCaptured
       });
+      setAppliedRulesSnapshot(frozenRulesSnap);
+      setRuleSetVersion(frozenRuleVer);
+      setRuleSetCapturedAt(frozenRuleCaptured);
       setFrozenOrderPack(emittedOrderPack);
       setIsMeasureLockGateOpen(false);
       setMeasureLocked(true);
@@ -3048,6 +3307,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       quantity: breakdown.recommendedQuantity,
       totalLinearMetres: +(breakdown.recommendedQuantity * pieceLengthLm).toFixed(3),
       notes: getDefaultMitreNotes(targetLine.flashingKind),
+      source: 'user',
       assignedAt: new Date().toISOString(),
       orderedToWorkshop: false,
       orderedToCrm: false
@@ -3156,6 +3416,47 @@ export const ExactRoofingHub: React.FC<Props> = ({
         <Ruler className="w-3.5 h-3.5 text-sky-400" />
         <span>Open flashings workshop</span>
       </button>
+
+      {!isReadOnlyGeometry && (
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              setIsTemplateDropdownOpen(false);
+              handleRunTakeoffPlaybook();
+            }}
+            className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-extrabold flex items-center gap-2 text-emerald-300 hover:bg-emerald-600/20 transition-colors cursor-pointer"
+          >
+            <Play className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Run takeoff (All steps)</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setIsTemplateDropdownOpen(false);
+              handleAssignStandardFlashings();
+            }}
+            className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 text-amber-200 hover:bg-amber-600/20 transition-colors cursor-pointer"
+          >
+            <Ruler className="w-3.5 h-3.5 text-amber-400" />
+            <span>Assign standard flashings</span>
+          </button>
+        </>
+      )}
+
+      {lifecycleStage === 'quoting' && !measureLocked && (
+        <button
+          type="button"
+          onClick={() => {
+            setIsTemplateDropdownOpen(false);
+            setIsFlashingRulesModalOpen(true);
+          }}
+          className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 text-sky-200 hover:bg-sky-600/20 transition-colors cursor-pointer"
+        >
+          <Sliders className="w-3.5 h-3.5 text-sky-400" />
+          <span>Flashing rules (Admin)</span>
+        </button>
+      )}
 
       {!isReadOnlyGeometry && canUndo && (
         <button
@@ -4063,6 +4364,84 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
               {!isReadOnlyGeometry && (
                 <div className="space-y-2 pt-2 border-t border-slate-800">
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMobileToolsOpen(false);
+                        handleRunTakeoffPlaybook();
+                      }}
+                      className="min-h-[44px] px-3 rounded-2xl border bg-emerald-950/50 border-emerald-500/50 text-emerald-200 text-left flex items-center gap-2 text-xs font-extrabold cursor-pointer"
+                    >
+                      <Play className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>Run takeoff</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMobileToolsOpen(false);
+                        handleAssignStandardFlashings();
+                      }}
+                      className="min-h-[44px] px-3 rounded-2xl border bg-amber-950/40 border-amber-500/40 text-amber-200 text-left flex items-center gap-2 text-xs font-bold cursor-pointer"
+                    >
+                      <Ruler className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>Auto Flashings</span>
+                    </button>
+                  </div>
+
+                  {lifecycleStage === 'quoting' && !measureLocked && (
+                    <div className="p-2.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
+                          Flashing Spec &amp; Rules
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsMobileToolsOpen(false);
+                            setIsFlashingRulesModalOpen(true);
+                          }}
+                          className="text-[11px] font-bold text-sky-300 hover:text-sky-200 cursor-pointer"
+                        >
+                          Edit Rules
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                        <select
+                          value={windZoneCode}
+                          onChange={(e) => setWindZoneCode(e.target.value as WindZoneCode)}
+                          className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-white font-bold"
+                          aria-label="Wind Zone"
+                        >
+                          {(['L', 'M', 'H', 'VH', 'EH'] as const).map((wz) => (
+                            <option key={wz} value={wz}>Wind {wz}</option>
+                          ))}
+                        </select>
+                        <select
+                          value={roofProfileFamily}
+                          onChange={(e) =>
+                            setRoofProfileFamily(e.target.value as Exclude<RoofProfileFamily, '*'>)
+                          }
+                          className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-white font-bold"
+                          aria-label="Profile Family"
+                        >
+                          <option value="corrugate">Corrugate</option>
+                          <option value="trapezoidal">Trapezoid</option>
+                          <option value="standing_seam">Stand Seam</option>
+                        </select>
+                        <select
+                          value={ventedRidge}
+                          onChange={(e) => setVentedRidge(e.target.value as VentedRidgeOption)}
+                          className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-white font-bold"
+                          aria-label="Vented Ridge"
+                        >
+                          <option value="none">Std Ridge</option>
+                          <option value="RV10P">RV10P Vent</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-3 gap-1.5">
                     <button
                       type="button"
@@ -4650,6 +5029,27 @@ export const ExactRoofingHub: React.FC<Props> = ({
             }}
             onAssignProfile={handleAssignFromDrawingSuite}
             onClose={() => setDrawingSuiteSession(null)}
+          />
+        )}
+
+        {lifecycleStage === 'quoting' && !measureLocked && (
+          <FlashingRulesModal
+            isOpen={isFlashingRulesModalOpen}
+            ruleSet={ruleSet}
+            readOnly={measureLocked || lifecycleStage !== 'quoting'}
+            onClose={() => setIsFlashingRulesModalOpen(false)}
+            onSaveRuleSet={(next) => {
+              const saved = saveFlashingRuleSet(next);
+              setRuleSet(saved);
+              triggerNotice(`✓ Saved ${saved.rules.length} flashing rules (v${saved.version})`);
+            }}
+            onResetSeeds={() => {
+              const reset = resetFlashingRuleSetToSeeds();
+              setRuleSet(reset);
+              triggerNotice('Restored default flashing seed rules');
+              return reset;
+            }}
+            onReapplyFlashings={(next) => handleAssignStandardFlashings(next)}
           />
         )}
       </div>
@@ -5603,6 +6003,83 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
                 <button
                   type="button"
+                  onClick={handleRunTakeoffPlaybook}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-extrabold flex items-center justify-between gap-2 text-emerald-200 bg-emerald-950/35 hover:bg-emerald-600/25 border border-emerald-500/35 transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <Play className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span className="truncate">Run takeoff</span>
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleAssignStandardFlashings()}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 text-amber-200 hover:bg-amber-600/20 transition-colors cursor-pointer"
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <Ruler className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span className="truncate">Assign flashings</span>
+                  </span>
+                  {flashingAssignments.length > 0 && (
+                    <span className="text-[10px] font-mono text-amber-400 tabular-nums shrink-0">
+                      {flashingAssignments.length}
+                    </span>
+                  )}
+                </button>
+
+                {lifecycleStage === 'quoting' && !measureLocked && (
+                  <div className="mt-1 p-2 rounded-xl bg-slate-950/70 border border-slate-800 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
+                        Rule Context
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setIsFlashingRulesModalOpen(true)}
+                        className="text-[10px] font-extrabold text-sky-400 hover:text-sky-300 cursor-pointer"
+                      >
+                        Flashing rules
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1 text-[11px]">
+                      <select
+                        value={windZoneCode}
+                        onChange={(e) => setWindZoneCode(e.target.value as WindZoneCode)}
+                        className="bg-slate-900 border border-slate-800 rounded-lg px-1.5 py-1 text-white font-bold outline-none cursor-pointer"
+                        aria-label="Wind Zone"
+                      >
+                        {(['L', 'M', 'H', 'VH', 'EH'] as const).map((wz) => (
+                          <option key={wz} value={wz}>Wind {wz}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={ventedRidge}
+                        onChange={(e) => setVentedRidge(e.target.value as VentedRidgeOption)}
+                        className="bg-slate-900 border border-slate-800 rounded-lg px-1.5 py-1 text-white font-bold outline-none cursor-pointer"
+                        aria-label="Vented Ridge"
+                      >
+                        <option value="none">Std Ridge</option>
+                        <option value="RV10P">RV10P</option>
+                      </select>
+                    </div>
+                    <select
+                      value={roofProfileFamily}
+                      onChange={(e) =>
+                        setRoofProfileFamily(e.target.value as Exclude<RoofProfileFamily, '*'>)
+                      }
+                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-1.5 py-1 text-[11px] text-white font-bold outline-none cursor-pointer"
+                      aria-label="Roof Profile Family"
+                    >
+                      <option value="corrugate">Profile: Corrugate</option>
+                      <option value="trapezoidal">Profile: Trapezoidal</option>
+                      <option value="standing_seam">Profile: Standing Seam</option>
+                    </select>
+                  </div>
+                )}
+
+                <button
+                  type="button"
                   disabled={!canUndo}
                   onClick={handleUndo}
                   className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold flex items-center justify-between gap-2 text-slate-300 hover:bg-slate-800/80 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
@@ -6533,6 +7010,27 @@ export const ExactRoofingHub: React.FC<Props> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {lifecycleStage === 'quoting' && !measureLocked && (
+        <FlashingRulesModal
+          isOpen={isFlashingRulesModalOpen}
+          ruleSet={ruleSet}
+          readOnly={measureLocked || lifecycleStage !== 'quoting'}
+          onClose={() => setIsFlashingRulesModalOpen(false)}
+          onSaveRuleSet={(next) => {
+            const saved = saveFlashingRuleSet(next);
+            setRuleSet(saved);
+            triggerNotice(`✓ Saved ${saved.rules.length} flashing rules (v${saved.version})`);
+          }}
+          onResetSeeds={() => {
+            const reset = resetFlashingRuleSetToSeeds();
+            setRuleSet(reset);
+            triggerNotice('Restored default flashing seed rules');
+            return reset;
+          }}
+          onReapplyFlashings={(next) => handleAssignStandardFlashings(next)}
+        />
       )}
     </div>
   );

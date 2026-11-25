@@ -13,6 +13,7 @@ import {
   RoofOutline,
   RoofPlane,
   SheetSpec,
+  SkeletonLine,
   TakeoffCompletenessIssue,
   TakeoffCompletenessReport,
   WallPlan
@@ -22,10 +23,10 @@ import {
   computeFlashingPieceBreakdown,
   dist,
   generateCuttingLayout,
-  generateSkeletonLines,
   isEdgeWallEnabled,
   polygonArea
 } from './exactRoofingEngine';
+import { createRoofPipelineState, ensureSkeleton } from './roofPipeline';
 import {
   findMatchingCategoryRank,
   getDefaultMitreNotes
@@ -152,7 +153,7 @@ export function normalizeAndVerifyAiRoofOutline(
 ): {
   points: Point2D[];
   pitchDeg: number;
-  skeleton: ReturnType<typeof generateSkeletonLines>;
+  skeleton: SkeletonLine[];
   outline: RoofOutline;
   repairsApplied: string[];
 } {
@@ -275,7 +276,23 @@ export function normalizeAndVerifyAiRoofOutline(
     levelId: 'level-1',
     defaultEaveHeightM: 2.7
   });
-  const skeleton = generateSkeletonLines(outline);
+  const skelResult = ensureSkeleton(
+    createRoofPipelineState({
+      levels: [
+        {
+          id: 'level-1',
+          code: 'L1',
+          name: 'Main Roof',
+          eaveHeightM: 2.7,
+          outline,
+          skeleton: []
+        }
+      ],
+      planes: []
+    }),
+    { mode: 'auto' }
+  );
+  const skeleton = skelResult.state.levels[0]?.skeleton || [];
 
   return {
     points: outline.points,

@@ -1,20 +1,28 @@
 import {
   AssignableRoofLine,
+  EdgeType,
+  FlashingRuleContext,
+  FlashingRuleSet,
   LayoutResult,
   OrderPack,
   PitchBreakLine,
   PlanEdge,
+  Point2D,
   RoofAsset,
   RoofBomSummary,
   RoofFlashingAssignment,
+  RoofJunctionNode,
   RoofLevel,
   RoofOutline,
   RoofOutlinePresetKey,
   RoofPlane,
+  RoofProfileFamily,
   SheetOrderComparisonSummary,
   SheetOrderMode,
   SheetSpec,
+  SkeletonLine,
   TakeoffCompletenessReport,
+  VentedRidgeOption,
   WallPlan
 } from '../types/exactRoofing';
 import { Project, FlashingProfile } from '../types/crm';
@@ -27,21 +35,27 @@ import {
   buildFacesFromClassification,
   computeTruthfulRoofAreaM2,
   createPlaneFromEdge,
+  createRoofLevel,
   deduplicateRoofPlanes,
   deleteRoofPlanes,
+  dist,
   generateCuttingLayout,
   generateSkeletonLines,
   getAllOutlineEdges,
-  getMultiLevelPreset,
+  getAssignableRoofLinesMultiLevel,
   getOutlineFootprintAreaM2,
   getPresetOutline,
+  getRoofJunctionNodes,
+  isGableEdgeType,
   isStationaryEdgeType,
   mergeColinearRidgeLines,
+  pointsClose,
   polygonArea,
-  syncMultiLevelPlanes,
-  toggleJunctionGable
+  syncMultiLevelPlanes
 } from './exactRoofingEngine';
 import { buildOrderPack, buildRoofBillOfMaterials } from './exactRoofingBomBridge';
+import { assignStandardFlashings } from './flashingRules';
+import { evaluateTakeoffCompleteness } from './takeoffCompleteness';
 
 export { DEFAULT_MAX_AREA_INFLATION_RATIO, computeTruthfulRoofAreaM2 };
 
@@ -400,6 +414,21 @@ export function ensureSkeleton(
   };
 }
 
+function hasStructuralSkeleton(skeleton: SkeletonLine[]): boolean {
+  return skeleton.some(
+    (s) =>
+      s.suggestedType === 'ridge' ||
+      s.suggestedType === 'hip' ||
+      s.suggestedType === 'valley' ||
+      s.suggestedType === 'eave' ||
+      s.suggestedType === 'barge' ||
+      s.suggestedType === 'rake' ||
+      s.suggestedType === 'apron' ||
+      s.suggestedType === 'wall' ||
+      s.suggestedType === 'change-of-pitch'
+  );
+}
+
 /**
  * Ensures closed planar roof faces for all levels using one deterministic commit path.
  * Replaces planes cleanly (never appends duplicate faces) and preserves manual skeleton lines.
@@ -449,9 +478,31 @@ export function ensureFaces(
     };
   }
 
-  const built = buildFacesFromClassification(state.levels, state.planes, defaultPitch, {
-    allowAutoSkeletonWhenEmpty: options?.allowAutoSkeletonWhenEmpty
-  });
+  let working = state;
+  if (options?.allowAutoSkeletonWhenEmpty) {
+    const emptyAutoIds = working.levels
+      .filter((lvl) => {
+        if (lvl.outline.points.length < 3) return false;
+        if (hasStructuralSkeleton(lvl.skeleton)) return false;
+        const allEdges = getAllOutlineEdges(lvl.outline);
+        const hasClassifiedEave = allEdges.some((e) => e.type === 'outline');
+        const activeEaves = allEdges.filter((e) =>
+          !hasClassifiedEave && e.type === 'unclassified' ? true : e.type === 'outline'
+        ).length;
+        return activeEaves >= 2;
+      })
+      .map((l) => l.id);
+
+    if (emptyAutoIds.length > 0) {
+      working = ensureSkeleton(working, {
+        mode: 'auto',
+        targetLevelIds: emptyAutoIds,
+        maxVertices: options?.maxVertices
+      }).state;
+    }
+  }
+
+  const built = buildFacesFromClassification(working.levels, working.planes, defaultPitch);
   const dedupedPlanes = deduplicateRoofPlanes(built.planes);
   const areaSanity = checkRoofAreaSanity(built.levels, dedupedPlanes, {
     maxInflationRatio: options?.maxInflationRatio
@@ -459,7 +510,7 @@ export function ensureFaces(
 
   return {
     state: {
-      ...state,
+      ...working,
       levels: built.levels,
       planes: dedupedPlanes,
       dirty: {
@@ -600,6 +651,348 @@ export function updatePlanesBatchViaPipeline(
   return invalidateFaces(state, cleanPlanes, {
     maxInflationRatio: params.maxInflationRatio
   });
+}
+
+function solveOutlineSkeletonViaPipeline(
+  outline: RoofOutline,
+  levelId = outline.levelId || 'level-1',
+  eaveHeightM = 2.7
+): SkeletonLine[] {
+  const lvl: RoofLevel = {
+    id: levelId,
+    code: 'L1',
+    name: 'Roof',
+    eaveHeightM,
+    outline: { ...outline, levelId },
+    skeleton: []
+  };
+  return ensureSkeleton(createRoofPipelineState({ levels: [lvl], planes: [] }), {
+    mode: 'auto',
+    targetLevelIds: [levelId]
+  }).state.levels[0].skeleton;
+}
+
+export function createRoofLevelWithSkeleton(
+  index: number,
+  name: string,
+  eaveHeightM: number,
+  points: Point2D[] = [
+    { x: 0, y: 0 },
+    { x: 10, y: 0 },
+    { x: 10, y: 5 },
+    { x: 0, y: 5 }
+  ],
+  edgeTypes?: EdgeType[],
+  options?: { autoGenerateSkeleton?: boolean; initialEdgeType?: EdgeType }
+): RoofLevel {
+  const base = createRoofLevel(index, name, eaveHeightM, points, edgeTypes, {
+    initialEdgeType: options?.initialEdgeType
+  });
+  if (options?.autoGenerateSkeleton === false) {
+    return base;
+  }
+  return ensureSkeleton(createRoofPipelineState({ levels: [base], planes: [] }), {
+    mode: 'auto',
+    targetLevelIds: [base.id]
+  }).state.levels[0];
+}
+
+export function setEdgeMode(
+  outline: RoofOutline,
+  skeleton: SkeletonLine[],
+  edgeId: string,
+  targetMode: 'hipped' | 'gable' | 'wall'
+): {
+  outline: RoofOutline;
+  skeleton: SkeletonLine[];
+  toggledTo: 'hipped' | 'gable' | 'wall' | null;
+  edge?: PlanEdge;
+} {
+  const edge = outline.edges.find((e) => e.id === edgeId);
+  if (!edge) {
+    return { outline, skeleton, toggledTo: null };
+  }
+
+  if (targetMode === 'gable' || targetMode === 'wall') {
+    const remainingOutlineCount = outline.edges.filter(
+      (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
+    ).length;
+    if (remainingOutlineCount < 1) {
+      return { outline, skeleton, toggledTo: null, edge };
+    }
+  }
+
+  const nextEdgeType: PlanEdge['type'] =
+    targetMode === 'gable' ? 'verge' : targetMode === 'wall' ? 'wall' : 'outline';
+
+  if (edge.type === nextEdgeType) {
+    return { outline, skeleton, toggledTo: targetMode, edge };
+  }
+
+  const nextOutline: RoofOutline = {
+    ...outline,
+    edges: outline.edges.map((e) => (e.id === edgeId ? { ...e, type: nextEdgeType } : e))
+  };
+  const nextSkeleton = solveOutlineSkeletonViaPipeline(nextOutline);
+
+  return {
+    outline: nextOutline,
+    skeleton: nextSkeleton,
+    toggledTo: targetMode,
+    edge: { ...edge, type: nextEdgeType }
+  };
+}
+
+export function toggleEdgeGable(
+  outline: RoofOutline,
+  skeleton: SkeletonLine[],
+  edgeId: string,
+  forceMode?: 'hipped' | 'gable'
+): {
+  outline: RoofOutline;
+  skeleton: SkeletonLine[];
+  toggledTo: 'gable' | 'hipped' | null;
+  edge?: PlanEdge;
+} {
+  const edge = outline.edges.find((e) => e.id === edgeId);
+  if (!edge) {
+    return { outline, skeleton, toggledTo: null };
+  }
+
+  const targetIsGable =
+    forceMode !== undefined ? forceMode === 'gable' : !isGableEdgeType(edge.type);
+
+  const remainingOutlineCount = outline.edges.filter(
+    (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
+  ).length;
+  if (targetIsGable && remainingOutlineCount < 1) {
+    return { outline, skeleton, toggledTo: null, edge };
+  }
+
+  const nextEdgeType: PlanEdge['type'] = targetIsGable ? 'verge' : 'outline';
+  if (edge.type === nextEdgeType) {
+    return {
+      outline,
+      skeleton,
+      toggledTo: targetIsGable ? 'gable' : 'hipped',
+      edge
+    };
+  }
+
+  const nextOutline: RoofOutline = {
+    ...outline,
+    edges: outline.edges.map((e) => (e.id === edgeId ? { ...e, type: nextEdgeType } : e))
+  };
+  const nextSkeleton = solveOutlineSkeletonViaPipeline(nextOutline);
+
+  return {
+    outline: nextOutline,
+    skeleton: nextSkeleton,
+    toggledTo: targetIsGable ? 'gable' : 'hipped',
+    edge: { ...edge, type: nextEdgeType }
+  };
+}
+
+export function applyRoofStylePreset(
+  outline: RoofOutline,
+  mode: 'hipped' | 'gable'
+): {
+  outline: RoofOutline;
+  skeleton: SkeletonLine[];
+} {
+  if (outline.edges.length === 0) {
+    return { outline, skeleton: [] };
+  }
+
+  if (mode === 'hipped') {
+    const nextOutline: RoofOutline = {
+      ...outline,
+      edges: outline.edges.map((e) => ({ ...e, type: 'outline' }))
+    };
+    return {
+      outline: nextOutline,
+      skeleton: solveOutlineSkeletonViaPipeline(nextOutline)
+    };
+  }
+
+  const longestEdge = [...outline.edges].sort(
+    (a, b) => dist(b.from, b.to) - dist(a.from, a.to)
+  )[0];
+  const lLen = dist(longestEdge.from, longestEdge.to) || 1;
+  const mainAxis = {
+    x: (longestEdge.to.x - longestEdge.from.x) / lLen,
+    y: (longestEdge.to.y - longestEdge.from.y) / lLen
+  };
+
+  let nextEdges: PlanEdge[] = outline.edges.map((e) => {
+    const eLen = dist(e.from, e.to) || 1;
+    const eDir = { x: (e.to.x - e.from.x) / eLen, y: (e.to.y - e.from.y) / eLen };
+    const dot = Math.abs(eDir.x * mainAxis.x + eDir.y * mainAxis.y);
+    return {
+      ...e,
+      type:
+        e.type === 'wall' || e.type === 'apron'
+          ? e.type
+          : dot > 0.707
+          ? 'outline'
+          : isGableEdgeType(e.type)
+          ? e.type
+          : 'verge'
+    };
+  });
+
+  if (nextEdges.filter((e) => !isStationaryEdgeType(e.type)).length < 1) {
+    const topTwoIds = new Set(
+      [...outline.edges]
+        .sort((a, b) => dist(b.from, b.to) - dist(a.from, a.to))
+        .slice(0, 2)
+        .map((e) => e.id)
+    );
+    nextEdges = outline.edges.map((e) => ({
+      ...e,
+      type: topTwoIds.has(e.id) ? 'outline' : 'verge'
+    }));
+  }
+
+  const nextOutline: RoofOutline = {
+    ...outline,
+    edges: nextEdges
+  };
+  return {
+    outline: nextOutline,
+    skeleton: solveOutlineSkeletonViaPipeline(nextOutline)
+  };
+}
+
+export function toggleJunctionGable(
+  outline: RoofOutline,
+  skeleton: SkeletonLine[],
+  targetIdOrPoint: string | Point2D
+): {
+  outline: RoofOutline;
+  skeleton: SkeletonLine[];
+  toggledTo: 'gable' | 'hipped' | null;
+  junction?: RoofJunctionNode;
+} {
+  const nodes = getRoofJunctionNodes(outline, skeleton);
+  const target =
+    typeof targetIdOrPoint === 'string'
+      ? nodes.find((n) => n.id === targetIdOrPoint)
+      : nodes.find((n) => pointsClose(n.point, targetIdOrPoint, 0.75));
+
+  if (!target) {
+    if (typeof targetIdOrPoint === 'string' && targetIdOrPoint.startsWith('junction-')) {
+      const edgeId = targetIdOrPoint.replace(/^junction-/, '');
+      const res = toggleEdgeGable(outline, skeleton, edgeId);
+      return {
+        outline: res.outline,
+        skeleton: res.skeleton,
+        toggledTo: res.toggledTo
+      };
+    }
+    return { outline, skeleton, toggledTo: null };
+  }
+
+  const forceMode: 'gable' | 'hipped' = target.mode === 'hipped' ? 'gable' : 'hipped';
+  const res = toggleEdgeGable(outline, skeleton, target.eaveEdgeId, forceMode);
+  return {
+    outline: res.outline,
+    skeleton: res.skeleton,
+    toggledTo: res.toggledTo,
+    junction: target
+  };
+}
+
+export function getMultiLevelPreset(
+  preset: RoofOutlinePresetKey,
+  defaultPitchDeg = 22.5
+): { levels: RoofLevel[]; planes: RoofPlane[] } {
+  let levels: RoofLevel[] = [];
+
+  if (preset === 'two_storey_split') {
+    const lowerLevel = createRoofLevelWithSkeleton(
+      1,
+      'Lower Roof (1F)',
+      2.7,
+      [
+        { x: 0, y: 5.5 },
+        { x: 14, y: 5.5 },
+        { x: 14, y: 10 },
+        { x: 0, y: 10 }
+      ],
+      ['wall', 'verge', 'outline', 'verge']
+    );
+    const upperLevel = createRoofLevelWithSkeleton(
+      2,
+      'Upper Storey (2F)',
+      5.4,
+      [
+        { x: 0, y: 0 },
+        { x: 14, y: 0 },
+        { x: 14, y: 6.2 },
+        { x: 0, y: 6.2 }
+      ],
+      ['outline', 'outline', 'outline', 'outline']
+    );
+    levels = [lowerLevel, upperLevel];
+  } else if (preset === 'cascading_terrace') {
+    const tier1 = createRoofLevelWithSkeleton(
+      1,
+      'Lower Terrace',
+      2.7,
+      [
+        { x: 0, y: 8 },
+        { x: 14, y: 8 },
+        { x: 14, y: 12 },
+        { x: 0, y: 12 }
+      ],
+      ['wall', 'verge', 'outline', 'verge']
+    );
+    const tier2 = createRoofLevelWithSkeleton(
+      2,
+      'Mid Terrace',
+      4.1,
+      [
+        { x: 0, y: 4 },
+        { x: 14, y: 4 },
+        { x: 14, y: 8 },
+        { x: 0, y: 8 }
+      ],
+      ['wall', 'verge', 'outline', 'verge']
+    );
+    const tier3 = createRoofLevelWithSkeleton(
+      3,
+      'Upper Terrace',
+      5.5,
+      [
+        { x: 0, y: 0 },
+        { x: 14, y: 0 },
+        { x: 14, y: 4 },
+        { x: 0, y: 4 }
+      ],
+      ['wall', 'verge', 'outline', 'verge']
+    );
+    levels = [tier1, tier2, tier3];
+  } else {
+    const outline = getPresetOutline(preset);
+    const skeleton = solveOutlineSkeletonViaPipeline(outline, 'level-1', 2.7);
+    levels = [
+      {
+        id: 'level-1',
+        code: 'L1',
+        name: 'Main Roof',
+        eaveHeightM: 2.7,
+        outline: { ...outline, levelId: 'level-1' },
+        skeleton: skeleton.map((s) => ({ ...s, levelId: 'level-1' }))
+      }
+    ];
+  }
+
+  const ensured = ensureFaces(createRoofPipelineState({ levels, planes: [], dirty: { faces: true } }), {
+    defaultPitchDeg,
+    preserveUserDeleted: true
+  });
+  return { levels: ensured.state.levels, planes: ensured.state.planes };
 }
 
 /**
@@ -834,6 +1227,10 @@ export function ensureBom(
     locked?: boolean;
     confirmedAt?: string;
     confirmedBy?: string;
+    roofProfileFamily?: RoofProfileFamily;
+    ventedRidge?: VentedRidgeOption;
+    ruleSetVersion?: number;
+    ruleSetCapturedAt?: string;
   }
 ): {
   state: RoofPipelineState;
@@ -900,7 +1297,11 @@ export function ensureBom(
       confirmedAt: params.confirmedAt,
       confirmedBy: params.confirmedBy,
       sheetOrderMode: params.sheetOrderMode,
-      comparisonSummary: params.comparisonSummary
+      comparisonSummary: params.comparisonSummary,
+      roofProfileFamily: params.roofProfileFamily,
+      ventedRidge: params.ventedRidge,
+      ruleSetVersion: params.ruleSetVersion,
+      ruleSetCapturedAt: params.ruleSetCapturedAt
     });
   }
 
@@ -942,6 +1343,10 @@ export function buildOrderPackViaPipeline(params: {
   confirmedBy?: string;
   sheetOrderMode?: SheetOrderMode;
   comparisonSummary?: SheetOrderComparisonSummary;
+  roofProfileFamily?: RoofProfileFamily;
+  ventedRidge?: VentedRidgeOption;
+  ruleSetVersion?: number;
+  ruleSetCapturedAt?: string;
 }): OrderPack {
   const cleanPlanes = deduplicateRoofPlanes(params.planes);
   return buildOrderPack({
@@ -960,7 +1365,11 @@ export function buildOrderPackViaPipeline(params: {
     confirmedAt: params.confirmedAt,
     confirmedBy: params.confirmedBy,
     sheetOrderMode: params.sheetOrderMode,
-    comparisonSummary: params.comparisonSummary
+    comparisonSummary: params.comparisonSummary,
+    roofProfileFamily: params.roofProfileFamily,
+    ventedRidge: params.ventedRidge,
+    ruleSetVersion: params.ruleSetVersion,
+    ruleSetCapturedAt: params.ruleSetCapturedAt
   });
 }
 
@@ -1063,3 +1472,226 @@ export async function runRoofPipelineBuildAsync(params: {
     areaSanity: working.areaSanity
   };
 }
+
+export interface RunTakeoffPlaybookContext {
+  sheetSpec: SheetSpec;
+  sheetOrderMode?: SheetOrderMode;
+  defaultPitchDeg?: number;
+  preserveUserDeleted?: boolean;
+  maxInflationRatio?: number;
+  startPlaneId?: string;
+  startEdgeId?: string;
+  assets?: RoofAsset[];
+  pitchBreaks?: PitchBreakLine[];
+  wallPlan?: WallPlan | null;
+  project?: Project | null;
+  flashingContext: FlashingRuleContext;
+  libraryProfiles: FlashingProfile[];
+  ruleSet?: FlashingRuleSet;
+  existingAssignments?: RoofFlashingAssignment[];
+  locked?: boolean;
+  confirmedAt?: string;
+  confirmedBy?: string;
+}
+
+export interface RunTakeoffPlaybookResult {
+  ok: boolean;
+  state: RoofPipelineState;
+  layout: LayoutResult | null;
+  bom: RoofBomSummary | null;
+  orderPack: OrderPack | null;
+  assignableLines: AssignableRoofLine[];
+  assignments: RoofFlashingAssignment[];
+  appliedRuleIds: string[];
+  unresolvedLineIds: string[];
+  completenessReport: TakeoffCompletenessReport | null;
+  ruleSnapshot: {
+    ruleSetVersion: number;
+    ruleSetCapturedAt: string;
+    appliedRulesSnapshot: FlashingRuleSet;
+  } | null;
+  areaSanity: RoofAreaSanityResult;
+}
+
+/**
+ * Part E Deterministic Takeoff Playbook:
+ * ensureSkeleton (only if closed level lacks structural skeleton)
+ *   -> ensureFaces
+ *   -> areaSanity guard (aborts cleanly before layout if failed)
+ *   -> ensureLayout (practical default)
+ *   -> assignStandardFlashings (preserving source === 'user')
+ *   -> ensureBom(strictAreaSanity: true) + Order Pack
+ */
+export function runTakeoffPlaybook(
+  state: RoofPipelineState,
+  context: RunTakeoffPlaybookContext
+): RunTakeoffPlaybookResult {
+  assertRoofDomainComplexity(state.levels, MAX_ROOF_DOMAIN_VERTICES);
+
+  let working = state;
+  const levelsNeedingSkeleton = working.levels
+    .filter((lvl) => {
+      if (lvl.outline.points.length < 3) return false;
+      if (hasStructuralSkeleton(lvl.skeleton)) return false;
+      const allEdges = getAllOutlineEdges(lvl.outline);
+      const hasClassifiedEave = allEdges.some((e) => e.type === 'outline');
+      const activeEaves = allEdges.filter((e) =>
+        !hasClassifiedEave && e.type === 'unclassified' ? true : e.type === 'outline'
+      ).length;
+      return activeEaves >= 2;
+    })
+    .map((l) => l.id);
+
+  if (levelsNeedingSkeleton.length > 0) {
+    working = ensureSkeleton(working, {
+      mode: 'auto',
+      targetLevelIds: levelsNeedingSkeleton
+    }).state;
+  }
+
+  if (!working.dirty.faces && working.planes.length > 0) {
+    const preSanity = checkRoofAreaSanity(working.levels, working.planes, {
+      maxInflationRatio: context.maxInflationRatio
+    });
+    if (!preSanity.ok) {
+      return {
+        ok: false,
+        state: {
+          ...working,
+          layout: null,
+          bom: null,
+          orderPack: null,
+          areaSanity: preSanity,
+          lastBuildError: preSanity.warning || 'Area sanity check failed'
+        },
+        layout: null,
+        bom: null,
+        orderPack: null,
+        assignableLines: [],
+        assignments: context.existingAssignments || [],
+        appliedRuleIds: [],
+        unresolvedLineIds: [],
+        completenessReport: null,
+        ruleSnapshot: null,
+        areaSanity: preSanity
+      };
+    }
+  }
+
+  const facesRes = ensureFaces(working, {
+    defaultPitchDeg: context.defaultPitchDeg ?? 22.5,
+    preserveUserDeleted: context.preserveUserDeleted ?? false,
+    allowAutoSkeletonWhenEmpty: false,
+    maxInflationRatio: context.maxInflationRatio
+  });
+  working = facesRes.state;
+
+  if (!facesRes.areaSanity.ok) {
+    return {
+      ok: false,
+      state: {
+        ...working,
+        layout: null,
+        bom: null,
+        orderPack: null,
+        lastBuildError: facesRes.areaSanity.warning || 'Area sanity check failed'
+      },
+      layout: null,
+      bom: null,
+      orderPack: null,
+      assignableLines: [],
+      assignments: context.existingAssignments || [],
+      appliedRuleIds: [],
+      unresolvedLineIds: [],
+      completenessReport: null,
+      ruleSnapshot: null,
+      areaSanity: facesRes.areaSanity
+    };
+  }
+
+  const sheetOrderMode: SheetOrderMode = context.sheetOrderMode ?? 'practical';
+  const layoutRes = ensureLayout(working, {
+    sheetSpec: context.sheetSpec,
+    sheetOrderMode,
+    startPlaneId: context.startPlaneId,
+    startEdgeId: context.startEdgeId,
+    assets: context.assets,
+    pitchBreaks: context.pitchBreaks,
+    strictDirtyCheck: true,
+    maxInflationRatio: context.maxInflationRatio
+  });
+  working = layoutRes.state;
+
+  const assignableLines = getAssignableRoofLinesMultiLevel(
+    working.levels,
+    working.planes,
+    context.assets || [],
+    context.pitchBreaks || []
+  );
+
+  const flashRes = assignStandardFlashings(
+    assignableLines,
+    context.flashingContext,
+    context.libraryProfiles,
+    context.ruleSet,
+    context.existingAssignments || []
+  );
+
+  const capturedAt = new Date().toISOString();
+  const completenessReport = evaluateTakeoffCompleteness({
+    levels: working.levels,
+    planes: working.planes,
+    assignableLines,
+    flashingAssignments: flashRes.assignments,
+    wallPlan: context.wallPlan ?? null,
+    assets: context.assets || [],
+    areaSanity: layoutRes.areaSanity,
+    outOfScopeLineIds: context.flashingContext.outOfScopeLineIds,
+    outOfScopeKinds: context.flashingContext.outOfScopeKinds
+  });
+
+  const bomRes = ensureBom(working, {
+    sheetSpec: context.sheetSpec,
+    sheetOrderMode,
+    startPlaneId: context.startPlaneId,
+    startEdgeId: context.startEdgeId,
+    assets: context.assets,
+    pitchBreaks: context.pitchBreaks,
+    assignments: flashRes.assignments,
+    assignableLines,
+    strictDirtyCheck: true,
+    strictAreaSanity: true,
+    maxInflationRatio: context.maxInflationRatio,
+    project: context.project,
+    libraryProfiles: context.libraryProfiles,
+    wallPlan: context.wallPlan,
+    completenessReport,
+    locked: context.locked,
+    confirmedAt: context.confirmedAt,
+    confirmedBy: context.confirmedBy,
+    roofProfileFamily: context.flashingContext.roofProfileFamily,
+    ventedRidge: context.flashingContext.ventedRidge,
+    ruleSetVersion: flashRes.ruleSet.version,
+    ruleSetCapturedAt: capturedAt
+  });
+
+  return {
+    ok: true,
+    state: bomRes.state,
+    layout: bomRes.state.layout,
+    bom: bomRes.bom,
+    orderPack: bomRes.orderPack,
+    assignableLines,
+    assignments: flashRes.assignments,
+    appliedRuleIds: flashRes.appliedRuleIds,
+    unresolvedLineIds: flashRes.unresolvedLineIds,
+    completenessReport,
+    ruleSnapshot: {
+      ruleSetVersion: flashRes.ruleSet.version,
+      ruleSetCapturedAt: capturedAt,
+      appliedRulesSnapshot: flashRes.ruleSet
+    },
+    areaSanity: bomRes.areaSanity
+  };
+}
+

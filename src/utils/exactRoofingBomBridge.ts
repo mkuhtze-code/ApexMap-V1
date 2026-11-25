@@ -25,9 +25,11 @@ import {
   RoofPackLengthGroup,
   RoofPackOffcutTransfer,
   RoofPlane,
+  RoofProfileFamily,
   SheetOrderComparisonSummary,
   SheetOrderMode,
   TakeoffCompletenessReport,
+  VentedRidgeOption,
   WallPlan
 } from '../types/exactRoofing';
 import { LongRunProfileKey, RoofFacet } from '../types/longrun';
@@ -1139,6 +1141,10 @@ export function buildOrderPack(params: {
   overhangMm?: number;
   sheetOrderMode?: SheetOrderMode;
   comparisonSummary?: SheetOrderComparisonSummary;
+  roofProfileFamily?: RoofProfileFamily;
+  ventedRidge?: VentedRidgeOption;
+  ruleSetVersion?: number;
+  ruleSetCapturedAt?: string;
 }): OrderPack {
   const {
     project,
@@ -1157,7 +1163,11 @@ export function buildOrderPack(params: {
     endLapMm = 150,
     overhangMm = 50,
     sheetOrderMode,
-    comparisonSummary
+    comparisonSummary,
+    roofProfileFamily,
+    ventedRidge,
+    ruleSetVersion,
+    ruleSetCapturedAt
   } = params;
 
   const bom =
@@ -1239,7 +1249,11 @@ export function buildOrderPack(params: {
     total_lm: g.totalLinearMetres,
     color: g.colorName,
     line_labels: g.lineLabels,
-    notes: `${g.lineLabels.join(' + ')}${g.notes ? ` · ${g.notes}` : ''}`
+    notes: `${g.lineLabels.join(' + ')}${g.notes ? ` · ${g.notes}` : ''}`,
+    ...(g.coverMm !== undefined ? { cover_mm: g.coverMm } : {}),
+    ...(g.shopNotes ? { shop_notes: g.shopNotes } : {}),
+    ...(g.ruleId ? { rule_id: g.ruleId } : {}),
+    ...(g.source ? { source: g.source } : {})
   }));
 
   const displayPlanes = getDisplayPlanes(planes, layout);
@@ -1397,6 +1411,10 @@ export function buildOrderPack(params: {
       color: colorName,
       windZone: project?.windZone,
       exposureZone: project?.exposureZone,
+      ...(roofProfileFamily ? { roofProfileFamily } : {}),
+      ...(ventedRidge ? { ventedRidge } : {}),
+      ...(ruleSetVersion !== undefined ? { ruleSetVersion } : {}),
+      ...(ruleSetCapturedAt ? { ruleSetCapturedAt } : {}),
       coverWidthMm,
       endLapMm,
       overhangMm,
@@ -1464,7 +1482,7 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
   lines.push('');
 
   // Unified Schedule Header
-  lines.push(['SECTION', 'code', 'description', 'qty', 'unit', 'length_mm', 'modeled_length_mm', 'is_override', 'total_lm', 'girth_mm', 'bend_count', 'has_hem_crush', 'notes'].join(','));
+  lines.push(['SECTION', 'code', 'description', 'qty', 'unit', 'length_mm', 'modeled_length_mm', 'is_override', 'total_lm', 'girth_mm', 'cover_mm', 'bend_count', 'has_hem_crush', 'shop_notes', 'notes'].join(','));
 
   orderPack.sheets.forEach((sh) => {
     lines.push([
@@ -1477,6 +1495,8 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
       sh.modeled_length_mm,
       sh.is_override ? 'YES' : 'NO',
       sh.total_lm.toFixed(3),
+      '',
+      '',
       '',
       '',
       '',
@@ -1496,8 +1516,10 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
       'NO',
       fl.total_lm.toFixed(3),
       fl.girth_mm,
+      fl.cover_mm ?? '',
       fl.bend_count,
       fl.has_hem_crush ? 'YES' : 'NO',
+      esc(fl.shop_notes || ''),
       esc(fl.notes)
     ].join(','));
   });
@@ -1516,6 +1538,8 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
       '',
       '',
       '',
+      '',
+      '',
       esc(pen.notes)
     ].join(','));
   });
@@ -1530,6 +1554,8 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
       '',
       '',
       'NO',
+      '',
+      '',
       '',
       '',
       '',
@@ -1553,6 +1579,8 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
         '',
         '',
         '',
+        '',
+        '',
         esc(wl.notes)
       ].join(','));
     });
@@ -1571,6 +1599,8 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
         '',
         '',
         '',
+        '',
+        '',
         esc('Includes parapet upstand coping flashing allowance')
       ].join(','));
     }
@@ -1585,6 +1615,8 @@ export function exportOrderPackToCsv(orderPack: OrderPack): string {
         op.width_mm,
         op.height_mm,
         'NO',
+        '',
+        '',
         '',
         '',
         '',

@@ -128,6 +128,7 @@ export const FlashingAssignmentModal: React.FC<Props> = ({
       quantity: qty,
       totalLinearMetres: +(qty * cleanLenLm).toFixed(3),
       notes: notes.trim() || undefined,
+      source: 'user',
       assignedAt: new Date().toISOString(),
       orderedToWorkshop: false,
       orderedToCrm: false

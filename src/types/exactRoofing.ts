@@ -404,11 +404,11 @@ export type VentedRidgeOption = 'none' | 'RV10P';
 export interface FlashingRule {
   id: string;
   enabled: boolean;
-  profileFamily: RoofProfileFamily;
+  profileFamily: RoofProfileFamily | string;
   lineKind: RoofLineFlashingKind | '*';
-  windMin: WindZoneCode;
-  windMax: WindZoneCode;
-  ventedRidge: VentedRidgeOption | '*';
+  windMin: WindZoneCode | null;
+  windMax: WindZoneCode | null;
+  ventedRidge: VentedRidgeOption | '*' | null;
   libraryProfileId: string;
   productCode: string;
   coverMm: number;
@@ -867,6 +867,7 @@ export interface OrderPack {
     ventedRidge?: VentedRidgeOption;
     ruleSetVersion?: number;
     ruleSetCapturedAt?: string;
+    ruleSetRevision?: string;
     coverWidthMm: number;
     endLapMm: number;
     overhangMm: number;
@@ -937,6 +938,7 @@ export interface ExactRoofModelSnapshot {
   roofProfileFamily?: RoofProfileFamily;
   ruleSetVersion?: number;
   ruleSetCapturedAt?: string;
+  ruleSetRevision?: string;
   appliedRulesSnapshot?: FlashingRuleSet;
   outOfScopeLineIds?: string[];
   outOfScopeKinds?: RoofLineFlashingKind[];

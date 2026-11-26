@@ -1,9 +1,11 @@
 import React from 'react';
 import {
   EdgeType,
+  FlashingRuleSet,
   RoofPlane,
   RoofOutline,
   RoofLevel,
+  RoofProfileFamily,
   LayoutResult,
   RoofAsset,
   PitchBreakLine,
@@ -13,13 +15,16 @@ import {
   SkeletonLineType,
   TakeoffCompletenessIssue,
   TakeoffCompletenessReport,
+  VentedRidgeOption,
   WallCladdingType,
   WallFacet,
   WallFacetKind,
   WallFilterMode,
   WallHeightSource,
-  WallPlan
+  WallPlan,
+  WindZoneCode
 } from '../../types/exactRoofing';
+import { resolveMatchingFlashingRule } from '../../utils/flashingRules';
 import {
   X,
   Sliders,
@@ -158,6 +163,14 @@ interface Props {
   ) => void;
   onUndo?: () => void;
   canUndo?: boolean;
+  windZoneCode?: WindZoneCode;
+  roofProfileFamily?: Exclude<RoofProfileFamily, '*'>;
+  ventedRidge?: VentedRidgeOption;
+  flashingRuleSet?: FlashingRuleSet;
+  onChangeWindZoneCode?: (wz: WindZoneCode) => void;
+  onChangeRoofProfileFamily?: (pf: Exclude<RoofProfileFamily, '*'>) => void;
+  onChangeVentedRidge?: (vr: VentedRidgeOption) => void;
+  onOpenFlashingRules?: () => void;
 }
 
 export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
@@ -235,7 +248,15 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   onBatchSkeletonLineType,
   onBatchWallUpdate,
   onUndo,
-  canUndo = false
+  canUndo = false,
+  windZoneCode = 'M',
+  roofProfileFamily = 'corrugate',
+  ventedRidge = 'none',
+  flashingRuleSet,
+  onChangeWindZoneCode,
+  onChangeRoofProfileFamily,
+  onChangeVentedRidge,
+  onOpenFlashingRules
 }) => {
   const { isMobile } = useDeviceDetection();
   const isInstalling = lifecycleStage === 'installing';
@@ -2901,19 +2922,87 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               .toFixed(1);
             return (
               <div className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
-                    Flashings ({flashingAssignments.length}/{keyLines.length || assignableLines.length})
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
+                      Flashings ({flashingAssignments.length}/{keyLines.length || assignableLines.length})
+                    </div>
+                    <span className="font-mono text-[11px] font-bold text-emerald-400 tabular-nums">
+                      {totalFlashingLm} lm
+                    </span>
                   </div>
-                  <span className="font-mono text-[11px] font-bold text-emerald-400 tabular-nums">
-                    {totalFlashingLm} lm
-                  </span>
-                </div>
+
+                  {!isLockedView &&
+                    onChangeWindZoneCode &&
+                    onChangeRoofProfileFamily &&
+                    onChangeVentedRidge && (
+                      <div className="p-2 rounded-xl bg-slate-950/75 border border-slate-800 space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
+                            Flashing Context
+                          </span>
+                          {onOpenFlashingRules && (
+                            <button
+                              type="button"
+                              onClick={onOpenFlashingRules}
+                              className="text-[10px] font-extrabold text-sky-400 hover:text-sky-300 cursor-pointer"
+                            >
+                              Flashing rules
+                            </button>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-3 gap-1 text-[10px]">
+                          <select
+                            value={roofProfileFamily}
+                            onChange={(e) =>
+                              onChangeRoofProfileFamily(
+                                e.target.value as Exclude<RoofProfileFamily, '*'>
+                              )
+                            }
+                            className="bg-slate-900 border border-slate-800 rounded-lg px-1.5 py-1 text-white font-bold outline-none cursor-pointer"
+                            aria-label="Inspector Profile Family"
+                          >
+                            <option value="corrugate">Corrugate</option>
+                            <option value="trapezoidal">Trapezoid</option>
+                            <option value="standing_seam">Stand Seam</option>
+                          </select>
+                          <select
+                            value={windZoneCode}
+                            onChange={(e) => onChangeWindZoneCode(e.target.value as WindZoneCode)}
+                            className="bg-slate-900 border border-slate-800 rounded-lg px-1.5 py-1 text-white font-bold outline-none cursor-pointer"
+                            aria-label="Inspector Wind Zone"
+                          >
+                            {(['L', 'M', 'H', 'VH', 'EH'] as const).map((wz) => (
+                              <option key={wz} value={wz}>Wind {wz}</option>
+                            ))}
+                          </select>
+                          <select
+                            value={ventedRidge}
+                            onChange={(e) =>
+                              onChangeVentedRidge(e.target.value as VentedRidgeOption)
+                            }
+                            className="bg-slate-900 border border-slate-800 rounded-lg px-1.5 py-1 text-white font-bold outline-none cursor-pointer"
+                            aria-label="Inspector Vented Ridge"
+                          >
+                            <option value="none">Std Ridge</option>
+                            <option value="RV10P">RV10P</option>
+                          </select>
+                        </div>
+                      </div>
+                    )}
 
                 {keyLines.length > 0 && (
                   <div className="space-y-1 max-h-44 overflow-y-auto pr-0.5">
                     {keyLines.map((line) => {
                       const assigned = flashingAssignments.find((a) => a.lineId === line.lineId);
+                      const hasMatchingRule = flashingRuleSet
+                        ? Boolean(
+                            resolveMatchingFlashingRule(flashingRuleSet.rules, line.flashingKind, {
+                              roofProfileFamily,
+                              windZone: windZoneCode,
+                              ventedRidge
+                            })
+                          )
+                        : true;
                       return (
                         <button
                           key={line.lineId}
@@ -2925,6 +3014,8 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                           } ${
                             assigned
                               ? 'bg-emerald-950/35 border-emerald-500/40'
+                              : !hasMatchingRule
+                              ? 'bg-rose-950/25 border-rose-500/45'
                               : 'bg-slate-950/60 border-slate-800/80'
                           }`}
                         >
@@ -2942,6 +3033,10 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                             <span className="text-emerald-400 font-bold text-[10px] flex items-center gap-0.5 shrink-0">
                               <Check className="w-3 h-3" />
                               <span>Set</span>
+                            </span>
+                          ) : !hasMatchingRule ? (
+                            <span className="px-1.5 py-0.5 rounded bg-rose-500/20 border border-rose-500/40 text-rose-300 font-bold text-[10px] shrink-0">
+                              No rule
                             </span>
                           ) : !isLockedView ? (
                             <span className="text-sky-400 font-bold text-[10px] shrink-0">

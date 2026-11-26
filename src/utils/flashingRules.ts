@@ -15,7 +15,7 @@ import {
   getDefaultMitreNotes
 } from './exactRoofingFlashingBridge';
 
-export const FLASHING_RULES_STORAGE_KEY = 'archtech_flashing_rules_v1';
+export const FLASHING_RULES_STORAGE_KEY = 'apexmap.flashingRuleSet.v1';
 
 const WIND_ZONE_ORDER: WindZoneCode[] = ['L', 'M', 'H', 'VH', 'EH'];
 
@@ -23,11 +23,11 @@ let inMemoryRuleSetStore: string | null = null;
 
 function windIndex(code: WindZoneCode): number {
   const idx = WIND_ZONE_ORDER.indexOf(code);
-  return idx >= 0 ? idx : 2;
+  return idx >= 0 ? idx : 1;
 }
 
 export function normalizeWindZoneCode(raw?: string | null): WindZoneCode {
-  if (!raw) return 'H';
+  if (!raw) return 'M';
   const trimmed = raw.trim().toUpperCase();
   if (trimmed === 'L' || trimmed === 'M' || trimmed === 'H' || trimmed === 'VH' || trimmed === 'EH') {
     return trimmed;
@@ -77,14 +77,14 @@ function buildSeedRulesForFamily(
       windMax: 'M',
       ventedRidge: 'none',
       libraryProfileId: 'preset-ventilated-ridge',
-      productCode: 'FL-RDG-150',
+      productCode: 'RIDGE-150',
       coverMm: 150,
-      priority: basePriority + 20,
+      priority: basePriority + 10,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: '150mm cover · soft-edge wings · 150mm lap · 30mm end turn'
+      shopNotes: '150mm cover; soft-edge wings, 150mm lap, 30mm end turn.'
     },
     {
       id: `seed-${famTag}-ridge-heh`,
@@ -96,14 +96,14 @@ function buildSeedRulesForFamily(
       windMax: 'EH',
       ventedRidge: 'none',
       libraryProfileId: 'preset-ventilated-ridge',
-      productCode: 'FL-RDG-200',
+      productCode: 'RIDGE-200',
       coverMm: 200,
-      priority: basePriority + 20,
+      priority: basePriority + 10,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: '200mm cover H-EH wind · soft-edge wings · 150mm lap · 30mm end turn'
+      shopNotes: '200mm cover H-EH wind; soft-edge wings, 150mm lap, 30mm end turn.'
     },
     {
       id: `seed-${famTag}-ridge-rv10p`,
@@ -111,18 +111,18 @@ function buildSeedRulesForFamily(
       enabled: true,
       profileFamily,
       lineKind: 'ridge',
-      windMin: 'L',
-      windMax: 'EH',
+      windMin: null,
+      windMax: null,
       ventedRidge: 'RV10P',
       libraryProfileId: 'preset-ventilated-ridge',
-      productCode: 'FL-RDG-RV10P',
+      productCode: 'RIDGE-RV10P',
       coverMm: 200,
-      priority: basePriority + 30,
+      priority: basePriority + 20,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: 'RV10P vented ridge kit · 10mm free vent gap · 150mm lap · 30mm end turn'
+      shopNotes: 'RV10P vented ridge kit; 10mm free vent gap, 150mm lap, 30mm end turn.'
     },
     {
       id: `seed-${famTag}-hip`,
@@ -130,18 +130,18 @@ function buildSeedRulesForFamily(
       enabled: true,
       profileFamily,
       lineKind: 'hip',
-      windMin: 'L',
-      windMax: 'EH',
-      ventedRidge: '*',
+      windMin: null,
+      windMax: null,
+      ventedRidge: null,
       libraryProfileId: 'preset-ventilated-ridge',
-      productCode: 'FL-HIP-150',
+      productCode: 'HIP-150',
       coverMm: 150,
-      priority: basePriority + 10,
+      priority: basePriority + 5,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: 'Mitred hip cap · 150mm lap · 30mm end turn'
+      shopNotes: 'Mitre hip cap at ridge; 150mm lap joins and 30mm stop-end turn.'
     },
     {
       id: `seed-${famTag}-valley`,
@@ -149,18 +149,18 @@ function buildSeedRulesForFamily(
       enabled: true,
       profileFamily,
       lineKind: 'valley',
-      windMin: 'L',
-      windMax: 'EH',
-      ventedRidge: '*',
+      windMin: null,
+      windMax: null,
+      ventedRidge: null,
       libraryProfileId: 'preset-valley-gutter',
-      productCode: 'FL-VAL-250',
+      productCode: 'VALLEY-250',
       coverMm: 250,
-      priority: basePriority + 10,
+      priority: basePriority + 5,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: '250mm valley trough · 30mm side upstands + safety folds'
+      shopNotes: '250mm valley trough; fold 30mm side upstands and safety crush hems.'
     },
     {
       id: `seed-${famTag}-barge`,
@@ -168,18 +168,18 @@ function buildSeedRulesForFamily(
       enabled: true,
       profileFamily,
       lineKind: 'barge',
-      windMin: 'L',
-      windMax: 'EH',
-      ventedRidge: '*',
+      windMin: null,
+      windMax: null,
+      ventedRidge: null,
       libraryProfileId: 'preset-barge-roll',
-      productCode: 'FL-BRG-120',
+      productCode: 'BARGE-120',
       coverMm: 120,
-      priority: basePriority + 10,
+      priority: basePriority + 5,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: '120mm cover barge · 45° apex mitre · eave stop-end turn down'
+      shopNotes: '120mm cover barge; 45 deg apex mitre cut and eave stop-end fold-back.'
     },
     {
       id: `seed-${famTag}-apron`,
@@ -187,18 +187,18 @@ function buildSeedRulesForFamily(
       enabled: true,
       profileFamily,
       lineKind: 'apron',
-      windMin: 'L',
-      windMax: 'EH',
-      ventedRidge: '*',
+      windMin: null,
+      windMax: null,
+      ventedRidge: null,
       libraryProfileId: 'preset-apron-kick',
-      productCode: 'FL-APR-150',
+      productCode: 'APRON-150',
       coverMm: 150,
-      priority: basePriority + 10,
+      priority: basePriority + 5,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: '150mm wall upstand · anti-capillary hem · 15mm drip kick'
+      shopNotes: '150mm wall upstand apron; anti-capillary hem and 15mm drip kick.'
     }
   ];
 }
@@ -337,6 +337,7 @@ export function resolveMatchingFlashingRule(
     exactProfile: number;
     exactKind: number;
     exactVented: number;
+    boundedWind: number;
     negWindSpan: number;
     priority: number;
     index: number;
@@ -358,20 +359,24 @@ export function resolveMatchingFlashingRule(
         : -1;
     if (kindMatch < 0) return;
 
-    const minIdx = windIndex(rule.windMin);
-    const maxIdx = windIndex(rule.windMax);
+    const minIdx = rule.windMin ? windIndex(rule.windMin) : 0;
+    const maxIdx = rule.windMax ? windIndex(rule.windMax) : 4;
     const lo = Math.min(minIdx, maxIdx);
     const hi = Math.max(minIdx, maxIdx);
     if (windPos < lo || windPos > hi) return;
 
-    const ventedMatch = rule.ventedRidge === vented || rule.ventedRidge === '*';
+    const ventedMatch =
+      rule.ventedRidge === null || rule.ventedRidge === '*' || rule.ventedRidge === vented;
     if (!ventedMatch) return;
+
+    const isBoundedWind = rule.windMin !== null || rule.windMax !== null ? 1 : 0;
 
     candidates.push({
       rule,
       exactProfile: rule.profileFamily === family ? 1 : 0,
       exactKind: kindMatch,
       exactVented: rule.ventedRidge === vented ? 1 : 0,
+      boundedWind: isBoundedWind,
       negWindSpan: -(hi - lo),
       priority: Number.isFinite(rule.priority) ? rule.priority : 0,
       index
@@ -384,6 +389,7 @@ export function resolveMatchingFlashingRule(
     if (b.exactProfile !== a.exactProfile) return b.exactProfile - a.exactProfile;
     if (b.exactKind !== a.exactKind) return b.exactKind - a.exactKind;
     if (b.exactVented !== a.exactVented) return b.exactVented - a.exactVented;
+    if (b.boundedWind !== a.boundedWind) return b.boundedWind - a.boundedWind;
     if (b.negWindSpan !== a.negWindSpan) return b.negWindSpan - a.negWindSpan;
     if (b.priority !== a.priority) return b.priority - a.priority;
     return a.index - b.index;

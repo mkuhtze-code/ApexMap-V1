@@ -146,13 +146,18 @@ export function checkRoofAreaSanity(
     };
   }
 
-  const maxPitchDeg = Math.min(
-    72,
-    Math.max(1, ...structuralPlanes.map((p) => (Number.isFinite(p.pitchDeg) ? p.pitchDeg : 22.5)))
-  );
-  const cosMin = Math.max(0.3, Math.cos((maxPitchDeg * Math.PI) / 180));
+  let totalWeightedArea = 0;
+  let weightedPitchSum = 0;
+  structuralPlanes.forEach((p) => {
+    const w = Math.max(0.01, p.planPolygon.length >= 3 ? polygonArea(p.planPolygon) : p.area || 0);
+    const pitch = Number.isFinite(p.pitchDeg) ? Math.min(72, Math.max(1, p.pitchDeg)) : 22.5;
+    weightedPitchSum += w * pitch;
+    totalWeightedArea += w;
+  });
+  const dominantPitchDeg = totalWeightedArea > 0 ? weightedPitchSum / totalWeightedArea : 22.5;
+  const cosDominant = Math.max(0.3, Math.cos((dominantPitchDeg * Math.PI) / 180));
   const tolArea = Math.min(4, footprintAreaM2 * 0.08);
-  const expectedMaxAreaM2 = +((footprintAreaM2 / cosMin) * maxInflationRatio + tolArea).toFixed(2);
+  const expectedMaxAreaM2 = +((footprintAreaM2 / cosDominant) * maxInflationRatio + tolArea).toFixed(2);
   const expectedMaxPlanM2 = +(footprintAreaM2 * maxInflationRatio + tolArea).toFixed(2);
 
   const rawStructuralPlanes = planes.filter((p) => !p.isVirtualAssetPlane);
@@ -172,7 +177,7 @@ export function checkRoofAreaSanity(
 
   const reportedModeled = Math.max(modeledAreaM2, +rawModeledSum.toFixed(2));
   const inflationRatio = +(
-    reportedModeled / Math.max(0.1, footprintAreaM2 / cosMin)
+    reportedModeled / Math.max(0.1, footprintAreaM2 / cosDominant)
   ).toFixed(2);
 
   if (
@@ -1231,6 +1236,7 @@ export function ensureBom(
     ventedRidge?: VentedRidgeOption;
     ruleSetVersion?: number;
     ruleSetCapturedAt?: string;
+    ruleSetRevision?: string;
   }
 ): {
   state: RoofPipelineState;
@@ -1301,7 +1307,8 @@ export function ensureBom(
       roofProfileFamily: params.roofProfileFamily,
       ventedRidge: params.ventedRidge,
       ruleSetVersion: params.ruleSetVersion,
-      ruleSetCapturedAt: params.ruleSetCapturedAt
+      ruleSetCapturedAt: params.ruleSetCapturedAt,
+      ruleSetRevision: params.ruleSetRevision
     });
   }
 
@@ -1347,6 +1354,7 @@ export function buildOrderPackViaPipeline(params: {
   ventedRidge?: VentedRidgeOption;
   ruleSetVersion?: number;
   ruleSetCapturedAt?: string;
+  ruleSetRevision?: string;
 }): OrderPack {
   const cleanPlanes = deduplicateRoofPlanes(params.planes);
   return buildOrderPack({
@@ -1369,7 +1377,8 @@ export function buildOrderPackViaPipeline(params: {
     roofProfileFamily: params.roofProfileFamily,
     ventedRidge: params.ventedRidge,
     ruleSetVersion: params.ruleSetVersion,
-    ruleSetCapturedAt: params.ruleSetCapturedAt
+    ruleSetCapturedAt: params.ruleSetCapturedAt,
+    ruleSetRevision: params.ruleSetRevision
   });
 }
 
@@ -1496,6 +1505,7 @@ export interface RunTakeoffPlaybookContext {
 
 export interface RunTakeoffPlaybookResult {
   ok: boolean;
+  stage: 'skeleton' | 'faces' | 'layout' | 'flashings' | 'bom' | 'complete';
   state: RoofPipelineState;
   layout: LayoutResult | null;
   bom: RoofBomSummary | null;
@@ -1505,9 +1515,11 @@ export interface RunTakeoffPlaybookResult {
   appliedRuleIds: string[];
   unresolvedLineIds: string[];
   completenessReport: TakeoffCompletenessReport | null;
+  ruleSetRevision: string | null;
   ruleSnapshot: {
     ruleSetVersion: number;
     ruleSetCapturedAt: string;
+    ruleSetRevision: string;
     appliedRulesSnapshot: FlashingRuleSet;
   } | null;
   areaSanity: RoofAreaSanityResult;
@@ -1516,11 +1528,11 @@ export interface RunTakeoffPlaybookResult {
 /**
  * Part E Deterministic Takeoff Playbook:
  * ensureSkeleton (only if closed level lacks structural skeleton)
- *   -> ensureFaces
- *   -> areaSanity guard (aborts cleanly before layout if failed)
+ *   -> ensureFaces (preserveUserDeleted: true)
+ *   -> areaSanity guard (aborts cleanly at stage 'faces' before layout if failed)
  *   -> ensureLayout (practical default)
  *   -> assignStandardFlashings (preserving source === 'user')
- *   -> ensureBom(strictAreaSanity: true) + Order Pack
+ *   -> ensureBom(strictAreaSanity: true) + Order Pack stamped with ruleSetRevision
  */
 export function runTakeoffPlaybook(
   state: RoofPipelineState,
@@ -1556,6 +1568,7 @@ export function runTakeoffPlaybook(
     if (!preSanity.ok) {
       return {
         ok: false,
+        stage: 'faces',
         state: {
           ...working,
           layout: null,
@@ -1572,6 +1585,7 @@ export function runTakeoffPlaybook(
         appliedRuleIds: [],
         unresolvedLineIds: [],
         completenessReport: null,
+        ruleSetRevision: null,
         ruleSnapshot: null,
         areaSanity: preSanity
       };
@@ -1580,7 +1594,7 @@ export function runTakeoffPlaybook(
 
   const facesRes = ensureFaces(working, {
     defaultPitchDeg: context.defaultPitchDeg ?? 22.5,
-    preserveUserDeleted: context.preserveUserDeleted ?? false,
+    preserveUserDeleted: context.preserveUserDeleted ?? true,
     allowAutoSkeletonWhenEmpty: false,
     maxInflationRatio: context.maxInflationRatio
   });
@@ -1589,6 +1603,7 @@ export function runTakeoffPlaybook(
   if (!facesRes.areaSanity.ok) {
     return {
       ok: false,
+      stage: 'faces',
       state: {
         ...working,
         layout: null,
@@ -1604,6 +1619,7 @@ export function runTakeoffPlaybook(
       appliedRuleIds: [],
       unresolvedLineIds: [],
       completenessReport: null,
+      ruleSetRevision: null,
       ruleSnapshot: null,
       areaSanity: facesRes.areaSanity
     };
@@ -1638,6 +1654,7 @@ export function runTakeoffPlaybook(
   );
 
   const capturedAt = new Date().toISOString();
+  const ruleSetRevision = capturedAt;
   const completenessReport = evaluateTakeoffCompleteness({
     levels: working.levels,
     planes: working.planes,
@@ -1672,11 +1689,13 @@ export function runTakeoffPlaybook(
     roofProfileFamily: context.flashingContext.roofProfileFamily,
     ventedRidge: context.flashingContext.ventedRidge,
     ruleSetVersion: flashRes.ruleSet.version,
-    ruleSetCapturedAt: capturedAt
+    ruleSetCapturedAt: capturedAt,
+    ruleSetRevision
   });
 
   return {
     ok: true,
+    stage: 'complete',
     state: bomRes.state,
     layout: bomRes.state.layout,
     bom: bomRes.bom,
@@ -1686,9 +1705,11 @@ export function runTakeoffPlaybook(
     appliedRuleIds: flashRes.appliedRuleIds,
     unresolvedLineIds: flashRes.unresolvedLineIds,
     completenessReport,
+    ruleSetRevision,
     ruleSnapshot: {
       ruleSetVersion: flashRes.ruleSet.version,
       ruleSetCapturedAt: capturedAt,
+      ruleSetRevision,
       appliedRulesSnapshot: flashRes.ruleSet
     },
     areaSanity: bomRes.areaSanity

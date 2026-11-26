@@ -67,6 +67,7 @@ import {
   buildPresetPipelineState,
   checkRoofAreaSanity,
   computeSheetOrderComparisonViaPipeline,
+  computeTruthfulRoofAreaM2,
   createRoofLevelWithSkeleton,
   createRoofPipelineState,
   deletePlanesViaPipeline,
@@ -231,6 +232,7 @@ interface SavedRoofState {
   roofProfileFamily?: RoofProfileFamily;
   ruleSetVersion?: number;
   ruleSetCapturedAt?: string;
+  ruleSetRevision?: string;
   appliedRulesSnapshot?: FlashingRuleSet;
   outOfScopeLineIds?: string[];
   outOfScopeKinds?: RoofLineFlashingKind[];
@@ -438,6 +440,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
     activeQuote?.roofPlanModel?.ruleSetCapturedAt ||
       project?.roofPlanModel?.ruleSetCapturedAt ||
       initialState.ruleSetCapturedAt
+  );
+  const [ruleSetRevision, setRuleSetRevision] = useState<string | undefined>(
+    activeQuote?.roofPlanModel?.ruleSetRevision ||
+      project?.roofPlanModel?.ruleSetRevision ||
+      initialState.ruleSetRevision
   );
   const [windZoneCode, setWindZoneCode] = useState<WindZoneCode>(() =>
     normalizeWindZoneCode(
@@ -647,6 +654,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setAppliedRulesSnapshot(snap.appliedRulesSnapshot || null);
       setRuleSetVersion(snap.ruleSetVersion);
       setRuleSetCapturedAt(snap.ruleSetCapturedAt);
+      setRuleSetRevision(snap.ruleSetRevision);
       setWindZoneCode(normalizeWindZoneCode(snap.windZoneCode || project?.windZone));
       setRoofProfileFamily(normalizeProfileFamily(snap.roofProfileFamily || project?.profile));
       setVentedRidge(snap.ventedRidge || 'none');
@@ -698,6 +706,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         roofProfileFamily,
         ruleSetVersion,
         ruleSetCapturedAt,
+        ruleSetRevision,
         appliedRulesSnapshot: appliedRulesSnapshot || undefined,
         outOfScopeLineIds,
         outOfScopeKinds
@@ -728,6 +737,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     roofProfileFamily,
     ruleSetVersion,
     ruleSetCapturedAt,
+    ruleSetRevision,
     appliedRulesSnapshot,
     outOfScopeLineIds,
     outOfScopeKinds
@@ -2637,7 +2647,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
       roofProfileFamily,
       ventedRidge,
       ruleSetVersion: ruleSetVersion ?? effectiveRuleSet.version,
-      ruleSetCapturedAt
+      ruleSetCapturedAt,
+      ruleSetRevision
     });
   }, [
     measureLocked,
@@ -2659,7 +2670,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     ventedRidge,
     ruleSetVersion,
     effectiveRuleSet.version,
-    ruleSetCapturedAt
+    ruleSetCapturedAt,
+    ruleSetRevision
   ]);
 
   const deterministicAuditReport = useMemo<DeterministicRoofAuditReport>(
@@ -2769,6 +2781,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     roofProfileFamily,
     ruleSetVersion: overrides?.ruleSetVersion ?? ruleSetVersion ?? effectiveRuleSet.version,
     ruleSetCapturedAt: overrides?.ruleSetCapturedAt ?? ruleSetCapturedAt,
+    ruleSetRevision: overrides?.ruleSetRevision ?? ruleSetRevision,
     appliedRulesSnapshot:
       overrides?.appliedRulesSnapshot !== undefined
         ? overrides.appliedRulesSnapshot
@@ -2813,6 +2826,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setAppliedRulesSnapshot(res.ruleSet);
     setRuleSetVersion(res.ruleSet.version);
     setRuleSetCapturedAt(nowIso);
+    setRuleSetRevision(nowIso);
     const ruleCount = res.assignments.filter((a) => a.source === 'rule').length;
     const manualCount = res.assignments.filter((a) => a.source === 'user').length;
     triggerNotice(
@@ -2860,7 +2874,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
         }
         setPlanes(res.state.planes);
         setLayoutResult(null);
-        triggerNotice(res.areaSanity.warning || 'Area sanity check failed — takeoff aborted');
+        triggerNotice(
+          `Stage (${res.stage}): ${res.areaSanity.warning || 'Area sanity check failed — takeoff aborted'}`
+        );
         return;
       }
 
@@ -2878,14 +2894,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
         setAppliedRulesSnapshot(res.ruleSnapshot.appliedRulesSnapshot);
         setRuleSetVersion(res.ruleSnapshot.ruleSetVersion);
         setRuleSetCapturedAt(res.ruleSnapshot.ruleSetCapturedAt);
+        setRuleSetRevision(res.ruleSnapshot.ruleSetRevision);
       }
       setWallPlan((prev) =>
         prev ? syncWallPlanWithRoof(prev, res.state.levels, res.state.planes) : prev
       );
+      const truthfulAreaM2 = computeTruthfulRoofAreaM2(res.state.planes);
+      const flashingSticksCount = res.assignments.reduce((sum, a) => sum + (a.quantity || 0), 0);
       triggerNotice(
-        `✓ Takeoff complete: ${res.state.planes.length} faces · ${(
+        `✓ Takeoff complete: ${res.state.planes.length} faces · ${truthfulAreaM2.toFixed(1)}m² · ${(
           res.layout?.totalOrderedMetres || 0
-        ).toFixed(1)}m sheets · ${res.assignments.length} flashings`
+        ).toFixed(1)}m sheets · ${flashingSticksCount} flashing sticks`
       );
     } catch (err) {
       triggerNotice(err instanceof Error ? err.message : 'Unable to run takeoff playbook');
@@ -2981,7 +3000,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
           roofProfileFamily,
           ventedRidge,
           ruleSetVersion: ruleSetVersion ?? effectiveRuleSet.version,
-          ruleSetCapturedAt: ruleSetCapturedAt || confirmedAt
+          ruleSetCapturedAt: ruleSetCapturedAt || confirmedAt,
+          ruleSetRevision: ruleSetRevision || ruleSetCapturedAt || confirmedAt
         }
       );
       if (pipeRes.state.layout && !layoutResult) {
@@ -2991,6 +3011,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       const frozenRulesSnap = appliedRulesSnapshot || effectiveRuleSet;
       const frozenRuleVer = ruleSetVersion ?? frozenRulesSnap.version;
       const frozenRuleCaptured = ruleSetCapturedAt || confirmedAt;
+      const frozenRuleRevision = ruleSetRevision || frozenRuleCaptured;
       const nextSnap = buildCurrentSnapshot({
         stage: 'installing',
         measureLocked: true,
@@ -3001,11 +3022,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
         orderPack: emittedOrderPack,
         appliedRulesSnapshot: frozenRulesSnap,
         ruleSetVersion: frozenRuleVer,
-        ruleSetCapturedAt: frozenRuleCaptured
+        ruleSetCapturedAt: frozenRuleCaptured,
+        ruleSetRevision: frozenRuleRevision
       });
       setAppliedRulesSnapshot(frozenRulesSnap);
       setRuleSetVersion(frozenRuleVer);
       setRuleSetCapturedAt(frozenRuleCaptured);
+      setRuleSetRevision(frozenRuleRevision);
       setFrozenOrderPack(emittedOrderPack);
       setIsMeasureLockGateOpen(false);
       setMeasureLocked(true);
@@ -3428,7 +3451,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
             className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-extrabold flex items-center gap-2 text-emerald-300 hover:bg-emerald-600/20 transition-colors cursor-pointer"
           >
             <Play className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Run takeoff (All steps)</span>
+            <span>Run takeoff</span>
           </button>
           <button
             type="button"
@@ -3444,7 +3467,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
         </>
       )}
 
-      {lifecycleStage === 'quoting' && !measureLocked && (
+      {lifecycleStage !== 'installing' && !measureLocked && (
         <button
           type="button"
           onClick={() => {
@@ -3702,11 +3725,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
                       ) : lifecycleStage === 'measuring' && !measureLocked ? (
                         <button
                           type="button"
+                          disabled={!completenessReport.canLockMeasure || !areaSanity.ok}
                           onClick={() => {
                             handleRequestLockMeasure();
                             setIsMobileHubMenuOpen(false);
                           }}
-                          className="min-h-[38px] px-2 rounded-xl bg-amber-600/25 border border-amber-500/50 text-amber-300 text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                          className="min-h-[38px] px-2 rounded-xl bg-amber-600/25 border border-amber-500/50 text-amber-300 disabled:bg-slate-800 disabled:border-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer"
                         >
                           <Lock className="w-3.5 h-3.5" />
                           <span>Lock Measure</span>
@@ -3942,17 +3966,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   ) : !measureLocked ? (
                     <button
                       onClick={handleRequestLockMeasure}
-                      className={`h-9 px-2.5 rounded-xl text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap ${
-                        completenessReport.blockersCount > 0
+                      disabled={!completenessReport.canLockMeasure || !areaSanity.ok}
+                      className={`h-9 px-2.5 rounded-xl text-white text-[11px] font-extrabold flex items-center gap-1 whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed ${
+                        completenessReport.blockersCount > 0 || !areaSanity.ok
                           ? 'bg-rose-700 hover:bg-rose-600'
-                          : 'bg-emerald-600 hover:bg-emerald-500'
+                          : 'bg-emerald-600 hover:bg-emerald-500 cursor-pointer'
                       }`}
                       aria-label="Confirm and Lock Measure"
                     >
                       <Lock className="w-3.5 h-3.5" />
                       <span>
-                        {completenessReport.blockersCount > 0
-                          ? `Fix (${completenessReport.blockersCount})`
+                        {completenessReport.blockersCount > 0 || !areaSanity.ok
+                          ? `Fix (${Math.max(1, completenessReport.blockersCount)})`
                           : 'Confirm & Lock'}
                       </span>
                     </button>
@@ -4193,6 +4218,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 assets={assets}
                 wallPlan={wallPlan}
                 completenessReport={completenessReport}
+                areaSanity={areaSanity}
                 auditReport={deterministicAuditReport}
                 measureLocked={measureLocked}
                 sheetOrderMode={sheetOrderMode}
@@ -4389,7 +4415,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                     </button>
                   </div>
 
-                  {lifecycleStage === 'quoting' && !measureLocked && (
+                  {!measureLocked && (
                     <div className="p-2.5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
@@ -4843,6 +4869,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onBuildFacesFromClassification={handleBuildFacesFromClassification}
           onUndo={handleUndo}
           canUndo={canUndo}
+          windZoneCode={windZoneCode}
+          roofProfileFamily={roofProfileFamily}
+          ventedRidge={ventedRidge}
+          flashingRuleSet={effectiveRuleSet}
+          onChangeWindZoneCode={setWindZoneCode}
+          onChangeRoofProfileFamily={setRoofProfileFamily}
+          onChangeVentedRidge={setVentedRidge}
+          onOpenFlashingRules={() => setIsFlashingRulesModalOpen(true)}
         />
 
         {/* Modals */}
@@ -4965,6 +4999,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
           completenessReport={completenessReport}
           areaSanity={areaSanity}
           orderPack={liveOrderPack}
+          flashingRuleSet={effectiveRuleSet}
+          flashingRuleContext={flashingRuleContext}
           sheetOrderMode={sheetOrderMode}
           onChangeSheetOrderMode={handleChangeSheetOrderMode}
           sheetOrderComparison={sheetOrderComparison}
@@ -5032,11 +5068,11 @@ export const ExactRoofingHub: React.FC<Props> = ({
           />
         )}
 
-        {lifecycleStage === 'quoting' && !measureLocked && (
+        {lifecycleStage !== 'installing' && !measureLocked && (
           <FlashingRulesModal
             isOpen={isFlashingRulesModalOpen}
             ruleSet={ruleSet}
-            readOnly={measureLocked || lifecycleStage !== 'quoting'}
+            readOnly={isReadOnlyGeometry}
             onClose={() => setIsFlashingRulesModalOpen(false)}
             onSaveRuleSet={(next) => {
               const saved = saveFlashingRuleSet(next);
@@ -5185,7 +5221,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
     onDeletePlanes: handleDeletePlanes,
     onBuildFacesFromClassification: handleBuildFacesFromClassification,
     onUndo: handleUndo,
-    canUndo
+    canUndo,
+    windZoneCode,
+    roofProfileFamily,
+    ventedRidge,
+    flashingRuleSet: effectiveRuleSet,
+    onChangeWindZoneCode: setWindZoneCode,
+    onChangeRoofProfileFamily: setRoofProfileFamily,
+    onChangeVentedRidge: setVentedRidge,
+    onOpenFlashingRules: () => setIsFlashingRulesModalOpen(true)
   };
 
   const renderPlanCanvas = () => (
@@ -5303,6 +5347,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       assets={assets}
       wallPlan={wallPlan}
       completenessReport={completenessReport}
+      areaSanity={areaSanity}
       auditReport={deterministicAuditReport}
       measureLocked={measureLocked}
       sheetOrderMode={sheetOrderMode}
@@ -5748,17 +5793,22 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 {!measureLocked ? (
                   <button
                     onClick={handleRequestLockMeasure}
-                    className={`px-3.5 py-1.5 rounded-xl text-white font-extrabold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
-                      completenessReport.blockersCount > 0
+                    disabled={!completenessReport.canLockMeasure || !areaSanity.ok}
+                    className={`px-3.5 py-1.5 rounded-xl text-white font-extrabold text-xs shadow-md transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-60 disabled:cursor-not-allowed ${
+                      completenessReport.blockersCount > 0 || !areaSanity.ok
                         ? 'bg-rose-700 hover:bg-rose-600'
-                        : 'bg-emerald-600 hover:bg-emerald-500'
+                        : 'bg-emerald-600 hover:bg-emerald-500 cursor-pointer'
                     }`}
-                    title="Confirm & lock site measure to emit Order Pack"
+                    title={
+                      !areaSanity.ok && areaSanity.warning
+                        ? areaSanity.warning
+                        : 'Confirm & lock site measure to emit Order Pack'
+                    }
                   >
                     <Lock className="w-3.5 h-3.5" />
                     <span className="tabular-nums">
-                      {completenessReport.blockersCount > 0
-                        ? `Confirm & lock (${completenessReport.blockersCount})`
+                      {completenessReport.blockersCount > 0 || !areaSanity.ok
+                        ? `Confirm & lock (${Math.max(1, completenessReport.blockersCount)})`
                         : 'Confirm & lock'}
                     </span>
                   </button>
@@ -6028,7 +6078,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   )}
                 </button>
 
-                {lifecycleStage === 'quoting' && !measureLocked && (
+                {!measureLocked && (
                   <div className="mt-1 p-2 rounded-xl bg-slate-950/70 border border-slate-800 space-y-1.5">
                     <div className="flex items-center justify-between">
                       <span className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-bold">
@@ -6462,20 +6512,28 @@ export const ExactRoofingHub: React.FC<Props> = ({
                         </span>
                       </div>
 
+                      {!areaSanity.ok && areaSanity.warning && (
+                        <div className="p-2 rounded-lg bg-rose-950/60 border border-rose-500/45 text-[11px] font-bold text-rose-200 flex items-start gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+                          <span>{areaSanity.warning}</span>
+                        </div>
+                      )}
+
                       {!measureLocked && (
                         <button
                           type="button"
+                          disabled={!completenessReport.canLockMeasure || !areaSanity.ok}
                           onClick={handleRequestLockMeasure}
-                          className={`w-full py-2 rounded-lg text-xs font-extrabold text-white cursor-pointer flex items-center justify-center gap-1.5 ${
-                            completenessReport.blockersCount > 0
+                          className={`w-full py-2 rounded-lg text-xs font-extrabold text-white flex items-center justify-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed ${
+                            completenessReport.blockersCount > 0 || !areaSanity.ok
                               ? 'bg-rose-700 hover:bg-rose-600'
-                              : 'bg-emerald-600 hover:bg-emerald-500'
+                              : 'bg-emerald-600 hover:bg-emerald-500 cursor-pointer'
                           }`}
                         >
                           <Lock className="w-3.5 h-3.5" />
                           <span>
-                            {completenessReport.blockersCount > 0
-                              ? `Resolve ${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'}`
+                            {completenessReport.blockersCount > 0 || !areaSanity.ok
+                              ? `Resolve ${Math.max(1, completenessReport.blockersCount)} Blocker${completenessReport.blockersCount === 1 ? '' : 's'}`
                               : 'Confirm & lock'}
                           </span>
                         </button>
@@ -6784,6 +6842,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
         completenessReport={completenessReport}
         areaSanity={areaSanity}
         orderPack={liveOrderPack}
+        flashingRuleSet={effectiveRuleSet}
+        flashingRuleContext={flashingRuleContext}
         sheetOrderMode={sheetOrderMode}
         onChangeSheetOrderMode={handleChangeSheetOrderMode}
         sheetOrderComparison={sheetOrderComparison}
@@ -6999,24 +7059,24 @@ export const ExactRoofingHub: React.FC<Props> = ({
               </button>
               <button
                 type="button"
-                disabled={!completenessReport.canLockMeasure}
+                disabled={!completenessReport.canLockMeasure || !areaSanity.ok}
                 onClick={handleConfirmLockMeasure}
                 className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-extrabold cursor-pointer"
               >
-                {completenessReport.canLockMeasure
+                {completenessReport.canLockMeasure && areaSanity.ok
                   ? 'Lock with Warnings & Emit Order Pack'
-                  : `Resolve ${completenessReport.blockersCount} Blocker(s) First`}
+                  : `Resolve ${Math.max(1, completenessReport.blockersCount)} Blocker(s) First`}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {lifecycleStage === 'quoting' && !measureLocked && (
+      {lifecycleStage !== 'installing' && !measureLocked && (
         <FlashingRulesModal
           isOpen={isFlashingRulesModalOpen}
           ruleSet={ruleSet}
-          readOnly={measureLocked || lifecycleStage !== 'quoting'}
+          readOnly={isReadOnlyGeometry}
           onClose={() => setIsFlashingRulesModalOpen(false)}
           onSaveRuleSet={(next) => {
             const saved = saveFlashingRuleSet(next);

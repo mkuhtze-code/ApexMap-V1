@@ -113,18 +113,18 @@ export const FlashingRulesModal: React.FC<Props> = ({
       enabled: true,
       profileFamily: filterFamily !== 'all' && filterFamily !== '*' ? filterFamily : 'corrugate',
       lineKind: 'ridge',
-      windMin: 'L',
-      windMax: 'EH',
+      windMin: null,
+      windMax: null,
       ventedRidge: 'none',
       libraryProfileId: 'preset-ventilated-ridge',
-      productCode: 'FL-RDG-CUSTOM',
+      productCode: 'RIDGE-CUSTOM',
       coverMm: 180,
       priority: 120,
       preferredStickMm: 2400,
       maxStickMm: 3000,
       joinAllowanceMm: 150,
       endAllowanceMm: 30,
-      shopNotes: '180mm cover · 150mm lap · 30mm end turn'
+      shopNotes: '180mm cover; 150mm lap, 30mm end turn.'
     };
     setDraftRules((prev) => [nextRule, ...prev]);
     setSelectedRuleId(newId);
@@ -206,7 +206,7 @@ export const FlashingRulesModal: React.FC<Props> = ({
                 Standard Flashing Rules Admin
               </h2>
               <p className="text-[11px] text-slate-400">
-                Quote-stage rule engine · specificity + priority · manual lines stay protected
+                Quote &amp; Measure rule engine · specificity + priority · manual lines stay protected
               </p>
             </div>
           </div>
@@ -278,9 +278,10 @@ export const FlashingRulesModal: React.FC<Props> = ({
                           {r.label}
                         </div>
                         <div className="text-[11px] font-mono text-slate-400 truncate">
-                          {r.productCode} · {r.coverMm}mm · {r.windMin}–{r.windMax} ·{' '}
+                          {r.productCode} · {r.coverMm}mm ·{' '}
+                          {r.windMin || r.windMax ? `${r.windMin || 'L'}–${r.windMax || 'EH'}` : 'Any Wind'} ·{' '}
                           {r.profileFamily} · {r.lineKind}
-                          {r.ventedRidge !== '*' ? ` · ${r.ventedRidge}` : ''}
+                          {r.ventedRidge && r.ventedRidge !== '*' ? ` · ${r.ventedRidge}` : ''}
                         </div>
                       </div>
                       <button
@@ -398,12 +399,15 @@ export const FlashingRulesModal: React.FC<Props> = ({
                     <span className="text-[11px] font-bold text-slate-400">Wind Zone Min</span>
                     <select
                       disabled={readOnly}
-                      value={activeRule.windMin}
+                      value={activeRule.windMin ?? ''}
                       onChange={(e) =>
-                        updateRule(activeRule.id, { windMin: e.target.value as WindZoneCode })
+                        updateRule(activeRule.id, {
+                          windMin: e.target.value ? (e.target.value as WindZoneCode) : null
+                        })
                       }
                       className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-bold outline-none disabled:opacity-60"
                     >
+                      <option value="">Any (Null)</option>
                       {WIND_ZONES.map((wz) => (
                         <option key={wz} value={wz}>
                           {wz}
@@ -416,12 +420,15 @@ export const FlashingRulesModal: React.FC<Props> = ({
                     <span className="text-[11px] font-bold text-slate-400">Wind Zone Max</span>
                     <select
                       disabled={readOnly}
-                      value={activeRule.windMax}
+                      value={activeRule.windMax ?? ''}
                       onChange={(e) =>
-                        updateRule(activeRule.id, { windMax: e.target.value as WindZoneCode })
+                        updateRule(activeRule.id, {
+                          windMax: e.target.value ? (e.target.value as WindZoneCode) : null
+                        })
                       }
                       className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-bold outline-none disabled:opacity-60"
                     >
+                      <option value="">Any (Null)</option>
                       {WIND_ZONES.map((wz) => (
                         <option key={wz} value={wz}>
                           {wz}
@@ -434,10 +441,11 @@ export const FlashingRulesModal: React.FC<Props> = ({
                     <span className="text-[11px] font-bold text-slate-400">Vented Ridge Option</span>
                     <select
                       disabled={readOnly}
-                      value={activeRule.ventedRidge}
+                      value={activeRule.ventedRidge ?? '*'}
                       onChange={(e) =>
                         updateRule(activeRule.id, {
-                          ventedRidge: e.target.value as VentedRidgeOption | '*'
+                          ventedRidge:
+                            e.target.value === '*' ? null : (e.target.value as VentedRidgeOption)
                         })
                       }
                       className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-bold outline-none disabled:opacity-60"

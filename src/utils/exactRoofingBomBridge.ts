@@ -1145,6 +1145,7 @@ export function buildOrderPack(params: {
   ventedRidge?: VentedRidgeOption;
   ruleSetVersion?: number;
   ruleSetCapturedAt?: string;
+  ruleSetRevision?: string;
 }): OrderPack {
   const {
     project,
@@ -1167,7 +1168,8 @@ export function buildOrderPack(params: {
     roofProfileFamily,
     ventedRidge,
     ruleSetVersion,
-    ruleSetCapturedAt
+    ruleSetCapturedAt,
+    ruleSetRevision
   } = params;
 
   const bom =
@@ -1415,6 +1417,7 @@ export function buildOrderPack(params: {
       ...(ventedRidge ? { ventedRidge } : {}),
       ...(ruleSetVersion !== undefined ? { ruleSetVersion } : {}),
       ...(ruleSetCapturedAt ? { ruleSetCapturedAt } : {}),
+      ...(ruleSetRevision ? { ruleSetRevision } : {}),
       coverWidthMm,
       endLapMm,
       overhangMm,

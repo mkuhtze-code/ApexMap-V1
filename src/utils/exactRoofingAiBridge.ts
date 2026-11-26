@@ -22,11 +22,10 @@ import {
   buildOutlineFromPoints,
   computeFlashingPieceBreakdown,
   dist,
-  generateCuttingLayout,
   isEdgeWallEnabled,
   polygonArea
 } from './exactRoofingEngine';
-import { createRoofPipelineState, ensureSkeleton } from './roofPipeline';
+import { createRoofPipelineState, ensureLayout, ensureSkeleton } from './roofPipeline';
 import {
   findMatchingCategoryRank,
   getDefaultMitreNotes
@@ -430,11 +429,21 @@ export function runDeterministicRoofAudit(params: {
   if (structuralPlanes.length >= 2 && layout) {
     let bestLayout: { plane: RoofPlane; res: LayoutResult } | null = null;
     for (const candidate of structuralPlanes) {
-      const sim = generateCuttingLayout(planes, sheetSpec, {
-        startPlaneId: candidate.id,
-        assets,
-        pitchBreaks
-      });
+      const sim = ensureLayout(
+        createRoofPipelineState({
+          levels,
+          planes,
+          dirty: { faces: false, layout: true, bom: true }
+        }),
+        {
+          sheetSpec,
+          startPlaneId: candidate.id,
+          assets,
+          pitchBreaks,
+          strictDirtyCheck: false
+        }
+      ).layout;
+      if (!sim) continue;
       if (
         !bestLayout ||
         sim.totalOrderedMetres < bestLayout.res.totalOrderedMetres - 0.1 ||

@@ -21,9 +21,11 @@ import {
 } from '../roofPipeline';
 import {
   assignStandardFlashings,
+  clearFlashingRuleStoreForTest,
   computeRuleStickPlan,
   FLASHING_RULES_STORAGE_KEY,
   loadFlashingRuleSet,
+  normalizeWindZoneCode,
   resetFlashingRuleSetToSeeds,
   resolveMatchingFlashingRule,
   saveFlashingRuleSet
@@ -187,8 +189,36 @@ function resetRulesStorage() {
     comp.issues.some((i) => i.category === 'area_sanity' && i.severity === 'blocker'),
     'Completeness must emit area_sanity blocker'
   );
+
+  // Manual structural ridge guard: ensureFaces must preserve manual ridge without overwriting skeleton
+  const manualRidgeLvl: RoofLevel = {
+    id: 'lvl-manual-ridge',
+    code: 'L1',
+    name: 'Manual Ridge Gable',
+    eaveHeightM: 2.7,
+    outline: rectOut,
+    skeleton: [
+      {
+        id: 'manual-ridge-1',
+        from: { x: 0, y: 3 },
+        to: { x: 10, y: 3 },
+        suggestedType: 'ridge'
+      }
+    ]
+  };
+  const manualFacesRes = ensureFaces(
+    createRoofPipelineState({ levels: [manualRidgeLvl], planes: [], dirty: { faces: true } }),
+    { defaultPitchDeg: 22.5, preserveUserDeleted: true }
+  );
+  assert.equal(
+    manualFacesRes.state.levels[0].skeleton.length,
+    1,
+    'ensureFaces must NOT invent or overwrite skeleton lines when manual structural ridge exists'
+  );
+  assert.equal(manualFacesRes.state.levels[0].skeleton[0].id, 'manual-ridge-1');
+  assert.equal(manualFacesRes.state.planes.length, 2, 'Manual ridge 10x6 gable builds 2 faces');
 }
-console.log('✓ Part B1/B3/B4/B5 Passed: 10x6 gable idempotency, face delete suppression, dirty layout rebuild & 2x block verified.');
+console.log('✓ Part B1/B3/B4/B5 Passed: 10x6 gable idempotency, face delete suppression, manual skeleton guard, dirty layout rebuild & 2x block verified.');
 
 {
   // B2. 10x6 + 4x2 courtyard hole -> zero centroids inside hole, net footprint 52m², modeled tracks net
@@ -247,8 +277,70 @@ console.log('✓ Part B1/B3/B4/B5 Passed: 10x6 gable idempotency, face delete su
     Math.abs(bomVoid.bom.totalRoofAreaM2 - expectedModeled) < expectedModeled * 0.08,
     `Courtyard modeled area (${bomVoid.bom.totalRoofAreaM2}m²) must reflect net 52m² footprint (~${expectedModeled.toFixed(2)}m²)`
   );
+
+  // Verify 3D scene produces ZERO triangles with centroids inside the 4x2 courtyard hole
+  const stubVoidTex = {
+    normalMap: null as any,
+    roughnessMap: null as any,
+    bumpMap: null as any,
+    dispose: () => {}
+  };
+  const stubVoidWallTex = {
+    weatherboard: { normalMap: null, roughnessMap: null, bumpMap: null },
+    profiled_metal: { normalMap: null, roughnessMap: null, bumpMap: null },
+    brick: { normalMap: null, roughnessMap: null, bumpMap: null },
+    fibre_cement: { normalMap: null, roughnessMap: null, bumpMap: null },
+    plaster: { normalMap: null, roughnessMap: null, bumpMap: null },
+    stone: { normalMap: null, roughnessMap: null, bumpMap: null },
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null,
+    getEntry: () => ({ normalMap: null, roughnessMap: null, bumpMap: null }),
+    dispose: () => {}
+  } as any;
+  const sceneVoid = buildRoofSceneGroup({
+    outline: bomVoid.state.levels[0].outline,
+    skeleton: bomVoid.state.levels[0].skeleton,
+    planes: bomVoid.state.planes,
+    levels: bomVoid.state.levels,
+    shadingMode: 'studio_finish',
+    swatch: { id: 'flaxpod', name: 'FlaxPod', hex: '#343635', metalness: 0.36, roughness: 0.42 },
+    textures: stubVoidTex,
+    wallTextures: stubVoidWallTex,
+    showFlashings: false,
+    showWalls: false,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+  try {
+    let trianglesInHole = 0;
+    bomVoid.state.planes.forEach((pl) => {
+      const meshes = sceneVoid.planeMeshById.get(pl.id) || [];
+      meshes.forEach((mesh) => {
+        const pos = mesh.geometry.getAttribute('position');
+        if (!pos) return;
+        const idx = mesh.geometry.getIndex();
+        const triCount = idx ? Math.floor(idx.count / 3) : Math.floor(pos.count / 3);
+        for (let t = 0; t < triCount; t++) {
+          const i0 = idx ? idx.getX(t * 3) : t * 3;
+          const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+          const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+          const cx =
+            (pos.getX(i0) + pos.getX(i1) + pos.getX(i2)) / 3 + sceneVoid.bounds.midX;
+          const cy =
+            (pos.getZ(i0) + pos.getZ(i1) + pos.getZ(i2)) / 3 + sceneVoid.bounds.midY;
+          if (cx > 3.05 && cx < 6.95 && cy > 2.05 && cy < 3.95) {
+            trianglesInHole++;
+          }
+        }
+      });
+    });
+    assert.equal(trianglesInHole, 0, '3D courtyard roof must have ZERO triangles inside the 4x2 hole');
+  } finally {
+    sceneVoid.dispose();
+  }
 }
-console.log('✓ Part B2 Passed: 10x6 + 4x2 courtyard hole excludes void centroids & tracks 52m² net footprint.');
+console.log('✓ Part B2 Passed: 10x6 + 4x2 courtyard hole excludes 2D centroids & 3D mesh triangles & tracks 52m² net footprint.');
 
 // ============================================================================
 // PART C — SEALED T/L MESH FIXTURE (SHARED ENDPOINTS + ZERO BARGE SLIVERS)
@@ -382,13 +474,105 @@ console.log('✓ Part B2 Passed: 10x6 + 4x2 courtyard hole excludes void centroi
   } finally {
     sceneC.dispose();
   }
+
+  // C2: 12x6 gable + 4x3 side bay fixture -> sealed shared 3D endpoints (<5mm) & no <0.05m² slivers
+  const bayPts = [
+    { x: 0, y: 0 },
+    { x: 12, y: 0 },
+    { x: 12, y: 6 },
+    { x: 8, y: 6 },
+    { x: 8, y: 9 },
+    { x: 4, y: 9 },
+    { x: 4, y: 6 },
+    { x: 0, y: 6 }
+  ];
+  let bayOut = buildOutlineFromPoints(bayPts, 'c2-gable-bay', {
+    initialEdgeType: 'outline',
+    defaultEaveHeightM: 2.7
+  });
+  bayOut = applyEdgeType(bayOut, [bayOut.edges[1].id, bayOut.edges[4].id, bayOut.edges[7].id], 'verge');
+  let pipeBay = createRoofPipelineState({
+    levels: [
+      {
+        id: 'lvl-c2',
+        code: 'L1',
+        name: '12x6 Gable + 4x3 Bay',
+        eaveHeightM: 2.7,
+        outline: bayOut,
+        skeleton: []
+      }
+    ],
+    planes: []
+  });
+  pipeBay = ensureSkeleton(pipeBay, { mode: 'auto' }).state;
+  pipeBay = ensureFaces(pipeBay, { defaultPitchDeg: 22.5 }).state;
+  assert.ok(pipeBay.planes.length >= 4, `Expected >=4 faces on 12x6 + 4x3 gable bay, got ${pipeBay.planes.length}`);
+  pipeBay.planes.forEach((pl) => {
+    assert.ok(
+      (pl.area ?? 0) >= 0.05,
+      `Detected synthetic sliver on 12x6+4x3 face ${pl.code} (area=${pl.area})`
+    );
+  });
+  const sharedBay = resolveLevelSharedVertexElevations(
+    pipeBay.planes,
+    pipeBay.levels[0].outline,
+    pipeBay.levels[0].skeleton,
+    2.7
+  );
+  assert.ok(sharedBay.getVertexForPoint({ x: 6, y: 3 }).z > 2.7, '12x6+4x3 ridge junction must sit above 2.7m');
+  const sceneBay = buildRoofSceneGroup({
+    outline: pipeBay.levels[0].outline,
+    skeleton: pipeBay.levels[0].skeleton,
+    planes: pipeBay.planes,
+    levels: pipeBay.levels,
+    shadingMode: 'studio_finish',
+    swatch: { id: 'flaxpod', name: 'FlaxPod', hex: '#343635', metalness: 0.36, roughness: 0.42 },
+    textures: stubTex,
+    wallTextures: stubWallTex,
+    showFlashings: false,
+    showWalls: false,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+  try {
+    const checkBayPts = pipeBay.levels[0].skeleton
+      .filter((s) => s.suggestedType === 'ridge' || s.suggestedType === 'valley')
+      .flatMap((s) => [s.from, s.to]);
+    checkBayPts.forEach((pt) => {
+      const wx = pt.x - sceneBay.bounds.midX;
+      const wz = pt.y - sceneBay.bounds.midY;
+      const heights: number[] = [];
+      pipeBay.planes.forEach((pl) => {
+        (sceneBay.planeMeshById.get(pl.id) || []).forEach((mesh) => {
+          const pos = mesh.geometry.getAttribute('position');
+          if (!pos) return;
+          let maxYNear = -Infinity;
+          for (let vi = 0; vi < pos.count; vi++) {
+            if (Math.hypot(pos.getX(vi) - wx, pos.getZ(vi) - wz) <= 0.005) {
+              maxYNear = Math.max(maxYNear, pos.getY(vi));
+            }
+          }
+          if (maxYNear > -Infinity) heights.push(maxYNear);
+        });
+      });
+      if (heights.length >= 2) {
+        const span = Math.max(...heights) - Math.min(...heights);
+        assert.ok(span <= 0.005, `12x6+4x3 3D seam gap ${(span * 1000).toFixed(2)}mm exceeded 5mm`);
+      }
+    });
+  } finally {
+    sceneBay.dispose();
+  }
 }
-console.log('✓ Part C Passed: Sealed T-bay gable 3D meshes share endpoints within 5mm & contain zero barge slivers.');
+console.log('✓ Part C Passed: Sealed 14x6+6x5 T-bay & 12x6+4x3 bay 3D meshes share endpoints within 5mm & contain zero slivers.');
 
 // ============================================================================
 // PART D + ADDENDUM — STANDARD FLASHING RULES & ADMIN OVERRIDES
 // ============================================================================
 {
+  assert.equal(FLASHING_RULES_STORAGE_KEY, 'apexmap.flashingRuleSet.v1');
+  assert.equal(normalizeWindZoneCode(), 'M', 'Default fallback wind zone must be M');
+  clearFlashingRuleStoreForTest();
   const seeded = resetRulesStorage();
   assert.ok(seeded.rules.length >= 12, 'Factory seed rules must populate defaults cleanly');
 
@@ -467,13 +651,13 @@ console.log('✓ Part C Passed: Sealed T-bay gable 3D meshes share endpoints wit
   const bargeLine = lines.find((l) => l.flashingKind === 'barge')!;
   assert.ok(ridgeLine && bargeLine, 'Expected ridge & barge assignable lines');
 
-  // Wind zone M -> FL-RDG-150 (cover 150)
+  // Wind zone M -> RIDGE-150 (cover 150)
   const assignM = gPipe.assignments.find((a) => a.lineId === ridgeLine.lineId)!;
-  assert.equal(assignM.productCode, 'FL-RDG-150');
+  assert.equal(assignM.productCode, 'RIDGE-150');
   assert.equal(assignM.coverMm, 150);
   assert.equal(assignM.source, 'rule');
 
-  // Switch M -> H -> FL-RDG-200 (cover 200)
+  // Switch M -> H -> RIDGE-200 (cover 200)
   const resH = assignStandardFlashings(
     lines,
     { windZone: 'H', roofProfileFamily: 'corrugate', ventedRidge: 'none' },
@@ -482,7 +666,7 @@ console.log('✓ Part C Passed: Sealed T-bay gable 3D meshes share endpoints wit
     gPipe.assignments
   );
   const assignH = resH.assignments.find((a) => a.lineId === ridgeLine.lineId)!;
-  assert.equal(assignH.productCode, 'FL-RDG-200', 'Wind zone H must select FL-RDG-200');
+  assert.equal(assignH.productCode, 'RIDGE-200', 'Wind zone H must select RIDGE-200');
   assert.equal(assignH.coverMm, 200);
 
   // Add manual source: 'user' override on bargeLine, then switch ventedRidge -> RV10P
@@ -506,7 +690,7 @@ console.log('✓ Part C Passed: Sealed T-bay gable 3D meshes share endpoints wit
   );
   const assignRV = resVented.assignments.find((a) => a.lineId === ridgeLine.lineId)!;
   const preservedBarge = resVented.assignments.find((a) => a.lineId === bargeLine.lineId)!;
-  assert.equal(assignRV.productCode, 'FL-RDG-RV10P', 'RV10P option must pick FL-RDG-RV10P');
+  assert.equal(assignRV.productCode, 'RIDGE-RV10P', 'RV10P option must pick RIDGE-RV10P');
   assert.equal(preservedBarge.productCode, 'CUSTOM-USER-BRG', 'Manual source=user line must remain untouched');
   assert.equal(preservedBarge.coverMm, 275);
 
@@ -539,6 +723,11 @@ console.log('✓ Part C Passed: Sealed T-bay gable 3D meshes share endpoints wit
     }
   );
   assert.ok(editedPlaybook.orderPack, 'Playbook must emit OrderPack');
+  assert.ok(
+    editedPlaybook.orderPack!.assumptions.ruleSetRevision &&
+      !Number.isNaN(Date.parse(editedPlaybook.orderPack!.assumptions.ruleSetRevision)),
+    'OrderPack.assumptions.ruleSetRevision must be stamped with a valid ISO timestamp'
+  );
   const ridgePackLine = editedPlaybook.orderPack!.flashings.find(
     (f) => f.flashing_kind === 'ridge'
   )!;
@@ -719,6 +908,7 @@ console.log('✓ Part D + Addendum Passed: Seed persistence, Wind/RV10P resoluti
     ruleSet: seeded
   });
   assert.equal(strictAbort.ok, false, 'runTakeoffPlaybook must abort cleanly when areaSanity fails');
+  assert.equal(strictAbort.stage, 'faces', 'Aborted playbook must report stage === "faces"');
   assert.equal(strictAbort.layout, null, 'Aborted playbook must NOT generate layout');
   assert.equal(strictAbort.bom, null, 'Aborted playbook must NOT generate BOM');
   assert.equal(strictAbort.orderPack, null, 'Aborted playbook must NOT emit OrderPack');

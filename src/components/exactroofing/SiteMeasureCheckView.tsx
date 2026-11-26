@@ -21,6 +21,7 @@ import {
   DeterministicRoofAuditReport,
   DeterministicRoofPatch
 } from '../../utils/exactRoofingAiBridge';
+import type { RoofAreaSanityResult } from '../../utils/roofPipeline';
 import {
   AlertTriangle,
   Building2,
@@ -48,6 +49,7 @@ interface Props {
   assets: RoofAsset[];
   wallPlan?: WallPlan | null;
   completenessReport?: TakeoffCompletenessReport;
+  areaSanity?: RoofAreaSanityResult;
   auditReport?: DeterministicRoofAuditReport;
   measureLocked: boolean;
   sheetOrderMode?: SheetOrderMode;
@@ -75,6 +77,7 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
   assets,
   wallPlan = null,
   completenessReport,
+  areaSanity,
   auditReport,
   measureLocked,
   sheetOrderMode,
@@ -173,21 +176,26 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
           {!measureLocked && (
             <button
               type="button"
+              disabled={(completenessReport && !completenessReport.canLockMeasure) || areaSanity?.ok === false}
               onClick={onConfirmLockMeasure}
               title={
-                completenessReport && !completenessReport.canLockMeasure
+                areaSanity?.ok === false
+                  ? areaSanity.warning || 'Area sanity check failed'
+                  : completenessReport && !completenessReport.canLockMeasure
                   ? `Resolve ${completenessReport.blockersCount} blocker(s) before locking`
                   : 'Confirm & lock final site measure to emit Order Pack'
               }
-              className={`min-h-[42px] px-4 py-2 rounded-xl text-white text-xs font-extrabold flex items-center gap-2 shadow-lg cursor-pointer whitespace-nowrap ${
-                completenessReport && !completenessReport.canLockMeasure
-                  ? 'bg-rose-700 hover:bg-rose-600 border border-rose-400/50'
-                  : 'bg-emerald-600 hover:bg-emerald-500'
+              className={`min-h-[42px] px-4 py-2 rounded-xl text-white text-xs font-extrabold flex items-center gap-2 shadow-lg whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed ${
+                (completenessReport && !completenessReport.canLockMeasure) || areaSanity?.ok === false
+                  ? 'bg-rose-700 border border-rose-400/50'
+                  : 'bg-emerald-600 hover:bg-emerald-500 cursor-pointer'
               }`}
             >
               <Lock className="w-4 h-4" />
               <span>
-                {completenessReport && !completenessReport.canLockMeasure
+                {areaSanity?.ok === false
+                  ? 'Area Check Blocked'
+                  : completenessReport && !completenessReport.canLockMeasure
                   ? `Resolve ${completenessReport.blockersCount} Blocker${completenessReport.blockersCount === 1 ? '' : 's'}`
                   : 'Confirm & Lock'}
               </span>
@@ -195,6 +203,20 @@ export const SiteMeasureCheckView: React.FC<Props> = ({
           )}
         </div>
       </div>
+
+      {areaSanity && !areaSanity.ok && (
+        <div className="rounded-2xl border border-rose-500/55 bg-rose-950/35 p-3.5 flex items-start gap-2.5 text-xs text-rose-100">
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <div className="font-extrabold text-rose-200">
+              Roof Area Sanity Check Failed ({areaSanity.modeledAreaM2.toFixed(1)}m² modeled vs {areaSanity.footprintAreaM2.toFixed(1)}m² net footprint)
+            </div>
+            <p className="text-rose-200/90">
+              {areaSanity.warning || 'Modeled area exceeds pitch-adjusted net footprint band. Rebuild faces from edges before locking.'}
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* 1B. LINEAR MEASURE CHECKLIST (Completeness Blockers + Safe System Fixes) */}
       {!measureLocked &&

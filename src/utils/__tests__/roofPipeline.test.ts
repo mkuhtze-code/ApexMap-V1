@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
 import {
   addCourtyardHoleToOutline,
+  applyEaveHeightToFaceEaves,
+  applyEaveHeightToLevelEaves,
   applyEdgeType,
+  buildAttachedOutlineFromEdge,
   buildOutlineFromPoints,
   getOutlineFootprintAreaM2,
   polygonCentroid,
-  resolveLevelSharedVertexElevations
+  resolveLevelSharedVertexElevations,
+  tryAddCourtyardHoleToLevel
 } from '../exactRoofingEngine';
 import {
+  applyTypologyPresetEdges,
   checkRoofAreaSanity,
   computeTruthfulRoofAreaM2,
   createRoofPipelineState,
@@ -17,8 +22,10 @@ import {
   ensureLayout,
   ensureSkeleton,
   invalidateOutline,
-  runTakeoffPlaybook
+  runTakeoffPlaybook,
+  setEdgeMode
 } from '../roofPipeline';
+import { deriveWallPlanFromRoofLevels } from '../wallCladdingEngine';
 import {
   assignStandardFlashings,
   clearFlashingRuleStoreForTest,
@@ -915,4 +922,439 @@ console.log('✓ Part D + Addendum Passed: Seed persistence, Wind/RV10P resoluti
 }
 console.log('✓ Part E Passed: runTakeoffPlaybook orchestrates full takeoff and aborts cleanly before layout on areaSanity failure.');
 
+// ──────────────────────────────────────────────────────────────────────────────
+// PART F — Draw any roof: Void, Mixed Form, Stepped Eaves
+// ──────────────────────────────────────────────────────────────────────────────
+// F1: Courtyard void stays inside 1 level, rejects exterior centroids, skips hole interior in skeleton & sheet layout
+{
+  const outer = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 8 },
+      { x: 0, y: 8 }
+    ],
+    'out-f1',
+    { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  const baseLevel: RoofLevel = {
+    id: 'lvl-f1',
+    code: 'L1',
+    name: 'Main Roof',
+    eaveHeightM: 2.7,
+    outline: outer,
+    skeleton: []
+  };
+
+  // Exterior centroid must reject cleanly
+  const badVoid = tryAddCourtyardHoleToLevel(baseLevel, [
+    { x: 12, y: 2 },
+    { x: 14, y: 2 },
+    { x: 14, y: 4 },
+    { x: 12, y: 4 }
+  ]);
+  assert.equal(badVoid.ok, false, 'Exterior courtyard void must be rejected');
+  if (!badVoid.ok) {
+    assert.equal(badVoid.error, 'Void must sit inside the roof.');
+  }
+
+  // Interior courtyard void must attach to existing level as 1 hole ring with wall edges & no eaveHeightM
+  const goodVoid = tryAddCourtyardHoleToLevel(baseLevel, [
+    { x: 3.5, y: 3 },
+    { x: 6.5, y: 3 },
+    { x: 6.5, y: 5 },
+    { x: 3.5, y: 5 }
+  ]);
+  assert.equal(goodVoid.ok, true, 'Interior courtyard void must succeed');
+  if (goodVoid.ok) {
+    const holes = goodVoid.level.outline.holes ?? [];
+    assert.equal(holes.length, 1, 'Level must contain exactly 1 courtyard hole ring');
+    assert.ok(
+      holes[0].edges.every((e) => e.type === 'wall'),
+      'All courtyard hole edges must be classified as wall'
+    );
+    assert.ok(
+      holes[0].edges.every((e) => e.eaveHeightM === undefined),
+      'Courtyard hole edges must not inherit eaveHeightM'
+    );
+
+    const skelRes = ensureSkeleton(
+      createRoofPipelineState({ levels: [goodVoid.level], planes: [] }),
+      { mode: 'auto' }
+    );
+    const holeInteriorLines = skelRes.state.levels[0].skeleton.filter((s) => {
+      const mx = (s.from.x + s.to.x) / 2;
+      const my = (s.from.y + s.to.y) / 2;
+      return mx > 3.6 && mx < 6.4 && my > 3.1 && my < 4.9;
+    });
+    assert.equal(holeInteriorLines.length, 0, 'Wavefront skeleton must skip courtyard hole interior');
+
+    const facesRes = ensureFaces(skelRes.state, { defaultPitchDeg: 20 });
+    const holeEdgeIds = new Set(holes[0].edges.map((e) => e.id));
+    assert.ok(
+      facesRes.state.planes.every((p) => !holeEdgeIds.has(p.eaveEdgeId)),
+      'No sheeted roof plane may originate from a courtyard hole edge'
+    );
+
+    const layoutRes = ensureLayout(facesRes.state, { sheetSpec: SHEET_SPEC, strictDirtyCheck: true });
+    assert.ok(layoutRes.layout, 'Courtyard void roof must produce layout');
+    const netFootprint = getOutlineFootprintAreaM2(goodVoid.level.outline);
+    assert.equal(+netFootprint.toFixed(1), 74.0, 'Net footprint must exclude 6m² courtyard hole');
+    assert.ok(
+      layoutRes.layout!.totalRoofArea < 82 && layoutRes.layout!.totalRoofArea > 70,
+      `Courtyard layout totalRoofArea (${layoutRes.layout!.totalRoofArea.toFixed(1)}m²) must exclude courtyard void`
+    );
+  }
+}
+
+// F2: Typology presets (Hip, Gable, Mono) — edges-only, never run wavefront, never double faces
+{
+  const quadOutline = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 6 },
+      { x: 0, y: 6 }
+    ],
+    'out-f2-quad',
+    { initialEdgeType: 'unclassified', defaultEaveHeightM: 2.7 }
+  );
+
+  // Hip preset on quad: edges-only -> 4 faces on ensureFaces -> still 4 when built twice
+  const hipRes = applyTypologyPresetEdges(quadOutline, 'hipped');
+  assert.equal(hipRes.applied, true);
+  assert.equal(hipRes.skeleton.length, 0, 'Hip preset must never run wavefront solver');
+  assert.ok(hipRes.outline.edges.every((e) => e.type === 'outline'));
+
+  const hipLevel: RoofLevel = {
+    id: 'lvl-f2-hip',
+    code: 'L1',
+    name: 'Hip Test',
+    eaveHeightM: 2.7,
+    outline: hipRes.outline,
+    skeleton: []
+  };
+  const hipFaces1 = ensureFaces(createRoofPipelineState({ levels: [hipLevel], planes: [] }), {
+    defaultPitchDeg: 20,
+    allowAutoSkeletonWhenEmpty: true
+  });
+  assert.equal(hipFaces1.state.planes.length, 4, 'Hipped quad must produce 4 planes');
+  const hipFaces2 = ensureFaces(hipFaces1.state, { defaultPitchDeg: 20 });
+  assert.equal(hipFaces2.state.planes.length, 4, 'Re-running ensureFaces must never double planes');
+
+  // Gable preset on quad: longer edges -> outline, shorter edges -> verge, 0 hip lines, 2 faces
+  const gableRes = applyTypologyPresetEdges(quadOutline, 'gable');
+  assert.equal(gableRes.applied, true);
+  assert.equal(gableRes.skeleton.length, 0, 'Gable preset must remain edges-only');
+  assert.equal(gableRes.outline.edges[0].type, 'outline');
+  assert.equal(gableRes.outline.edges[1].type, 'verge');
+  assert.equal(gableRes.outline.edges[2].type, 'outline');
+  assert.equal(gableRes.outline.edges[3].type, 'verge');
+
+  const gableFaces = ensureFaces(
+    createRoofPipelineState({
+      levels: [
+        {
+          id: 'lvl-f2-gable',
+          code: 'L1',
+          name: 'Gable Test',
+          eaveHeightM: 2.7,
+          outline: gableRes.outline,
+          skeleton: []
+        }
+      ],
+      planes: []
+    }),
+    { defaultPitchDeg: 20, allowAutoSkeletonWhenEmpty: true }
+  );
+  assert.equal(
+    gableFaces.state.levels[0].skeleton.filter((s) => s.suggestedType === 'hip').length,
+    0,
+    'Gable roof must produce 0 hip lines'
+  );
+  assert.equal(gableFaces.state.planes.length, 2, 'Gable quad must produce 2 planes');
+
+  // L-shape gable preset prompts for 2 barges when unpicked, then applies on pick
+  const lOutline = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 4 },
+      { x: 5, y: 4 },
+      { x: 5, y: 8 },
+      { x: 0, y: 8 }
+    ],
+    'out-f2-l',
+    { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  const lGablePrompt = applyTypologyPresetEdges(lOutline, 'gable');
+  assert.equal(lGablePrompt.applied, false);
+  assert.equal(lGablePrompt.needsPick, 'two_barges');
+
+  const lGablePicked = applyTypologyPresetEdges(lOutline, 'gable', {
+    bargeEdgeIds: [lOutline.edges[1].id, lOutline.edges[4].id]
+  });
+  assert.equal(lGablePicked.applied, true);
+  assert.equal(lGablePicked.skeleton.length, 0);
+  assert.equal(lGablePicked.outline.edges[1].type, 'verge');
+  assert.equal(lGablePicked.outline.edges[4].type, 'verge');
+  assert.equal(lGablePicked.outline.edges[0].type, 'outline');
+
+  // Mono preset prompts for low_eave -> sets opposite ridge & perpendicular verges -> 1 plane & 0 skel
+  const monoPrompt = applyTypologyPresetEdges(quadOutline, 'mono');
+  assert.equal(monoPrompt.applied, false);
+  assert.equal(monoPrompt.needsPick, 'low_eave');
+
+  const monoApplied = applyTypologyPresetEdges(quadOutline, 'mono', {
+    lowEaveEdgeId: quadOutline.edges[0].id
+  });
+  assert.equal(monoApplied.applied, true);
+  assert.equal(monoApplied.skeleton.length, 0, 'Mono preset must remain edges-only');
+  assert.equal(monoApplied.outline.edges[0].type, 'outline');
+  assert.equal(monoApplied.outline.edges[2].type, 'ridge');
+  assert.equal(monoApplied.outline.edges[1].type, 'verge');
+  assert.equal(monoApplied.outline.edges[3].type, 'verge');
+
+  const monoFaces = ensureFaces(
+    createRoofPipelineState({
+      levels: [
+        {
+          id: 'lvl-f2-mono',
+          code: 'L1',
+          name: 'Mono Test',
+          eaveHeightM: 2.7,
+          outline: monoApplied.outline,
+          skeleton: []
+        }
+      ],
+      planes: []
+    }),
+    { defaultPitchDeg: 10, allowAutoSkeletonWhenEmpty: true }
+  );
+  assert.equal(monoFaces.state.levels[0].skeleton.length, 0, 'Monopitch must keep 0 structural skeleton lines');
+  assert.equal(monoFaces.state.planes.length, 1, 'Monopitch must build 1 roof plane');
+}
+
+// F3: setEdgeMode edgesOnly never invokes wavefront solver and never mutates sibling edges
+{
+  const quad = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 8, y: 0 },
+      { x: 8, y: 5 },
+      { x: 0, y: 5 }
+    ],
+    'out-f3',
+    { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  const s1 = setEdgeMode(quad, [], quad.edges[1].id, 'gable', { edgesOnly: true });
+  const s2 = setEdgeMode(s1.outline, s1.skeleton, quad.edges[2].id, 'apron', { edgesOnly: true });
+  const s3 = setEdgeMode(s2.outline, s2.skeleton, quad.edges[3].id, 'wall', { edgesOnly: true });
+  assert.equal(s3.skeleton.length, 0, 'edgesOnly setEdgeMode must leave skeleton untouched');
+  assert.equal(s3.outline.edges[0].type, 'outline', 'Sibling eave edge must stay outline');
+  assert.equal(s3.outline.edges[1].type, 'verge');
+  assert.equal(s3.outline.edges[2].type, 'apron');
+  assert.equal(s3.outline.edges[3].type, 'wall');
+}
+
+// F4: Stepped eaves — Apply to face / Apply to level only touch outer 'outline' edges, and 3D preserves distinct eave Zs
+{
+  const base = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 6 },
+      { x: 0, y: 6 }
+    ],
+    'out-f4',
+    { initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  // Make right/left ends verges and add a courtyard hole
+  let stepOut = applyEdgeType(base, [base.edges[2].id, base.edges[4].id], 'verge');
+  stepOut = addCourtyardHoleToOutline(stepOut, [
+    { x: 3.5, y: 2 },
+    { x: 6.5, y: 2 },
+    { x: 6.5, y: 4 },
+    { x: 3.5, y: 4 }
+  ]);
+  // Give the two colinear front eaves (0..5 and 5..10) stepped heights 2.7m and 3.4m
+  stepOut = {
+    ...stepOut,
+    edges: stepOut.edges.map((e, idx) =>
+      idx === 1 ? { ...e, eaveHeightM: 3.4 } : e
+    )
+  };
+  const stepFaces = ensureFaces(
+    createRoofPipelineState({
+      levels: [{ id: 'lvl-f4', code: 'L1', name: 'Stepped', eaveHeightM: 2.7, outline: stepOut, skeleton: [] }],
+      planes: []
+    }),
+    { defaultPitchDeg: 20, allowAutoSkeletonWhenEmpty: true }
+  );
+
+  // Face propagation: targeting edge 0 with 2.9 only updates edge 0 (never edge 3 on opposite side or hole edges)
+  const faceProp = applyEaveHeightToFaceEaves(stepOut, stepFaces.state.planes, stepOut.edges[0].id, 2.9);
+  assert.equal(faceProp.edges[0].eaveHeightM, 2.9);
+  assert.equal(faceProp.edges[3].eaveHeightM, 2.7, 'Opposite face eave must stay 2.7m');
+  assert.ok(
+    (faceProp.holes?.[0].edges ?? []).every((he) => he.eaveHeightM === undefined),
+    'Face eave propagation must never write eaveHeightM onto void holes'
+  );
+
+  // Level propagation: touches all outer 'outline' edges ONLY (not verges or holes)
+  const lvlProp = applyEaveHeightToLevelEaves(stepOut, 3.8);
+  assert.equal(lvlProp.edges[0].eaveHeightM, 3.8);
+  assert.equal(lvlProp.edges[1].eaveHeightM, 3.8);
+  assert.equal(lvlProp.edges[3].eaveHeightM, 3.8);
+  assert.equal(lvlProp.edges[2].eaveHeightM, 2.7, 'Verge edge eaveHeightM must not be overwritten by level eave propagation');
+  assert.equal(lvlProp.edges[4].eaveHeightM, 2.7, 'Verge edge eaveHeightM must not be overwritten by level eave propagation');
+  assert.ok(
+    (lvlProp.holes?.[0].edges ?? []).every((he) => he.eaveHeightM === undefined),
+    'Level eave propagation must never touch courtyard void holes'
+  );
+
+  // 3D shared vertex elevation check: stepped corner vertices at x=0 (2.7m) vs x=10 (3.4m) stay distinct (~0.7m apart)
+  const resolvedStep = resolveLevelSharedVertexElevations(
+    stepFaces.state.planes,
+    stepFaces.state.levels[0].outline,
+    stepFaces.state.levels[0].skeleton,
+    2.7
+  );
+  const leftCorner = resolvedStep.vertices.find((v) => Math.hypot(v.x - 0, v.y - 0) < 0.05);
+  const rightCorner = resolvedStep.vertices.find((v) => Math.hypot(v.x - 10, v.y - 0) < 0.05);
+  assert.ok(leftCorner && rightCorner, 'Stepped eave corners must resolve in 3D vertex set');
+  assert.ok(Math.abs(leftCorner!.z - 2.7) < 0.05, `Left corner Z must stay 2.7m, got ${leftCorner!.z}`);
+  assert.ok(Math.abs(rightCorner!.z - 3.4) < 0.05, `Right corner Z must stay 3.4m, got ${rightCorner!.z}`);
+
+  const stubTex = {
+    normalMap: null as any,
+    roughnessMap: null as any,
+    bumpMap: null as any,
+    dispose: () => {}
+  };
+  const stubWallTex = {
+    weatherboard: { normalMap: null, roughnessMap: null, bumpMap: null },
+    profiled_metal: { normalMap: null, roughnessMap: null, bumpMap: null },
+    brick: { normalMap: null, roughnessMap: null, bumpMap: null },
+    fibre_cement: { normalMap: null, roughnessMap: null, bumpMap: null },
+    plaster: { normalMap: null, roughnessMap: null, bumpMap: null },
+    stone: { normalMap: null, roughnessMap: null, bumpMap: null },
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null,
+    getEntry: () => ({ normalMap: null, roughnessMap: null, bumpMap: null }),
+    dispose: () => {}
+  } as any;
+  const stepScene = buildRoofSceneGroup({
+    outline: stepFaces.state.levels[0].outline,
+    skeleton: stepFaces.state.levels[0].skeleton,
+    planes: stepFaces.state.planes,
+    levels: stepFaces.state.levels,
+    shadingMode: 'studio_finish',
+    swatch: { id: 'flaxpod', name: 'FlaxPod', hex: '#343635', metalness: 0.36, roughness: 0.42 },
+    textures: stubTex,
+    wallTextures: stubWallTex,
+    showFlashings: false,
+    showWalls: false,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+  try {
+    assert.ok(stepScene.selectableMeshes.length >= 1, 'Stepped roof must build valid 3D meshes');
+    const yValues: number[] = [];
+    stepScene.selectableMeshes.forEach((mesh) => {
+      const pos = mesh.geometry.getAttribute('position');
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        yValues.push(pos.getY(i));
+      }
+    });
+    assert.ok(yValues.some((y) => Math.abs(y - 2.7) < 0.08), '3D mesh must retain ~2.7m low eave vertices');
+    assert.ok(yValues.some((y) => Math.abs(y - 3.4) < 0.08), '3D mesh must retain ~3.4m stepped eave vertices');
+  } finally {
+    stepScene.dispose();
+  }
+}
+
+// F5: From Wall/Eave attached ring stays on same level (parentLevelId), copies host Z only onto chord, and suppresses duplicate abutment walls
+{
+  let mainOut = buildOutlineFromPoints(
+    [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 6 },
+      { x: 0, y: 6 }
+    ],
+    'out-main-f5',
+    { levelId: 'lvl-main-f5', initialEdgeType: 'outline', defaultEaveHeightM: 2.7 }
+  );
+  // Host right edge (10,0 -> 10,6) has explicit stepped Z = 3.6m
+  const hostEdgeId = mainOut.edges[1].id;
+  mainOut = {
+    ...mainOut,
+    edges: mainOut.edges.map((e) => (e.id === hostEdgeId ? { ...e, eaveHeightM: 3.6 } : e))
+  };
+  const hostEdge = mainOut.edges[1];
+
+  const wingOut = buildAttachedOutlineFromEdge(
+    hostEdge,
+    [
+      { x: 10, y: 1 },
+      { x: 14, y: 1 },
+      { x: 14, y: 5 },
+      { x: 10, y: 5 }
+    ],
+    'out-wing-f5',
+    { levelId: 'lvl-wing-f5', defaultEaveHeightM: 2.7, initialEdgeType: 'unclassified' }
+  );
+
+  const chordEdge = wingOut.edges.find((e) => e.type === 'wall');
+  assert.ok(chordEdge, 'Shared colinear wing edge along host must be classified wall');
+  assert.equal(chordEdge!.eaveHeightM, 3.6, 'Shared chord must copy host eaveHeightM');
+  const outerWingEdges = wingOut.edges.filter((e) => e.id !== chordEdge!.id);
+  assert.equal(outerWingEdges.length, 3);
+  assert.ok(
+    outerWingEdges.every((e) => (e.eaveHeightM ?? 2.7) === 2.7),
+    'Outer wing eaves must NOT copy host stepped eaveHeightM'
+  );
+
+  const mainLevel: RoofLevel = {
+    id: 'lvl-main-f5',
+    code: 'L1',
+    name: 'Main Roof',
+    eaveHeightM: 2.7,
+    outline: mainOut,
+    skeleton: []
+  };
+  const wingLevel: RoofLevel = {
+    id: 'lvl-wing-f5',
+    code: 'L1b',
+    name: 'Wing',
+    parentLevelId: 'lvl-main-f5',
+    eaveHeightM: 2.7,
+    outline: wingOut,
+    skeleton: []
+  };
+
+  const wallPlan = deriveWallPlanFromRoofLevels([mainLevel, wingLevel], 2.7);
+  assert.ok(wallPlan, 'Wall plan must derive from parent + attached wing levels');
+  const chordFacetsAtX10 = wallPlan!.facets.filter((f) => {
+    const midX = (f.from.x + f.to.x) / 2;
+    return Math.abs(midX - 10) < 0.35;
+  });
+  // Verify wing chord facet overlapping host at x≈10 is suppressed (at most 1 facet per span, promoted to abutment)
+  assert.ok(
+    chordFacetsAtX10.some((f) => f.kind === 'abutment'),
+    'Shared host wall segment must be tagged abutment'
+  );
+  assert.equal(
+    chordFacetsAtX10.length,
+    1,
+    'Duplicate overlapping abutment wall at x≈10 must be suppressed (expected 1 host wall, not 2)'
+  );
+}
+console.log('✓ Part F Passed: Courtyard voids, typology presets (Hip/Gable/Mono), edge-only edits, stepped eaves, and attached same-level wings.');
+
 console.log('ALL ROOF PIPELINE DETERMINISTIC GOLDEN & FLASHING RULE TESTS PASSED! ✓');
+

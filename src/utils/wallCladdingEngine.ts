@@ -23,6 +23,7 @@ import {
   computeEdgeSetbackLine,
   deriveRoofWallSegments,
   dist,
+  getAllOutlineEdges,
   getDefaultEdgeSetbackM,
   getPointElevationFromPlanes,
   isEdgeWallEnabled,
@@ -172,6 +173,18 @@ interface SegmentCandidate {
   to: Point2D;
   heightM?: number;
   bottomZ?: number;
+  roofEdgeId?: string;
+}
+
+function wallSignedRingArea2(pts: Point2D[]): number {
+  if (pts.length < 3) return 0;
+  let area = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area;
 }
 
 function lineIntersection2D(
@@ -237,7 +250,8 @@ function mergeCollinearWallRuns(segments: SegmentCandidate[]): SegmentCandidate[
         from: { ...seg.from },
         to: { ...seg.to },
         heightM: seg.heightM,
-        bottomZ: seg.bottomZ
+        bottomZ: seg.bottomZ,
+        roofEdgeId: seg.roofEdgeId
       });
     }
   }
@@ -277,7 +291,7 @@ function findMatchingRoofEdgeId(
   let bestScore = Infinity;
 
   for (const lvl of scopedLevels) {
-    for (const edge of lvl.outline.edges) {
+    for (const edge of getAllOutlineEdges(lvl.outline)) {
       const sb = computeEdgeSetbackLine(lvl.outline, edge.id);
       const refFrom = sb?.wallFrom || edge.from;
       const refTo = sb?.wallTo || edge.to;
@@ -635,6 +649,7 @@ export function buildWallFacetsFromPlan(
     defaultHeightSource?: 'roof' | 'manual';
     defaultCladdingType?: WallCladdingType;
     defaultDetailConfirmed?: boolean;
+    defaultKind?: WallFacetKind;
     existingFacets?: WallFacet[];
     roofLevels?: RoofLevel[];
     mergeCollinear?: boolean;
@@ -656,7 +671,8 @@ export function buildWallFacetsFromPlan(
       from: { x: +e.from.x.toFixed(3), y: +e.from.y.toFixed(3) },
       to: { x: +e.to.x.toFixed(3), y: +e.to.y.toFixed(3) },
       heightM: 'eaveHeightM' in e && typeof e.eaveHeightM === 'number' ? e.eaveHeightM : undefined,
-      bottomZ: 'wallBottomZ' in e && typeof e.wallBottomZ === 'number' ? e.wallBottomZ : undefined
+      bottomZ: 'wallBottomZ' in e && typeof e.wallBottomZ === 'number' ? e.wallBottomZ : undefined,
+      roofEdgeId: 'roofEdgeId' in e && typeof (e as any).roofEdgeId === 'string' ? (e as any).roofEdgeId : undefined
     }));
   } else if (outline.points && outline.points.length >= 3) {
     const pts = outline.points;
@@ -677,13 +693,23 @@ export function buildWallFacetsFromPlan(
 
   const runs = mergeCollinear ? mergeCollinearWallRuns(rawSegments) : rawSegments;
 
-  // Two-pass matching so exact endpoint matches claim their existing facets before collinear fallbacks,
-  // and no existing facet (e.g. 'wall-facet-2') can ever be assigned to two runs.
+  // Multi-pass matching: exact endpoints first, then matching roofEdgeId (e.g. after setback shifts),
+  // then collinear fallback — guaranteeing 1-to-1 preservation of openings & cladding.
   const usedExistingIds = new Set<string>();
   const matchedByRunIdx: (WallFacet | undefined)[] = runs.map((seg) => {
     const exact = findExactExistingFacet(seg.from, seg.to, options?.existingFacets, usedExistingIds);
     if (exact) usedExistingIds.add(exact.id);
     return exact;
+  });
+  runs.forEach((seg, idx) => {
+    if (matchedByRunIdx[idx] || !seg.roofEdgeId || !options?.existingFacets) return;
+    const byRoofEdge = options.existingFacets.find(
+      (f) => !usedExistingIds.has(f.id) && f.roofEdgeId === seg.roofEdgeId
+    );
+    if (byRoofEdge) {
+      usedExistingIds.add(byRoofEdge.id);
+      matchedByRunIdx[idx] = byRoofEdge;
+    }
   });
   runs.forEach((seg, idx) => {
     if (matchedByRunIdx[idx]) return;
@@ -744,7 +770,7 @@ export function buildWallFacetsFromPlan(
     const regions = prev?.regions
       ? prev.regions.map((r) => clampWallRegionToFacet(facetBase, r))
       : undefined;
-    const resolvedKind = prev?.kind;
+    const resolvedKind = prev?.kind ?? options?.defaultKind;
     const isParapet = resolvedKind === 'parapet';
     const resolvedCladding = prev?.claddingType ?? defaultCladding;
     const resolvedDetailConfirmed =
@@ -763,6 +789,7 @@ export function buildWallFacetsFromPlan(
     const resolvedLevelId = prev?.levelId ?? options?.levelId;
     const resolvedBodyId = prev?.bodyId ?? options?.bodyId;
     const matchedRoofEdgeId =
+      seg.roofEdgeId ??
       prev?.roofEdgeId ??
       findMatchingRoofEdgeId(seg.from, seg.to, options?.roofLevels, resolvedLevelId ?? resolvedBodyId);
 
@@ -799,10 +826,13 @@ export function buildWallFacetsFromPlan(
   });
 }
 
-function computeMiteredWallPointsForOutline(outline: RoofOutline): Point2D[] {
-  const edges = outline.edges;
-  if (edges.length >= 3) {
-    const setbackLines = edges.map((edge) => {
+function computeMiteredWallPointsForRing(
+  outline: RoofOutline,
+  ringPoints: Point2D[],
+  ringEdges: PlanEdge[]
+): Point2D[] {
+  if (ringEdges.length >= 3) {
+    const setbackLines = ringEdges.map((edge) => {
       const sb = isEdgeWallEnabled(edge)
         ? computeEdgeSetbackLine(outline, edge.id)
         : computeEdgeSetbackLine(outline, edge.id, 0);
@@ -818,10 +848,10 @@ function computeMiteredWallPointsForOutline(outline: RoofOutline): Point2D[] {
       const prev = setbackLines[(i - 1 + setbackLines.length) % setbackLines.length];
       const curr = setbackLines[i];
       if (prev.setback < 0.01 && curr.setback < 0.01) {
-        cornerPts.push({ ...outline.points[i % outline.points.length] });
+        cornerPts.push({ ...ringPoints[i % ringPoints.length] });
       } else {
         const inter = lineIntersection2D(prev.from, prev.to, curr.from, curr.to);
-        const origCorner = outline.points[i % outline.points.length] || curr.from;
+        const origCorner = ringPoints[i % ringPoints.length] || curr.from;
         const maxMiter = Math.max(prev.setback, curr.setback) * 3 + 0.5;
         if (inter && dist(inter, origCorner) <= maxMiter) {
           cornerPts.push({ x: +inter.x.toFixed(3), y: +inter.y.toFixed(3) });
@@ -832,7 +862,7 @@ function computeMiteredWallPointsForOutline(outline: RoofOutline): Point2D[] {
     }
     return cornerPts;
   }
-  return outline.points.map((p) => ({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) }));
+  return ringPoints.map((p) => ({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) }));
 }
 
 function areWallSegmentsCoincident2D(
@@ -905,18 +935,25 @@ export function deriveWallPlanFromRoofLevels(
 
   validLevels.forEach((lvl, lvlIdx) => {
     const hM = +(lvl.eaveHeightM || defaultHeightM).toFixed(3);
-    const wallPoints = computeMiteredWallPointsForOutline(lvl.outline);
+    const wallPoints = computeMiteredWallPointsForRing(
+      lvl.outline,
+      lvl.outline.points,
+      lvl.outline.edges
+    );
     const wallEdges = buildWallEdgesFromPoints(
       wallPoints,
       lvlIdx === 0 ? 'wall-edge' : `wall-edge-${lvl.id}`
-    );
+    ).map((we, idx) => ({
+      ...we,
+      roofEdgeId: lvl.outline.edges[idx]?.id
+    }));
 
     const scopedExisting = [
       ...ringOnlyExisting.filter(
-        (f) => !claimedExistingIds.has(f.id) && (f.levelId === lvl.id || f.bodyId === lvl.id)
+        (f) => !claimedExistingIds.has(f.id) && f.kind !== 'void_edge' && (f.levelId === lvl.id || f.bodyId === lvl.id)
       ),
       ...ringOnlyExisting.filter(
-        (f) => !claimedExistingIds.has(f.id) && f.levelId !== lvl.id && f.bodyId !== lvl.id
+        (f) => !claimedExistingIds.has(f.id) && f.kind !== 'void_edge' && f.levelId !== lvl.id && f.bodyId !== lvl.id
       )
     ];
 
@@ -941,6 +978,68 @@ export function deriveWallPlanFromRoofLevels(
       }
     });
 
+    // Derive inner courtyard / void_edge wall rings for every RoofHoleRing on this level
+    const holeFacetsAll: WallFacet[] = [];
+    (lvl.outline.holes || []).forEach((hole, holeIdx) => {
+      if (!hole.points || hole.points.length < 3) return;
+      const holeBodyId = `${lvl.id}::hole::${hole.id}`;
+      let holeWallPts = computeMiteredWallPointsForRing(
+        lvl.outline,
+        hole.points,
+        hole.edges || []
+      );
+      let holeSourceEdges = hole.edges || [];
+      // Force clockwise winding (signedArea2 <= 0) for courtyard holes so right-hand normal faces INTO courtyard
+      const needReverse = wallSignedRingArea2(holeWallPts) > 0;
+      if (needReverse) {
+        holeWallPts = [...holeWallPts].reverse();
+      }
+      const holeWallEdges = buildWallEdgesFromPoints(
+        holeWallPts,
+        `wall-hole-${lvl.id}-${holeIdx + 1}`
+      ).map((we, idx) => {
+        const matchedRoofEdge = holeSourceEdges.find(
+          (he) =>
+            (pointsClose(he.from, we.from, 1.2) && pointsClose(he.to, we.to, 1.2)) ||
+            (pointsClose(he.from, we.to, 1.2) && pointsClose(he.to, we.from, 1.2))
+        );
+        return {
+          ...we,
+          roofEdgeId: (needReverse ? undefined : holeSourceEdges[idx]?.id) ?? matchedRoofEdge?.id
+        };
+      });
+
+      const scopedHoleExisting = [
+        ...ringOnlyExisting.filter(
+          (f) => !claimedExistingIds.has(f.id) && (f.kind === 'void_edge' || f.bodyId === holeBodyId)
+        ),
+        ...ringOnlyExisting.filter((f) => !claimedExistingIds.has(f.id))
+      ];
+
+      const builtHoleFacets = buildWallFacetsFromPlan(
+        { points: holeWallPts, edges: holeWallEdges },
+        {
+          defaultHeightM: hM,
+          defaultHeightSource: 'roof',
+          defaultCladdingType: resolvedDefaultCladding,
+          defaultDetailConfirmed: resolvedDetailConfirmed,
+          defaultKind: 'void_edge',
+          existingFacets: scopedHoleExisting,
+          roofLevels: [lvl],
+          bodyId: holeBodyId,
+          levelId: lvl.id,
+          groupId: holeBodyId
+        }
+      );
+
+      builtHoleFacets.forEach((hf) => {
+        if (ringOnlyExisting.some((e) => e.id === hf.id)) {
+          claimedExistingIds.add(hf.id);
+        }
+        holeFacetsAll.push(hf.kind ? hf : { ...hf, kind: 'void_edge' });
+      });
+    });
+
     bodies.push({
       id: lvl.id,
       levelId: lvl.id,
@@ -951,7 +1050,7 @@ export function deriveWallPlanFromRoofLevels(
       eaveHeightM: hM
     });
 
-    facetsByLevelId.set(lvl.id, bodyFacets);
+    facetsByLevelId.set(lvl.id, [...bodyFacets, ...holeFacetsAll]);
   });
 
   // Ensure unique IDs across all bodies BEFORE Rule 2 suppression so facet IDs on distinct bodies never collide
@@ -969,7 +1068,7 @@ export function deriveWallPlanFromRoofLevels(
     const fA = rawCollected[i];
     if (suppressedFacetIds.has(fA.id)) continue;
     const lvlA = fA.levelId ? levelById.get(fA.levelId) : undefined;
-    const edgeA = lvlA?.outline.edges.find((e) => e.id === fA.roofEdgeId);
+    const edgeA = lvlA ? getAllOutlineEdges(lvlA.outline).find((e) => e.id === fA.roofEdgeId) : undefined;
 
     for (let j = i + 1; j < rawCollected.length; j++) {
       const fB = rawCollected[j];
@@ -978,7 +1077,7 @@ export function deriveWallPlanFromRoofLevels(
       if (!areWallSegmentsCoincident2D(fA.from, fA.to, fB.from, fB.to, 0.12)) continue;
 
       const lvlB = fB.levelId ? levelById.get(fB.levelId) : undefined;
-      const edgeB = lvlB?.outline.edges.find((e) => e.id === fB.roofEdgeId);
+      const edgeB = lvlB ? getAllOutlineEdges(lvlB.outline).find((e) => e.id === fB.roofEdgeId) : undefined;
       const zA = lvlA?.eaveHeightM ?? fA.topZ;
       const zB = lvlB?.eaveHeightM ?? fB.topZ;
 
@@ -989,6 +1088,21 @@ export function deriveWallPlanFromRoofLevels(
       } else if (zA > zB + 0.05 || (edgeB?.type === 'wall' && edgeA?.type !== 'wall')) {
         suppressedFacetIds.add(fB.id);
         promotedStepOverrides.set(fA.id, { kind: 'abutment' });
+      } else if (
+        edgeA?.type === 'wall' ||
+        edgeB?.type === 'wall' ||
+        lvlB?.parentLevelId === lvlA?.id ||
+        lvlA?.parentLevelId === lvlB?.id
+      ) {
+        const suppressB =
+          lvlB?.parentLevelId === lvlA?.id || (lvlA?.parentLevelId !== lvlB?.id && i < j);
+        if (suppressB) {
+          suppressedFacetIds.add(fB.id);
+          promotedStepOverrides.set(fA.id, { kind: 'abutment' });
+        } else {
+          suppressedFacetIds.add(fA.id);
+          promotedStepOverrides.set(fB.id, { kind: 'abutment' });
+        }
       }
     }
   }
@@ -1806,7 +1920,7 @@ export function resolveRoofTopForWallFacet(
         ? roofLevels.filter((l) => l.id === facetLevelId)
         : roofLevels;
     for (const lvl of searchLevels) {
-      const edge = lvl.outline.edges.find((e) => e.id === matchedEdgeId);
+      const edge = getAllOutlineEdges(lvl.outline).find((e) => e.id === matchedEdgeId);
       if (edge) {
         const planeMatch = roofPlanes.find(
           (p) => p.eaveEdgeId === edge.id && (p.levelId || 'level-1') === lvl.id
@@ -2583,9 +2697,11 @@ export function linkWallFacetsToRoofLevels(
     if (facet.isSpur || facet.kind === 'wing' || facet.kind === 'secondary') return facet;
     const matched =
       facet.roofEdgeId &&
-      roofLevels.some((lvl) => lvl.outline.edges.some((e) => e.id === facet.roofEdgeId))
+      roofLevels.some((lvl) =>
+        getAllOutlineEdges(lvl.outline).some((e) => e.id === facet.roofEdgeId)
+      )
         ? facet.roofEdgeId
-        : findMatchingRoofEdgeId(facet.from, facet.to, roofLevels);
+        : findMatchingRoofEdgeId(facet.from, facet.to, roofLevels, facet.levelId);
     return matched && matched !== facet.roofEdgeId
       ? { ...facet, roofEdgeId: matched }
       : facet;

@@ -12,6 +12,7 @@ import {
   AssignableRoofLine,
   RoofFlashingAssignment,
   RoofLifecycleStage,
+  SkeletonLine,
   SkeletonLineType,
   TakeoffCompletenessIssue,
   TakeoffCompletenessReport,
@@ -103,11 +104,15 @@ interface Props {
   onUpdatePlaneDirection: (planeId: string, direction: 'left' | 'right') => void;
   onUpdatePlaneOrderedSheetLength?: (planeId: string, lengthM: number | undefined) => void;
   onUpdatePlaneEaveHeight?: (planeId: string, heightM: number) => void;
+  onApplyEaveHeightToFace?: (targetEdgeOrPlaneId: string, heightM: number) => void;
+  onApplyEaveHeightToLevel?: (levelIdOrEdgeId: string, heightM: number) => void;
   onUpdateEdgeLength?: (edgeId: string, lengthM: number) => void;
   onUpdateEdgeWall?: (edgeId: string, updates: { hasWall?: boolean; eaveSetbackM?: number }) => void;
   onToggleEdgeGable?: (edgeId: string, forceMode?: 'hipped' | 'gable') => void;
-  onSetEdgeMode?: (edgeId: string, mode: 'hipped' | 'gable' | 'wall') => void;
-  onApplyRoofStylePreset?: (mode: 'hipped' | 'gable') => void;
+  onSetEdgeMode?: (edgeId: string, mode: 'hipped' | 'gable' | 'wall' | 'apron' | 'ridge') => void;
+  onApplyRoofStylePreset?: (mode: 'hipped' | 'gable' | 'mono') => void;
+  skeleton?: SkeletonLine[];
+  isFacesDirty?: boolean;
   onDeletePlane?: (planeId: string) => void;
   onDeletePlanes?: (planeIds: string[]) => void;
   onBuildFacesFromClassification?: () => void;
@@ -197,11 +202,15 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
   onUpdatePlaneDirection,
   onUpdatePlaneOrderedSheetLength,
   onUpdatePlaneEaveHeight,
+  onApplyEaveHeightToFace,
+  onApplyEaveHeightToLevel,
   onUpdateEdgeLength,
   onUpdateEdgeWall,
   onToggleEdgeGable,
   onSetEdgeMode,
   onApplyRoofStylePreset,
+  skeleton = [],
+  isFacesDirty = false,
   onDeletePlane,
   onDeletePlanes,
   onBuildFacesFromClassification,
@@ -1882,6 +1891,36 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                   </div>
                 )}
 
+                {!isLockedView && (onApplyEaveHeightToFace || onApplyEaveHeightToLevel) && (
+                  <div className="grid grid-cols-1 gap-1.5 pt-1">
+                    {onApplyEaveHeightToFace && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onApplyEaveHeightToFace(selectedPlane.id, selectedPlane.eaveHeightM ?? 2.7)
+                        }
+                        className="w-full py-1.5 px-2.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-amber-500/35 text-amber-300 text-[10px] font-bold cursor-pointer transition-colors"
+                      >
+                        Apply to eaves on this face
+                      </button>
+                    )}
+                    {onApplyEaveHeightToLevel && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onApplyEaveHeightToLevel(
+                            selectedPlane.levelId || activeLevelId,
+                            selectedPlane.eaveHeightM ?? 2.7
+                          )
+                        }
+                        className="w-full py-1.5 px-2.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-slate-200 text-[10px] font-bold cursor-pointer transition-colors"
+                      >
+                        Apply to all eaves on this level
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {onUpdateEdgeWall && selectedPlane.eaveEdgeId && (() => {
                   const owningOutline =
                     levels.find((l) => l.id === (selectedPlane.levelId || activeLevelId))?.outline ||
@@ -2614,94 +2653,125 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               </div>
 
               <div className="space-y-1.5">
-                {levels.map((lvl) => {
-                  const isFocused = activeLevelId === lvl.id;
-                  return (
-                    <div
-                      key={lvl.id}
-                      className={`p-2 rounded-xl border flex items-center justify-between gap-2 transition-colors ${
-                        isFocused
-                          ? 'bg-amber-950/35 border-amber-500/50'
-                          : 'bg-slate-950/60 border-slate-800/80'
-                      }`}
-                    >
-                      <button
-                        onClick={() => onSelectLevel?.(lvl.id)}
-                        className="flex items-center gap-2 text-left min-w-0 flex-1 cursor-pointer"
+                {(() => {
+                  const orderedLevels: RoofLevel[] = [];
+                  const seenIds = new Set<string>();
+                  for (const lvl of levels) {
+                    if (lvl.parentLevelId) continue;
+                    if (!seenIds.has(lvl.id)) {
+                      orderedLevels.push(lvl);
+                      seenIds.add(lvl.id);
+                    }
+                    for (const child of levels) {
+                      if (child.parentLevelId === lvl.id && !seenIds.has(child.id)) {
+                        orderedLevels.push(child);
+                        seenIds.add(child.id);
+                      }
+                    }
+                  }
+                  for (const lvl of levels) {
+                    if (!seenIds.has(lvl.id)) {
+                      orderedLevels.push(lvl);
+                      seenIds.add(lvl.id);
+                    }
+                  }
+                  return orderedLevels.map((lvl) => {
+                    const isFocused = activeLevelId === lvl.id;
+                    const isChildWing = Boolean(lvl.parentLevelId);
+                    return (
+                      <div
+                        key={lvl.id}
+                        className={`p-2 rounded-xl border flex items-center justify-between gap-2 transition-colors ${
+                          isChildWing ? 'ml-3 pl-2.5 border-l-2 border-l-amber-500/50' : ''
+                        } ${
+                          isFocused
+                            ? 'bg-amber-950/35 border-amber-500/50'
+                            : 'bg-slate-950/60 border-slate-800/80'
+                        }`}
                       >
-                        <span className="px-1.5 py-0.5 rounded bg-slate-800 text-amber-300 font-mono font-bold text-[10px] shrink-0">
-                          {lvl.code}
-                        </span>
-                        <span className="font-bold text-slate-200 truncate text-[11px]">
-                          {lvl.name}
-                        </span>
-                      </button>
-
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[10px] text-slate-500 font-bold">Z</span>
-                        {isLockedView ? (
-                          <span className="font-mono font-bold text-white text-[11px] tabular-nums">
-                            {lvl.eaveHeightM.toFixed(2)} m
+                        <button
+                          onClick={() => onSelectLevel?.(lvl.id)}
+                          className="flex items-center gap-2 text-left min-w-0 flex-1 cursor-pointer"
+                        >
+                          <span className="px-1.5 py-0.5 rounded bg-slate-800 text-amber-300 font-mono font-bold text-[10px] shrink-0">
+                            {lvl.code}
                           </span>
-                        ) : (
-                          <>
-                            <input
-                              type="number"
-                              step="0.1"
-                              min="0.5"
-                              max="15"
-                              value={levelZDrafts[lvl.id] ?? String(+lvl.eaveHeightM.toFixed(2))}
-                              onFocus={(e) => {
-                                focusedFieldRef.current = `lvlZ:${lvl.id}`;
-                                e.currentTarget.select();
-                              }}
-                              onChange={(e) =>
-                                setLevelZDrafts((prev) => ({ ...prev, [lvl.id]: e.target.value }))
-                              }
-                              onBlur={() => {
-                                focusedFieldRef.current = null;
-                                const raw = levelZDrafts[lvl.id] ?? '';
-                                const val = parseFloat(raw);
-                                if (Number.isFinite(val) && val >= 0.5 && onUpdateLevelHeight) {
-                                  const clamped = Math.min(15, +val.toFixed(2));
-                                  onUpdateLevelHeight(lvl.id, clamped);
-                                  setLevelZDrafts((prev) => ({ ...prev, [lvl.id]: String(clamped) }));
-                                } else {
-                                  setLevelZDrafts((prev) => ({
-                                    ...prev,
-                                    [lvl.id]: String(+lvl.eaveHeightM.toFixed(2))
-                                  }));
+                          {isChildWing && (
+                            <span className="px-1 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-bold text-[9px] uppercase tracking-wide shrink-0">
+                              Wing
+                            </span>
+                          )}
+                          <span className="font-bold text-slate-200 truncate text-[11px]">
+                            {lvl.name}
+                          </span>
+                        </button>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-[10px] text-slate-500 font-bold">Z</span>
+                          {isLockedView ? (
+                            <span className="font-mono font-bold text-white text-[11px] tabular-nums">
+                              {lvl.eaveHeightM.toFixed(2)} m
+                            </span>
+                          ) : (
+                            <>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0.5"
+                                max="15"
+                                value={levelZDrafts[lvl.id] ?? String(+lvl.eaveHeightM.toFixed(2))}
+                                onFocus={(e) => {
+                                  focusedFieldRef.current = `lvlZ:${lvl.id}`;
+                                  e.currentTarget.select();
+                                }}
+                                onChange={(e) =>
+                                  setLevelZDrafts((prev) => ({ ...prev, [lvl.id]: e.target.value }))
                                 }
-                              }}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
-                                if (e.key === 'Escape') {
+                                onBlur={() => {
                                   focusedFieldRef.current = null;
-                                  setLevelZDrafts((prev) => ({
-                                    ...prev,
-                                    [lvl.id]: String(+lvl.eaveHeightM.toFixed(2))
-                                  }));
-                                  (e.currentTarget as HTMLInputElement).blur();
-                                }
-                              }}
-                              className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-[11px] tabular-nums text-right focus:outline-hidden focus:border-amber-400"
-                            />
-                            <span className="text-[10px] text-slate-400">m</span>
-                            {levels.length > 1 && onDeleteLevel && (
-                              <button
-                                onClick={() => onDeleteLevel(lvl.id)}
-                                className="p-1 text-slate-500 hover:text-rose-400 cursor-pointer"
-                                title="Remove Tier"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                          </>
-                        )}
+                                  const raw = levelZDrafts[lvl.id] ?? '';
+                                  const val = parseFloat(raw);
+                                  if (Number.isFinite(val) && val >= 0.5 && onUpdateLevelHeight) {
+                                    const clamped = Math.min(15, +val.toFixed(2));
+                                    onUpdateLevelHeight(lvl.id, clamped);
+                                    setLevelZDrafts((prev) => ({ ...prev, [lvl.id]: String(clamped) }));
+                                  } else {
+                                    setLevelZDrafts((prev) => ({
+                                      ...prev,
+                                      [lvl.id]: String(+lvl.eaveHeightM.toFixed(2))
+                                    }));
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                  if (e.key === 'Escape') {
+                                    focusedFieldRef.current = null;
+                                    setLevelZDrafts((prev) => ({
+                                      ...prev,
+                                      [lvl.id]: String(+lvl.eaveHeightM.toFixed(2))
+                                    }));
+                                    (e.currentTarget as HTMLInputElement).blur();
+                                  }
+                                }}
+                                className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-mono font-bold text-[11px] tabular-nums text-right focus:outline-hidden focus:border-amber-400"
+                              />
+                              <span className="text-[10px] text-slate-400">m</span>
+                              {levels.length > 1 && onDeleteLevel && (
+                                <button
+                                  onClick={() => onDeleteLevel(lvl.id)}
+                                  className="p-1 text-slate-500 hover:text-rose-400 cursor-pointer"
+                                  title="Remove Tier"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  });
+                })()}
               </div>
             </div>
           )}
@@ -2712,7 +2782,12 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
                 Facets, Walls &amp; Gables
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                {isFacesDirty && (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                    Faces stale — click Build Faces
+                  </span>
+                )}
                 {!isLockedView && onBuildFacesFromClassification && outline && outline.edges.length >= 3 && (
                   <button
                     type="button"
@@ -2726,8 +2801,17 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                 {outline && outline.edges.length > 0 && (() => {
                   const vergeCount = outline.edges.filter((e) => isGableEdgeType(e.type)).length;
                   const wallCount = outline.edges.filter((e) => e.type === 'wall' || e.type === 'apron').length;
+                  const ridgeEdgeCount = outline.edges.filter((e) => e.type === 'ridge').length;
                   const modeLabel =
-                    wallCount > 0 ? 'Terraced / Wall' : vergeCount === 0 ? 'Hipped' : vergeCount >= 2 && planes.length <= 2 ? 'Gable' : 'Mixed';
+                    ridgeEdgeCount > 0
+                      ? 'Monopitch'
+                      : wallCount > 0
+                      ? 'Terraced / Wall'
+                      : vergeCount === 0
+                      ? 'Hipped'
+                      : vergeCount >= 2 && planes.length <= 2
+                      ? 'Gable'
+                      : 'Mixed';
                   return (
                     <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-slate-800 text-sky-300 border border-slate-700">
                       {modeLabel}
@@ -2737,37 +2821,68 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
               </div>
             </div>
 
-            {!isLockedView && onApplyRoofStylePreset && outline && outline.edges.length > 0 && (
-              <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950 rounded-xl border border-slate-800">
-                <button
-                  onClick={() => onApplyRoofStylePreset('hipped')}
-                  className={`py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
-                    outline.edges.every((e) => e.type === 'outline')
-                      ? 'bg-emerald-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  All Hipped
-                </button>
-                <button
-                  onClick={() => onApplyRoofStylePreset('gable')}
-                  className={`py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
-                    outline.edges.some((e) => isGableEdgeType(e.type))
-                      ? 'bg-indigo-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  Gable Ends
-                </button>
-              </div>
-            )}
+            {(() => {
+              const activeSkel = levels.find((l) => l.id === activeLevelId)?.skeleton ?? skeleton;
+              const hasStructuralSkel = activeSkel.some((s) =>
+                ['ridge', 'hip', 'valley', 'barge', 'rake'].includes(s.suggestedType)
+              );
+              if (
+                isLockedView ||
+                !onApplyRoofStylePreset ||
+                !outline ||
+                outline.edges.length < 3 ||
+                hasStructuralSkel
+              ) {
+                return null;
+              }
+              return (
+                <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => onApplyRoofStylePreset('hipped')}
+                    className={`py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
+                      outline.edges.every((e) => e.type === 'outline')
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Hip
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onApplyRoofStylePreset('gable')}
+                    className={`py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
+                      outline.edges.some((e) => isGableEdgeType(e.type)) &&
+                      !outline.edges.some((e) => e.type === 'ridge')
+                        ? 'bg-indigo-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Gable
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onApplyRoofStylePreset('mono')}
+                    className={`py-1.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
+                      outline.edges.some((e) => e.type === 'ridge')
+                        ? 'bg-amber-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Mono
+                  </button>
+                </div>
+              );
+            })()}
 
             <div className="space-y-1">
               {outline && outline.edges.length > 0
                 ? outline.edges.map((edge, idx) => {
                     const matchedPlane = planes.find((p) => p.eaveEdgeId === edge.id);
                     const isGable = isGableEdgeType(edge.type);
-                    const isWall = edge.type === 'wall' || edge.type === 'apron';
+                    const isApron = edge.type === 'apron';
+                    const isWall = edge.type === 'wall';
+                    const isRidgeEdge = edge.type === 'ridge';
                     const edgeLen = dist(edge.from, edge.to).toFixed(1);
                     const edgeZ = (edge.eaveHeightM ?? matchedPlane?.eaveHeightM ?? 2.7).toFixed(1);
                     return (
@@ -2785,7 +2900,9 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                           <span
                             className="w-2.5 h-2.5 rounded-full shrink-0"
                             style={{
-                              backgroundColor: isWall
+                              backgroundColor: isRidgeEdge
+                                ? '#ef4444'
+                                : isWall || isApron
                                 ? '#f59e0b'
                                 : isGable
                                 ? '#818cf8'
@@ -2793,7 +2910,15 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                             }}
                           />
                           <span className="font-bold text-slate-200 truncate text-xs tabular-nums">
-                            {matchedPlane ? `${matchedPlane.code} · ` : isWall ? 'Wall · ' : `Side ${idx + 1} · `}
+                            {matchedPlane
+                              ? `${matchedPlane.code} · `
+                              : isWall
+                              ? 'Wall · '
+                              : isApron
+                              ? 'Apron · '
+                              : isRidgeEdge
+                              ? 'High Ridge · '
+                              : `Side ${idx + 1} · `}
                             {edgeLen}m
                           </span>
                           <span className="font-mono text-amber-400/90 text-[10px] tabular-nums shrink-0">
@@ -2802,24 +2927,26 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                         </button>
 
                         {!isLockedView && (
-                          <div className="flex items-center gap-1 shrink-0">
+                          <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
                             {(onSetEdgeMode || onToggleEdgeGable) && (
                               <div className="flex items-center bg-slate-900 rounded-lg p-0.5 border border-slate-800">
                                 <button
+                                  type="button"
                                   onClick={() =>
                                     onSetEdgeMode
                                       ? onSetEdgeMode(edge.id, 'hipped')
                                       : onToggleEdgeGable?.(edge.id, 'hipped')
                                   }
                                   className={`px-1.5 py-1 rounded-md text-[10px] font-bold transition-all cursor-pointer ${
-                                    !isGable && !isWall
+                                    !isGable && !isWall && !isApron && !isRidgeEdge
                                       ? 'bg-emerald-600/90 text-white'
                                       : 'text-slate-500 hover:text-slate-300'
                                   }`}
                                 >
-                                  Hip
+                                  Eave
                                 </button>
                                 <button
+                                  type="button"
                                   onClick={() =>
                                     onSetEdgeMode
                                       ? onSetEdgeMode(edge.id, 'gable')
@@ -2833,6 +2960,32 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                                 >
                                   Gab
                                 </button>
+                                {onSetEdgeMode && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => onSetEdgeMode(edge.id, 'wall')}
+                                      className={`px-1.5 py-1 rounded-md text-[10px] font-bold transition-all cursor-pointer ${
+                                        isWall
+                                          ? 'bg-amber-600 text-white'
+                                          : 'text-slate-500 hover:text-slate-300'
+                                      }`}
+                                    >
+                                      Wall
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => onSetEdgeMode(edge.id, 'apron')}
+                                      className={`px-1.5 py-1 rounded-md text-[10px] font-bold transition-all cursor-pointer ${
+                                        isApron
+                                          ? 'bg-orange-600 text-white'
+                                          : 'text-slate-500 hover:text-slate-300'
+                                      }`}
+                                    >
+                                      Apron
+                                    </button>
+                                  </>
+                                )}
                               </div>
                             )}
                             {onUpdateEdgeWall && (
@@ -2842,13 +2995,13 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                                   onUpdateEdgeWall(edge.id, { hasWall: !isEdgeWallEnabled(edge) })
                                 }
                                 title="Toggle Wall Below Roof Edge"
-                                className={`px-2 py-1 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
+                                className={`px-1.5 py-1 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
                                   isEdgeWallEnabled(edge)
                                     ? 'bg-amber-500 text-slate-950 border-amber-400'
                                     : 'bg-slate-900 text-slate-500 hover:text-slate-300 border-slate-800'
                                 }`}
                               >
-                                Wall
+                                Below
                               </button>
                             )}
                           </div>
@@ -2875,6 +3028,30 @@ export const ExactRoofingInspectorDrawer: React.FC<Props> = ({
                     </button>
                   ))}
             </div>
+
+            {outline && (outline.holes?.length ?? 0) > 0 && (
+              <div className="pt-2 border-t border-slate-800/80 space-y-1">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-amber-300/90">
+                  Courtyard Voids ({outline.holes!.length}) — Not Sheeted
+                </div>
+                {outline.holes!.map((hole, hIdx) => {
+                  const perim = hole.edges.reduce((acc, e) => acc + dist(e.from, e.to), 0);
+                  return (
+                    <div
+                      key={hole.id}
+                      className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-slate-950/70 border border-amber-500/25 text-[11px]"
+                    >
+                      <span className="font-bold text-slate-300">
+                        {hole.name || `Courtyard Void ${hIdx + 1}`}
+                      </span>
+                      <span className="font-mono text-slate-400 text-[10px] tabular-nums">
+                        {hole.edges.length} walls · {perim.toFixed(1)}m perim
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Added Features & Pitch Breaks Quick List */}

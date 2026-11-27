@@ -134,7 +134,7 @@ interface Props {
   onAddLevel?: () => void;
   onUpdateEdgeEaveHeight?: (edgeId: string, heightM: number) => void;
   onUpdateEdgeWall?: (edgeId: string, updates: { hasWall?: boolean; eaveSetbackM?: number }) => void;
-  onSetEdgeMode?: (edgeId: string, mode: 'hipped' | 'gable' | 'wall') => void;
+  onSetEdgeMode?: (edgeId: string, mode: 'hipped' | 'gable' | 'wall' | 'apron' | 'ridge') => void;
   selectedPlaneId: string | null;
   layout?: LayoutResult;
   startPlaneId?: string | null;
@@ -151,6 +151,7 @@ interface Props {
       autoGenerateSkeleton?: boolean;
       mode?: 'replace' | 'add';
       attachedEdgeId?: string;
+      separateLevel?: boolean;
       scaleFactor?: number;
       scaleAnchor?: Point2D;
     }
@@ -211,8 +212,17 @@ interface Props {
       heightM?: number;
     }
   ) => void;
-  onAddCourtyardHole?: (levelId: string, holePoints: Point2D[]) => void;
+  onAddCourtyardHole?: (levelId: string, holePoints: Point2D[]) => boolean | void;
   onRemoveCourtyardHole?: (levelId: string, holeId: string) => void;
+  onApplyEaveHeightToFace?: (targetEdgeOrPlaneId: string, heightM: number) => void;
+  onApplyEaveHeightToLevel?: (levelIdOrEdgeId: string, heightM: number) => void;
+  isFacesDirty?: boolean;
+  presetPickState?:
+    | null
+    | { mode: 'gable_barges'; pickedEdgeIds: string[]; levelId: string }
+    | { mode: 'mono_low_eave'; levelId: string };
+  onPickEdgeForPreset?: (edgeId: string) => void;
+  onCancelPresetPick?: () => void;
   buildProgress?: { label: string; pct: number } | null;
   onCancelBuild?: () => void;
 }
@@ -288,6 +298,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   onBatchWallUpdate,
   onAddCourtyardHole,
   onRemoveCourtyardHole,
+  onApplyEaveHeightToFace,
+  onApplyEaveHeightToLevel,
+  isFacesDirty = false,
+  presetPickState = null,
+  onPickEdgeForPreset,
+  onCancelPresetPick,
   buildProgress = null,
   onCancelBuild
 }) => {
@@ -341,6 +357,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   // Freehand drawing, attach-to-edge & scaling state
   const [draftPoints, setDraftPoints] = useState<Point2D[]>([]);
   const [drawSubMode, setDrawSubMode] = useState<'free' | 'attach_edge' | 'courtyard_void'>('free');
+  const [separateRoofMode, setSeparateRoofMode] = useState<boolean>(false);
+  const [drawError, setDrawError] = useState<string | null>(null);
+  const [selectedHoleId, setSelectedHoleId] = useState<string | null>(null);
   const [attachedEdge, setAttachedEdge] = useState<PlanEdge | null>(null);
   const [lockedDraftBounds, setLockedDraftBounds] = useState<PlanViewportBounds | null>(null);
   const [draftScaleReady, setDraftScaleReady] = useState<boolean>(false);
@@ -363,6 +382,14 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   const hasEstablishedScale = Boolean(planUnderlay?.isCalibrated || hasExistingFootprint);
 
+  const focusedLevelFamilyIds = useMemo(() => {
+    if (!levels || levels.length === 0) return new Set<string>([outline.levelId || 'level-1']);
+    if (activeLevelId === 'all') return new Set(levels.map((l) => l.id));
+    const focus = levels.find((l) => l.id === activeLevelId) || levels[0];
+    const rootId = focus.parentLevelId || focus.id;
+    return new Set(levels.filter((l) => (l.parentLevelId || l.id) === rootId).map((l) => l.id));
+  }, [levels, activeLevelId, outline.levelId]);
+
   const allDisplayEdges = useMemo(
     () =>
       levels && levels.length > 0
@@ -384,10 +411,12 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
   const displaySkeleton = useMemo(
     () =>
-      activeLevelId === 'all' && levels && levels.length > 1
-        ? levels.flatMap((l) => l.skeleton)
+      levels && levels.length > 1
+        ? levels
+            .filter((l) => focusedLevelFamilyIds.has(l.id))
+            .flatMap((l) => l.skeleton)
         : skeleton,
-    [activeLevelId, levels, skeleton]
+    [levels, focusedLevelFamilyIds, skeleton]
   );
 
   const lastOutlineIdRef = useRef<string>(outline.id);
@@ -1311,6 +1340,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       if (readOnlyGeometry) return;
       if (isFirstLineModalOpen) return;
       if (drawSubMode === 'attach_edge' && !attachedEdge) return;
+      setDrawError(null);
 
       const prevPt = draftPoints.length > 0 ? draftPoints[draftPoints.length - 1] : null;
       const pt = resolveDrawRoofPointerPoint(e.clientX, e.clientY, prevPt);
@@ -1484,17 +1514,26 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const finishCustomOutline = (overridePoints?: Point2D[]) => {
     const pts = overridePoints || draftPoints;
     if (pts.length >= 3) {
-      if (drawSubMode === 'courtyard_void' && onAddCourtyardHole) {
+      if (drawSubMode === 'courtyard_void') {
         const centroid = polygonCentroid(pts);
         const enclosingLvl =
-          (levels &&
-            levels.find(
-              (l) => l.outline.points.length >= 3 && isPointInPolygon(centroid, l.outline.points)
-            )) ||
-          (activeLevelId !== 'all' ? levels?.find((l) => l.id === activeLevelId) : undefined) ||
-          levels?.[0];
-        const targetLvlId = enclosingLvl?.id || outline.levelId || 'level-1';
-        onAddCourtyardHole(targetLvlId, pts);
+          levels && levels.length > 0
+            ? levels.find(
+                (l) => l.outline.points.length >= 3 && isPointInPolygon(centroid, l.outline.points)
+              )
+            : outline.points.length >= 3 && isPointInPolygon(centroid, outline.points)
+            ? { id: outline.levelId || 'level-1' }
+            : undefined;
+        if (!enclosingLvl || !onAddCourtyardHole) {
+          setDrawError('Void must sit inside the roof.');
+          return;
+        }
+        const ok = onAddCourtyardHole(enclosingLvl.id, pts);
+        if (ok === false) {
+          setDrawError('Void must sit inside the roof.');
+          return;
+        }
+        setDrawError(null);
         setDraftPoints([]);
         setAttachedEdge(null);
         setDrawSubMode('free');
@@ -1520,8 +1559,18 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       onUpdateOutline(newOutline, {
         autoGenerateSkeleton: false,
         mode: hasExistingFootprint ? 'add' : 'replace',
-        attachedEdgeId: attachedEdge?.id
+        attachedEdgeId: attachedEdge?.id,
+        separateLevel: drawSubMode === 'free' ? separateRoofMode : false
       });
+      const focusEdge =
+        newOutline.edges.find((ed) => ed.type !== 'wall' && ed.type !== 'apron') ||
+        newOutline.edges[0];
+      if (focusEdge) {
+        setSelectedEdgeIds([focusEdge.id]);
+        setInspectedLine({ kind: 'edge', id: focusEdge.id });
+      }
+      setDrawError(null);
+      setSeparateRoofMode(false);
       setDraftPoints([]);
       setAttachedEdge(null);
       setDrawSubMode('free');
@@ -1620,6 +1669,11 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
   const handleEdgeClick = (edge: PlanEdge, e: React.MouseEvent) => {
     if (isCanvasTapTool) return;
     e.stopPropagation();
+    if (!readOnlyGeometry && presetPickState && onPickEdgeForPreset) {
+      onPickEdgeForPreset(edge.id);
+      return;
+    }
+    setSelectedHoleId(null);
     if (activeTool === 'assign_flashing' && onSelectLineForFlashing) {
       onSelectLineForFlashing(edge.id);
       return;
@@ -1654,7 +1708,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       }
       return;
     }
-    // Select / Inspect mode -> display line info card with length, flashing, pitch & hip/gable actions
+    // Select / Inspect mode -> display line info card with length, flashing, pitch & hip/gable/wall/apron actions
     setEditingMeasurement(null);
     onSelectPlane(null);
     onSelectWallFacet?.(null);
@@ -2271,58 +2325,83 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
                 {activeTool === 'draw_roof' && (
                   <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#080d18]/95 backdrop-blur-md border border-emerald-500/45 shadow-xl text-[11px] max-w-full">
-                    {hasExistingFootprint && draftPoints.length === 0 && (
-                      <div className="w-full flex flex-wrap items-center justify-center gap-1 pb-1 border-b border-slate-800">
+                    <div className="w-full flex flex-wrap items-center justify-center gap-1 pb-1 border-b border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDrawSubMode('free');
+                          setAttachedEdge(null);
+                          setDrawError(null);
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                          drawSubMode === 'free'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-slate-800 text-slate-300'
+                        }`}
+                      >
+                        New outline
+                      </button>
+                      {hasExistingFootprint && drawSubMode === 'free' && (
                         <button
                           type="button"
-                          onClick={() => {
-                            setDrawSubMode('free');
-                            setAttachedEdge(null);
-                          }}
-                          className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
-                            drawSubMode === 'free'
-                              ? 'bg-emerald-600 text-white'
-                              : 'bg-slate-800 text-slate-300'
+                          onClick={() => setSeparateRoofMode((v) => !v)}
+                          title="Create on a separate roof level instead of the current level"
+                          className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer border ${
+                            separateRoofMode
+                              ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                              : 'bg-slate-900 border-slate-700 text-slate-400'
                           }`}
                         >
-                          Add Roof
+                          {separateRoofMode ? 'Separate roof ON' : 'Separate roof'}
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setDrawSubMode('attach_edge');
-                            setAttachedEdge(null);
-                          }}
-                          className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
-                            drawSubMode === 'attach_edge'
-                              ? 'bg-amber-600 text-white'
-                              : 'bg-slate-800 text-slate-300'
-                          }`}
-                        >
-                          From Wall / Eave
-                        </button>
-                        {onAddCourtyardHole && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setDrawSubMode('courtyard_void');
-                              setAttachedEdge(null);
-                            }}
-                            className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
-                              drawSubMode === 'courtyard_void'
-                                ? 'bg-rose-600 text-white'
-                                : 'bg-slate-800 text-rose-300'
-                            }`}
-                          >
-                            Courtyard Void
-                          </button>
-                        )}
+                      )}
+                      <button
+                        type="button"
+                        disabled={!hasExistingFootprint}
+                        onClick={() => {
+                          setDrawSubMode('attach_edge');
+                          setAttachedEdge(null);
+                          setSeparateRoofMode(false);
+                          setDrawError(null);
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed ${
+                          drawSubMode === 'attach_edge'
+                            ? 'bg-amber-600 text-white'
+                            : 'bg-slate-800 text-slate-300'
+                        }`}
+                      >
+                        From wall / eave
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!hasExistingFootprint || !onAddCourtyardHole}
+                        title="Hole in this roof. Not a new roof."
+                        onClick={() => {
+                          setDrawSubMode('courtyard_void');
+                          setAttachedEdge(null);
+                          setSeparateRoofMode(false);
+                          setDrawError(null);
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed ${
+                          drawSubMode === 'courtyard_void'
+                            ? 'bg-rose-600 text-white'
+                            : 'bg-slate-800 text-rose-300'
+                        }`}
+                      >
+                        Courtyard void
+                      </button>
+                    </div>
+                    {drawError && (
+                      <div className="w-full text-center text-[10px] font-extrabold text-rose-300 bg-rose-950/70 border border-rose-500/40 rounded-lg px-2 py-0.5">
+                        {drawError}
                       </div>
                     )}
                     <Crosshair className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                     <span className="text-emerald-200 font-bold truncate">
-                      {drawSubMode === 'courtyard_void' && draftPoints.length === 0
-                        ? 'Tap corner 1 inside roof for Courtyard Void'
+                      {drawSubMode === 'courtyard_void'
+                        ? draftPoints.length === 0
+                          ? 'Hole in this roof. Not a new roof. Tap corner 1 inside.'
+                          : `Hole in this roof (${draftPoints.length} pts · Tap green start)`
                         : drawSubMode === 'attach_edge' && !attachedEdge
                         ? 'Tap an existing wall or eave edge'
                         : draftPoints.length === 0 && attachedEdge
@@ -2331,7 +2410,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                         ? planUnderlay && !planUnderlay.isCalibrated && !hasEstablishedScale
                           ? 'Draw line 1 or use 2-Pt Scale'
                           : hasExistingFootprint
-                          ? 'Tap corner 1 for new roof'
+                          ? separateRoofMode
+                            ? 'Tap corner 1 for separate roof'
+                            : 'Tap corner 1 for outline on current level'
                           : 'Tap corner 1 to start'
                         : draftPoints.length === 1 && !draftScaleReady && !hasEstablishedScale
                         ? 'Tap corner 2 (scale prompt next)'
@@ -3017,58 +3098,83 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
 
       {!isMobile && activeTool === 'draw_roof' && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-2 px-3.5 py-2 rounded-2xl bg-[#080d18]/95 backdrop-blur-md border border-emerald-500/45 shadow-2xl text-xs animate-in fade-in slide-in-from-bottom-2">
-          {hasExistingFootprint && draftPoints.length === 0 && (
-            <div className="flex items-center gap-1 p-0.5 rounded-xl bg-slate-900 border border-slate-800">
+          <div className="flex items-center gap-1 p-0.5 rounded-xl bg-slate-900 border border-slate-800">
+            <button
+              type="button"
+              onClick={() => {
+                setDrawSubMode('free');
+                setAttachedEdge(null);
+                setDrawError(null);
+              }}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                drawSubMode === 'free'
+                  ? 'bg-emerald-600 text-white'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              New outline
+            </button>
+            {hasExistingFootprint && drawSubMode === 'free' && (
               <button
                 type="button"
-                onClick={() => {
-                  setDrawSubMode('free');
-                  setAttachedEdge(null);
-                }}
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
-                  drawSubMode === 'free'
-                    ? 'bg-emerald-600 text-white'
-                    : 'text-slate-300 hover:text-white'
+                onClick={() => setSeparateRoofMode((v) => !v)}
+                title="Create on a separate roof level instead of the current level"
+                className={`px-2 py-1 rounded-lg text-[10px] font-bold cursor-pointer border ${
+                  separateRoofMode
+                    ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                    : 'bg-slate-950 border-slate-700 text-slate-400 hover:text-white'
                 }`}
               >
-                New Footprint
+                {separateRoofMode ? 'Separate roof ON' : 'Separate roof'}
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setDrawSubMode('attach_edge');
-                  setAttachedEdge(null);
-                }}
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
-                  drawSubMode === 'attach_edge'
-                    ? 'bg-amber-600 text-white'
-                    : 'text-slate-300 hover:text-white'
-                }`}
-              >
-                From Wall / Eave
-              </button>
-              {onAddCourtyardHole && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setDrawSubMode('courtyard_void');
-                    setAttachedEdge(null);
-                  }}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
-                    drawSubMode === 'courtyard_void'
-                      ? 'bg-rose-600 text-white'
-                      : 'text-rose-300 hover:text-white'
-                  }`}
-                >
-                  Courtyard Void
-                </button>
-              )}
-            </div>
+            )}
+            <button
+              type="button"
+              disabled={!hasExistingFootprint}
+              onClick={() => {
+                setDrawSubMode('attach_edge');
+                setAttachedEdge(null);
+                setSeparateRoofMode(false);
+                setDrawError(null);
+              }}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed ${
+                drawSubMode === 'attach_edge'
+                  ? 'bg-amber-600 text-white'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              From wall / eave
+            </button>
+            <button
+              type="button"
+              disabled={!hasExistingFootprint || !onAddCourtyardHole}
+              title="Hole in this roof. Not a new roof."
+              onClick={() => {
+                setDrawSubMode('courtyard_void');
+                setAttachedEdge(null);
+                setSeparateRoofMode(false);
+                setDrawError(null);
+              }}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed ${
+                drawSubMode === 'courtyard_void'
+                  ? 'bg-rose-600 text-white'
+                  : 'text-rose-300 hover:text-white'
+              }`}
+            >
+              Courtyard void
+            </button>
+          </div>
+          {drawError && (
+            <span className="px-2.5 py-1 rounded-lg bg-rose-950/80 border border-rose-500/50 text-rose-200 font-extrabold text-[11px]">
+              {drawError}
+            </span>
           )}
           <Crosshair className="w-4 h-4 text-emerald-400 shrink-0" />
           <span className="text-emerald-200 font-bold">
-            {drawSubMode === 'courtyard_void' && draftPoints.length === 0
-              ? 'Click inside an existing roof outline to punch an open Courtyard Void (no roof inside hole)'
+            {drawSubMode === 'courtyard_void'
+              ? draftPoints.length === 0
+                ? 'Hole in this roof. Not a new roof. Click inside the roof outline.'
+                : `Hole in this roof. Not a new roof. · ${draftPoints.length} pts`
               : drawSubMode === 'attach_edge' && !attachedEdge
               ? 'Click an existing wall or eave edge to set host reference line'
               : draftPoints.length === 0 && attachedEdge
@@ -3077,7 +3183,9 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               ? planUnderlay && !planUnderlay.isCalibrated && !hasEstablishedScale
                 ? 'Click first corner (or use 2-Pt Scale first)'
                 : hasExistingFootprint
-                ? 'Click corner 1 to add new roof outline (preserves existing)'
+                ? separateRoofMode
+                  ? 'Click corner 1 for a separate roof level (preserves existing)'
+                  : 'Click corner 1 to add another ring on current level'
                 : 'Click first corner on canvas to draw'
               : draftPoints.length === 1 && !draftScaleReady && !hasEstablishedScale
               ? 'Click corner 2 to set first-line scale length'
@@ -3296,6 +3404,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
       >
         <svg
           ref={svgRef}
+          data-apex-svg="2d"
           viewBox={`0 0 ${svgWidth} ${svgHeight}`}
           onClick={(e) => {
             if (suppressNextClickRef.current) {
@@ -3504,7 +3613,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           {levels &&
             levels.length > 1 &&
             levels
-              .filter((lvl) => activeLevelId !== 'all' && lvl.id !== activeLevelId)
+              .filter((lvl) => activeLevelId !== 'all' && !focusedLevelFamilyIds.has(lvl.id))
               .map((lvl) => (
                 <g
                   key={`ghost-${lvl.id}`}
@@ -3548,7 +3657,7 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           {planes.map((plane) => {
             const isDimmedByLevel =
               Boolean(levels && levels.length > 1 && activeLevelId && activeLevelId !== 'all') &&
-              (plane.levelId || 'level-1') !== activeLevelId;
+              !focusedLevelFamilyIds.has(plane.levelId || 'level-1');
             const isSelected = selectedPlaneId === plane.id;
             const isMultiSelected = selectedPlaneIds.includes(plane.id);
             const isStart =
@@ -3779,13 +3888,15 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           })}
 
           {/* COURTYARD VOIDS (Inner Hole Rings — Open Sky Cutouts, Zero Roof Inside) */}
-          {(activeLevelId === 'all' && levels && levels.length > 1
-            ? levels.flatMap((l) =>
-                (l.outline.holes || []).map((hole) => ({
-                  levelId: l.id,
-                  hole
-                }))
-              )
+          {(levels && levels.length > 1
+            ? levels
+                .filter((l) => focusedLevelFamilyIds.has(l.id))
+                .flatMap((l) =>
+                  (l.outline.holes || []).map((hole) => ({
+                    levelId: l.id,
+                    hole
+                  }))
+                )
             : (outline.holes || []).map((hole) => ({
                 levelId: outline.levelId || levels?.[0]?.id || 'level-1',
                 hole
@@ -3796,28 +3907,40 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const c = polygonCentroid(hole.points);
             const cx = toSvgX(c.x);
             const cy = toSvgY(c.y);
+            const isHoleSelected = selectedHoleId === hole.id;
             return (
-              <g key={`void-ring-${hole.id}`}>
+              <g
+                key={`void-ring-${hole.id}`}
+                pointerEvents={isDrawingOrGeometryTool ? 'none' : undefined}
+                onClick={(ev) => {
+                  if (isDrawingOrGeometryTool) return;
+                  ev.stopPropagation();
+                  setInspectedLine(null);
+                  setSelectedEdgeIds([]);
+                  onSelectPlane(null);
+                  setSelectedHoleId((prev) => (prev === hole.id ? null : hole.id));
+                }}
+                className={isDrawingOrGeometryTool ? 'pointer-events-none' : 'cursor-pointer'}
+              >
                 <polygon
                   points={holePtsStr}
                   fill="#040812"
                   fillOpacity="0.88"
-                  stroke="#f43f5e"
-                  strokeWidth="1.8"
+                  stroke={isHoleSelected ? '#ffffff' : '#f43f5e'}
+                  strokeWidth={isHoleSelected ? '2.6' : '1.8'}
                   strokeDasharray="6 4"
-                  pointerEvents="none"
                 />
                 <g transform={`translate(${cx}, ${cy})`}>
                   <rect
-                    x="-46"
+                    x="-54"
                     y="-10"
-                    width={!readOnlyGeometry && onRemoveCourtyardHole ? 92 : 76}
+                    width={!readOnlyGeometry && onRemoveCourtyardHole ? 108 : 92}
                     height="20"
                     rx="10"
-                    fill="#1e0a14"
-                    fillOpacity="0.94"
-                    stroke="#f43f5e"
-                    strokeOpacity="0.65"
+                    fill={isHoleSelected ? '#4c0519' : '#1e0a14'}
+                    fillOpacity="0.95"
+                    stroke={isHoleSelected ? '#ffffff' : '#f43f5e'}
+                    strokeOpacity={isHoleSelected ? '0.9' : '0.65'}
                     strokeWidth="1"
                   />
                   <text
@@ -3825,19 +3948,20 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                     y="3.5"
                     textAnchor="middle"
                     fill="#fda4af"
-                    fontSize="8.5"
+                    fontSize="8.2"
                     fontWeight="800"
                     fontFamily="monospace"
                     pointerEvents="none"
                   >
-                    VOID (OPEN)
+                    {isHoleSelected ? 'HOLE (NOT SHEETED)' : 'VOID (OPEN)'}
                   </text>
                   {!readOnlyGeometry && onRemoveCourtyardHole && (
                     <g
-                      transform="translate(35, 0)"
+                      transform="translate(42, 0)"
                       className="cursor-pointer"
                       onClick={(ev) => {
                         ev.stopPropagation();
+                        setSelectedHoleId(null);
                         onRemoveCourtyardHole(levelId, hole.id);
                       }}
                     >
@@ -4475,8 +4599,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           {/* OUTLINE EDGES (ALL 10 CLASSIFICATIONS — OUTER + COURTYARD VOIDS) */}
           {(() => {
             const displayEdges =
-              activeLevelId === 'all' && levels && levels.length > 1
-                ? levels.flatMap((l) => getAllOutlineEdges(l.outline))
+              levels && levels.length > 1
+                ? levels
+                    .filter((l) => focusedLevelFamilyIds.has(l.id))
+                    .flatMap((l) => getAllOutlineEdges(l.outline))
                 : getAllOutlineEdges(outline);
             return displayEdges;
           })().map((e) => {
@@ -4493,7 +4619,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
             const isDefined = planes.some((p) => p.eaveEdgeId === e.id);
             const assignedFlashing = assignmentByLineId.get(e.id);
             const isInspected = inspectedLine?.kind === 'edge' && inspectedLine.id === e.id;
-            const isMultiEdge = selectedEdgeIds.includes(e.id);
+            const isPresetPicked =
+              presetPickState?.mode === 'gable_barges' &&
+              presetPickState.pickedEdgeIds.includes(e.id);
+            const isMultiEdge = selectedEdgeIds.includes(e.id) || isPresetPicked;
             const edgeCode = edgeMeta.code;
             const edgeStroke = e.type === 'outline' && isDefined ? '#22c55e' : edgeMeta.colorHex;
 
@@ -4729,18 +4858,41 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               const ux = (fx2 - fx1) / wallSpanSvg;
               const uy = (fy2 - fy1) / wallSpanSvg;
 
-              // Orient tag inward toward owning body centroid if available
+              const kind = getWallFacetKind(facet);
+              // Orient tag toward courtyard hole centroid for void_edge walls, else owning outer body centroid
               const owningOutline =
                 (levels && (facet.levelId || facet.bodyId)
                   ? levels.find((l) => l.id === (facet.levelId || facet.bodyId))?.outline
                   : undefined) || outline;
+              let centroidPts = owningOutline.points;
+              if (
+                kind === 'void_edge' &&
+                owningOutline.holes &&
+                owningOutline.holes.length > 0
+              ) {
+                const fMidX = (facet.from.x + facet.to.x) / 2;
+                const fMidY = (facet.from.y + facet.to.y) / 2;
+                let bestHole = owningOutline.holes[0];
+                let bestDist = Infinity;
+                for (const h of owningOutline.holes) {
+                  if (h.points.length < 3) continue;
+                  const hcx = h.points.reduce((a, p) => a + p.x, 0) / h.points.length;
+                  const hcy = h.points.reduce((a, p) => a + p.y, 0) / h.points.length;
+                  const d = Math.hypot(hcx - fMidX, hcy - fMidY);
+                  if (d < bestDist) {
+                    bestDist = d;
+                    bestHole = h;
+                  }
+                }
+                if (bestHole.points.length >= 3) {
+                  centroidPts = bestHole.points;
+                }
+              }
               let nx = -uy;
               let ny = ux;
-              if (owningOutline.points.length >= 3) {
-                const cx =
-                  owningOutline.points.reduce((a, p) => a + p.x, 0) / owningOutline.points.length;
-                const cy =
-                  owningOutline.points.reduce((a, p) => a + p.y, 0) / owningOutline.points.length;
+              if (centroidPts.length >= 3) {
+                const cx = centroidPts.reduce((a, p) => a + p.x, 0) / centroidPts.length;
+                const cy = centroidPts.reduce((a, p) => a + p.y, 0) / centroidPts.length;
                 const toCdx = toSvgX(cx) - (fx1 + fx2) / 2;
                 const toCdy = toSvgY(cy) - (fy1 + fy2) / 2;
                 if (toCdx * nx + toCdy * ny < 0) {
@@ -4756,11 +4908,10 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
               const isDimmedByLevel =
                 Boolean(levels && levels.length > 1 && activeLevelId && activeLevelId !== 'all') &&
                 Boolean(facet.levelId) &&
-                facet.levelId !== activeLevelId;
+                !focusedLevelFamilyIds.has(facet.levelId!);
 
               const primClad = getFacetPrimaryDisplayCladding(facet);
               const cladHex = getWallCladdingMeta(primClad).hex;
-              const kind = getWallFacetKind(facet);
               const badgeDistPx = Math.min(20, Math.max(13, wallSpanSvg * 0.22));
               const tagX = (fx1 + fx2) / 2 + nx * badgeDistPx;
               const tagY = (fy1 + fy2) / 2 + ny * badgeDistPx;
@@ -5540,6 +5691,38 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
           </div>
         )}
 
+        {!readOnlyGeometry && presetPickState && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 px-3.5 py-1.5 rounded-xl bg-[#080d18]/96 border border-indigo-500/60 text-xs text-indigo-100 shadow-2xl">
+            <span className="font-extrabold">
+              {presetPickState.mode === 'gable_barges'
+                ? `Tap 2 edges: these are the barges (${presetPickState.pickedEdgeIds.length}/2)`
+                : 'Tap 1 edge as the low Mono eave'}
+            </span>
+            {onCancelPresetPick && (
+              <button
+                type="button"
+                onClick={onCancelPresetPick}
+                className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold cursor-pointer"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        )}
+
+        {!readOnlyGeometry && !presetPickState && !buildProgress && isFacesDirty && onBuildFacesFromClassification && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-25 flex items-center gap-2 px-3 py-1 rounded-xl bg-[#080d18]/94 border border-emerald-500/45 text-[11px] text-emerald-200 shadow-xl">
+            <span className="font-bold">Edges updated — Build Faces to refresh 3D &amp; cuts</span>
+            <button
+              type="button"
+              onClick={onBuildFacesFromClassification}
+              className="px-2 py-0.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-[10px] cursor-pointer"
+            >
+              Build Faces
+            </button>
+          </div>
+        )}
+
         {/* Roof Perimeter & Ridge/Hip/Valley Color Legend (Desktop only) */}
         {!isMobile && (
           <div className="absolute bottom-3 right-3 bg-[#080d18]/92 backdrop-blur-md border border-slate-800 px-3 py-1.5 rounded-xl text-[11px] text-slate-300 flex items-center gap-3 shadow-lg pointer-events-none">
@@ -5676,40 +5859,69 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                   </div>
                 )}
 
-                {/* Compact Wall Height (Z) Editor for Perimeter Eaves & Abutment Walls */}
+                {/* Compact Wall Height (Z) Editor + Explicit Face / Level Propagation */}
                 {edgeObj && !readOnlyGeometry && onUpdateEdgeEaveHeight && (
-                  <div className="px-2.5 py-1.5 rounded-xl bg-slate-900/90 border border-amber-500/25 flex items-center justify-between gap-2 text-[11px]">
-                    <span className="text-amber-300 font-bold shrink-0">Eave Z:</span>
-                    <div className="flex items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => onUpdateEdgeEaveHeight(edgeObj.id, Math.max(0.5, +(currentEdgeZ - 0.5).toFixed(2)))}
-                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono font-bold text-[10px] cursor-pointer"
-                      >
-                        -0.5
-                      </button>
-                      <input
-                        type="number"
-                        step="0.1"
-                        min="0.5"
-                        max="15"
-                        value={+currentEdgeZ.toFixed(2)}
-                        onChange={(ev) => {
-                          const v = parseFloat(ev.target.value);
-                          if (Number.isFinite(v) && v >= 0.5) {
-                            onUpdateEdgeEaveHeight(edgeObj.id, v);
-                          }
-                        }}
-                        className="w-14 bg-slate-950 border border-amber-500/40 rounded-lg px-1.5 py-1 text-center font-mono font-bold text-white text-[11px] tabular-nums focus:outline-hidden focus:border-amber-400"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => onUpdateEdgeEaveHeight(edgeObj.id, Math.min(15, +(currentEdgeZ + 0.5).toFixed(2)))}
-                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono font-bold text-[10px] cursor-pointer"
-                      >
-                        +0.5
-                      </button>
+                  <div className="px-2.5 py-1.5 rounded-xl bg-slate-900/90 border border-amber-500/25 space-y-1.5 text-[11px]">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-amber-300 font-bold shrink-0">Eave Z:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => onUpdateEdgeEaveHeight(edgeObj.id, Math.max(0.5, +(currentEdgeZ - 0.5).toFixed(2)))}
+                          className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono font-bold text-[10px] cursor-pointer"
+                        >
+                          -0.5
+                        </button>
+                        <input
+                          type="number"
+                          step="0.1"
+                          min="0.5"
+                          max="15"
+                          value={+currentEdgeZ.toFixed(2)}
+                          onChange={(ev) => {
+                            const v = parseFloat(ev.target.value);
+                            if (Number.isFinite(v) && v >= 0.5) {
+                              onUpdateEdgeEaveHeight(edgeObj.id, v);
+                            }
+                          }}
+                          className="w-14 bg-slate-950 border border-amber-500/40 rounded-lg px-1.5 py-1 text-center font-mono font-bold text-white text-[11px] tabular-nums focus:outline-hidden focus:border-amber-400"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => onUpdateEdgeEaveHeight(edgeObj.id, Math.min(15, +(currentEdgeZ + 0.5).toFixed(2)))}
+                          className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono font-bold text-[10px] cursor-pointer"
+                        >
+                          +0.5
+                        </button>
+                      </div>
                     </div>
+                    {(onApplyEaveHeightToFace || onApplyEaveHeightToLevel) && (
+                      <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                        {edgeObj.type === 'outline' && onApplyEaveHeightToFace && (
+                          <button
+                            type="button"
+                            onClick={() => onApplyEaveHeightToFace(edgeObj.id, currentEdgeZ)}
+                            className="px-2 py-0.5 rounded-md bg-amber-500/20 hover:bg-amber-500/35 border border-amber-500/40 text-amber-200 text-[10px] font-bold cursor-pointer"
+                          >
+                            Apply to eaves on this face
+                          </button>
+                        )}
+                        {onApplyEaveHeightToLevel && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onApplyEaveHeightToLevel(
+                                edgeObj.levelId || outline.levelId || edgeObj.id,
+                                currentEdgeZ
+                              )
+                            }
+                            className="px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10px] font-bold cursor-pointer"
+                          >
+                            Apply to all eaves on this level
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -5832,8 +6044,8 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                             ? onSetEdgeMode(edgeObj.id, 'hipped')
                             : onToggleEdgeGable?.(edgeObj.id, 'hipped')
                         }
-                        className={`min-h-[34px] px-2.5 rounded-lg text-[11px] font-bold cursor-pointer ${
-                          !isVerge && !isWall
+                        className={`min-h-[34px] px-2 rounded-lg text-[11px] font-bold cursor-pointer ${
+                          edgeObj.type === 'outline'
                             ? 'bg-emerald-600 text-white'
                             : 'text-slate-400 hover:text-white'
                         }`}
@@ -5847,12 +6059,38 @@ export const ExactRoofingCanvas: React.FC<Props> = ({
                             ? onSetEdgeMode(edgeObj.id, 'gable')
                             : onToggleEdgeGable?.(edgeObj.id, 'gable')
                         }
-                        className={`min-h-[34px] px-2.5 rounded-lg text-[11px] font-bold cursor-pointer ${
+                        className={`min-h-[34px] px-2 rounded-lg text-[11px] font-bold cursor-pointer ${
                           isVerge ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
                         }`}
                       >
                         Gable
                       </button>
+                      {onSetEdgeMode && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => onSetEdgeMode(edgeObj.id, 'wall')}
+                            className={`min-h-[34px] px-2 rounded-lg text-[11px] font-bold cursor-pointer ${
+                              edgeObj.type === 'wall'
+                                ? 'bg-amber-600 text-white'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            Wall
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onSetEdgeMode(edgeObj.id, 'apron')}
+                            className={`min-h-[34px] px-2 rounded-lg text-[11px] font-bold cursor-pointer ${
+                              edgeObj.type === 'apron'
+                                ? 'bg-amber-500 text-slate-950'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            Apron
+                          </button>
+                        </>
+                      )}
                     </div>
                   )}
 

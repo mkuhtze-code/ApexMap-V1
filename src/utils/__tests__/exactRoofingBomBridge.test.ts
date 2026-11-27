@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import {
+  applyBomToQuoteObject,
+  buildOrderPack,
+  buildQuoteSections,
   buildRoofBillOfMaterials,
   computeRoofingPacks,
   buildQuoteSpreadsheetFromRoofBom,
@@ -7,12 +10,26 @@ import {
   exportRoofBomToCsv
 } from '../exactRoofingBomBridge';
 import {
+  appendMeasuredEnvelopeHistory,
+  buildEnvelopeSnapshot,
+  getLatestMeasuredEnvelope,
+  getNextEnvelopeRevision
+} from '../envelopeSnapshot';
+import {
+  addCourtyardHoleToOutline,
+  buildOutlineFromPoints,
+  computeTruthfulRoofAreaM2,
   createPlaneFromEdge,
   generateCuttingLayout,
   generateSkeletonLines,
   getPresetOutline
 } from '../exactRoofingEngine';
-import { RoofFlashingAssignment, SheetSpec } from '../../types/exactRoofing';
+import {
+  ExactRoofModelSnapshot,
+  RoofFlashingAssignment,
+  SheetSpec
+} from '../../types/exactRoofing';
+import { Quote } from '../../types/crm';
 
 const outline = getPresetOutline('rectangle_14x10');
 const skeleton = generateSkeletonLines(outline);
@@ -124,7 +141,6 @@ assert.ok(csv.includes('SECTION 1: MILL STOCK SHEET SCHEDULE'), 'CSV includes se
 assert.ok(csv.includes('SECTION 3: ONSITE ROOFING PACK SEQUENCE'), 'CSV includes section 3');
 
 // 5. Site-Measured Ordered Sheet Length Override (5450mm run -> 5435mm actual sheet, Geometry Unchanged)
-import { buildOutlineFromPoints } from '../exactRoofingEngine';
 
 const monoOutline = buildOutlineFromPoints([
   { x: 0, y: 0 },
@@ -263,4 +279,284 @@ assert.ok(pracCsv.includes('Cut Breakdown'), 'BOM CSV includes Cut Breakdown col
 assert.ok(!pracCsv.includes('$'), 'BOM CSV must stay commercial-neutral (zero $)');
 
 console.log('✓ exactRoofingBomBridge unit tests passed');
+
+// 8. EnvelopeSnapshot gating, lifecycle revisions/history cap, distinct RIDGE codes & idempotent Quote push
+{
+  const modelSnap: ExactRoofModelSnapshot = {
+    version: 2,
+    stage: 'quoting',
+    measureLocked: false,
+    selectedPreset: 'rectangle_14x10',
+    outline,
+    skeleton,
+    planes,
+    levels: [
+      {
+        id: 'level-1',
+        code: 'L1',
+        name: 'Main Roof',
+        eaveHeightM: 2.7,
+        outline,
+        skeleton
+      }
+    ],
+    startPlaneId: planes[0].id,
+    assets: [],
+    pitchBreaks: [],
+    flashingAssignments: assignments,
+    windZoneCode: 'H',
+    roofProfileFamily: 'corrugate',
+    ventedRidge: 'none',
+    ruleSetRevision: 'v2-2026',
+    installProgress: {
+      customSequencePlaneIds: [],
+      stagedPlaneIds: [],
+      completedPlaneIds: [],
+      completedPieceIds: []
+    },
+    lastUpdatedAt: '2026-11-26T00:00:00.000Z'
+  };
+
+  const orderPackEst = buildOrderPack({
+    planes,
+    levels: modelSnap.levels,
+    layout,
+    bom,
+    assignableLines: [],
+    assignments,
+    libraryProfiles: [],
+    locked: false
+  });
+
+  // 8a. Refuses on failed area sanity & completeness blocker
+  assert.throws(
+    () =>
+      buildEnvelopeSnapshot({
+        revision: 1,
+        kind: 'estimated',
+        model: modelSnap,
+        bom,
+        orderPack: orderPackEst,
+        areaSanity: { ok: false, warning: 'Area doubled' }
+      }),
+    /Area doubled/,
+    'buildEnvelopeSnapshot must refuse when areaSanity fails'
+  );
+
+  assert.throws(
+    () =>
+      buildEnvelopeSnapshot({
+        revision: 1,
+        kind: 'estimated',
+        model: modelSnap,
+        bom,
+        orderPack: orderPackEst,
+        areaSanity: { ok: true },
+        completenessReport: {
+          isComplete: false,
+          canLockMeasure: false,
+          blockersCount: 1,
+          warningsCount: 0,
+          totalIssuesCount: 1,
+          undetailedWallsCount: 0,
+          undetailedReturnsCount: 0,
+          unassignedFlashingsCount: 1,
+          incompletePlanesCount: 0,
+          incompletePenetrationsCount: 0,
+          issues: [
+            {
+              id: 'blk-1',
+              severity: 'blocker',
+              category: 'missing_flashing',
+              title: 'Ridge flashing missing',
+              detail: 'Assign ridge flashing'
+            }
+          ]
+        }
+      }),
+    /Ridge flashing missing/,
+    'buildEnvelopeSnapshot must refuse when completenessReport has blockers'
+  );
+
+  // 8b. Distinct RIDGE-150 / RIDGE-200 / RIDGE-RV10P codes & deterministic IDs across repeat calls
+  const multiRidgeAssignments: RoofFlashingAssignment[] = [
+    {
+      ...assignments[0],
+      id: 'assign-r150',
+      lineId: 'skel-ridge-150',
+      lineLabel: 'Low Wind Ridge',
+      profileId: 'std-ridge-150',
+      profileName: 'Ridge 150',
+      productCode: 'RIDGE-150'
+    },
+    {
+      ...assignments[0],
+      id: 'assign-r200',
+      lineId: 'skel-ridge-200',
+      lineLabel: 'High Wind Ridge',
+      profileId: 'std-ridge-200',
+      profileName: 'Ridge 200',
+      productCode: 'RIDGE-200'
+    },
+    {
+      ...assignments[0],
+      id: 'assign-rv10p',
+      lineId: 'skel-ridge-rv10p',
+      lineLabel: 'Vented Ridge',
+      profileId: 'std-ridge-rv10p',
+      profileName: 'Ridge RV10P',
+      productCode: 'RIDGE-RV10P'
+    }
+  ];
+  const multiBom = buildRoofBillOfMaterials({
+    planes,
+    layout,
+    assignments: multiRidgeAssignments,
+    assignableLines: []
+  });
+  const snapEst1 = buildEnvelopeSnapshot({
+    revision: 1,
+    kind: 'estimated',
+    model: modelSnap,
+    bom: multiBom,
+    orderPack: orderPackEst,
+    areaSanity: { ok: true }
+  });
+  assert.equal(snapEst1.revision, 1);
+  assert.equal(snapEst1.kind, 'estimated');
+
+  const built1 = buildQuoteSections(snapEst1);
+  const built2 = buildQuoteSections(snapEst1);
+  assert.deepEqual(
+    built1.sections.map((s) => s.id),
+    built2.sections.map((s) => s.id),
+    'buildQuoteSections must emit identical deterministic section IDs'
+  );
+  assert.deepEqual(
+    built1.rows.map((r) => r.id),
+    built2.rows.map((r) => r.id),
+    'buildQuoteSections must emit identical deterministic row IDs'
+  );
+  const flashCodes = built1.rows
+    .filter((r) => r.sectionId === 'sec-apex-flash')
+    .map((r) => r.itemCode);
+  assert.deepEqual(
+    flashCodes,
+    ['RIDGE-150', 'RIDGE-200', 'RIDGE-RV10P'],
+    'Distinct RIDGE-150 / RIDGE-200 / RIDGE-RV10P product codes must survive buildQuoteSections'
+  );
+
+  // 8c. Idempotent applyBomToQuoteObject preserves manual non-Apex sections without duplicating Apex rows
+  const baseQuoteWithManual: Quote = {
+    ...({} as Quote),
+    id: 'q-idem-1',
+    quoteNumber: 'QT-1001',
+    clientName: 'Test Client',
+    clientEmail: 't@example.com',
+    clientPhone: '021',
+    siteAddress: '1 Test Rd',
+    profile: 'TRS Corrugate 0.55mm',
+    material: 'Kiwicolour® Vitor+ PVDF (The Roofing Store)',
+    colorName: 'FlaxPod',
+    roofAreaM2: 140,
+    markupPercent: 18,
+    status: 'draft',
+    version: 1,
+    createdAt: '2026-11-26',
+    validUntil: '2026-12-26',
+    spreadsheetSections: [
+      { id: 'sec-manual-scaff', title: 'Manual Scaffolding', colorTag: '#64748b', sectionType: 'custom' }
+    ],
+    spreadsheetRows: [
+      {
+        id: 'row-manual-scaff',
+        sectionId: 'sec-manual-scaff',
+        itemCode: 'SCAF-1',
+        description: 'Edge Protection',
+        category: 'Safety',
+        quantity: 1,
+        unit: 'lot',
+        wastagePercent: 0,
+        unitCostNZD: 1200,
+        markupPercent: 10,
+        unitSellNZD: 1320,
+        totalNZD: 1320
+      }
+    ]
+  };
+  const pushedOnce = applyBomToQuoteObject({
+    quote: baseQuoteWithManual,
+    envelope: snapEst1,
+    replaceExistingSections: true
+  });
+  const pushedTwice = applyBomToQuoteObject({
+    quote: pushedOnce,
+    envelope: snapEst1,
+    replaceExistingSections: true
+  });
+  assert.equal(
+    pushedTwice.spreadsheetRows?.length,
+    pushedOnce.spreadsheetRows?.length,
+    'Pushing twice with replaceExistingSections=true must be idempotent'
+  );
+  assert.ok(
+    pushedTwice.spreadsheetSections?.some((s) => s.id === 'sec-manual-scaff'),
+    'Manual non-Apex section must be preserved'
+  );
+  assert.ok(
+    pushedTwice.spreadsheetRows?.some((r) => r.id === 'row-manual-scaff'),
+    'Manual non-Apex row must be preserved'
+  );
+  assert.equal(
+    pushedTwice.roofPlanModel?.envelopeSnapshot?.revision,
+    1,
+    'Attached Quote roofPlanModel retains EnvelopeSnapshot'
+  );
+
+  // 8d. Lifecycle revisions & measured history cap (5)
+  const measuredRev2 = buildEnvelopeSnapshot({
+    revision: getNextEnvelopeRevision(snapEst1, []),
+    kind: 'measured',
+    model: { ...modelSnap, stage: 'installing', measureLocked: true },
+    bom: multiBom,
+    orderPack: { ...orderPackEst, locked: true },
+    areaSanity: { ok: true }
+  });
+  let history = appendMeasuredEnvelopeHistory([], measuredRev2, 5);
+  assert.equal(measuredRev2.revision, 2);
+  assert.equal(history.length, 1);
+
+  // Unlock advances to estimated rev 3 without mutating measuredRev2 in history
+  const estRev3 = buildEnvelopeSnapshot({
+    revision: getNextEnvelopeRevision(measuredRev2, history),
+    kind: 'estimated',
+    model: modelSnap,
+    bom: multiBom,
+    orderPack: orderPackEst,
+    areaSanity: { ok: true }
+  });
+  assert.equal(estRev3.revision, 3);
+  assert.equal(getLatestMeasuredEnvelope({ envelopeSnapshot: estRev3, envelopeHistory: history })?.revision, 2);
+
+  // Cap at 5 measured revisions
+  for (let r = 4; r <= 9; r++) {
+    const m = buildEnvelopeSnapshot({
+      revision: r,
+      kind: 'measured',
+      model: { ...modelSnap, stage: 'installing', measureLocked: true },
+      bom: multiBom,
+      orderPack: { ...orderPackEst, locked: true },
+      areaSanity: { ok: true }
+    });
+    history = appendMeasuredEnvelopeHistory(history, m, 5);
+  }
+  assert.equal(history.length, 5, 'Measured envelope history must cap at 5 entries');
+  assert.deepEqual(
+    history.map((h) => h.revision),
+    [5, 6, 7, 8, 9],
+    'Measured envelope history keeps the 5 newest measured revisions'
+  );
+}
+console.log('✓ Test 8 Passed: EnvelopeSnapshot gating, distinct RIDGE codes, idempotent Quote sections, and 5-cap measured history');
+
 

@@ -99,6 +99,20 @@ import { ProposalPreview } from './ProposalPreview';
 import { ExactRoofingHub } from './exactroofing/ExactRoofingHub';
 import { RoofBomSummary, ExactRoofModelSnapshot } from '../types/exactRoofing';
 import { applyBomToQuoteObject } from '../utils/exactRoofingBomBridge';
+import {
+  EnvelopeRevisionKind,
+  EnvelopeSnapshot
+} from '../types/exactRoofing';
+import { buildEnvelopeSnapshot } from '../utils/envelopeSnapshot';
+import {
+  buildOrderPackViaPipeline,
+  checkRoofAreaSanity,
+  createRoofPipelineState,
+  ensureBom
+} from '../utils/roofPipeline';
+import { evaluateTakeoffCompleteness } from '../utils/takeoffCompleteness';
+import { getAssignableRoofLinesMultiLevel } from '../utils/exactRoofingEngine';
+import { getMergedFlashingLibrary } from '../utils/exactRoofingFlashingBridge';
 
 interface Props {
   quotes: Quote[];
@@ -892,11 +906,22 @@ export const QuoteBuilder: React.FC<Props> = ({
     includeUnderlay: boolean;
     includeLabourEstimate: boolean;
     replaceExistingSections: boolean;
+    revisionKind: EnvelopeRevisionKind;
+    envelope: EnvelopeSnapshot;
     bom: RoofBomSummary;
     snapshot: ExactRoofModelSnapshot;
     project?: Project;
+    stillCaptureFailed?: boolean;
   }) => {
+    if (!opts.envelope || !opts.envelope.areaSanityOk || opts.envelope.bom?.areaSanityWarning) {
+      showMatrixToast(
+        opts.envelope?.bom?.areaSanityWarning || 'Quote push refused: roof area sanity or completeness failed.',
+        'error'
+      );
+      return;
+    }
     const targetProject = opts.project || activeTakeoffProject || matchingProject;
+    const replaceSections = opts.replaceExistingSections ?? true;
     if (opts.targetQuoteId === 'new') {
       const baseNewQuote: Quote = {
         ...activeQuote,
@@ -920,6 +945,7 @@ export const QuoteBuilder: React.FC<Props> = ({
       };
       const populated = applyBomToQuoteObject({
         quote: baseNewQuote,
+        envelope: opts.envelope,
         bom: opts.bom,
         snapshot: opts.snapshot,
         includeHardware: opts.includeHardware,
@@ -933,11 +959,14 @@ export const QuoteBuilder: React.FC<Props> = ({
         onUpdateProject({
           ...targetProject,
           roofPlanModel: opts.snapshot as any,
-          roofAreaM2: opts.bom.totalRoofAreaM2 || targetProject.roofAreaM2
+          roofAreaM2: opts.envelope.areaM2 || opts.bom.totalRoofAreaM2 || targetProject.roofAreaM2
         });
       }
       setIsApexStudioModalOpen(false);
-      showMatrixToast(`Created quote ${populated.quoteNumber} from ApexMap BOM (${formatNZD(populated.totalNZD || 0)} incl. GST).`, 'success');
+      showMatrixToast(
+        `Created quote ${populated.quoteNumber} from ${opts.revisionKind} envelope rev ${opts.envelope.revision} (${formatNZD(populated.totalNZD || 0)} incl. GST).`,
+        'success'
+      );
     } else {
       const target = quotes.find(q => q.id === opts.targetQuoteId) || activeQuote;
       const updated = applyBomToQuoteObject({
@@ -949,12 +978,13 @@ export const QuoteBuilder: React.FC<Props> = ({
           colorName: opts.colorName,
           markupPercent: opts.markupPercent
         },
+        envelope: opts.envelope,
         bom: opts.bom,
         snapshot: opts.snapshot,
         includeHardware: opts.includeHardware,
         includeUnderlay: opts.includeUnderlay,
         includeLabourEstimate: opts.includeLabourEstimate,
-        replaceExistingSections: opts.replaceExistingSections
+        replaceExistingSections: replaceSections
       });
       onUpdateQuote(updated);
       setSelectedQuoteId(updated.id);
@@ -962,29 +992,117 @@ export const QuoteBuilder: React.FC<Props> = ({
         onUpdateProject({
           ...targetProject,
           roofPlanModel: opts.snapshot as any,
-          roofAreaM2: opts.bom.totalRoofAreaM2 || targetProject.roofAreaM2
+          roofAreaM2: opts.envelope.areaM2 || opts.bom.totalRoofAreaM2 || targetProject.roofAreaM2
         });
       }
       setIsApexStudioModalOpen(false);
-      showMatrixToast(`Imported ApexMap BOM into ${updated.quoteNumber} (${formatNZD(updated.totalNZD || 0)} incl. GST).`, 'success');
+      showMatrixToast(
+        `Updated ${updated.quoteNumber} from ${opts.revisionKind} envelope rev ${opts.envelope.revision} (${formatNZD(updated.totalNZD || 0)} incl. GST).`,
+        'success'
+      );
     }
   };
 
   const handleImportSavedRoofBom = () => {
     const savedModel = activeTakeoffProject?.roofPlanModel as ExactRoofModelSnapshot | undefined;
-    if (!savedModel?.bom) return;
-    const populated = applyBomToQuoteObject({
-      quote: activeQuote,
-      bom: savedModel.bom,
-      snapshot: savedModel,
-      includeHardware: true,
-      includeUnderlay: true,
-      includeLabourEstimate: true,
-      replaceExistingSections: false
-    });
-    onUpdateQuote(populated);
-    setIsTakeoffModalOpen(false);
-    showMatrixToast(`Imported saved ApexMap Roof BOM (${savedModel.bom.totalRoofAreaM2} m², ${savedModel.bom.totalSheetsCount} sheets) into ${activeQuote.quoteNumber}.`, 'success');
+    if (!savedModel) return;
+    try {
+      let envelope = savedModel.envelopeSnapshot || null;
+      if (!envelope) {
+        const levels = savedModel.levels && savedModel.levels.length > 0
+          ? savedModel.levels
+          : [{
+              id: 'level-1',
+              code: 'L1',
+              name: 'Main Roof',
+              eaveHeightM: savedModel.outline?.edges?.[0]?.eaveHeightM ?? 2.7,
+              outline: savedModel.outline,
+              skeleton: savedModel.skeleton || []
+            }];
+        const planes = savedModel.planes || [];
+        const sanity = checkRoofAreaSanity(levels, planes);
+        const assignableLines = getAssignableRoofLinesMultiLevel(
+          levels,
+          planes,
+          savedModel.assets || [],
+          savedModel.pitchBreaks || []
+        );
+        const assignments = savedModel.flashingAssignments || [];
+        const completeness = evaluateTakeoffCompleteness({
+          levels,
+          planes,
+          assignableLines,
+          flashingAssignments: assignments,
+          wallPlan: savedModel.wallPlan || null,
+          assets: savedModel.assets || [],
+          areaSanity: sanity,
+          outOfScopeLineIds: savedModel.outOfScopeLineIds || [],
+          outOfScopeKinds: savedModel.outOfScopeKinds || []
+        });
+        const pipeBom = savedModel.bom
+          ? { bom: savedModel.bom }
+          : ensureBom(
+              createRoofPipelineState({
+                levels,
+                planes,
+                layout: savedModel.layout || null,
+                dirty: { faces: false, layout: !savedModel.layout && planes.length > 0, bom: true }
+              }),
+              {
+                sheetSpec: { coverWidth: 0.762, maxLength: 6.0, endLap: 0.15, overhang: 0.05 },
+                sheetOrderMode: savedModel.sheetOrderMode || 'practical',
+                assignments,
+                assignableLines
+              }
+            );
+        const libraryProfiles = getMergedFlashingLibrary(activeTakeoffProject);
+        const orderPack = savedModel.orderPack || buildOrderPackViaPipeline({
+          project: activeTakeoffProject,
+          planes,
+          levels,
+          layout: savedModel.layout || null,
+          bom: pipeBom.bom,
+          assignableLines,
+          assignments,
+          libraryProfiles,
+          assets: savedModel.assets || [],
+          wallPlan: savedModel.wallPlan || null,
+          completenessReport: completeness,
+          locked: Boolean(savedModel.measureLocked),
+          sheetOrderMode: savedModel.sheetOrderMode || 'practical'
+        });
+        envelope = buildEnvelopeSnapshot({
+          revision: 1,
+          kind: savedModel.measureLocked ? 'measured' : 'estimated',
+          model: savedModel,
+          bom: pipeBom.bom,
+          orderPack,
+          areaSanity: sanity,
+          completenessReport: completeness,
+          stillDataUrl: null
+        });
+      }
+      const populated = applyBomToQuoteObject({
+        quote: activeQuote,
+        envelope,
+        snapshot: savedModel,
+        includeHardware: true,
+        includeUnderlay: true,
+        includeLabourEstimate: true,
+        replaceExistingSections: true
+      });
+      onUpdateQuote(populated);
+      setIsTakeoffModalOpen(false);
+      showMatrixToast(
+        `Imported ApexMap envelope rev ${envelope.revision} (${envelope.areaM2} m², ${envelope.totalSheets} sheets) into ${activeQuote.quoteNumber}.`,
+        'success'
+      );
+    } catch (err) {
+      showMatrixToast(
+        err instanceof Error ? err.message : 'Unable to import BOM: fix roof blockers first.',
+        'error'
+      );
+    }
   };
 
   // Holistic Architectural Proposal Presets & Standards

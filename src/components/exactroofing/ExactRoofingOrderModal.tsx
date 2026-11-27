@@ -9,6 +9,8 @@ import {
 } from '../../types/crm';
 import {
   AssignableRoofLine,
+  EnvelopeRevisionKind,
+  EnvelopeSnapshot,
   FaceRoofingPack,
   FlashingRuleContext,
   FlashingRuleSet,
@@ -25,6 +27,7 @@ import {
   TakeoffCompletenessReport,
   WallPlan
 } from '../../types/exactRoofing';
+import { captureRoofStillDataUrl } from '../../utils/canvasStillCapture';
 import { resolveMatchingFlashingRule } from '../../utils/flashingRules';
 import { ProfileThumbnail } from '../FlashingWorkshop';
 import {
@@ -112,6 +115,10 @@ interface Props {
     includeUnderlay: boolean;
     includeLabourEstimate: boolean;
     replaceExistingSections: boolean;
+    stillDataUrl?: string | null;
+    stillCaptureFailed?: boolean;
+    revisionKind?: EnvelopeRevisionKind;
+    envelope?: EnvelopeSnapshot;
   }) => void;
   onOpenFlashingOrders?: () => void;
 }
@@ -201,7 +208,8 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   const [quoteIncHardware, setQuoteIncHardware] = useState<boolean>(true);
   const [quoteIncUnderlay, setQuoteIncUnderlay] = useState<boolean>(true);
   const [quoteIncLabour, setQuoteIncLabour] = useState<boolean>(true);
-  const [replaceQuoteSections, setReplaceQuoteSections] = useState<boolean>(false);
+  const [replaceQuoteSections, setReplaceQuoteSections] = useState<boolean>(true);
+  const [isPushingQuote, setIsPushingQuote] = useState<boolean>(false);
 
   const [dispatchedNotice, setDispatchedNotice] = useState<string | null>(null);
   const [expandedOrderPackGroupMm, setExpandedOrderPackGroupMm] = useState<number | null>(null);
@@ -307,6 +315,12 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
   const isInstalling = lifecycleStage === 'installing';
   const showQuoteTab = lifecycleStage === 'quoting' && Boolean(onPushBomToQuote);
   const isBomAreaBlocked = Boolean(bom.areaSanityWarning) || areaSanity?.ok === false;
+  const hasCompletenessBlockers = Boolean(
+    completenessReport && (!completenessReport.canLockMeasure || completenessReport.blockersCount > 0)
+  );
+  const hasStructuralPlanes =
+    planes.some((p) => !p.isVirtualAssetPlane) || bom.totalRoofAreaM2 > 0;
+  const isQuotePushBlocked = isBomAreaBlocked || hasCompletenessBlockers || !hasStructuralPlanes;
   const bomAreaBlockMessage =
     areaSanity?.warning ||
     bom.areaSanityWarning ||
@@ -410,28 +424,40 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
     );
   };
 
-  const handlePushToQuoteClick = () => {
-    if (!onPushBomToQuote || !showQuoteTab || isBomAreaBlocked) return;
-    onPushBomToQuote({
-      targetQuoteId,
-      profile: quoteProfile,
-      material: quoteMaterial,
-      colorName: quoteColor,
-      markupPercent: quoteMarkupPct,
-      includeHardware: quoteIncHardware,
-      includeUnderlay: quoteIncUnderlay,
-      includeLabourEstimate: quoteIncLabour,
-      replaceExistingSections: replaceQuoteSections
-    });
-    const destLabel =
-      targetQuoteId === 'new'
-        ? 'new draft Quote'
-        : openQuotes.find((q) => q.id === targetQuoteId)?.quoteNumber || 'Quote';
-    setDispatchedNotice(
-      `Pushed ${liveQuotePreview.rows.length} BOM line items (${formatNZDWithDecimals(
-        liveQuotePreview.totalNZD
-      )} incl. GST) into ${destLabel}.`
-    );
+  const handlePushToQuoteClick = async () => {
+    if (!onPushBomToQuote || !showQuoteTab || isQuotePushBlocked || isPushingQuote) return;
+    setIsPushingQuote(true);
+    try {
+      const stillRes = await captureRoofStillDataUrl({ maxEdgePx: 1600, timeoutMs: 800 });
+      onPushBomToQuote({
+        targetQuoteId,
+        profile: quoteProfile,
+        material: quoteMaterial,
+        colorName: quoteColor,
+        markupPercent: quoteMarkupPct,
+        includeHardware: quoteIncHardware,
+        includeUnderlay: quoteIncUnderlay,
+        includeLabourEstimate: quoteIncLabour,
+        replaceExistingSections: replaceQuoteSections,
+        stillDataUrl: stillRes.dataUrl,
+        stillCaptureFailed: stillRes.failed
+      });
+      const destLabel =
+        targetQuoteId === 'new'
+          ? 'new draft Quote'
+          : openQuotes.find((q) => q.id === targetQuoteId)?.quoteNumber || 'Quote';
+      setDispatchedNotice(
+        `Pushed ${liveQuotePreview.rows.length} BOM line items (${formatNZDWithDecimals(
+          liveQuotePreview.totalNZD
+        )} incl. GST) into ${destLabel}.${stillRes.failed ? ' (Preview image unavailable — quantity push succeeded)' : ''}`
+      );
+    } catch (err) {
+      setDispatchedNotice(
+        err instanceof Error ? err.message : 'Unable to push Quote from EnvelopeSnapshot'
+      );
+    } finally {
+      setIsPushingQuote(false);
+    }
   };
 
   return (
@@ -613,6 +639,23 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
           {modalTab === 'quote' && showQuoteTab ? (
             /* ===================== TAB 2: PUSH BOM TO QUOTE (Quoting stage only) ===================== */
             <div className="space-y-4">
+              {isQuotePushBlocked && (
+                <div className="p-3.5 rounded-2xl bg-rose-950/60 border border-rose-500/50 text-rose-200 text-xs font-semibold flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-extrabold text-rose-100">
+                      Quote push blocked until takeoff validation passes
+                    </div>
+                    <div className="text-[11px] text-rose-200/90 mt-0.5">
+                      {isBomAreaBlocked
+                        ? bomAreaBlockMessage
+                        : hasCompletenessBlockers
+                        ? `Resolve ${completenessReport?.blockersCount || 1} completeness blocker(s) before pushing BOM to Quote.`
+                        : 'Build roof faces before pushing BOM to Quote.'}
+                    </div>
+                  </div>
+                </div>
+              )}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3.5">
                 <div className="flex items-center justify-between">
                   <h4 className="text-xs font-extrabold uppercase tracking-wider text-blue-300">
@@ -1714,11 +1757,21 @@ export const ExactRoofingOrderModal: React.FC<Props> = ({
                 <button
                   type="button"
                   onClick={handlePushToQuoteClick}
-                  disabled={isBomAreaBlocked}
+                  disabled={isQuotePushBlocked || isPushingQuote}
                   className="px-5 py-2.5 min-h-[42px] rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-extrabold flex items-center gap-1.5 shadow-lg cursor-pointer"
                 >
                   <FileSpreadsheet className="w-4 h-4" />
-                  <span>{isBomAreaBlocked ? 'Blocked by Area Check' : 'Push BOM to Quote'}</span>
+                  <span>
+                    {isPushingQuote
+                      ? 'Pushing Envelope...'
+                      : isBomAreaBlocked
+                      ? 'Blocked by Area Check'
+                      : hasCompletenessBlockers
+                      ? `Resolve ${completenessReport?.blockersCount || 1} Blocker(s)`
+                      : !hasStructuralPlanes
+                      ? 'Build Roof Faces First'
+                      : 'Push BOM to Quote'}
+                  </span>
                 </button>
               ) : (
                 <button

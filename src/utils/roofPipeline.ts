@@ -706,11 +706,12 @@ export function setEdgeMode(
   outline: RoofOutline,
   skeleton: SkeletonLine[],
   edgeId: string,
-  targetMode: 'hipped' | 'gable' | 'wall'
+  targetMode: 'hipped' | 'gable' | 'wall' | 'apron' | 'ridge',
+  options?: { edgesOnly?: boolean }
 ): {
   outline: RoofOutline;
   skeleton: SkeletonLine[];
-  toggledTo: 'hipped' | 'gable' | 'wall' | null;
+  toggledTo: 'hipped' | 'gable' | 'wall' | 'apron' | 'ridge' | null;
   edge?: PlanEdge;
 } {
   const edge = outline.edges.find((e) => e.id === edgeId);
@@ -718,7 +719,7 @@ export function setEdgeMode(
     return { outline, skeleton, toggledTo: null };
   }
 
-  if (targetMode === 'gable' || targetMode === 'wall') {
+  if (!options?.edgesOnly && (targetMode === 'gable' || targetMode === 'wall')) {
     const remainingOutlineCount = outline.edges.filter(
       (e) => e.id !== edgeId && !isStationaryEdgeType(e.type)
     ).length;
@@ -728,7 +729,15 @@ export function setEdgeMode(
   }
 
   const nextEdgeType: PlanEdge['type'] =
-    targetMode === 'gable' ? 'verge' : targetMode === 'wall' ? 'wall' : 'outline';
+    targetMode === 'gable'
+      ? 'verge'
+      : targetMode === 'wall'
+      ? 'wall'
+      : targetMode === 'apron'
+      ? 'apron'
+      : targetMode === 'ridge'
+      ? 'ridge'
+      : 'outline';
 
   if (edge.type === nextEdgeType) {
     return { outline, skeleton, toggledTo: targetMode, edge };
@@ -736,9 +745,19 @@ export function setEdgeMode(
 
   const nextOutline: RoofOutline = {
     ...outline,
-    edges: outline.edges.map((e) => (e.id === edgeId ? { ...e, type: nextEdgeType } : e))
+    edges: outline.edges.map((e) =>
+      e.id === edgeId
+        ? {
+            ...e,
+            type: nextEdgeType,
+            ...(nextEdgeType === 'wall' ? { hasWall: true } : {})
+          }
+        : e
+    )
   };
-  const nextSkeleton = solveOutlineSkeletonViaPipeline(nextOutline);
+  const nextSkeleton = options?.edgesOnly
+    ? skeleton
+    : solveOutlineSkeletonViaPipeline(nextOutline);
 
   return {
     outline: nextOutline,
@@ -798,15 +817,185 @@ export function toggleEdgeGable(
   };
 }
 
+export type TypologyPresetMode = 'hipped' | 'gable' | 'mono';
+
+export interface TypologyPresetEdgeResult {
+  outline: RoofOutline;
+  skeleton: SkeletonLine[];
+  applied: boolean;
+  needsPick?: 'two_barges' | 'low_eave';
+}
+
+/**
+ * Edge-only typology preset helper (Hip / Gable / Mono).
+ * NEVER builds faces and NEVER runs the wavefront skeleton solver.
+ */
+export function applyTypologyPresetEdges(
+  outline: RoofOutline,
+  mode: TypologyPresetMode,
+  options?: {
+    bargeEdgeIds?: string[];
+    lowEaveEdgeId?: string;
+  }
+): TypologyPresetEdgeResult {
+  if (outline.edges.length === 0) {
+    return { outline, skeleton: [], applied: false };
+  }
+
+  if (mode === 'hipped') {
+    return {
+      outline: {
+        ...outline,
+        edges: outline.edges.map((e) => ({ ...e, type: 'outline' }))
+      },
+      skeleton: [],
+      applied: true
+    };
+  }
+
+  if (mode === 'gable') {
+    if (options?.bargeEdgeIds && options.bargeEdgeIds.length > 0) {
+      const bargeSet = new Set(options.bargeEdgeIds);
+      return {
+        outline: {
+          ...outline,
+          edges: outline.edges.map((e) => ({
+            ...e,
+            type: bargeSet.has(e.id) ? 'verge' : 'outline'
+          }))
+        },
+        skeleton: [],
+        applied: true
+      };
+    }
+
+    if (outline.edges.length === 4) {
+      const edges = outline.edges;
+      const len02 =
+        (dist(edges[0].from, edges[0].to) + dist(edges[2].from, edges[2].to)) / 2;
+      const len13 =
+        (dist(edges[1].from, edges[1].to) + dist(edges[3].from, edges[3].to)) / 2;
+      const bargeIndices = len02 >= len13 ? new Set([1, 3]) : new Set([0, 2]);
+      return {
+        outline: {
+          ...outline,
+          edges: edges.map((e, idx) => ({
+            ...e,
+            type: bargeIndices.has(idx) ? 'verge' : 'outline'
+          }))
+        },
+        skeleton: [],
+        applied: true
+      };
+    }
+
+    return {
+      outline,
+      skeleton: [],
+      applied: false,
+      needsPick: 'two_barges'
+    };
+  }
+
+  // Mono-pitch preset: low eave -> 'outline', opposite head edge -> 'ridge', perpendicular cheeks -> 'verge'
+  const lowEdgeIdx = options?.lowEaveEdgeId
+    ? outline.edges.findIndex((e) => e.id === options.lowEaveEdgeId)
+    : -1;
+  if (lowEdgeIdx < 0) {
+    return {
+      outline,
+      skeleton: [],
+      applied: false,
+      needsPick: 'low_eave'
+    };
+  }
+
+  const lowEdge = outline.edges[lowEdgeIdx];
+  const lowDx = lowEdge.to.x - lowEdge.from.x;
+  const lowDy = lowEdge.to.y - lowEdge.from.y;
+  const lowLen = Math.hypot(lowDx, lowDy) || 1;
+  const lowDir = { x: lowDx / lowLen, y: lowDy / lowLen };
+  const lowMid = {
+    x: (lowEdge.from.x + lowEdge.to.x) / 2,
+    y: (lowEdge.from.y + lowEdge.to.y) / 2
+  };
+  const normA = { x: -lowDir.y, y: lowDir.x };
+  const centroid =
+    outline.points.length >= 3
+      ? {
+          x: outline.points.reduce((a, p) => a + p.x, 0) / outline.points.length,
+          y: outline.points.reduce((a, p) => a + p.y, 0) / outline.points.length
+        }
+      : lowMid;
+  const dotC = (centroid.x - lowMid.x) * normA.x + (centroid.y - lowMid.y) * normA.y;
+  const inward = dotC >= 0 ? normA : { x: -normA.x, y: -normA.y };
+
+  let oppositeIdx = -1;
+  let bestScore = -Infinity;
+  outline.edges.forEach((cand, idx) => {
+    if (idx === lowEdgeIdx) return;
+    const cDx = cand.to.x - cand.from.x;
+    const cDy = cand.to.y - cand.from.y;
+    const cLen = Math.hypot(cDx, cDy) || 1;
+    const cDir = { x: cDx / cLen, y: cDy / cLen };
+    const antiParallelDot = -(cDir.x * lowDir.x + cDir.y * lowDir.y);
+    const cMid = {
+      x: (cand.from.x + cand.to.x) / 2,
+      y: (cand.from.y + cand.to.y) / 2
+    };
+    const inwardProj = (cMid.x - lowMid.x) * inward.x + (cMid.y - lowMid.y) * inward.y;
+    if (antiParallelDot > 0.5) {
+      const score = antiParallelDot * 10 + inwardProj;
+      if (score > bestScore) {
+        bestScore = score;
+        oppositeIdx = idx;
+      }
+    }
+  });
+  if (oppositeIdx < 0 && outline.edges.length >= 3) {
+    oppositeIdx = (lowEdgeIdx + Math.floor(outline.edges.length / 2)) % outline.edges.length;
+  }
+
+  return {
+    outline: {
+      ...outline,
+      edges: outline.edges.map((e, idx) => ({
+        ...e,
+        type: idx === lowEdgeIdx ? 'outline' : idx === oppositeIdx ? 'ridge' : 'verge'
+      }))
+    },
+    skeleton: [],
+    applied: true
+  };
+}
+
 export function applyRoofStylePreset(
   outline: RoofOutline,
-  mode: 'hipped' | 'gable'
+  mode: TypologyPresetMode,
+  options?: {
+    edgesOnly?: boolean;
+    bargeEdgeIds?: string[];
+    lowEaveEdgeId?: string;
+  }
 ): {
   outline: RoofOutline;
   skeleton: SkeletonLine[];
+  needsPick?: 'two_barges' | 'low_eave';
 } {
   if (outline.edges.length === 0) {
     return { outline, skeleton: [] };
+  }
+
+  if (options?.edgesOnly || mode === 'mono') {
+    const res = applyTypologyPresetEdges(outline, mode, {
+      bargeEdgeIds: options?.bargeEdgeIds,
+      lowEaveEdgeId: options?.lowEaveEdgeId
+    });
+    return {
+      outline: res.outline,
+      skeleton: [],
+      ...(res.needsPick ? { needsPick: res.needsPick } : {})
+    };
   }
 
   if (mode === 'hipped') {
@@ -1454,7 +1643,8 @@ export async function runRoofPipelineBuildAsync(params: {
     defaultPitchDeg: params.defaultPitchDeg ?? 22.5,
     preserveUserDeleted:
       params.action === 'build_faces' ? false : params.preserveUserDeleted,
-    allowAutoSkeletonWhenEmpty: params.allowAutoSkeletonWhenEmpty
+    allowAutoSkeletonWhenEmpty:
+      params.allowAutoSkeletonWhenEmpty ?? (params.action === 'build_faces')
   });
   working = facesRes.state;
   createdCount = facesRes.createdCount;

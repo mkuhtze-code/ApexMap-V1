@@ -53,7 +53,12 @@ import { ExactRoofingHub } from './components/exactroofing/ExactRoofingHub';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { useDeviceDetection } from './hooks/useDeviceDetection';
 import { applyBomToQuoteObject } from './utils/exactRoofingBomBridge';
-import { RoofBomSummary, ExactRoofModelSnapshot } from './types/exactRoofing';
+import {
+  EnvelopeRevisionKind,
+  EnvelopeSnapshot,
+  RoofBomSummary,
+  ExactRoofModelSnapshot
+} from './types/exactRoofing';
 import { RoofingProfile, CoilMaterial } from './types/crm';
 
 export default function App() {
@@ -346,10 +351,19 @@ export default function App() {
     includeUnderlay: boolean;
     includeLabourEstimate: boolean;
     replaceExistingSections: boolean;
+    revisionKind: EnvelopeRevisionKind;
+    envelope: EnvelopeSnapshot;
+    stillCaptureFailed?: boolean;
     bom: RoofBomSummary;
     snapshot: ExactRoofModelSnapshot;
     project?: Project;
   }) => {
+    if (!opts.envelope || !opts.envelope.areaSanityOk) {
+      throw new Error('Refusing Quote push: valid EnvelopeSnapshot is required.');
+    }
+    const effectiveEnvelope = opts.envelope;
+    const effectiveBom = effectiveEnvelope.bom;
+    const replaceExisting = opts.replaceExistingSections ?? true;
     const targetProject = opts.project || projects.find((p) => p.id === selectedProjectId) || projects[0];
     if (opts.targetQuoteId === 'new') {
       const baseTemplate = quotes[0] || ({} as Quote);
@@ -362,11 +376,11 @@ export default function App() {
         clientEmail: '',
         clientPhone: '',
         siteAddress: targetProject?.siteAddress || 'Auckland Site',
-        notes: `ApexMap Studio BOM Quote (${opts.bom.totalRoofAreaM2}m² · ${opts.bom.totalSheetsCount} sheets)`,
+        notes: `ApexMap Studio ${effectiveEnvelope.kind === 'measured' ? 'Measured' : 'Estimated'} Rev ${effectiveEnvelope.revision} (${effectiveEnvelope.areaM2}m² · ${effectiveEnvelope.totalSheets} sheets)`,
         profile: opts.profile,
         material: opts.material,
         colorName: opts.colorName,
-        roofAreaM2: opts.bom.totalRoofAreaM2,
+        roofAreaM2: effectiveEnvelope.areaM2,
         markupPercent: opts.markupPercent,
         status: 'draft',
         version: 1,
@@ -380,12 +394,16 @@ export default function App() {
 
       const populated = applyBomToQuoteObject({
         quote: baseQuote,
-        bom: opts.bom,
-        snapshot: opts.snapshot,
+        envelope: effectiveEnvelope,
+        bom: effectiveBom,
+        snapshot: {
+          ...opts.snapshot,
+          envelopeSnapshot: effectiveEnvelope
+        },
         includeHardware: opts.includeHardware,
         includeUnderlay: opts.includeUnderlay,
         includeLabourEstimate: opts.includeLabourEstimate,
-        replaceExistingSections: true
+        replaceExistingSections: replaceExisting
       });
       handleAddQuote(populated);
     } else {
@@ -400,12 +418,16 @@ export default function App() {
             colorName: opts.colorName,
             markupPercent: opts.markupPercent
           },
-          bom: opts.bom,
-          snapshot: opts.snapshot,
+          envelope: effectiveEnvelope,
+          bom: effectiveBom,
+          snapshot: {
+            ...opts.snapshot,
+            envelopeSnapshot: effectiveEnvelope
+          },
           includeHardware: opts.includeHardware,
           includeUnderlay: opts.includeUnderlay,
           includeLabourEstimate: opts.includeLabourEstimate,
-          replaceExistingSections: opts.replaceExistingSections
+          replaceExistingSections: replaceExisting
         });
         handleUpdateQuote(updated);
       }
@@ -414,8 +436,11 @@ export default function App() {
     if (targetProject) {
       handleUpdateProject({
         ...targetProject,
-        roofPlanModel: opts.snapshot as any,
-        roofAreaM2: opts.bom.totalRoofAreaM2 || targetProject.roofAreaM2
+        roofPlanModel: {
+          ...opts.snapshot,
+          envelopeSnapshot: effectiveEnvelope
+        } as any,
+        roofAreaM2: effectiveEnvelope.areaM2 || targetProject.roofAreaM2
       });
     }
     setActiveTab('quotes');

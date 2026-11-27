@@ -36,8 +36,17 @@ import {
   VentedRidgeOption,
   FlashingRuleSet,
   FlashingRuleContext,
-  RoofLineFlashingKind
+  RoofLineFlashingKind,
+  EnvelopeRevisionKind,
+  EnvelopeSnapshot
 } from '../../types/exactRoofing';
+import {
+  appendMeasuredEnvelopeHistory,
+  buildEnvelopeSnapshot,
+  getLatestMeasuredEnvelope,
+  getNextEnvelopeRevision
+} from '../../utils/envelopeSnapshot';
+import { captureRoofStillDataUrl } from '../../utils/canvasStillCapture';
 import {
   getPresetOutline,
   buildOutlineFromPoints,
@@ -59,10 +68,14 @@ import {
   getAllOutlineEdges,
   addCourtyardHoleToOutline,
   removeCourtyardHoleFromOutline,
+  tryAddCourtyardHoleToLevel,
+  applyEaveHeightToLevelEaves,
+  applyEaveHeightToFaceEaves,
+  polygonCentroid,
   dist
 } from '../../utils/exactRoofingEngine';
 import {
-  applyRoofStylePreset,
+  applyTypologyPresetEdges,
   buildOrderPackViaPipeline,
   buildPresetPipelineState,
   checkRoofAreaSanity,
@@ -133,6 +146,8 @@ import { ContractorFlashingGuide } from './ContractorFlashingGuide';
 import { FlashingDesigner } from '../FlashingDesigner';
 import { FlashingWorkshop } from '../FlashingWorkshop';
 import { FlashingRulesModal } from './FlashingRulesModal';
+import { PlanTriageModal } from '../../planTriage/PlanTriageModal';
+import type { ImportedEnvelopeModel } from '../../planTriage/importToApexMap';
 import { PWAInstallButton } from '../PWAInstallButton';
 import { useDeviceDetection } from '../../hooks/useDeviceDetection';
 import {
@@ -157,6 +172,7 @@ import {
   Lock,
   Unlock,
   FileImage,
+  FileText,
   Package,
   Play,
   Undo2,
@@ -200,6 +216,9 @@ interface Props {
     includeUnderlay: boolean;
     includeLabourEstimate: boolean;
     replaceExistingSections: boolean;
+    revisionKind: EnvelopeRevisionKind;
+    envelope: EnvelopeSnapshot;
+    stillCaptureFailed?: boolean;
     bom: RoofBomSummary;
     snapshot: ExactRoofModelSnapshot;
     project?: Project;
@@ -236,6 +255,8 @@ interface SavedRoofState {
   appliedRulesSnapshot?: FlashingRuleSet;
   outOfScopeLineIds?: string[];
   outOfScopeKinds?: RoofLineFlashingKind[];
+  envelopeSnapshot?: EnvelopeSnapshot | null;
+  envelopeHistory?: EnvelopeSnapshot[];
 }
 
 const DEFAULT_INSTALL_PROGRESS: RoofInstallProgress = {
@@ -418,6 +439,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [frozenOrderPack, setFrozenOrderPack] = useState<OrderPack | null>(
     project?.roofPlanModel?.orderPack || activeQuote?.roofPlanModel?.orderPack || null
   );
+  const [envelopeSnapshot, setEnvelopeSnapshot] = useState<EnvelopeSnapshot | null>(
+    activeQuote?.roofPlanModel?.envelopeSnapshot ??
+      project?.roofPlanModel?.envelopeSnapshot ??
+      initialState.envelopeSnapshot ??
+      null
+  );
+  const [envelopeHistory, setEnvelopeHistory] = useState<EnvelopeSnapshot[]>(
+    activeQuote?.roofPlanModel?.envelopeHistory ??
+      project?.roofPlanModel?.envelopeHistory ??
+      initialState.envelopeHistory ??
+      []
+  );
   const [sheetOrderMode, setSheetOrderMode] = useState<SheetOrderMode>(
     activeQuote?.roofPlanModel?.sheetOrderMode ||
       project?.roofPlanModel?.sheetOrderMode ||
@@ -495,6 +528,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
   const [selectedSkeletonLineIds, setSelectedSkeletonLineIds] = useState<string[]>([]);
   const [selectedWallFacetIds, setSelectedWallFacetIds] = useState<string[]>([]);
+  const [isFacesDirty, setIsFacesDirty] = useState<boolean>(false);
+  const [presetPickState, setPresetPickState] = useState<
+    | null
+    | { mode: 'gable_barges'; pickedEdgeIds: string[]; levelId: string }
+    | { mode: 'mono_low_eave'; levelId: string }
+  >(null);
   const [isMobileToolsOpen, setIsMobileToolsOpen] = useState<boolean>(false);
   const [isInstallViewsOpen, setIsInstallViewsOpen] = useState<boolean>(false);
   const installViewsRef = useRef<HTMLDivElement>(null);
@@ -578,6 +617,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
   // 8. Modals, AI Drawer & Notices
   const [selectedEdgeForPlane, setSelectedEdgeForPlane] = useState<PlanEdge | null>(null);
   const [isImportModalOpen, setIsImportModalOpen] = useState<boolean>(false);
+  const [isPlanTriageOpen, setIsPlanTriageOpen] = useState<boolean>(false);
   const [isAiCopilotOpen, setIsAiCopilotOpen] = useState<boolean>(false);
   const [isAiDrawerOpen, setIsAiDrawerOpen] = useState<boolean>(false);
   const [activeFlashingLineId, setActiveFlashingLineId] = useState<string | null>(null);
@@ -649,6 +689,24 @@ export const ExactRoofingHub: React.FC<Props> = ({
       );
       setFrozenOrderPack(snap.orderPack || null);
       setMeasureLocked(Boolean(snap.measureLocked));
+      const hydratedHistory = Array.isArray(snap.envelopeHistory) ? snap.envelopeHistory : [];
+      let hydratedEnvelope: EnvelopeSnapshot | null = snap.envelopeSnapshot ?? null;
+      if (!hydratedEnvelope && snap.measureLocked && snap.orderPack && snap.bom) {
+        try {
+          hydratedEnvelope = buildEnvelopeSnapshot({
+            revision: getNextEnvelopeRevision(null, hydratedHistory),
+            kind: 'measured',
+            model: snap,
+            bom: snap.bom,
+            orderPack: snap.orderPack,
+            areaSanity: checkRoofAreaSanity(nextLevels, snap.planes)
+          });
+        } catch {
+          hydratedEnvelope = null;
+        }
+      }
+      setEnvelopeSnapshot(hydratedEnvelope);
+      setEnvelopeHistory(hydratedHistory);
       setSheetOrderMode(snap.sheetOrderMode || 'practical');
       setInstallProgress(snap.installProgress || DEFAULT_INSTALL_PROGRESS);
       setAppliedRulesSnapshot(snap.appliedRulesSnapshot || null);
@@ -674,6 +732,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
         setActiveTab(resolveDefaultTabForStage(hydratedStage, Boolean(snap.measureLocked)));
       }
     } else if (initialStage) {
+      setEnvelopeSnapshot(null);
+      setEnvelopeHistory([]);
       setLifecycleStage(initialStage);
       if (initialTab === 'canvas_plan') {
         setActiveTab(resolveDefaultTabForStage(initialStage, false));
@@ -709,7 +769,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
         ruleSetRevision,
         appliedRulesSnapshot: appliedRulesSnapshot || undefined,
         outOfScopeLineIds,
-        outOfScopeKinds
+        outOfScopeKinds,
+        envelopeSnapshot,
+        envelopeHistory
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {
@@ -740,7 +802,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
     ruleSetRevision,
     appliedRulesSnapshot,
     outOfScopeLineIds,
-    outOfScopeKinds
+    outOfScopeKinds,
+    envelopeSnapshot,
+    envelopeHistory
   ]);
 
   // Close dropdowns on outside click
@@ -851,6 +915,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedPlaneId(null);
     setSelectedAssetId(null);
     setSelectedPitchBreakId(null);
+    setIsFacesDirty(false);
+    setPresetPickState(null);
     clearMultiSelections();
     resetUndoHistory();
     setActiveTab('canvas_plan');
@@ -1013,7 +1079,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
   // Recompute layout whenever roof areas, specs, assets, pitch breaks, start edge, or ordering mode change via RoofPipeline
   useEffect(() => {
-    if (planes.length > 0) {
+    if (planes.length > 0 && !isFacesDirty) {
       const pipe = createRoofPipelineState({
         levels,
         planes,
@@ -1028,12 +1094,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
         strictDirtyCheck: true
       });
       setLayoutResult(ensured.layout);
-    } else {
+    } else if (planes.length === 0) {
       setLayoutResult(null);
     }
-  }, [levels, planes, sheetSpec, startPlaneId, assets, pitchBreaks, sheetOrderMode]);
+  }, [levels, planes, isFacesDirty, sheetSpec, startPlaneId, assets, pitchBreaks, sheetOrderMode]);
 
   const handleSetStartPlane = (planeId: string) => {
+    if (isReadOnlyGeometry) return;
     setStartPlaneId(planeId);
     const target = planes.find((p) => p.id === planeId);
     triggerNotice(`★ Start Edge: ${target?.name || 'Section ' + target?.code}`);
@@ -1092,7 +1159,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
         eaveHeightM: clampedZ,
         outline: {
           ...lvl.outline,
-          edges: lvl.outline.edges.map((e) => ({ ...e, eaveHeightM: clampedZ }))
+          edges: lvl.outline.edges.map((e) =>
+            e.type === 'outline' ? { ...e, eaveHeightM: clampedZ } : e
+          )
         }
       };
     });
@@ -1134,13 +1203,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
     triggerNotice('Removed roof level');
   };
 
-  // Synchronized Outline Update (supports additive multi-body roofs & never auto-generates skeletons unless explicitly requested)
+  // Synchronized Outline Update (supports additive same-level / separate-level bodies & never auto-generates skeletons unless explicitly requested)
   const handleUpdateOutline = (
     newOutline: RoofOutline,
     options?: {
       autoGenerateSkeleton?: boolean;
       mode?: 'replace' | 'add';
       attachedEdgeId?: string;
+      separateLevel?: boolean;
       scaleFactor?: number;
       scaleAnchor?: Point2D;
     }
@@ -1153,6 +1223,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
       });
       const nextIdx = (existingNums.length > 0 ? Math.max(...existingNums) : 1) + 1;
       const parentLvl = options.attachedEdgeId ? findLevelForEdge(options.attachedEdgeId) : focusedLevel;
+      const isSameLevelBody = Boolean(options.attachedEdgeId) || !options.separateLevel;
+      const rootLevelId = parentLvl.parentLevelId || parentLvl.id;
       const baseZ = parentLvl.eaveHeightM;
       const levelId = `level-${nextIdx}`;
       const prefix = `l${nextIdx}__`;
@@ -1166,14 +1238,19 @@ export const ExactRoofingHub: React.FC<Props> = ({
             ? e.id
             : `${prefix}${e.id.replace(/^l\d+__/, '') || `edge-out-${idx + 1}`}`,
           levelId,
-          eaveHeightM: e.eaveHeightM ?? baseZ
+          eaveHeightM: e.eaveHeightM
         }))
       };
       const newLvlBase: RoofLevel = {
         id: levelId,
-        code: `L${nextIdx}`,
-        name: `Roof ${nextIdx} (${baseZ}m)`,
+        code: isSameLevelBody ? parentLvl.code : `L${nextIdx}`,
+        name: options.attachedEdgeId
+          ? `${parentLvl.name} Wing`
+          : isSameLevelBody
+          ? `${parentLvl.name} Ring`
+          : `Roof ${nextIdx} (${baseZ}m)`,
         eaveHeightM: baseZ,
+        ...(isSameLevelBody ? { parentLevelId: rootLevelId } : {}),
         outline: normalizedNewOutline,
         skeleton: []
       };
@@ -1183,20 +1260,26 @@ export const ExactRoofingHub: React.FC<Props> = ({
           }).state.levels[0]
         : newLvlBase;
       const nextLevels = [...levels, newLvl];
+      const nextActiveId = isSameLevelBody ? parentLvl.id : newLvl.id;
       setLevels(nextLevels);
-      setActiveLevelId('all');
+      setActiveLevelId(nextActiveId);
       setOutline(newLvl.outline);
       setSkeleton(newLvl.skeleton);
-      setPlanes((prev) =>
-        ensureFaces(
-          createRoofPipelineState({ levels: nextLevels, planes: prev, dirty: { faces: true } }),
-          { preserveUserDeleted: true }
-        ).state.planes
-      );
+      setLayoutResult(null);
+      setIsFacesDirty(true);
+      setPresetPickState(null);
+      const focusEdge =
+        newLvl.outline.edges.find((e) => e.type !== 'wall' && e.type !== 'apron') ||
+        newLvl.outline.edges[0];
+      if (focusEdge) {
+        setSelectedEdgeIds([focusEdge.id]);
+      }
       triggerNotice(
         options.attachedEdgeId
-          ? `✓ Attached ${newLvl.code} roof section (click an edge to set Eave & Sheet direction)`
-          : `✓ Added ${newLvl.code} roof outline (existing roofs preserved)`
+          ? `✓ Attached roof wing to ${parentLvl.code} (classify edges or run Hip/Gable/Mono)`
+          : isSameLevelBody
+          ? `✓ Added roof outline to ${parentLvl.code} (classify edges or run Hip/Gable/Mono)`
+          : `✓ Added separate roof ${newLvl.code} (existing roofs preserved)`
       );
       return;
     }
@@ -1208,13 +1291,16 @@ export const ExactRoofingHub: React.FC<Props> = ({
         ? levels.find((l) => getAllOutlineEdges(l.outline).some((e) => e.id === newOutline.edges[0].id)) || focusedLevel
         : focusedLevel;
 
+    const isFreshUnclassifiedOutline =
+      normalizedCheckUnclassified(newOutline) && targetLvl.outline.points.length === 0;
+
     const normalizedOutline: RoofOutline = {
       ...newOutline,
       levelId: targetLvl.id,
       edges: newOutline.edges.map((e) => ({
         ...e,
         levelId: e.levelId ?? targetLvl.id,
-        eaveHeightM: e.eaveHeightM ?? targetLvl.eaveHeightM
+        eaveHeightM: isFreshUnclassifiedOutline ? e.eaveHeightM : e.eaveHeightM ?? targetLvl.eaveHeightM
       }))
     };
 
@@ -1250,18 +1336,31 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setSkeleton(nextSkel);
     }
     if (normalizedOutline.edges.length > 0) {
-      setPlanes((prev) =>
-        ensureFaces(
-          createRoofPipelineState({ levels: nextLevels, planes: prev, dirty: { faces: true } }),
-          { preserveUserDeleted: true }
-        ).state.planes
-      );
+      if (isFreshUnclassifiedOutline) {
+        setLayoutResult(null);
+        setIsFacesDirty(true);
+        const focusEdge = normalizedOutline.edges[0];
+        if (focusEdge) setSelectedEdgeIds([focusEdge.id]);
+      } else {
+        setPlanes((prev) =>
+          ensureFaces(
+            createRoofPipelineState({ levels: nextLevels, planes: prev, dirty: { faces: true } }),
+            { preserveUserDeleted: true }
+          ).state.planes
+        );
+      }
     } else if (nextLevels.length === 1) {
       setPlanes([]);
       setAssets([]);
       setPitchBreaks([]);
+      setLayoutResult(null);
+      setIsFacesDirty(false);
     }
   };
+
+  function normalizedCheckUnclassified(ol: RoofOutline): boolean {
+    return ol.edges.length >= 3 && ol.edges.every((e) => e.type === 'unclassified');
+  }
 
   // Synchronized Roof Lines Update (partitions across levels when viewing All Levels)
   const handleUpdateSkeleton = (newSkel: SkeletonLine[]) => {
@@ -1342,61 +1441,44 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
   };
 
-  // Set Edge 3-Way Mode: Hipped Eave ('outline') | Gable Verge ('verge') | Abutment Wall ('wall')
-  // Preserves empty / manually-drawn skeletons instead of auto-regenerating lines unexpectedly
-  const handleSetEdgeMode = (edgeId: string, mode: 'hipped' | 'gable' | 'wall') => {
+  // Edge classification switcher (Hipped Eave | Gable | Wall | Apron | Ridge)
+  // Mutates edges only — never runs wavefront or auto-rebuilds faces until Build Faces / Run takeoff
+  const handleSetEdgeMode = (
+    edgeId: string,
+    mode: 'hipped' | 'gable' | 'wall' | 'apron' | 'ridge'
+  ) => {
     if (isReadOnlyGeometry) return;
     pushUndoSnapshot();
     const owningLvl = findLevelForEdge(edgeId);
-    const usesManualOrEmptySkel =
-      owningLvl.skeleton.length === 0 || owningLvl.skeleton.some((s) => !s.id.includes('skel-'));
-
-    if (usesManualOrEmptySkel) {
-      const targetType: EdgeType =
-        mode === 'gable' ? 'verge' : mode === 'wall' ? 'wall' : 'outline';
-      const nextOutline = classifyOutlineEdge(owningLvl.outline, edgeId, targetType);
-      let nextLevels = levels.map((l) =>
-        l.id === owningLvl.id ? { ...l, outline: nextOutline } : l
-      );
-      if (targetType === 'outline') {
-        nextLevels = unsuppressOutlineEdges(nextLevels, [edgeId]);
-      }
-      const updatedPlanes = applyLevelsUpdate(nextLevels, planes);
-      if (selectedPlaneId && !updatedPlanes.some((p) => p.id === selectedPlaneId)) {
-        setSelectedPlaneId(null);
-      }
-      if (targetType === 'verge') {
-        triggerNotice('✓ Converted edge to Gable End');
-      } else if (targetType === 'wall') {
-        triggerNotice('✓ Converted edge to Abutment Wall (apron line)');
-      } else {
-        triggerNotice('✓ Converted edge to Hipped Slope');
-      }
-      return;
-    }
-
-    const res = setEdgeMode(owningLvl.outline, owningLvl.skeleton, edgeId, mode);
-    if (!res.toggledTo) {
-      triggerNotice('At least 1 edge must remain a sloped roof eave');
-      return;
-    }
+    const res = setEdgeMode(owningLvl.outline, owningLvl.skeleton, edgeId, mode, {
+      edgesOnly: true
+    });
+    if (!res.toggledTo) return;
     let nextLevels = levels.map((l) =>
-      l.id === owningLvl.id ? { ...l, outline: res.outline, skeleton: res.skeleton } : l
+      l.id === owningLvl.id ? { ...l, outline: res.outline } : l
     );
     if (mode === 'hipped') {
       nextLevels = unsuppressOutlineEdges(nextLevels, [edgeId]);
     }
-    const updatedPlanes = applyLevelsUpdate(nextLevels, planes);
-    if (selectedPlaneId && !updatedPlanes.some((p) => p.id === selectedPlaneId)) {
-      setSelectedPlaneId(null);
+    setLevels(nextLevels);
+    if (owningLvl.id === focusedLevel.id) {
+      const updated = nextLevels.find((l) => l.id === owningLvl.id);
+      if (updated) setOutline(updated.outline);
     }
-    if (res.toggledTo === 'gable') {
-      triggerNotice('✓ Converted edge to Gable End');
-    } else if (res.toggledTo === 'wall') {
-      triggerNotice('✓ Converted edge to Abutment Wall (apron line)');
-    } else {
-      triggerNotice('✓ Converted edge to Hipped Slope');
+    if (mode !== 'hipped' && selectedPlaneId) {
+      const selPlane = planes.find((p) => p.id === selectedPlaneId);
+      if (selPlane?.eaveEdgeId === edgeId) setSelectedPlaneId(null);
     }
+    setLayoutResult(null);
+    setIsFacesDirty(true);
+    const labelMap: Record<typeof mode, string> = {
+      hipped: 'Eave (Hipped)',
+      gable: 'Gable End',
+      wall: 'Wall Abutment',
+      apron: 'Apron Flashing',
+      ridge: 'High Ridge'
+    };
+    triggerNotice(`✓ Edge set to ${labelMap[mode]} · Click Build Faces to refresh 3D & cuts`);
   };
 
   // Toggle ANY perimeter edge / facet between Hipped Slope ('outline') and Gable End ('verge')
@@ -1459,6 +1541,76 @@ export const ExactRoofingHub: React.FC<Props> = ({
     handleUpdateEdgeEaveHeight(targetPlane.eaveEdgeId, heightM);
   };
 
+  const handleApplyEaveHeightToFace = (targetEdgeOrPlaneId: string, heightM: number) => {
+    if (isReadOnlyGeometry) return;
+    pushUndoSnapshot();
+    const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
+    const owningPlane = planes.find(
+      (p) => p.id === targetEdgeOrPlaneId || p.eaveEdgeId === targetEdgeOrPlaneId
+    );
+    const owningLvl = owningPlane
+      ? levels.find((l) => l.id === (owningPlane.levelId || 'level-1')) ||
+        findLevelForEdge(owningPlane.eaveEdgeId || targetEdgeOrPlaneId)
+      : findLevelForEdge(targetEdgeOrPlaneId);
+    const updatedOutline = applyEaveHeightToFaceEaves(
+      owningLvl.outline,
+      planes,
+      targetEdgeOrPlaneId,
+      clampedZ
+    );
+    const updatedEdgeIds = new Set(
+      updatedOutline.edges
+        .filter((e, i) => e.type === 'outline' && e.eaveHeightM !== owningLvl.outline.edges[i]?.eaveHeightM)
+        .map((e) => e.id)
+    );
+    if (owningPlane?.eaveEdgeId) updatedEdgeIds.add(owningPlane.eaveEdgeId);
+    const direct = updatedOutline.edges.find((e) => e.id === targetEdgeOrPlaneId && e.type === 'outline');
+    if (direct) updatedEdgeIds.add(direct.id);
+
+    const nextLevels = levels.map((lvl) =>
+      lvl.id === owningLvl.id ? { ...lvl, outline: updatedOutline } : lvl
+    );
+    setLevels(nextLevels);
+    if (owningLvl.id === focusedLevel.id) {
+      setOutline(updatedOutline);
+    }
+    const nextPlanes = planes.map((p) =>
+      updatedEdgeIds.has(p.eaveEdgeId) || (owningPlane && p.id === owningPlane.id)
+        ? { ...p, eaveHeightM: clampedZ }
+        : p
+    );
+    setPlanes(nextPlanes);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, nextLevels, nextPlanes) : prev));
+    triggerNotice(`✓ Applied Z=${clampedZ}m to eaves on this face`);
+  };
+
+  const handleApplyEaveHeightToLevel = (levelIdOrEdgeId: string, heightM: number) => {
+    if (isReadOnlyGeometry) return;
+    pushUndoSnapshot();
+    const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
+    const targetLvl =
+      levels.find((l) => l.id === levelIdOrEdgeId) || findLevelForEdge(levelIdOrEdgeId);
+    const updatedOutline = applyEaveHeightToLevelEaves(targetLvl.outline, clampedZ);
+    const updatedOutlineEdgeIds = new Set(
+      updatedOutline.edges.filter((e) => e.type === 'outline').map((e) => e.id)
+    );
+    const nextLevels = levels.map((lvl) =>
+      lvl.id === targetLvl.id ? { ...lvl, outline: updatedOutline } : lvl
+    );
+    setLevels(nextLevels);
+    if (targetLvl.id === focusedLevel.id) {
+      setOutline(updatedOutline);
+    }
+    const nextPlanes = planes.map((p) =>
+      (p.levelId || 'level-1') === targetLvl.id && updatedOutlineEdgeIds.has(p.eaveEdgeId)
+        ? { ...p, eaveHeightM: clampedZ }
+        : p
+    );
+    setPlanes(nextPlanes);
+    setWallPlan((prev) => (prev ? syncWallPlanWithRoof(prev, nextLevels, nextPlanes) : prev));
+    triggerNotice(`✓ Applied Z=${clampedZ}m to all eaves on ${targetLvl.code}`);
+  };
+
   // Non-destructive Wall & Eave Width (Setback) Update — sits strictly under roof plane without altering roof geometry
   const handleUpdateEdgeWall = (
     edgeId: string,
@@ -1481,17 +1633,62 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
   };
 
-  // Apply Roof Style Preset (All Hipped or Gable Ends)
-  const handleApplyRoofStylePreset = (mode: 'hipped' | 'gable') => {
+  // Apply Typology Preset (Hip / Gable / Mono — edges only; never builds faces or runs wavefront)
+  const handleApplyRoofStylePreset = (
+    mode: 'hipped' | 'gable' | 'mono',
+    options?: { bargeEdgeIds?: string[]; lowEaveEdgeId?: string }
+  ) => {
     if (isReadOnlyGeometry) return;
     const targetLvl = focusedLevel;
-    const res = applyRoofStylePreset(targetLvl.outline, mode);
+    const res = applyTypologyPresetEdges(targetLvl.outline, mode, options);
+    if (res.needsPick === 'two_barges') {
+      setPresetPickState({ mode: 'gable_barges', pickedEdgeIds: [], levelId: targetLvl.id });
+      triggerNotice('Tap 2 edges: these are the barges');
+      return;
+    }
+    if (res.needsPick === 'low_eave') {
+      setPresetPickState({ mode: 'mono_low_eave', levelId: targetLvl.id });
+      triggerNotice('Tap 1 low eave edge for Mono slope');
+      return;
+    }
+    if (!res.applied) return;
+    pushUndoSnapshot();
     const nextLevels = levels.map((l) =>
-      l.id === targetLvl.id ? { ...l, outline: res.outline, skeleton: res.skeleton } : l
+      l.id === targetLvl.id ? { ...l, outline: res.outline } : l
     );
-    applyLevelsUpdate(nextLevels, planes);
+    setLevels(nextLevels);
+    if (targetLvl.id === focusedLevel.id) {
+      setOutline(res.outline);
+    }
+    setPresetPickState(null);
     setSelectedPlaneId(null);
-    triggerNotice(mode === 'hipped' ? '✓ Converted roof to All Hipped' : '✓ Converted end facets to Gable Roof');
+    setLayoutResult(null);
+    setIsFacesDirty(true);
+    triggerNotice(
+      mode === 'hipped'
+        ? '✓ Edges set for Hip — click Build Faces or Auto Lines'
+        : mode === 'gable'
+        ? '✓ Edges set for Gable — click Build Faces or Auto Lines'
+        : '✓ Edges set for Mono — click Build Faces'
+    );
+  };
+
+  const handlePickEdgeForPreset = (edgeId: string) => {
+    if (!presetPickState) return;
+    if (presetPickState.mode === 'mono_low_eave') {
+      handleApplyRoofStylePreset('mono', { lowEaveEdgeId: edgeId });
+      return;
+    }
+    const already = presetPickState.pickedEdgeIds.includes(edgeId);
+    const nextPicked = already
+      ? presetPickState.pickedEdgeIds.filter((id) => id !== edgeId)
+      : [...presetPickState.pickedEdgeIds, edgeId];
+    if (nextPicked.length >= 2) {
+      handleApplyRoofStylePreset('gable', { bargeEdgeIds: nextPicked.slice(0, 2) });
+    } else {
+      setPresetPickState({ ...presetPickState, pickedEdgeIds: nextPicked });
+      triggerNotice('Tap 1 more edge for the second barge');
+    }
   };
 
   // Live Pitch Adjustment
@@ -1794,6 +1991,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedPlaneId(null);
     setSelectedAssetId(null);
     setSelectedPitchBreakId(null);
+    setIsFacesDirty(false);
+    setPresetPickState(null);
     clearMultiSelections();
     resetUndoHistory();
     triggerNotice(
@@ -1829,6 +2028,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setSelectedPlaneId(null);
     setSelectedAssetId(null);
     setSelectedPitchBreakId(null);
+    setIsFacesDirty(false);
+    setPresetPickState(null);
     clearMultiSelections();
     resetUndoHistory();
     setActiveTab('canvas_plan');
@@ -1852,9 +2053,41 @@ export const ExactRoofingHub: React.FC<Props> = ({
     setPitchBreaks([]);
     setFlashingAssignments([]);
     setSelectedPlaneId(null);
+    setIsFacesDirty(false);
+    setPresetPickState(null);
     clearMultiSelections();
     resetUndoHistory();
     triggerNotice(`✓ Imported outline (${newOutline.points.length} corners)`);
+  };
+
+  // Import Confirmed Plan Triage EnvelopeIntent (never auto-generates skeleton, faces, or takeoff)
+  const handleConfirmPlanTriageImport = (imported: ImportedEnvelopeModel) => {
+    setSelectedPreset('custom');
+    setIsTemplateDropdownOpen(false);
+    setIsPlanTriageOpen(false);
+    setLevels([imported.level]);
+    setActiveLevelId(imported.level.id);
+    setOutline(imported.level.outline);
+    setSkeleton(imported.level.skeleton);
+    setPlanes([]);
+    setLayoutResult(null);
+    setAssets([]);
+    setPitchBreaks([]);
+    setFlashingAssignments([]);
+    setRoofProfileFamily(imported.roofProfileFamily);
+    setWindZoneCode(imported.windZone);
+    setVentedRidge(imported.ventedRidge);
+    setSelectedPlaneId(null);
+    setSelectedAssetId(null);
+    setSelectedPitchBreakId(null);
+    setIsFacesDirty(false);
+    setPresetPickState(null);
+    clearMultiSelections();
+    resetUndoHistory();
+    setActiveTab('canvas_plan');
+    triggerNotice(
+      `✓ Imported Plan Triage envelope (${imported.level.outline.points.length} corners, ${imported.defaultPitchDeg}° target pitch)`
+    );
   };
 
   // Delete single or multiple roof faces cleanly (persists across subsequent unrelated edits; lines remain untouched)
@@ -1901,29 +2134,46 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   // First-class Courtyard / Void Ring Addition & Removal
-  const handleAddCourtyardHole = (levelId: string, holePoints: Point2D[]) => {
-    if (isReadOnlyGeometry) return;
-    const targetLvl = levels.find((l) => l.id === levelId) || focusedLevel;
-    if (!targetLvl || targetLvl.outline.points.length < 3) {
-      triggerNotice('Draw an outer roof footprint first');
-      return;
+  const handleAddCourtyardHole = (levelId: string, holePoints: Point2D[]): boolean => {
+    if (isReadOnlyGeometry) return false;
+    if (holePoints.length < 3) {
+      triggerNotice('Void must sit inside the roof.');
+      return false;
     }
-    const nextOutline = addCourtyardHoleToOutline(targetLvl.outline, holePoints, {
-      eaveHeightM: targetLvl.eaveHeightM,
-      initialEdgeType: 'outline',
+    const centroid = polygonCentroid(holePoints);
+    const enclosingLvl =
+      levels.find(
+        (l) => l.id === levelId && l.outline.points.length >= 3 && isPointInPolygon(centroid, l.outline.points)
+      ) ||
+      levels.find((l) => l.outline.points.length >= 3 && isPointInPolygon(centroid, l.outline.points));
+    if (!enclosingLvl) {
+      triggerNotice('Void must sit inside the roof.');
+      return false;
+    }
+    const res = tryAddCourtyardHoleToLevel(enclosingLvl, holePoints, {
+      initialEdgeType: 'wall',
       hasWall: true
     });
-    if ((nextOutline.holes?.length || 0) === (targetLvl.outline.holes?.length || 0)) {
-      triggerNotice('Draw the Courtyard Void completely inside the roof footprint');
-      return;
+    if (!res.ok) {
+      triggerNotice(res.error || 'Void must sit inside the roof.');
+      return false;
     }
     pushUndoSnapshot();
     const nextLevels = levels.map((l) =>
-      l.id === targetLvl.id ? { ...l, outline: nextOutline } : l
+      l.id === enclosingLvl.id ? res.level : l
     );
     setLayoutResult(null);
-    applyLevelsUpdate(nextLevels, planes, 22.5, targetLvl.id);
-    triggerNotice('✓ Added Courtyard Void (no roof inside cutout — walls & perimeter trims linked)');
+    if (planes.length > 0) {
+      applyLevelsUpdate(nextLevels, planes, 22.5, enclosingLvl.id);
+    } else {
+      setLevels(nextLevels);
+      if (enclosingLvl.id === focusedLevel.id) {
+        setOutline(res.level.outline);
+      }
+      setIsFacesDirty(true);
+    }
+    triggerNotice('✓ Added Courtyard Void (no roof inside cutout — perimeter walls linked)');
+    return true;
   };
 
   const handleRemoveCourtyardHole = (levelId: string, holeId: string) => {
@@ -1982,6 +2232,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
       }
       setPlanes(res.state.planes);
       setLayoutResult(null);
+      setIsFacesDirty(false);
+      setPresetPickState(null);
       setAssets((prev) => prev.filter((a) => rebuiltIdSet.has(a.planeId)));
       setPitchBreaks((prev) => prev.filter((pb) => rebuiltIdSet.has(pb.planeId)));
       if (selectedPlaneId && !rebuiltIdSet.has(selectedPlaneId)) {
@@ -2047,6 +2299,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
       }
       setPlanes(res.state.planes);
       setLayoutResult(null);
+      setIsFacesDirty(false);
+      setPresetPickState(null);
       setWallPlan((prev) =>
         prev ? syncWallPlanWithRoof(prev, res.state.levels, res.state.planes) : prev
       );
@@ -2101,7 +2355,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     executeAutoLines(targetIds);
   };
 
-  // Classify a boundary edge without mutating skeleton or other edges' fall direction
+  // Classify a boundary edge without mutating skeleton or auto-rebuilding faces
   const handleClassifyEdge = (edgeId: string, edgeType: EdgeType) => {
     if (isReadOnlyGeometry) return;
     pushUndoSnapshot();
@@ -2113,8 +2367,14 @@ export const ExactRoofingHub: React.FC<Props> = ({
     if (edgeType === 'outline') {
       nextLevels = unsuppressOutlineEdges(nextLevels, [edgeId]);
     }
-    applyLevelsUpdate(nextLevels, planes);
-    triggerNotice(`✓ Classified edge as ${getRoofEdgeTypeMeta(edgeType).label}`);
+    setLevels(nextLevels);
+    if (owningLvl.id === focusedLevel.id) {
+      const updated = nextLevels.find((l) => l.id === owningLvl.id);
+      if (updated) setOutline(updated.outline);
+    }
+    setLayoutResult(null);
+    setIsFacesDirty(true);
+    triggerNotice(`✓ Classified edge as ${getRoofEdgeTypeMeta(edgeType).label} · Click Build Faces to refresh 3D & cuts`);
   };
 
   // Batch Multi-Select Edit Handlers (Lock & Install Stage Gated + 15-Step Undo)
@@ -2196,8 +2456,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
     if (edgeType === 'outline') {
       nextLevels = unsuppressOutlineEdges(nextLevels, edgeIds);
     }
-    applyLevelsUpdate(nextLevels, planes);
-    triggerNotice(`✓ Classified ${edgeIds.length} edges as ${getRoofEdgeTypeMeta(edgeType).label}`);
+    setLevels(nextLevels);
+    const updatedFocus = nextLevels.find((l) => l.id === focusedLevel.id);
+    if (updatedFocus) setOutline(updatedFocus.outline);
+    setLayoutResult(null);
+    setIsFacesDirty(true);
+    triggerNotice(`✓ Classified ${edgeIds.length} edges as ${getRoofEdgeTypeMeta(edgeType).label} · Click Build Faces to refresh`);
   };
 
   const handleBatchEdgeWall = (
@@ -2450,12 +2714,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
     });
 
     applyLevelsUpdate(nextLevels, upserted.state.planes, options.pitchDeg);
+    setIsFacesDirty(false);
+    setPresetPickState(null);
     setSelectedPlaneId(upserted.plane.id);
     triggerNotice(`✓ ${upserted.plane.name} · ${options.pitchDeg}° @ Z:${clampedZ}m`);
   };
 
   // Generate Layout Button (via single RoofPipeline CPU ensureLayout)
   const handleGenerateLayoutClick = () => {
+    if (isReadOnlyGeometry) {
+      setActiveTab('layout_results');
+      return;
+    }
     if (!levels.some((l) => l.outline.edges.length >= 3) && planes.length === 0) {
       triggerNotice('Draw outline & set pitch first');
       return;
@@ -2693,6 +2963,98 @@ export const ExactRoofingHub: React.FC<Props> = ({
   const isReadOnlyGeometry =
     lifecycleStage === 'installing' || (lifecycleStage === 'measuring' && measureLocked);
 
+  const activeMeasuredEnvelope = useMemo<EnvelopeSnapshot | null>(() => {
+    if (!measureLocked) return null;
+    if (envelopeSnapshot?.kind === 'measured') return envelopeSnapshot;
+    return getLatestMeasuredEnvelope({ envelopeSnapshot, envelopeHistory });
+  }, [measureLocked, envelopeSnapshot, envelopeHistory]);
+
+  const installGateBlocked = lifecycleStage === 'installing' && !activeMeasuredEnvelope;
+  const isUsingFrozenMeasured =
+    (lifecycleStage === 'installing' || measureLocked) && Boolean(activeMeasuredEnvelope);
+
+  const installLevels = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.model.levels || levels
+        : levels,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, levels]
+  );
+  const installPlanes = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.model.planes || planes
+        : planes,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, planes]
+  );
+  const installLayout = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.model.layout || null
+        : layoutResult,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, layoutResult]
+  );
+  const installBom = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope ? activeMeasuredEnvelope.bom : roofBom,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, roofBom]
+  );
+  const installOrderPack = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.orderPack
+        : liveOrderPack,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, liveOrderPack]
+  );
+  const installAssignments = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.model.flashingAssignments || []
+        : flashingAssignments,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, flashingAssignments]
+  );
+  const installAssets = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.model.assets || []
+        : assets,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, assets]
+  );
+  const installWallPlan = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? activeMeasuredEnvelope.model.wallPlan ?? null
+        : wallPlan,
+    [isUsingFrozenMeasured, activeMeasuredEnvelope, wallPlan]
+  );
+  const installAssignableLines = useMemo(
+    () =>
+      isUsingFrozenMeasured && activeMeasuredEnvelope
+        ? getAssignableRoofLinesMultiLevel(
+            installLevels,
+            installPlanes,
+            installAssets,
+            activeMeasuredEnvelope.model.pitchBreaks || []
+          )
+        : assignableLines,
+    [
+      isUsingFrozenMeasured,
+      activeMeasuredEnvelope,
+      installLevels,
+      installPlanes,
+      installAssets,
+      assignableLines
+    ]
+  );
+  const installPacks = useMemo(() => {
+    if (installGateBlocked) return [];
+    return computeRoofingPacks({
+      layout: installLayout,
+      planes: installPlanes,
+      customSequencePlaneIds: installProgress.customSequencePlaneIds
+    });
+  }, [installGateBlocked, installLayout, installPlanes, installProgress.customSequencePlaneIds]);
+
   const pushUndoSnapshot = () => {
     if (isReadOnlyGeometry) return;
     const snap: RoofUndoSnapshot = {
@@ -2791,14 +3153,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
     installProgress: overrides?.installProgress ?? installProgress,
     planUnderlay: overrides?.planUnderlay !== undefined ? overrides.planUnderlay : planUnderlay,
     wallPlan: overrides?.wallPlan !== undefined ? overrides.wallPlan : wallPlan,
-    layout: layoutResult || undefined,
-    bom: roofBom,
+    layout: overrides?.layout !== undefined ? overrides.layout : layoutResult || undefined,
+    bom: overrides?.bom ?? roofBom,
     orderPack:
       overrides?.orderPack !== undefined
         ? overrides.orderPack
         : measureLocked
         ? frozenOrderPack || liveOrderPack
         : undefined,
+    envelopeSnapshot:
+      overrides?.envelopeSnapshot !== undefined ? overrides.envelopeSnapshot : envelopeSnapshot,
+    envelopeHistory:
+      overrides?.envelopeHistory !== undefined ? overrides.envelopeHistory : envelopeHistory,
     lastUpdatedAt: new Date().toISOString(),
     updatedBy: activeMemberName || 'ApexMap User'
   });
@@ -2889,6 +3255,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
       }
       setPlanes(res.state.planes);
       setLayoutResult(res.layout);
+      setIsFacesDirty(false);
+      setPresetPickState(null);
       setFlashingAssignments(res.assignments);
       if (res.ruleSnapshot) {
         setAppliedRulesSnapshot(res.ruleSnapshot.appliedRulesSnapshot);
@@ -2925,24 +3293,32 @@ export const ExactRoofingHub: React.FC<Props> = ({
   }, [project?.architecturalPlans, project?.plans]);
 
   const persistSnapshotToProject = (snap: ExactRoofModelSnapshot) => {
-    if (onSaveToProject && layoutResult) {
-      onSaveToProject(planes, layoutResult, flashingAssignments, snap);
+    const activePlanes = snap.planes || planes;
+    const activeLayout = snap.layout ?? layoutResult;
+    const activeAssignments = snap.flashingAssignments || flashingAssignments;
+    if (onSaveToProject && activeLayout) {
+      onSaveToProject(activePlanes, activeLayout, activeAssignments, snap);
       return;
     }
     if (project && onUpdateProject) {
       const convertedFacets = convertExactLayoutToRoofFacets({
-        planes,
-        layout: layoutResult,
+        planes: activePlanes,
+        layout: activeLayout || null,
         colorName: project.colorName
       });
+      const resolvedArea =
+        snap.envelopeSnapshot?.areaM2 ??
+        snap.bom?.totalRoofAreaM2 ??
+        roofBom.totalRoofAreaM2 ??
+        project.roofAreaM2;
       onUpdateProject({
         ...project,
-        roofAreaM2: +(roofBom.totalRoofAreaM2 || project.roofAreaM2).toFixed(1),
+        roofAreaM2: +(resolvedArea || project.roofAreaM2).toFixed(1),
         roofPlanModel: {
           ...(project.roofPlanModel || {}),
           ...snap,
           facets: convertedFacets,
-          pitchDegrees: planes[0]?.pitchDeg || project.roofPitchDegrees
+          pitchDegrees: activePlanes[0]?.pitchDeg || project.roofPitchDegrees
         },
         roofMapFacets: convertedFacets
       });
@@ -2955,7 +3331,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     triggerNotice(project ? `✓ Saved stage (${lifecycleStage}) & BOM to ${project.projectNumber}` : '✓ Saved roof plan');
   };
 
-  const handleConfirmLockMeasure = () => {
+  const handleConfirmLockMeasure = async () => {
     if (!completenessReport.canLockMeasure || !areaSanity.ok) {
       setIsMeasureLockGateOpen(true);
       triggerNotice(
@@ -2967,6 +3343,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
     const confirmedAt = new Date().toISOString();
     const confirmedBy = activeMemberName || 'Site Lead';
+    let stillDataUrl: string | null = null;
+    try {
+      const stillRes = await captureRoofStillDataUrl({ maxEdgePx: 1600, timeoutMs: 800 });
+      stillDataUrl = stillRes.dataUrl;
+    } catch {
+      stillDataUrl = null;
+    }
     try {
       const pipeRes = ensureBom(
         createRoofPipelineState({
@@ -3012,7 +3395,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       const frozenRuleVer = ruleSetVersion ?? frozenRulesSnap.version;
       const frozenRuleCaptured = ruleSetCapturedAt || confirmedAt;
       const frozenRuleRevision = ruleSetRevision || frozenRuleCaptured;
-      const nextSnap = buildCurrentSnapshot({
+      const baseLockedModel = buildCurrentSnapshot({
         stage: 'installing',
         measureLocked: true,
         measureConfirmedAt: confirmedAt,
@@ -3025,6 +3408,35 @@ export const ExactRoofingHub: React.FC<Props> = ({
         ruleSetCapturedAt: frozenRuleCaptured,
         ruleSetRevision: frozenRuleRevision
       });
+      const measuredEnvelope = buildEnvelopeSnapshot({
+        revision: getNextEnvelopeRevision(envelopeSnapshot, envelopeHistory),
+        kind: 'measured',
+        model: baseLockedModel,
+        bom: pipeRes.bom,
+        orderPack: emittedOrderPack,
+        areaSanity,
+        completenessReport,
+        stillDataUrl,
+        createdAt: confirmedAt
+      });
+      const nextHistory = appendMeasuredEnvelopeHistory(envelopeHistory, measuredEnvelope, 5);
+      const nextSnap = buildCurrentSnapshot({
+        stage: 'installing',
+        measureLocked: true,
+        measureConfirmedAt: confirmedAt,
+        measureConfirmedBy: confirmedBy,
+        layout: pipeRes.state.layout || layoutResult || undefined,
+        bom: pipeRes.bom,
+        orderPack: emittedOrderPack,
+        appliedRulesSnapshot: frozenRulesSnap,
+        ruleSetVersion: frozenRuleVer,
+        ruleSetCapturedAt: frozenRuleCaptured,
+        ruleSetRevision: frozenRuleRevision,
+        envelopeSnapshot: measuredEnvelope,
+        envelopeHistory: nextHistory
+      });
+      setEnvelopeSnapshot(measuredEnvelope);
+      setEnvelopeHistory(nextHistory);
       setAppliedRulesSnapshot(frozenRulesSnap);
       setRuleSetVersion(frozenRuleVer);
       setRuleSetCapturedAt(frozenRuleCaptured);
@@ -3037,7 +3449,9 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setIsToolsDockOpen(false);
       setIsInspectorOpen(false);
       persistSnapshotToProject(nextSnap);
-      triggerNotice('Measure confirmed & locked · Order Pack emitted for site & yard');
+      triggerNotice(
+        `Measure confirmed & locked (Rev ${measuredEnvelope.revision}) · Order Pack emitted for site & yard`
+      );
     } catch (err) {
       setIsMeasureLockGateOpen(true);
       triggerNotice(err instanceof Error ? err.message : 'Unable to lock measure');
@@ -3049,7 +3463,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setIsMeasureLockGateOpen(true);
       return;
     }
-    handleConfirmLockMeasure();
+    void handleConfirmLockMeasure();
   };
 
   const handleJumpToCompletenessIssue = (issue: TakeoffCompletenessIssue) => {
@@ -3148,11 +3562,57 @@ export const ExactRoofingHub: React.FC<Props> = ({
   };
 
   const handleUnlockMeasure = () => {
+    const nextRev = getNextEnvelopeRevision(envelopeSnapshot, envelopeHistory);
+    const unlockedOrderPack = buildOrderPackViaPipeline({
+      project,
+      planes,
+      levels,
+      layout: layoutResult,
+      bom: roofBom,
+      assignableLines,
+      assignments: flashingAssignments,
+      libraryProfiles,
+      assets,
+      wallPlan,
+      completenessReport,
+      locked: false,
+      sheetOrderMode,
+      comparisonSummary: sheetOrderComparison,
+      roofProfileFamily,
+      ventedRidge,
+      ruleSetVersion: ruleSetVersion ?? effectiveRuleSet.version,
+      ruleSetCapturedAt,
+      ruleSetRevision
+    });
+    const baseUnlockedSnap = buildCurrentSnapshot({
+      stage: 'measuring',
+      measureLocked: false,
+      orderPack: null,
+      envelopeHistory
+    });
+    let nextEstimatedEnvelope: EnvelopeSnapshot | null = null;
+    try {
+      nextEstimatedEnvelope = buildEnvelopeSnapshot({
+        revision: nextRev,
+        kind: 'estimated',
+        model: baseUnlockedSnap,
+        bom: roofBom,
+        orderPack: unlockedOrderPack,
+        areaSanity,
+        completenessReport,
+        stillDataUrl: envelopeSnapshot?.stillDataUrl ?? null
+      });
+    } catch {
+      nextEstimatedEnvelope = null;
+    }
     const nextSnap = buildCurrentSnapshot({
       stage: 'measuring',
       measureLocked: false,
-      orderPack: null
+      orderPack: null,
+      envelopeSnapshot: nextEstimatedEnvelope,
+      envelopeHistory
     });
+    setEnvelopeSnapshot(nextEstimatedEnvelope);
     setFrozenOrderPack(null);
     setMeasureLocked(false);
     setLifecycleStage('measuring');
@@ -3164,7 +3624,78 @@ export const ExactRoofingHub: React.FC<Props> = ({
       setIsInspectorOpen(true);
     }
     persistSnapshotToProject(nextSnap);
-    triggerNotice('Measure unlocked for variations & re-measure');
+    triggerNotice('Measure unlocked for variations & re-measure · Prior measured history kept');
+  };
+
+  const handlePushOrderModalToQuote = (opts: {
+    targetQuoteId: string | 'new';
+    profile: RoofingProfile;
+    material: CoilMaterial;
+    colorName: string;
+    markupPercent: number;
+    includeHardware: boolean;
+    includeUnderlay: boolean;
+    includeLabourEstimate: boolean;
+    replaceExistingSections: boolean;
+    stillDataUrl?: string | null;
+    stillCaptureFailed?: boolean;
+  }) => {
+    if (!onPushBomToQuote) return;
+    let emittedEnvelope: EnvelopeSnapshot;
+    let nextHistory = envelopeHistory;
+
+    if (measureLocked && activeMeasuredEnvelope) {
+      emittedEnvelope = {
+        ...activeMeasuredEnvelope,
+        stillDataUrl:
+          opts.stillDataUrl !== undefined
+            ? opts.stillDataUrl
+            : activeMeasuredEnvelope.stillDataUrl ?? null
+      };
+      nextHistory = appendMeasuredEnvelopeHistory(envelopeHistory, emittedEnvelope, 5);
+    } else {
+      const pushBom = isUsingFrozenMeasured ? installBom : roofBom;
+      const pushOrderPack = isUsingFrozenMeasured ? installOrderPack : liveOrderPack;
+      const revision =
+        envelopeSnapshot?.kind === 'estimated'
+          ? envelopeSnapshot.revision
+          : getNextEnvelopeRevision(envelopeSnapshot, envelopeHistory);
+      const baseModel = buildCurrentSnapshot({
+        bom: pushBom,
+        orderPack: pushOrderPack,
+        envelopeHistory
+      });
+      emittedEnvelope = buildEnvelopeSnapshot({
+        revision,
+        kind: 'estimated',
+        model: baseModel,
+        bom: pushBom,
+        orderPack: pushOrderPack,
+        areaSanity,
+        completenessReport,
+        stillDataUrl: opts.stillDataUrl ?? envelopeSnapshot?.stillDataUrl ?? null
+      });
+    }
+
+    const persistedSnap = buildCurrentSnapshot({
+      bom: emittedEnvelope.bom,
+      orderPack: emittedEnvelope.kind === 'measured' ? emittedEnvelope.orderPack : undefined,
+      envelopeSnapshot: emittedEnvelope,
+      envelopeHistory: nextHistory
+    });
+    setEnvelopeSnapshot(emittedEnvelope);
+    setEnvelopeHistory(nextHistory);
+    persistSnapshotToProject(persistedSnap);
+    onPushBomToQuote({
+      ...opts,
+      replaceExistingSections: opts.replaceExistingSections ?? true,
+      revisionKind: emittedEnvelope.kind,
+      envelope: emittedEnvelope,
+      stillCaptureFailed: opts.stillCaptureFailed,
+      bom: emittedEnvelope.bom,
+      snapshot: persistedSnap,
+      project
+    });
   };
 
   const handleSelectStage = (nextStage: RoofLifecycleStage) => {
@@ -3204,15 +3735,21 @@ export const ExactRoofingHub: React.FC<Props> = ({
     }
   };
 
+  const activePackList = lifecycleStage === 'installing' ? installPacks : roofingPacks;
   const nextIncompletePack = useMemo(
     () =>
-      roofingPacks.find(
+      activePackList.find(
         (pk) => !installProgress.completedPlaneIds.includes(pk.planeId)
       ) || null,
-    [roofingPacks, installProgress.completedPlaneIds]
+    [activePackList, installProgress.completedPlaneIds]
   );
 
   const handleAdvanceNextInstallPack = () => {
+    if (installGateBlocked) {
+      handleSelectStage('measuring');
+      triggerNotice('Lock a measure before install');
+      return;
+    }
     if (!nextIncompletePack) {
       setOrderModalTab('order_pack');
       setIsOrderModalOpen(true);
@@ -3233,19 +3770,32 @@ export const ExactRoofingHub: React.FC<Props> = ({
       lastUpdatedAt: new Date().toISOString()
     };
     handleUpdateInstallProgress(nextProgress);
-    const upcoming = roofingPacks.find(
+    const upcoming = activePackList.find(
       (pk) => !nextCompleted.includes(pk.planeId)
     );
     if (upcoming) {
       handleSelectPlane(upcoming.planeId);
       triggerNotice(`✓ Face ${nextIncompletePack.code} complete · Next: Face ${upcoming.code}`);
     } else {
-      triggerNotice(`✓ All ${roofingPacks.length} packs completed`);
+      triggerNotice(`✓ All ${activePackList.length} packs completed`);
     }
   };
 
   const handleUpdateInstallProgress = (nextProgress: RoofInstallProgress) => {
     setInstallProgress(nextProgress);
+    if (activeMeasuredEnvelope) {
+      const snap = buildCurrentSnapshot({
+        installProgress: nextProgress,
+        planes: activeMeasuredEnvelope.model.planes,
+        layout: activeMeasuredEnvelope.model.layout,
+        bom: activeMeasuredEnvelope.bom,
+        orderPack: activeMeasuredEnvelope.orderPack,
+        envelopeSnapshot,
+        envelopeHistory
+      });
+      persistSnapshotToProject(snap);
+      return;
+    }
     const snap = buildCurrentSnapshot({ installProgress: nextProgress });
     persistSnapshotToProject(snap);
   };
@@ -3539,6 +4089,17 @@ export const ExactRoofingHub: React.FC<Props> = ({
           >
             <FileImage className="w-3.5 h-3.5" />
             <span>Architectural Plan (2-Pt Scale)</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setIsTemplateDropdownOpen(false);
+              setIsPlanTriageOpen(true);
+            }}
+            className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-sky-300 hover:bg-sky-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            <span>Plan Triage (PDF)</span>
           </button>
 
           <button
@@ -3915,11 +4476,19 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   <button
                     type="button"
                     onClick={handleAdvanceNextInstallPack}
-                    className="h-9 px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                    className={`h-9 px-2.5 rounded-xl text-white text-[11px] font-extrabold flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                      installGateBlocked
+                        ? 'bg-amber-600 hover:bg-amber-500'
+                        : 'bg-emerald-600 hover:bg-emerald-500'
+                    }`}
                   >
                     <Package className="w-3.5 h-3.5" />
                     <span>
-                      {nextIncompletePack ? `Next · ${nextIncompletePack.code}` : 'Order Pack'}
+                      {installGateBlocked
+                        ? 'Lock measure'
+                        : nextIncompletePack
+                        ? `Next · ${nextIncompletePack.code}`
+                        : 'Order Pack'}
                     </span>
                   </button>
                   {isFullscreen && embedded ? (
@@ -4112,6 +4681,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 onBatchWallUpdate={handleBatchWallUpdate}
                 onAddCourtyardHole={handleAddCourtyardHole}
                 onRemoveCourtyardHole={handleRemoveCourtyardHole}
+                onApplyEaveHeightToFace={handleApplyEaveHeightToFace}
+                onApplyEaveHeightToLevel={handleApplyEaveHeightToLevel}
+                isFacesDirty={isFacesDirty}
+                presetPickState={presetPickState}
+                onPickEdgeForPreset={handlePickEdgeForPreset}
+                onCancelPresetPick={() => setPresetPickState(null)}
                 buildProgress={pipelineBuildStatus}
                 onCancelBuild={handleCancelPipelineBuild}
               />
@@ -4163,35 +4738,59 @@ export const ExactRoofingHub: React.FC<Props> = ({
           )}
 
           {activeTab === 'layout_results' && (
-            layoutResult ? (
+            installGateBlocked ? (
+              <div className="h-full flex items-center justify-center p-4">
+                <div className="bg-[#0b101d] border border-amber-500/40 rounded-2xl p-5 max-w-sm text-center space-y-3">
+                  <Lock className="w-7 h-7 text-amber-400 mx-auto" />
+                  <div className="text-sm font-black text-white">Lock a measure before install</div>
+                  <p className="text-xs text-slate-400">
+                    Install packs, practical sheet lengths, and flashing sticks load only from a locked measured EnvelopeSnapshot.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectStage('measuring')}
+                    className="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer"
+                  >
+                    Go to Measure &amp; Lock
+                  </button>
+                </div>
+              </div>
+            ) : installLayout ? (
               <div className="h-full overflow-hidden">
                 <OffcutLayoutVisualizer
-                  layout={layoutResult}
-                  planes={planes}
+                  layout={installLayout}
+                  planes={installPlanes}
                   selectedPlaneId={selectedPlaneId}
-                  startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
-                  onSetStartPlane={handleSetStartPlane}
+                  startPlaneId={startPlaneId || installLayout?.startPlaneId || null}
+                  onSetStartPlane={isReadOnlyGeometry ? undefined : handleSetStartPlane}
                   onSelectPlane={handleSelectPlane}
                   projectName={project?.title || 'Exact Roof Plan'}
                   siteAddress={project?.siteAddress}
                   roofProfileLabel={project?.profile}
                   coilColorLabel={project?.colorName}
                   windZoneLabel={project?.windZone}
-                  onRegenerateLayout={handleGenerateLayoutClick}
-                  onOpenPlaneEditor={(plane) => {
-                    if (isReadOnlyGeometry) return;
-                    const edge = levels
-                      .flatMap((l) => l.outline.edges)
-                      .find((e) => e.id === plane.eaveEdgeId);
-                    if (edge) setSelectedEdgeForPlane(edge);
-                  }}
+                  onRegenerateLayout={isReadOnlyGeometry ? undefined : handleGenerateLayoutClick}
+                  onOpenPlaneEditor={
+                    isReadOnlyGeometry
+                      ? undefined
+                      : (plane) => {
+                          const edge = levels
+                            .flatMap((l) => l.outline.edges)
+                            .find((e) => e.id === plane.eaveEdgeId);
+                          if (edge) setSelectedEdgeForPlane(edge);
+                        }
+                  }
                   lifecycleStage={lifecycleStage}
                   measureLocked={measureLocked}
-                  roofingPacks={roofingPacks}
+                  roofingPacks={activePackList}
                   installProgress={installProgress}
                   onUpdateInstallProgress={handleUpdateInstallProgress}
                   sheetOrderMode={sheetOrderMode}
-                  onChangeSheetOrderMode={handleChangeSheetOrderMode}
+                  onChangeSheetOrderMode={
+                    measureLocked || lifecycleStage === 'installing'
+                      ? undefined
+                      : handleChangeSheetOrderMode
+                  }
                   sheetOrderComparison={sheetOrderComparison}
                 />
               </div>
@@ -4252,13 +4851,32 @@ export const ExactRoofingHub: React.FC<Props> = ({
           {activeTab === 'flashing_workshop' && (
             <div className="h-full overflow-y-auto px-1.5 pt-1.5">
               {lifecycleStage === 'installing' ? (
-                <ContractorFlashingGuide
-                  project={project}
-                  assignableLines={assignableLines}
-                  assignments={flashingAssignments}
-                  libraryProfiles={libraryProfiles}
-                  bom={roofBom}
-                />
+                installGateBlocked ? (
+                  <div className="h-full flex items-center justify-center p-4">
+                    <div className="bg-[#0b101d] border border-amber-500/40 rounded-2xl p-5 max-w-sm text-center space-y-3">
+                      <Lock className="w-7 h-7 text-amber-400 mx-auto" />
+                      <div className="text-sm font-black text-white">Lock a measure before install</div>
+                      <p className="text-xs text-slate-400">
+                        Flashing stick counts and shop notes require a locked measured EnvelopeSnapshot.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => handleSelectStage('measuring')}
+                        className="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer"
+                      >
+                        Go to Measure &amp; Lock
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <ContractorFlashingGuide
+                    project={project}
+                    assignableLines={installAssignableLines}
+                    assignments={installAssignments}
+                    libraryProfiles={libraryProfiles}
+                    bom={installBom}
+                  />
+                )
               ) : (
                 <FlashingWorkshop
                   view={flashingWorkshopView}
@@ -4468,7 +5086,18 @@ export const ExactRoofingHub: React.FC<Props> = ({
                     </div>
                   )}
 
-                  <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMobileToolsOpen(false);
+                        setIsPlanTriageOpen(true);
+                      }}
+                      className="min-h-[42px] px-2 rounded-xl bg-sky-950/50 border border-sky-500/40 text-sky-300 text-[11px] font-bold flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <FileText className="w-3.5 h-3.5 shrink-0" />
+                      <span>Plan Triage</span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => {
@@ -4787,6 +5416,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
           selectedAsset={selectedAsset}
           selectedPitchBreak={selectedPitchBreak}
           outline={outline}
+          skeleton={skeleton}
           levels={levels}
           activeLevelId={activeLevelId}
           onSelectLevel={handleSelectLevel}
@@ -4801,9 +5431,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onToggleEdgeGable={handleToggleEdgeGable}
           onSetEdgeMode={handleSetEdgeMode}
           onUpdatePlaneEaveHeight={handleUpdatePlaneEaveHeight}
+          onApplyEaveHeightToFace={handleApplyEaveHeightToFace}
+          onApplyEaveHeightToLevel={handleApplyEaveHeightToLevel}
           onUpdateEdgeLength={handleUpdateEdgeLength}
           onUpdateEdgeWall={handleUpdateEdgeWall}
           onApplyRoofStylePreset={handleApplyRoofStylePreset}
+          isFacesDirty={isFacesDirty}
           onSetStartPlane={handleSetStartPlane}
           onUpdatePlanePitch={handleUpdatePlanePitch}
           onUpdatePlaneDirection={handleUpdatePlaneDirection}
@@ -4907,6 +5540,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
           onImportOutline={handleImportOutline}
         />
 
+        <PlanTriageModal
+          isOpen={isPlanTriageOpen}
+          onClose={() => setIsPlanTriageOpen(false)}
+          onConfirmImport={(imported) => handleConfirmPlanTriageImport(imported)}
+        />
+
         <RoofingAiCopilotModal
           isOpen={isAiCopilotOpen}
           onClose={() => setIsAiCopilotOpen(false)}
@@ -4986,26 +5625,38 @@ export const ExactRoofingHub: React.FC<Props> = ({
           lifecycleStage={lifecycleStage}
           measureLocked={measureLocked}
           activeMemberName={activeMemberName}
-          assignableLines={assignableLines}
-          assignments={flashingAssignments}
+          assignableLines={isUsingFrozenMeasured ? installAssignableLines : assignableLines}
+          assignments={isUsingFrozenMeasured ? installAssignments : flashingAssignments}
           libraryProfiles={libraryProfiles}
-          layout={layoutResult}
-          bom={roofBom}
-          packs={roofingPacks}
-          planes={planes}
-          levels={levels}
-          assets={assets}
-          wallPlan={wallPlan}
+          layout={isUsingFrozenMeasured ? installLayout : layoutResult}
+          bom={isUsingFrozenMeasured ? installBom : roofBom}
+          packs={activePackList}
+          planes={isUsingFrozenMeasured ? installPlanes : planes}
+          levels={isUsingFrozenMeasured ? installLevels : levels}
+          assets={isUsingFrozenMeasured ? installAssets : assets}
+          wallPlan={isUsingFrozenMeasured ? installWallPlan : wallPlan}
           completenessReport={completenessReport}
           areaSanity={areaSanity}
-          orderPack={liveOrderPack}
+          orderPack={
+            installGateBlocked
+              ? null
+              : isUsingFrozenMeasured
+              ? installOrderPack
+              : liveOrderPack
+          }
           flashingRuleSet={effectiveRuleSet}
           flashingRuleContext={flashingRuleContext}
           sheetOrderMode={sheetOrderMode}
-          onChangeSheetOrderMode={handleChangeSheetOrderMode}
+          onChangeSheetOrderMode={
+            measureLocked || lifecycleStage === 'installing'
+              ? undefined
+              : handleChangeSheetOrderMode
+          }
           sheetOrderComparison={sheetOrderComparison}
           initialModalTab={orderModalTab}
-          onSelectLineToAssign={(line) => setActiveFlashingLineId(line.lineId)}
+          onSelectLineToAssign={(line) => {
+            if (!isReadOnlyGeometry) setActiveFlashingLineId(line.lineId);
+          }}
           onRemoveAssignment={handleRemoveFlashingAssignment}
           onMarkOrdered={({ workshop, crm }) => {
             setFlashingAssignments((prev) =>
@@ -5017,19 +5668,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
             );
           }}
           onUpdateProject={onUpdateProject}
-          onPushBomToQuote={
-            onPushBomToQuote
-              ? (opts) => {
-                  const snap = buildCurrentSnapshot();
-                  onPushBomToQuote({
-                    ...opts,
-                    bom: roofBom,
-                    snapshot: snap,
-                    project
-                  });
-                }
-              : undefined
-          }
+          onPushBomToQuote={onPushBomToQuote ? handlePushOrderModalToQuote : undefined}
           onOpenFlashingOrders={() => {
             setIsOrderModalOpen(false);
             setFlashingWorkshopView('orders');
@@ -5140,6 +5779,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
     selectedAsset,
     selectedPitchBreak,
     outline,
+    skeleton,
     levels,
     activeLevelId,
     onSelectLevel: handleSelectLevel,
@@ -5154,9 +5794,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
     onToggleEdgeGable: handleToggleEdgeGable,
     onSetEdgeMode: handleSetEdgeMode,
     onUpdatePlaneEaveHeight: handleUpdatePlaneEaveHeight,
+    onApplyEaveHeightToFace: handleApplyEaveHeightToFace,
+    onApplyEaveHeightToLevel: handleApplyEaveHeightToLevel,
     onUpdateEdgeLength: handleUpdateEdgeLength,
     onUpdateEdgeWall: handleUpdateEdgeWall,
     onApplyRoofStylePreset: handleApplyRoofStylePreset,
+    isFacesDirty,
     onSetStartPlane: handleSetStartPlane,
     onUpdatePlanePitch: handleUpdatePlanePitch,
     onUpdatePlaneDirection: handleUpdatePlaneDirection,
@@ -5331,6 +5974,12 @@ export const ExactRoofingHub: React.FC<Props> = ({
       onBatchWallUpdate={handleBatchWallUpdate}
       onAddCourtyardHole={handleAddCourtyardHole}
       onRemoveCourtyardHole={handleRemoveCourtyardHole}
+      onApplyEaveHeightToFace={handleApplyEaveHeightToFace}
+      onApplyEaveHeightToLevel={handleApplyEaveHeightToLevel}
+      isFacesDirty={isFacesDirty}
+      presetPickState={presetPickState}
+      onPickEdgeForPreset={handlePickEdgeForPreset}
+      onCancelPresetPick={() => setPresetPickState(null)}
       buildProgress={pipelineBuildStatus}
       onCancelBuild={handleCancelPipelineBuild}
     />
@@ -5830,15 +6479,21 @@ export const ExactRoofingHub: React.FC<Props> = ({
                 <button
                   type="button"
                   onClick={handleAdvanceNextInstallPack}
-                  className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer flex items-center gap-1.5 shadow-md whitespace-nowrap shrink-0"
+                  className={`px-3.5 py-1.5 rounded-xl text-white text-xs font-extrabold cursor-pointer flex items-center gap-1.5 shadow-md whitespace-nowrap shrink-0 ${
+                    installGateBlocked
+                      ? 'bg-amber-600 hover:bg-amber-500'
+                      : 'bg-emerald-600 hover:bg-emerald-500'
+                  }`}
                 >
                   <Package className="w-3.5 h-3.5" />
                   <span>
-                    {nextIncompletePack
+                    {installGateBlocked
+                      ? 'Lock a measure before install'
+                      : nextIncompletePack
                       ? activeTab === 'layout_results'
                         ? `Complete Face ${nextIncompletePack.code}`
                         : `Next pack · Face ${nextIncompletePack.code}`
-                      : `All ${roofingPacks.length} packs done`}
+                      : `All ${activePackList.length} packs done`}
                   </span>
                 </button>
                 {measureLocked && (
@@ -6155,6 +6810,15 @@ export const ExactRoofingHub: React.FC<Props> = ({
 
                 <button
                   type="button"
+                  onClick={() => setIsPlanTriageOpen(true)}
+                  className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-sky-300 hover:bg-sky-600/20 flex items-center gap-2 transition-colors cursor-pointer"
+                >
+                  <FileText className="w-3.5 h-3.5 shrink-0" />
+                  <span>Plan Triage (PDF)</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setIsImportModalOpen(true)}
                   className="w-full text-left px-2.5 py-2 rounded-xl text-xs font-bold text-blue-300 hover:bg-blue-600/20 flex items-center gap-2 transition-colors cursor-pointer"
                 >
@@ -6287,13 +6951,30 @@ export const ExactRoofingHub: React.FC<Props> = ({
             )}
 
             {activeTab === 'layout_results' && (
-              layoutResult ? (
+              installGateBlocked ? (
+                <div className="h-full flex items-center justify-center p-6">
+                  <div className="bg-[#0b101d] border border-amber-500/40 rounded-2xl p-6 max-w-md text-center space-y-3">
+                    <Lock className="w-8 h-8 text-amber-400 mx-auto" />
+                    <div className="text-base font-black text-white">Lock a measure before install</div>
+                    <p className="text-xs text-slate-400">
+                      Install packs, practical sheet lengths, flashing sticks, and shop notes are served strictly from a locked measured EnvelopeSnapshot.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleSelectStage('measuring')}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer"
+                    >
+                      Go to Measure &amp; Lock
+                    </button>
+                  </div>
+                </div>
+              ) : installLayout ? (
                 <OffcutLayoutVisualizer
-                  layout={layoutResult}
-                  planes={planes}
+                  layout={installLayout}
+                  planes={installPlanes}
                   selectedPlaneId={selectedPlaneId}
-                  startPlaneId={startPlaneId || layoutResult?.startPlaneId || null}
-                  onSetStartPlane={handleSetStartPlane}
+                  startPlaneId={startPlaneId || installLayout?.startPlaneId || null}
+                  onSetStartPlane={isReadOnlyGeometry ? undefined : handleSetStartPlane}
                   onSelectPlane={handleSelectPlane}
                   projectName={
                     project?.title ||
@@ -6313,21 +6994,28 @@ export const ExactRoofingHub: React.FC<Props> = ({
                   roofProfileLabel={project?.profile}
                   coilColorLabel={project?.colorName}
                   windZoneLabel={project?.windZone}
-                  onRegenerateLayout={handleGenerateLayoutClick}
-                  onOpenPlaneEditor={(plane) => {
-                    if (isReadOnlyGeometry) return;
-                    const edge = levels
-                      .flatMap((l) => l.outline.edges)
-                      .find((e) => e.id === plane.eaveEdgeId);
-                    if (edge) setSelectedEdgeForPlane(edge);
-                  }}
+                  onRegenerateLayout={isReadOnlyGeometry ? undefined : handleGenerateLayoutClick}
+                  onOpenPlaneEditor={
+                    isReadOnlyGeometry
+                      ? undefined
+                      : (plane) => {
+                          const edge = levels
+                            .flatMap((l) => l.outline.edges)
+                            .find((e) => e.id === plane.eaveEdgeId);
+                          if (edge) setSelectedEdgeForPlane(edge);
+                        }
+                  }
                   lifecycleStage={lifecycleStage}
                   measureLocked={measureLocked}
-                  roofingPacks={roofingPacks}
+                  roofingPacks={activePackList}
                   installProgress={installProgress}
                   onUpdateInstallProgress={handleUpdateInstallProgress}
                   sheetOrderMode={sheetOrderMode}
-                  onChangeSheetOrderMode={handleChangeSheetOrderMode}
+                  onChangeSheetOrderMode={
+                    measureLocked || lifecycleStage === 'installing'
+                      ? undefined
+                      : handleChangeSheetOrderMode
+                  }
                   sheetOrderComparison={sheetOrderComparison}
                 />
               ) : (
@@ -6346,13 +7034,32 @@ export const ExactRoofingHub: React.FC<Props> = ({
             {activeTab === 'flashing_workshop' && (
               <div className="p-1 sm:p-2">
                 {lifecycleStage === 'installing' ? (
-                  <ContractorFlashingGuide
-                    project={project}
-                    assignableLines={assignableLines}
-                    assignments={flashingAssignments}
-                    libraryProfiles={libraryProfiles}
-                    bom={roofBom}
-                  />
+                  installGateBlocked ? (
+                    <div className="h-full flex items-center justify-center p-6">
+                      <div className="bg-[#0b101d] border border-amber-500/40 rounded-2xl p-6 max-w-md text-center space-y-3">
+                        <Lock className="w-8 h-8 text-amber-400 mx-auto" />
+                        <div className="text-base font-black text-white">Lock a measure before install</div>
+                        <p className="text-xs text-slate-400">
+                          Flashing stick counts and shop notes require a locked measured EnvelopeSnapshot.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => handleSelectStage('measuring')}
+                          className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold cursor-pointer"
+                        >
+                          Go to Measure &amp; Lock
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <ContractorFlashingGuide
+                      project={project}
+                      assignableLines={installAssignableLines}
+                      assignments={installAssignments}
+                      libraryProfiles={libraryProfiles}
+                      bom={installBom}
+                    />
+                  )
                 ) : (
                   <FlashingWorkshop
                     view={flashingWorkshopView}
@@ -6385,13 +7092,19 @@ export const ExactRoofingHub: React.FC<Props> = ({
               </span>
               <span className="text-slate-600">·</span>
               <span>
-                {levels.length} {levels.length === 1 ? 'tier' : 'tiers'} · {planes.length} roof{' '}
-                {planes.length === 1 ? 'face' : 'faces'} · {wallPlan?.facets.length || 0} walls
+                {(isUsingFrozenMeasured ? installLevels : levels).length}{' '}
+                {(isUsingFrozenMeasured ? installLevels : levels).length === 1 ? 'tier' : 'tiers'} ·{' '}
+                {(isUsingFrozenMeasured ? installPlanes : planes).length} roof{' '}
+                {(isUsingFrozenMeasured ? installPlanes : planes).length === 1 ? 'face' : 'faces'} ·{' '}
+                {(isUsingFrozenMeasured ? installWallPlan : wallPlan)?.facets.length || 0} walls
               </span>
               <span className="text-slate-600">·</span>
               <span>
-                {sheetOrderMode === 'practical' ? 'Practical cuts' : 'Optimized cuts'} (
-                {roofBom.totalOrderedLm.toFixed(1)} m)
+                {(isUsingFrozenMeasured ? installBom.sheetOrderMode ?? sheetOrderMode : sheetOrderMode) ===
+                'practical'
+                  ? 'Practical cuts'
+                  : 'Optimized cuts'}{' '}
+                ({(isUsingFrozenMeasured ? installBom : roofBom).totalOrderedLm.toFixed(1)} m)
               </span>
               {!areaSanity.ok && (
                 <span
@@ -6635,7 +7348,8 @@ export const ExactRoofingHub: React.FC<Props> = ({
                           Sheet Lengths
                         </span>
                         <span className="font-mono font-bold text-sky-300 tabular-nums">
-                          {roofBom.totalSheetsCount} sheets · {roofBom.totalOrderedLm.toFixed(1)} m
+                          {(isUsingFrozenMeasured ? installBom : roofBom).totalSheetsCount} sheets ·{' '}
+                          {(isUsingFrozenMeasured ? installBom : roofBom).totalOrderedLm.toFixed(1)} m
                         </span>
                       </div>
                       {!measureLocked && (
@@ -6746,6 +7460,13 @@ export const ExactRoofingHub: React.FC<Props> = ({
         onImportOutline={handleImportOutline}
       />
 
+      {/* Plan Triage Modal */}
+      <PlanTriageModal
+        isOpen={isPlanTriageOpen}
+        onClose={() => setIsPlanTriageOpen(false)}
+        onConfirmImport={(imported) => handleConfirmPlanTriageImport(imported)}
+      />
+
       {/* AI Copilot Modal */}
       <RoofingAiCopilotModal
         isOpen={isAiCopilotOpen}
@@ -6829,26 +7550,38 @@ export const ExactRoofingHub: React.FC<Props> = ({
         lifecycleStage={lifecycleStage}
         measureLocked={measureLocked}
         activeMemberName={activeMemberName}
-        assignableLines={assignableLines}
-        assignments={flashingAssignments}
+        assignableLines={isUsingFrozenMeasured ? installAssignableLines : assignableLines}
+        assignments={isUsingFrozenMeasured ? installAssignments : flashingAssignments}
         libraryProfiles={libraryProfiles}
-        layout={layoutResult}
-        bom={roofBom}
-        packs={roofingPacks}
-        planes={planes}
-        levels={levels}
-        assets={assets}
-        wallPlan={wallPlan}
+        layout={isUsingFrozenMeasured ? installLayout : layoutResult}
+        bom={isUsingFrozenMeasured ? installBom : roofBom}
+        packs={activePackList}
+        planes={isUsingFrozenMeasured ? installPlanes : planes}
+        levels={isUsingFrozenMeasured ? installLevels : levels}
+        assets={isUsingFrozenMeasured ? installAssets : assets}
+        wallPlan={isUsingFrozenMeasured ? installWallPlan : wallPlan}
         completenessReport={completenessReport}
         areaSanity={areaSanity}
-        orderPack={liveOrderPack}
+        orderPack={
+          installGateBlocked
+            ? null
+            : isUsingFrozenMeasured
+            ? installOrderPack
+            : liveOrderPack
+        }
         flashingRuleSet={effectiveRuleSet}
         flashingRuleContext={flashingRuleContext}
         sheetOrderMode={sheetOrderMode}
-        onChangeSheetOrderMode={handleChangeSheetOrderMode}
+        onChangeSheetOrderMode={
+          measureLocked || lifecycleStage === 'installing'
+            ? undefined
+            : handleChangeSheetOrderMode
+        }
         sheetOrderComparison={sheetOrderComparison}
         initialModalTab={orderModalTab}
-        onSelectLineToAssign={(line) => setActiveFlashingLineId(line.lineId)}
+        onSelectLineToAssign={(line) => {
+          if (!isReadOnlyGeometry) setActiveFlashingLineId(line.lineId);
+        }}
         onRemoveAssignment={handleRemoveFlashingAssignment}
         onMarkOrdered={({ workshop, crm }) => {
           setFlashingAssignments((prev) =>
@@ -6860,19 +7593,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
           );
         }}
         onUpdateProject={onUpdateProject}
-        onPushBomToQuote={
-          onPushBomToQuote
-            ? (opts) => {
-                const snap = buildCurrentSnapshot();
-                onPushBomToQuote({
-                  ...opts,
-                  bom: roofBom,
-                  snapshot: snap,
-                  project
-                });
-              }
-            : undefined
-        }
+        onPushBomToQuote={onPushBomToQuote ? handlePushOrderModalToQuote : undefined}
         onOpenFlashingOrders={() => {
           setIsOrderModalOpen(false);
           setFlashingWorkshopView('orders');
@@ -7060,7 +7781,7 @@ export const ExactRoofingHub: React.FC<Props> = ({
               <button
                 type="button"
                 disabled={!completenessReport.canLockMeasure || !areaSanity.ok}
-                onClick={handleConfirmLockMeasure}
+                onClick={() => void handleConfirmLockMeasure()}
                 className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-extrabold cursor-pointer"
               >
                 {completenessReport.canLockMeasure && areaSanity.ok

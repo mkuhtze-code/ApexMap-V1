@@ -55,9 +55,12 @@ interface Props {
     includeUnderlay: boolean;
     includeLabourEstimate: boolean;
     replaceExistingSections: boolean;
+    revisionKind: import('../../types/exactRoofing').EnvelopeRevisionKind;
+    envelope: import('../../types/exactRoofing').EnvelopeSnapshot;
     bom: RoofBomSummary;
     snapshot: ExactRoofModelSnapshot;
     project?: Project;
+    stillCaptureFailed?: boolean;
   }) => void;
   activeMemberName?: string;
   embedded?: boolean;

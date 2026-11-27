@@ -84,6 +84,8 @@ export interface RoofLevel {
   skeleton: SkeletonLine[];
   /** Outline edge IDs whose roof plane was explicitly deleted by the user until explicitly rebuilt */
   suppressedPlaneEdgeIds?: string[];
+  /** Optional parent level ID when a wing/attached body belongs on the same storey level */
+  parentLevelId?: string;
 }
 
 export interface RoofWallSegment {
@@ -916,6 +918,29 @@ export interface OrderPack {
   completenessReport: TakeoffCompletenessReport;
 }
 
+export type EnvelopeRevisionKind = 'estimated' | 'measured';
+
+export interface EnvelopeSnapshot {
+  revision: number;
+  kind: EnvelopeRevisionKind;
+  createdAt: string;
+  ruleSetRevision: string | number | null;
+  roofProfileFamily: string;
+  windZone: string;
+  ventedRidge: string;
+  areaM2: number;
+  areaSanityOk: boolean;
+  faceCount: number;
+  sheetOrderMode: SheetOrderMode;
+  totalOrderedLm: number;
+  totalSheets: number;
+  flashingStickCount: number;
+  orderPack: OrderPack;
+  bom: RoofBomSummary;
+  model: ExactRoofModelSnapshot;
+  stillDataUrl: string | null;
+}
+
 export interface ExactRoofModelSnapshot {
   version: 2;
   stage: RoofLifecycleStage;
@@ -948,6 +973,8 @@ export interface ExactRoofModelSnapshot {
   layout?: LayoutResult;
   bom?: RoofBomSummary;
   orderPack?: OrderPack | null;
+  envelopeSnapshot?: EnvelopeSnapshot | null;
+  envelopeHistory?: EnvelopeSnapshot[];
   lastUpdatedAt: string;
   updatedBy?: string;
 }

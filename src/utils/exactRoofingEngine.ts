@@ -260,6 +260,55 @@ export function addCourtyardHoleToOutline(
   };
 }
 
+export function tryAddCourtyardHoleToLevel(
+  level: RoofLevel,
+  rawHolePoints: Point2D[],
+  options?: {
+    holeId?: string;
+    name?: string;
+    initialEdgeType?: EdgeType;
+    eaveHeightM?: number;
+    hasWall?: boolean;
+  }
+):
+  | { ok: true; level: RoofLevel; hole: RoofHoleRing }
+  | { ok: false; error: string } {
+  if (!rawHolePoints || rawHolePoints.length < 3 || level.outline.points.length < 3) {
+    return { ok: false, error: 'Void must sit inside the roof.' };
+  }
+  const cleaned: Point2D[] = [];
+  rawHolePoints.forEach((p) => {
+    if (cleaned.length === 0 || dist(cleaned[cleaned.length - 1], p) > 0.05) {
+      cleaned.push({ x: +p.x.toFixed(3), y: +p.y.toFixed(3) });
+    }
+  });
+  if (cleaned.length > 2 && dist(cleaned[0], cleaned[cleaned.length - 1]) <= 0.05) {
+    cleaned.pop();
+  }
+  if (cleaned.length < 3 || polygonArea(cleaned) < 0.25) {
+    return { ok: false, error: 'Void must sit inside the roof.' };
+  }
+  const cwPts = getSignedArea(cleaned) > 0 ? [...cleaned].reverse() : cleaned;
+  const centroid = polygonCentroid(cwPts);
+  if (!isPointInPolygon(centroid, level.outline.points)) {
+    return { ok: false, error: 'Void must sit inside the roof.' };
+  }
+  const nextOutline = addCourtyardHoleToOutline(level.outline, cwPts, {
+    ...options,
+    initialEdgeType: options?.initialEdgeType ?? 'wall',
+    hasWall: options?.hasWall ?? true
+  });
+  const addedHole = nextOutline.holes?.[nextOutline.holes.length - 1];
+  if (!addedHole || (nextOutline.holes?.length || 0) === (level.outline.holes?.length || 0)) {
+    return { ok: false, error: 'Void must sit inside the roof.' };
+  }
+  return {
+    ok: true,
+    level: { ...level, outline: nextOutline },
+    hole: addedHole
+  };
+}
+
 export function removeCourtyardHoleFromOutline(outline: RoofOutline, holeId: string): RoofOutline {
   if (!outline.holes || outline.holes.length === 0) return outline;
   const filtered = outline.holes.filter((h) => h.id !== holeId);
@@ -409,7 +458,7 @@ export function buildAttachedOutlineFromEdge(
 ): RoofOutline {
   const base = buildOutlineFromPoints(points, id, {
     ...options,
-    defaultEaveHeightM: options?.defaultEaveHeightM ?? attachedEdge.eaveHeightM,
+    defaultEaveHeightM: options?.defaultEaveHeightM,
     initialEdgeType: options?.initialEdgeType ?? 'unclassified'
   });
 
@@ -421,6 +470,9 @@ export function buildAttachedOutlineFromEdge(
       return {
         ...e,
         type: 'wall',
+        ...(attachedEdge.eaveHeightM !== undefined
+          ? { eaveHeightM: attachedEdge.eaveHeightM }
+          : {}),
         ...(attachedEdge.type === 'wall' || attachedEdge.hasWall === true
           ? { hasWall: true }
           : attachedEdge.hasWall === false
@@ -698,6 +750,80 @@ export function applyEaveHeightToEdges(
           }))
         }
       : {})
+  };
+}
+
+/**
+ * Sets explicit eave height Z on all outer eave ('outline') edges on one roof level/outline only.
+ * Never mutates gable ('verge'/'rake'), 'wall', 'apron', 'ridge', 'unclassified', or void hole edges.
+ */
+export function applyEaveHeightToLevelEaves(
+  outline: RoofOutline,
+  heightM: number
+): RoofOutline {
+  const targetIds = outline.edges
+    .filter((e) => e.type === 'outline')
+    .map((e) => e.id);
+  if (targetIds.length === 0) return outline;
+  const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
+  const targetSet = new Set(targetIds);
+  return {
+    ...outline,
+    edges: outline.edges.map((e) =>
+      targetSet.has(e.id) ? { ...e, eaveHeightM: clampedZ } : e
+    )
+  };
+}
+
+/**
+ * Sets explicit eave height Z on all outer eave ('outline') edges bordering one roof face.
+ * Never mutates gable ('verge'/'rake'), 'wall', 'apron', 'ridge', or void hole edges.
+ */
+export function applyEaveHeightToFaceEaves(
+  outline: RoofOutline,
+  planes: RoofPlane[],
+  targetEdgeOrPlaneId: string,
+  heightM: number
+): RoofOutline {
+  const clampedZ = +Math.max(0.5, Math.min(30, heightM)).toFixed(2);
+  const owningPlane = planes.find(
+    (p) => p.id === targetEdgeOrPlaneId || p.eaveEdgeId === targetEdgeOrPlaneId
+  );
+  const targetIds = new Set<string>();
+  const directEdge = outline.edges.find((e) => e.id === targetEdgeOrPlaneId);
+  if (directEdge && directEdge.type === 'outline') {
+    targetIds.add(directEdge.id);
+  }
+  if (owningPlane) {
+    if (owningPlane.eaveEdgeId) {
+      const ee = outline.edges.find((e) => e.id === owningPlane.eaveEdgeId);
+      if (ee && ee.type === 'outline') targetIds.add(ee.id);
+    }
+    const poly = owningPlane.planPolygon;
+    if (poly.length >= 3) {
+      const pointOnPolyBoundary = (pt: Point2D) =>
+        poly.some((v, idx) =>
+          distToSegment(pt, v, poly[(idx + 1) % poly.length]) <= 0.18
+        );
+      outline.edges.forEach((e) => {
+        if (e.type !== 'outline') return;
+        const mid = { x: (e.from.x + e.to.x) / 2, y: (e.from.y + e.to.y) / 2 };
+        if (
+          pointOnPolyBoundary(e.from) &&
+          pointOnPolyBoundary(e.to) &&
+          pointOnPolyBoundary(mid)
+        ) {
+          targetIds.add(e.id);
+        }
+      });
+    }
+  }
+  if (targetIds.size === 0) return outline;
+  return {
+    ...outline,
+    edges: outline.edges.map((e) =>
+      targetIds.has(e.id) ? { ...e, eaveHeightM: clampedZ } : e
+    )
   };
 }
 
@@ -1490,12 +1616,31 @@ export function mergeColinearRidgeLines(
 function cleanupSkeletonLines(
   rawLines: SkeletonLine[],
   perimeterPts: Point2D[] = [],
-  options?: { levelId?: string; idPrefix?: string; holePerimeterPts?: Point2D[] }
+  options?: {
+    levelId?: string;
+    idPrefix?: string;
+    holePerimeterPts?: Point2D[];
+    holes?: RoofHoleRing[];
+  }
 ): SkeletonLine[] {
   const holePts = options?.holePerimeterPts || [];
-  const hasHoles = holePts.length > 0;
+  const holesList = (options?.holes || []).filter((h) => h.points.length >= 3);
+  const hasHoles = holePts.length > 0 || holesList.length > 0;
+  const crossesHoleInterior = (from: Point2D, to: Point2D): boolean => {
+    if (holesList.length === 0) return false;
+    for (const t of [0.25, 0.5, 0.75]) {
+      const sample = {
+        x: from.x + (to.x - from.x) * t,
+        y: from.y + (to.y - from.y) * t
+      };
+      if (holesList.some((h) => isPointInsideHoleInterior(sample, h, 0.08))) {
+        return true;
+      }
+    }
+    return false;
+  };
   let lines = rawLines
-    .filter((l) => dist(l.from, l.to) > 0.02)
+    .filter((l) => dist(l.from, l.to) > 0.02 && !crossesHoleInterior(l.from, l.to))
     .map((l) => ({
       ...l,
       from: { x: +l.from.x.toFixed(3), y: +l.from.y.toFixed(3) },
@@ -1623,6 +1768,7 @@ function cleanupSkeletonLines(
   const finalDeduped: SkeletonLine[] = [];
   lines.forEach((l) => {
     if (dist(l.from, l.to) < 0.25) return;
+    if (crossesHoleInterior(l.from, l.to)) return;
     const dupIdx = finalDeduped.findIndex(
       (d) =>
         (pointsClose(d.from, l.from, 0.1) && pointsClose(d.to, l.to, 0.1)) ||
@@ -2497,7 +2643,8 @@ export function generateSkeletonLines(outline: RoofOutline): SkeletonLine[] {
     return cleanupSkeletonLines(rawLines, origPts, {
       levelId: outline.levelId,
       idPrefix: getLevelIdPrefixFromOutline(outline),
-      holePerimeterPts: holes.flatMap((h) => h.points)
+      holePerimeterPts: holes.flatMap((h) => h.points),
+      holes
     });
   }
 
@@ -3775,12 +3922,30 @@ function traceFacePolygon(
     return [];
   }
 
-  // True single-slope / monopitch sweep across full footprint ONLY when <= 1 eave exists, no holes, and no skeleton splits it
+  // True single-slope / monopitch sweep across full footprint when <= 1 eave exists OR all eaves run co-directionally toward a classified head/ridge edge
+  const activeEaveList = allOutlineEdges.filter((e) => e.type === 'outline');
+  const hasExplicitRidgeEdge = outline.edges.some((e) => e.type === 'ridge');
+  const allEavesCoDirectional =
+    activeEaveList.length >= 2 &&
+    hasExplicitRidgeEdge &&
+    activeEaveList.every((ea) => {
+      const len0 = dist(activeEaveList[0].from, activeEaveList[0].to) || 1;
+      const lenA = dist(ea.from, ea.to) || 1;
+      const d0 = {
+        x: (activeEaveList[0].to.x - activeEaveList[0].from.x) / len0,
+        y: (activeEaveList[0].to.y - activeEaveList[0].from.y) / len0
+      };
+      const dA = {
+        x: (ea.to.x - ea.from.x) / lenA,
+        y: (ea.to.y - ea.from.y) / lenA
+      };
+      return d0.x * dA.x + d0.y * dA.y > 0.85;
+    });
   if (
     outline.points.length >= 3 &&
     (!outline.holes || outline.holes.length === 0) &&
     skeleton.length === 0 &&
-    activeEavesCount <= 1
+    (activeEavesCount <= 1 || allEavesCoDirectional)
   ) {
     const startIdx = outline.points.findIndex((pt) => pointsClose(pt, eaveEdge.from, 0.08));
     if (startIdx >= 0) {
@@ -6877,7 +7042,44 @@ function getPlaneElevationAtPoint(
   const vInward = plane.runDirection || (dot >= 0 ? vVec : { x: -vVec.x, y: -vVec.y });
 
   const vDist = Math.max(0, (pt.x - pA.x) * vInward.x + (pt.y - pA.y) * vInward.y);
-  const baseH = plane.eaveHeightM ?? 2.7;
+  let baseH = plane.eaveHeightM ?? eaveEdge?.eaveHeightM ?? 2.7;
+  if (outline && plane.planPolygon.length >= 3) {
+    const pointOnPoly = (q: Point2D) =>
+      plane.planPolygon.some((v, idx) =>
+        distToSegment(q, v, plane.planPolygon[(idx + 1) % plane.planPolygon.length]) <= 0.18
+      );
+    const faceEaves = outline.edges.filter((e) => {
+      if (e.type !== 'outline') return false;
+      const mid = { x: (e.from.x + e.to.x) / 2, y: (e.from.y + e.to.y) / 2 };
+      return pointOnPoly(e.from) && pointOnPoly(e.to) && pointOnPoly(mid);
+    });
+    const distinctHeights = new Set(
+      faceEaves.map((fe) => +(fe.eaveHeightM ?? plane.eaveHeightM ?? 2.7).toFixed(2))
+    );
+    if (faceEaves.length >= 2 && distinctHeights.size >= 2) {
+      let bestEdge: PlanEdge | null = null;
+      let bestScore = Infinity;
+      for (const fe of faceEaves) {
+        const fdx = fe.to.x - fe.from.x;
+        const fdy = fe.to.y - fe.from.y;
+        const flen = Math.hypot(fdx, fdy) || 1;
+        const ux = fdx / flen;
+        const uy = fdy / flen;
+        const proj = (pt.x - fe.from.x) * ux + (pt.y - fe.from.y) * uy;
+        const clamped = Math.max(0, Math.min(flen, proj));
+        const dAlong = Math.abs(proj - clamped);
+        const anchorPt = { x: fe.from.x + ux * clamped, y: fe.from.y + uy * clamped };
+        const score = dAlong * 10 + dist(pt, anchorPt) * 0.01;
+        if (score < bestScore) {
+          bestScore = score;
+          bestEdge = fe;
+        }
+      }
+      if (bestEdge && bestEdge.eaveHeightM !== undefined) {
+        baseH = bestEdge.eaveHeightM;
+      }
+    }
+  }
   const tanPitch = Math.tan(((plane.pitchDeg || 22.5) * Math.PI) / 180);
   return baseH + vDist * tanPitch;
 }
@@ -7689,22 +7891,14 @@ export function buildFacesFromClassification(
       return { ...lvl, suppressedPlaneEdgeIds: undefined };
     }
 
-    const allExistingEdges = getAllOutlineEdges(lvl.outline);
-    const hasClassifiedEave = allExistingEdges.some((e) => e.type === 'outline');
+    const allExistingOuterEdges = lvl.outline.edges;
+    const hasClassifiedEave = allExistingOuterEdges.some((e) => e.type === 'outline');
     const promoteUnclassified = (e: PlanEdge): PlanEdge =>
       !hasClassifiedEave && e.type === 'unclassified' ? { ...e, type: 'outline' as const } : e;
 
     const nextOutline: RoofOutline = {
       ...lvl.outline,
-      edges: lvl.outline.edges.map(promoteUnclassified),
-      ...(lvl.outline.holes
-        ? {
-            holes: lvl.outline.holes.map((h) => ({
-              ...h,
-              edges: h.edges.map(promoteUnclassified)
-            }))
-          }
-        : {})
+      edges: lvl.outline.edges.map(promoteUnclassified)
     };
 
     const levelExistingPlanes = existingPlanes.filter(

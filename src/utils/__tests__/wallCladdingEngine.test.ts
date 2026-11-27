@@ -40,8 +40,10 @@ import {
   updateWallPlanEdgeLength
 } from '../wallCladdingEngine';
 import {
+  addCourtyardHoleToOutline,
   applyEdgeType,
   buildOutlineFromPoints,
+  computeTruthfulRoofAreaM2,
   createRoofLevel,
   deriveRoofWallSegments,
   generateCuttingLayout,
@@ -56,7 +58,7 @@ import {
 } from '../roofPipeline';
 import type { WallPlan } from '../../types/exactRoofing';
 import { evaluateTakeoffCompleteness } from '../takeoffCompleteness';
-import { buildOrderPack, exportOrderPackToCsv } from '../exactRoofingBomBridge';
+import { buildOrderPack, buildRoofBillOfMaterials, exportOrderPackToCsv } from '../exactRoofingBomBridge';
 import { buildWallPlan3DGroup } from '../../components/exactroofing/three/wallMeshBuilder';
 import { buildRoofSceneGroup } from '../../components/exactroofing/three/roofMeshBuilder';
 
@@ -1649,4 +1651,220 @@ console.log('✓ Test 28 Passed: Cascading 3-tier terrace enforces single shared
 }
 console.log('✓ Test 29 Passed: Gable end walls (verge & rake) reach true ridge apex cleanly in roof & wall 3D');
 
+// 30. Rectangle + courtyard hole -> outer + inner void_edge faces, zero facets crossing void, valid 3D
+{
+  const courtBase = getPresetOutline('rectangle_14x10');
+  const withHole = addCourtyardHoleToOutline(courtBase, [
+    { x: 5, y: 3 },
+    { x: 9, y: 3 },
+    { x: 9, y: 7 },
+    { x: 5, y: 7 }
+  ]);
+  const courtOutline = {
+    ...withHole,
+    edges: withHole.edges.map((e) => ({ ...e, hasWall: true, eaveSetbackM: 0.4 })),
+    holes: (withHole.holes || []).map((h) => ({
+      ...h,
+      edges: h.edges.map((e) => ({ ...e, hasWall: true, eaveSetbackM: 0.3 }))
+    }))
+  };
+  const courtSkel = generateSkeletonLines(courtOutline);
+  const courtLvl = {
+    ...createRoofLevel(1, 'Courtyard Roof', 2.7, courtOutline.points),
+    outline: courtOutline,
+    skeleton: courtSkel
+  };
+  const courtPlanes = syncMultiLevelPlanes([courtLvl], [], 20);
+  const courtWallPlan = deriveWallPlanFromRoofLevels([courtLvl], 2.7, undefined, courtPlanes)!;
+  assert.ok(courtWallPlan, 'Courtyard roof must derive WallPlan');
+
+  const outerWalls = courtWallPlan.facets.filter((f) => f.kind !== 'void_edge');
+  const innerVoidWalls = courtWallPlan.facets.filter((f) => f.kind === 'void_edge');
+  assert.equal(outerWalls.length, 4, 'Courtyard rectangle emits 4 outer perimeter wall facets');
+  assert.equal(innerVoidWalls.length, 4, 'Courtyard hole emits 4 inner void_edge wall facets');
+
+  // Verify no wall facet segment crosses the open interior of the courtyard void (strictly interior to [5.3..8.7] x [3.3..6.7])
+  courtWallPlan.facets.forEach((f) => {
+    const midX = (f.from.x + f.to.x) / 2;
+    const midY = (f.from.y + f.to.y) / 2;
+    const strictlyInsideVoid = midX > 5.05 && midX < 8.95 && midY > 3.05 && midY < 6.95;
+    assert.equal(
+      strictlyInsideVoid,
+      false,
+      `Wall facet ${f.code} (${f.kind}) midpoint (${midX.toFixed(2)}, ${midY.toFixed(2)}) must NOT cross inside courtyard void`
+    );
+  });
+
+  // Inner courtyard wall facets must sit around the hole setback box (3.4m x 3.4m or 4.6m x 4.6m depending on setback direction inward into solid roof)
+  assert.ok(
+    innerVoidWalls.every((f) => f.lengthM > 4.0 && Boolean(f.roofEdgeId)),
+    'Courtyard void_edge walls setback outward from void into solid roof footprint and carry roofEdgeId'
+  );
+
+  // Verify 3D wall meshes build cleanly without dropping hole facets
+  const stubRoofTex30 = {
+    normalMap: null,
+    roughnessMap: null,
+    bumpMap: null,
+    dispose: () => {}
+  } as any;
+  const stubWallTex30 = {
+    getEntry: () => null,
+    weatherboard: { normalMap: null },
+    fibre_cement: { normalMap: null },
+    brick: { map: null, normalMap: null },
+    garageDoor: null,
+    garageDoorRoughness: null,
+    garageDoorBump: null
+  } as any;
+  const courtScene30 = buildRoofSceneGroup({
+    outline: courtOutline,
+    skeleton: courtSkel,
+    planes: courtPlanes,
+    levels: [courtLvl],
+    wallPlan: courtWallPlan,
+    shadingMode: 'studio_finish',
+    swatch: { name: 'Ebony', hex: '#1e293b', metalness: 0.45, roughness: 0.35 } as any,
+    textures: stubRoofTex30,
+    wallTextures: stubWallTex30,
+    showFlashings: false,
+    showWalls: true,
+    showSheetSeams: false,
+    isSoftwareGl: true
+  });
+  const meshedWallIds = new Set(
+    courtScene30.selectableMeshes
+      .map((m) => m.userData?.wallFacetId)
+      .filter((id): id is string => typeof id === 'string')
+  );
+  assert.equal(
+    meshedWallIds.size,
+    8,
+    '3D WallPlan must mesh all 4 outer + 4 inner courtyard wall facets'
+  );
+  courtScene30.dispose();
+}
+console.log('✓ Test 30 Passed: Courtyard hole emits outer + inner void_edge walls, zero void crossings, valid 3D extrusion');
+
+// 31. Opening survives re-derive from roof when facet length & edge are unchanged (outer & courtyard void_edge)
+{
+  const rect31 = getPresetOutline('rectangle_14x10');
+  const hole31 = addCourtyardHoleToOutline(rect31, [
+    { x: 5, y: 3 },
+    { x: 9, y: 3 },
+    { x: 9, y: 7 },
+    { x: 5, y: 7 }
+  ]);
+  const outline31 = {
+    ...hole31,
+    edges: hole31.edges.map((e) => ({ ...e, hasWall: true, eaveSetbackM: 0.45 })),
+    holes: (hole31.holes || []).map((h) => ({
+      ...h,
+      edges: h.edges.map((e) => ({ ...e, hasWall: true, eaveSetbackM: 0.35 }))
+    }))
+  };
+  const skel31 = generateSkeletonLines(outline31);
+  const lvl31 = {
+    ...createRoofLevel(1, 'Main + Court', 2.7, outline31.points),
+    outline: outline31,
+    skeleton: skel31
+  };
+  const planes31 = syncMultiLevelPlanes([lvl31], [], 22.5);
+  const firstWp = deriveWallPlanFromRoofLevels([lvl31], 2.7, undefined, planes31)!;
+  const outerIdx = firstWp.facets.findIndex((f) => f.kind !== 'void_edge');
+  const courtIdx = firstWp.facets.findIndex((f) => f.kind === 'void_edge');
+  assert.ok(outerIdx >= 0 && courtIdx >= 0);
+
+  const wpWithOpenings: WallPlan = {
+    ...firstWp,
+    facets: firstWp.facets.map((f, idx) => {
+      if (idx === outerIdx) {
+        return {
+          ...f,
+          claddingType: 'weatherboard',
+          openings: [createDefaultWallOpening(f, 'door', 2.0)]
+        };
+      }
+      if (idx === courtIdx) {
+        return {
+          ...f,
+          claddingType: 'brick',
+          openings: [createDefaultWallOpening(f, 'window', 1.2)]
+        };
+      }
+      return f;
+    })
+  };
+
+  // Re-derive from same roof levels passing existingPlan.facets
+  const reDerived = deriveWallPlanFromRoofLevels([lvl31], 2.7, wpWithOpenings.facets, planes31)!;
+  const reOuter = reDerived.facets.find((f) => f.roofEdgeId === firstWp.facets[outerIdx].roofEdgeId);
+  const reCourt = reDerived.facets.find((f) => f.roofEdgeId === firstWp.facets[courtIdx].roofEdgeId);
+  assert.equal(reOuter?.openings.length, 1, 'Outer wall opening survives roof re-derive');
+  assert.equal(reOuter?.claddingType, 'weatherboard', 'Outer wall cladding survives roof re-derive');
+  assert.equal(reCourt?.openings.length, 1, 'Courtyard void_edge wall opening survives roof re-derive');
+  assert.equal(reCourt?.claddingType, 'brick', 'Courtyard void_edge wall cladding survives roof re-derive');
+}
+console.log('✓ Test 31 Passed: Outer and courtyard wall openings survive re-derive when edge/length unchanged');
+
+// 32. Roof m² is unchanged when walls are derived (and wall area remains net of openings)
+{
+  const rect32 = getPresetOutline('rectangle_14x10');
+  const outline32 = {
+    ...rect32,
+    edges: rect32.edges.map((e) => ({ ...e, hasWall: true, eaveSetbackM: 0.45 }))
+  };
+  const skel32 = generateSkeletonLines(outline32);
+  const lvl32 = {
+    ...createRoofLevel(1, 'Main Roof', 2.7, outline32.points),
+    outline: outline32,
+    skeleton: skel32
+  };
+  const planes32 = syncMultiLevelPlanes([lvl32], [], 22.5);
+  const roofAreaBefore = computeTruthfulRoofAreaM2(planes32);
+  const layout32 = generateCuttingLayout(planes32, {
+    coverWidth: 0.762,
+    maxLength: 6.0,
+    endLap: 0.15,
+    overhang: 0.05
+  });
+  const bom32 = buildRoofBillOfMaterials({
+    planes: planes32,
+    layout: layout32,
+    assignments: [],
+    assignableLines: [],
+    sheetOrderMode: 'practical'
+  });
+  const bomBefore = buildOrderPack({
+    planes: planes32,
+    levels: [lvl32],
+    layout: layout32,
+    bom: bom32,
+    assignableLines: [],
+    assignments: [],
+    libraryProfiles: []
+  });
+
+  const wp32 = deriveWallPlanFromRoofLevels([lvl32], 2.7, undefined, planes32)!;
+  const wp32Detailed: WallPlan = {
+    ...wp32,
+    facets: wp32.facets.map((f, idx) =>
+      idx === 0
+        ? { ...f, claddingType: 'weatherboard', openings: [createDefaultWallOpening(f, 'door', 2.0)] }
+        : { ...f, claddingType: 'weatherboard' }
+    )
+  };
+  const syncedWp32 = syncWallPlanWithRoof(wp32Detailed, [lvl32], planes32);
+  const roofAreaAfter = computeTruthfulRoofAreaM2(planes32);
+  assert.equal(roofAreaAfter, roofAreaBefore, 'Deriving and syncing walls must never modify roof m²');
+  assert.equal(bomBefore.totals.roofAreaM2, +roofAreaBefore.toFixed(2));
+  const wallSummary32 = computeWallTakeoffSummary(syncedWp32.facets);
+  assert.ok(
+    wallSummary32.totalNetAreaM2 < wallSummary32.totalGrossAreaM2,
+    'Wall cladding summary area remains net of door/window openings'
+  );
+}
+console.log('✓ Test 32 Passed: Roof m² unchanged when walls are derived and wall takeoff remains net of openings');
+
 console.log('--- All Wall Cladding Phase 1, Phase 2 & Parity+ Tests Passed ---');
+

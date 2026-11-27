@@ -299,7 +299,8 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
       renderer = new THREE.WebGLRenderer({
         antialias: !isSoftwareGl,
         powerPreference: 'high-performance',
-        alpha: false
+        alpha: false,
+        preserveDrawingBuffer: true
       });
     } catch {
       setWebglError('Unable to initialize 3D WebGL viewport.');
@@ -321,6 +322,7 @@ export const ExactRoofing3DViewer: React.FC<Props> = ({
     renderer.toneMappingExposure = initPreset.exposure;
     renderer.shadowMap.enabled = !isSoftwareGl;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.domElement.setAttribute('data-apex-canvas', '3d');
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';

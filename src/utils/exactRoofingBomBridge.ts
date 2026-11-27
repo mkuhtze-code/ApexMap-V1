@@ -12,6 +12,7 @@ import {
 } from '../types/crm';
 import {
   AssignableRoofLine,
+  EnvelopeSnapshot,
   FaceRoofingPack,
   LayoutResult,
   OrderPack,
@@ -629,6 +630,13 @@ export function buildCompleteBomMaterialOrder(params: {
   };
 }
 
+function slugIdPart(val: string): string {
+  return val
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'item';
+}
+
 export function buildQuoteSpreadsheetFromRoofBom(params: {
   bom: RoofBomSummary;
   profile?: RoofingProfile;
@@ -670,12 +678,24 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
   const profileDef = MODULAR_TRAY_PROFILES.find((p) => p.profile === profile) || MODULAR_TRAY_PROFILES[0];
   const panMm = profileDef.defaultPanSizeMm || 762;
   const mult = 1 + markupPercent / 100;
-  const stamp = Date.now();
 
-  const secSheetsId = `sec-apex-sheets-${stamp}`;
-  const secFlashId = `sec-apex-flash-${stamp}`;
-  const secHwId = `sec-apex-hw-${stamp}`;
-  const secLabourId = `sec-apex-lab-${stamp}`;
+  const secSheetsId = 'sec-apex-sheets';
+  const secFlashId = 'sec-apex-flash';
+  const secHwId = 'sec-apex-hw';
+  const secLabourId = 'sec-apex-lab';
+
+  const seenRowIds = new Set<string>();
+  const makeUniqueRowId = (base: string): string => {
+    if (!seenRowIds.has(base)) {
+      seenRowIds.add(base);
+      return base;
+    }
+    let suffix = 2;
+    while (seenRowIds.has(`${base}-${suffix}`)) suffix += 1;
+    const next = `${base}-${suffix}`;
+    seenRowIds.add(next);
+    return next;
+  };
 
   const sections: SpreadsheetSection[] = [
     {
@@ -703,14 +723,14 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
 
   // Section 1: Long-run ordered sheets grouped by mill cut length
   if (bom.sheetGroups.length > 0) {
-    bom.sheetGroups.forEach((grp, idx) => {
+    bom.sheetGroups.forEach((grp) => {
       const unitCost = +trayRate.ratePerLm.toFixed(2);
       const unitSell = +(unitCost * mult).toFixed(2);
       const qtyLm = +grp.totalLm.toFixed(2);
       const totalSell = +(qtyLm * unitSell).toFixed(2);
 
       rows.push({
-        id: `row-apex-sh-${idx + 1}-${stamp}`,
+        id: makeUniqueRowId(`row-apex-sh-${grp.lengthMm}`),
         sectionId: secSheetsId,
         itemCode: `APEX-${grp.lengthMm}`,
         description: `${profile} · ${colorName} · ${grp.count} × ${grp.lengthMm}mm sheets (${grp.targetCodes.join(', ')})`,
@@ -735,7 +755,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
     const unitSell = +(unitCost * mult).toFixed(2);
     const qty = +bom.totalRoofAreaM2.toFixed(2);
     rows.push({
-      id: `row-apex-area-${stamp}`,
+      id: 'row-apex-area',
       sectionId: secSheetsId,
       itemCode: 'APEX-AREA',
       description: `${profile} · ${colorName} (${bom.totalRoofAreaM2.toFixed(1)}m² modeled roof)`,
@@ -763,11 +783,19 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
     const unitCost = +flRate.ratePerLm.toFixed(2);
     const unitSell = +(unitCost * mult).toFixed(2);
     const qtyLm = +fl.totalLinearMetres.toFixed(2);
+    const resolvedCode = resolveFlashingProductCode({
+      profileId: fl.profileId,
+      flashingKind: fl.flashingKind,
+      explicitCode: fl.productCode,
+      blankWidthMm: fl.developedBlankWidthMm
+    });
 
     rows.push({
-      id: `row-apex-fl-${idx + 1}-${stamp}`,
+      id: makeUniqueRowId(
+        `row-apex-fl-${slugIdPart(resolvedCode)}-${slugIdPart(fl.lineId || String(idx + 1))}`
+      ),
       sectionId: secFlashId,
-      itemCode: `FL-${fl.flashingKind.toUpperCase()}`,
+      itemCode: resolvedCode,
       description: `${fl.profileName} · ${fl.lineLabel} (${fl.quantity} × ${fl.pieceLengthLm.toFixed(2)}m, ${girthTier})`,
       category: 'Flashings',
       quantity: qtyLm,
@@ -777,7 +805,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
       markupPercent,
       unitSellNZD: unitSell,
       totalNZD: +(qtyLm * unitSell).toFixed(2),
-      notes: fl.notes,
+      notes: fl.shopNotes ? `${fl.notes ? `${fl.notes} · ` : ''}${fl.shopNotes}` : fl.notes,
       isMatrixItem: true,
       matrixType: 'flashing',
       flashingType: flType,
@@ -800,7 +828,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
       const boxCost = 148;
       const boxSell = +(boxCost * mult).toFixed(2);
       rows.push({
-        id: `row-apex-scr-${stamp}`,
+        id: 'row-apex-scr',
         sectionId: secHwId,
         itemCode: 'HW-TEK-500',
         description: `Class 4 12-14 x 65mm Crest Fix Tek Screws (${colorName}, Box of 500)`,
@@ -818,7 +846,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
         const foamCost = 4.2;
         const foamSell = +(foamCost * mult).toFixed(2);
         rows.push({
-          id: `row-apex-foam-${stamp}`,
+          id: 'row-apex-foam',
           sectionId: secHwId,
           itemCode: 'HW-FOAM',
           description: 'Profiled Vented EPDM Ridge & Eave Foam Closures',
@@ -837,7 +865,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
         const kitCost = 95;
         const kitSell = +(kitCost * mult).toFixed(2);
         rows.push({
-          id: `row-apex-pen-${stamp}`,
+          id: 'row-apex-pen',
           sectionId: secHwId,
           itemCode: 'HW-PEN-KIT',
           description: 'Roof Asset Penetration / Skylight Boot & Saddle Kit',
@@ -857,7 +885,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
       const rollCost = 245;
       const rollSell = +(rollCost * mult).toFixed(2);
       rows.push({
-        id: `row-apex-ul-${stamp}`,
+        id: 'row-apex-ul',
         sectionId: secHwId,
         itemCode: 'UL-SYN-75',
         description: 'Synthetic Breathable Roof Underlay (75m² Roll w/ Lap Tape)',
@@ -885,7 +913,7 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
     const labSellPerM2 = +(labCostPerM2 * mult).toFixed(2);
     const areaQty = +bom.totalRoofAreaM2.toFixed(1);
     rows.push({
-      id: `row-apex-lab-${stamp}`,
+      id: 'row-apex-lab',
       sectionId: secLabourId,
       itemCode: 'LAB-ROOF-INST',
       description: `LBP Long-Run Roof Installation & Flashing Fixings (${bom.totalSheetsCount} sheets)`,
@@ -935,10 +963,45 @@ export function buildQuoteSpreadsheetFromRoofBom(params: {
   };
 }
 
+/**
+ * Deterministic Quote section & row generator from a validated EnvelopeSnapshot.
+ * Repeated invocations with the same snapshot yield identical section & row IDs.
+ */
+export function buildQuoteSections(
+  snapshot: EnvelopeSnapshot,
+  opts?: {
+    profile?: RoofingProfile;
+    material?: CoilMaterial;
+    colorName?: string;
+    markupPercent?: number;
+    includeHardware?: boolean;
+    includeUnderlay?: boolean;
+    includeLabourEstimate?: boolean;
+  }
+) {
+  if (!snapshot || !snapshot.areaSanityOk || snapshot.bom?.areaSanityWarning) {
+    throw new Error(
+      snapshot?.bom?.areaSanityWarning ||
+        'Refusing to build Quote sections: EnvelopeSnapshot failed roof area sanity check.'
+    );
+  }
+  return buildQuoteSpreadsheetFromRoofBom({
+    bom: snapshot.bom,
+    profile: opts?.profile,
+    material: opts?.material,
+    colorName: opts?.colorName,
+    markupPercent: opts?.markupPercent,
+    includeHardware: opts?.includeHardware,
+    includeUnderlay: opts?.includeUnderlay,
+    includeLabourEstimate: opts?.includeLabourEstimate
+  });
+}
+
 export function applyBomToQuoteObject(params: {
   quote: Quote;
-  bom: RoofBomSummary;
-  snapshot: any;
+  envelope: EnvelopeSnapshot;
+  bom?: RoofBomSummary;
+  snapshot?: any;
   includeHardware?: boolean;
   includeUnderlay?: boolean;
   includeLabourEstimate?: boolean;
@@ -946,16 +1009,23 @@ export function applyBomToQuoteObject(params: {
 }): Quote {
   const {
     quote,
-    bom,
+    envelope,
     snapshot,
     includeHardware = true,
     includeUnderlay = true,
     includeLabourEstimate = true,
-    replaceExistingSections = false
+    replaceExistingSections = true
   } = params;
 
-  const built = buildQuoteSpreadsheetFromRoofBom({
-    bom,
+  if (!envelope || !envelope.areaSanityOk || envelope.bom?.areaSanityWarning) {
+    throw new Error(
+      envelope?.bom?.areaSanityWarning ||
+        'Refusing Quote push: EnvelopeSnapshot is missing or failed area sanity.'
+    );
+  }
+
+  const effectiveBom = envelope.bom;
+  const built = buildQuoteSections(envelope, {
     profile: quote.profile,
     material: quote.material,
     colorName: quote.colorName,
@@ -965,8 +1035,16 @@ export function applyBomToQuoteObject(params: {
     includeLabourEstimate
   });
 
-  const baseSections = replaceExistingSections ? [] : quote.spreadsheetSections || [];
-  const baseRows = replaceExistingSections ? [] : quote.spreadsheetRows || [];
+  const isApexSectionId = (id?: string) => Boolean(id && id.startsWith('sec-apex-'));
+  const isApexRow = (r: SpreadsheetRow) =>
+    isApexSectionId(r.sectionId) || Boolean(r.id && r.id.startsWith('row-apex-'));
+
+  const baseSections = replaceExistingSections
+    ? (quote.spreadsheetSections || []).filter((s) => !isApexSectionId(s.id))
+    : quote.spreadsheetSections || [];
+  const baseRows = replaceExistingSections
+    ? (quote.spreadsheetRows || []).filter((r) => !isApexRow(r))
+    : quote.spreadsheetRows || [];
 
   const nextSections = [...built.sections, ...baseSections];
   const nextRows = [...built.rows, ...baseRows];
@@ -990,9 +1068,19 @@ export function applyBomToQuoteObject(params: {
   ).toFixed(2);
   const { gst, total } = calculateGST(subtotalNZD);
 
+  const attachedModel = snapshot
+    ? {
+        ...snapshot,
+        envelopeSnapshot: envelope
+      }
+    : {
+        ...envelope.model,
+        envelopeSnapshot: envelope
+      };
+
   return {
     ...quote,
-    roofAreaM2: bom.totalRoofAreaM2 || quote.roofAreaM2,
+    roofAreaM2: effectiveBom.totalRoofAreaM2 || quote.roofAreaM2,
     spreadsheetSections: nextSections,
     spreadsheetRows: nextRows,
     quoteSections: nextSections,
@@ -1010,7 +1098,7 @@ export function applyBomToQuoteObject(params: {
     subtotalNZD,
     gstNZD: gst,
     totalNZD: total,
-    roofPlanModel: snapshot
+    roofPlanModel: attachedModel
   };
 }
 

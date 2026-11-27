@@ -13,6 +13,9 @@ interface PlanTriageModalProps {
 }
 
 const EDGE_LABELS = ['South', 'East', 'North', 'West'];
+const PRESET_SCALES = [50, 100, 200] as const;
+const GUIDANCE_COPY =
+  'Details sheets have no roof outline. Choose the roof plan page, or set the scale if it is only drawn in the title block.';
 
 export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
   isOpen,
@@ -20,6 +23,10 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
   onConfirmImport
 }) => {
   const [sourceName, setSourceName] = useState<string | null>(null);
+  const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
+  const [selectedPage, setSelectedPage] = useState<number | undefined>(undefined);
+  const [manualScaleDenom, setManualScaleDenom] = useState<number | undefined>(undefined);
+  const [customScaleInput, setCustomScaleInput] = useState<string>('');
   const [intent, setIntent] = useState<EnvelopeIntent | null>(null);
   const [isReading, setIsReading] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
@@ -45,13 +52,25 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
   if (!isOpen) return null;
 
-  const parseBuffer = async (bytes: Uint8Array, label: string) => {
+  const parseBuffer = async (
+    bytes: Uint8Array,
+    label: string,
+    opts?: { pageNumber?: number; manualScaleDenom?: number }
+  ) => {
     setIsReading(true);
     setReadError(null);
     setSourceName(label);
+    setPdfBytes(bytes);
     try {
-      const extracted = await readVectorPdf(bytes, { workerSrc: pdfWorkerUrl });
+      const extracted = await readVectorPdf(bytes, {
+        workerSrc: pdfWorkerUrl,
+        ...(opts?.pageNumber !== undefined ? { pageNumber: opts.pageNumber } : {}),
+        ...(opts?.manualScaleDenom !== undefined
+          ? { manualScaleDenom: opts.manualScaleDenom }
+          : {})
+      });
       setIntent(extracted);
+      setSelectedPage(extracted.selectedPage);
     } catch (err) {
       setIntent(null);
       setReadError(err instanceof Error ? err.message : 'Unable to read vector PDF.');
@@ -64,6 +83,9 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     const buffer = await file.arrayBuffer();
+    setSelectedPage(undefined);
+    setManualScaleDenom(undefined);
+    setCustomScaleInput('');
     await parseBuffer(new Uint8Array(buffer), file.name);
     e.target.value = '';
   };
@@ -71,6 +93,9 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
   const handleLoadFixtureR01 = async () => {
     setIsReading(true);
     setReadError(null);
+    setSelectedPage(undefined);
+    setManualScaleDenom(undefined);
+    setCustomScaleInput('');
     try {
       const response = await fetch(r01FixturePdfUrl);
       if (!response.ok) {
@@ -85,6 +110,33 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
     }
   };
 
+  const handleSelectPage = async (pageNum: number) => {
+    if (!pdfBytes || !sourceName) return;
+    setSelectedPage(pageNum);
+    setManualScaleDenom(undefined);
+    setCustomScaleInput('');
+    await parseBuffer(pdfBytes, sourceName, { pageNumber: pageNum });
+  };
+
+  const handleApplyManualScale = async (denom: number) => {
+    if (!pdfBytes || !sourceName || !Number.isFinite(denom) || denom <= 0) return;
+    setManualScaleDenom(denom);
+    setCustomScaleInput(String(denom));
+    await parseBuffer(pdfBytes, sourceName, {
+      pageNumber: selectedPage ?? intent?.selectedPage,
+      manualScaleDenom: denom
+    });
+  };
+
+  const handleClearManualScale = async () => {
+    if (!pdfBytes || !sourceName) return;
+    setManualScaleDenom(undefined);
+    setCustomScaleInput('');
+    await parseBuffer(pdfBytes, sourceName, {
+      pageNumber: selectedPage ?? intent?.selectedPage
+    });
+  };
+
   const handleConfirm = () => {
     if (!intent || intent.blockers.length > 0 || intent.bodies.length === 0) return;
     const imported = importEnvelopeIntent(intent);
@@ -92,10 +144,20 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
     onClose();
   };
 
+  const activePageInfo =
+    intent?.pages?.find((p) => p.page === intent.selectedPage) ?? null;
+  const nonScaleBlockers =
+    intent?.blockers.filter((b) => b !== 'missing scale') ?? [];
+  const isMissingScale = Boolean(intent && intent.blockers.includes('missing scale'));
+  const hasRedBlockers = nonScaleBlockers.length > 0;
+  const customDenomParsed = Number(customScaleInput.trim());
+  const isCustomValid = Number.isFinite(customDenomParsed) && customDenomParsed > 0;
+
   const canConfirm = Boolean(
     !isReading &&
       !readError &&
       intent &&
+      intent.scale &&
       intent.blockers.length === 0 &&
       intent.bodies.length > 0
   );
@@ -165,7 +227,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
         <div className="p-5 overflow-y-auto space-y-5 flex-1 text-xs">
           {isReading && (
             <div className="py-10 text-center text-slate-400">
-              Reading page 1 vector text and lines...
+              Reading vector text and lines...
             </div>
           )}
 
@@ -183,25 +245,157 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
             <div className="py-8 px-4 border border-dashed border-slate-800 rounded-xl text-center space-y-2">
               <div className="text-sm font-semibold text-slate-200">No plan loaded</div>
               <p className="text-xs text-slate-400 max-w-md mx-auto">
-                Upload a vector architectural roof plan PDF or load the committed R01 fixture to inspect scale, outline geometry, edge modes, and flashing hints before importing.
+                Upload a vector architectural roof plan PDF or load the committed R01 fixture to inspect pages, scale, outline geometry, edge modes, and flashing hints before importing.
               </p>
             </div>
           )}
 
           {!isReading && intent && (
             <>
-              {/* Blockers Banner (Red) */}
-              {intent.blockers.length > 0 && (
-                <div className="p-3.5 rounded-xl bg-rose-950/75 border border-rose-500 text-rose-100 space-y-1.5">
+              {/* Page Picker (lists every page with its extracted title text) */}
+              {intent.pages && intent.pages.length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] text-slate-400">
+                    <span>
+                      Pages ({intent.pageCount ?? intent.pages.length}) — click to switch sheet
+                    </span>
+                    <span className="font-mono tabular-nums text-slate-300">
+                      Reading Page {intent.selectedPage ?? 1}
+                    </span>
+                  </div>
+                  <div className="max-h-36 overflow-y-auto divide-y divide-slate-800 border border-slate-800 rounded-xl bg-slate-950/60">
+                    {intent.pages.map((p) => {
+                      const isActive = p.page === (intent.selectedPage ?? 1);
+                      return (
+                        <button
+                          key={p.page}
+                          type="button"
+                          onClick={() => handleSelectPage(p.page)}
+                          className={`w-full px-3 py-2 text-left flex items-center justify-between gap-3 transition-colors cursor-pointer ${
+                            isActive
+                              ? 'bg-sky-950/60 text-white'
+                              : 'hover:bg-slate-800/60 text-slate-300'
+                          }`}
+                        >
+                          <div className="min-w-0 flex items-center gap-2.5">
+                            <span className="font-mono tabular-nums text-[11px] font-semibold text-sky-400 shrink-0">
+                              Page {p.page}
+                            </span>
+                            <span className="truncate font-medium">{p.title}</span>
+                          </div>
+                          <span className="text-[11px] font-mono shrink-0 text-slate-400">
+                            {p.role}
+                            {isActive ? ' · active' : ''}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Missing Scale Required Field (no red wall) */}
+              {isMissingScale && (
+                <div className="p-4 rounded-xl bg-slate-950/80 border border-amber-500/60 text-slate-100 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-amber-300">Scale not found</span>
+                    <span className="text-[11px] font-mono text-amber-400 uppercase">
+                      Required
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {PRESET_SCALES.map((denom) => (
+                      <button
+                        key={denom}
+                        type="button"
+                        onClick={() => handleApplyManualScale(denom)}
+                        className={`px-3 py-1.5 rounded-lg border font-mono tabular-nums text-xs font-semibold cursor-pointer transition-colors ${
+                          manualScaleDenom === denom
+                            ? 'bg-sky-600 border-sky-400 text-white'
+                            : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                        }`}
+                      >
+                        1:{denom}
+                      </button>
+                    ))}
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono text-slate-400">1:</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        placeholder="Custom"
+                        value={customScaleInput}
+                        onChange={(e) => setCustomScaleInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && isCustomValid) {
+                            handleApplyManualScale(customDenomParsed);
+                          }
+                        }}
+                        aria-label="Custom scale denominator"
+                        className="w-20 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white font-mono tabular-nums text-xs focus:outline-none focus:border-sky-500"
+                      />
+                      <button
+                        type="button"
+                        disabled={!isCustomValid}
+                        onClick={() => handleApplyManualScale(customDenomParsed)}
+                        className="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:bg-slate-800 disabled:text-slate-500 text-white text-xs font-semibold cursor-pointer disabled:cursor-not-allowed transition-colors"
+                      >
+                        Set
+                      </button>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Read Page {intent.selectedPage ?? 1} of {intent.pageCount ?? 1}
+                    {activePageInfo ? ` (${activePageInfo.title})` : ''}. {GUIDANCE_COPY}
+                  </p>
+                </div>
+              )}
+
+              {/* Non-Scale Blockers Banner (Red) */}
+              {hasRedBlockers && (
+                <div className="p-3.5 rounded-xl bg-rose-950/75 border border-rose-500 text-rose-100 space-y-2">
                   <div className="flex items-center gap-2 font-semibold text-rose-200">
                     <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                    <span>Import blocked ({intent.blockers.length})</span>
+                    <span>Import blocked ({nonScaleBlockers.length})</span>
                   </div>
                   <ul className="list-disc list-inside space-y-0.5 text-rose-200">
-                    {intent.blockers.map((blocker) => (
+                    {nonScaleBlockers.map((blocker) => (
                       <li key={blocker}>{blocker}</li>
                     ))}
                   </ul>
+                  <p className="text-[11px] text-rose-200/90 leading-relaxed pt-1 border-t border-rose-500/30">
+                    Read Page {intent.selectedPage ?? 1} of {intent.pageCount ?? 1}
+                    {activePageInfo ? ` (${activePageInfo.title})` : ''}. {GUIDANCE_COPY}
+                  </p>
+                  {intent.scaleSource === 'user' && (
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <span className="text-[11px] text-rose-200">Adjust scale:</span>
+                      {PRESET_SCALES.map((denom) => (
+                        <button
+                          key={denom}
+                          type="button"
+                          onClick={() => handleApplyManualScale(denom)}
+                          className={`px-2 py-1 rounded border font-mono tabular-nums text-[11px] cursor-pointer ${
+                            manualScaleDenom === denom
+                              ? 'bg-sky-600 border-sky-400 text-white'
+                              : 'bg-slate-900/70 border-rose-400/40 text-rose-100 hover:bg-slate-800'
+                          }`}
+                        >
+                          1:{denom}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={handleClearManualScale}
+                        className="px-2 py-1 rounded border border-rose-400/40 text-[11px] text-rose-200 hover:bg-rose-900/50 cursor-pointer"
+                      >
+                        Reset scale
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -210,8 +404,13 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                 <div>
                   <div className="text-[11px] text-slate-400">Scale</div>
                   <div className="text-sm font-mono tabular-nums font-semibold text-white mt-0.5">
-                    {intent.scale ?? 'Missing'}
+                    {intent.scale ?? 'Not found'}
                   </div>
+                  {intent.scaleSource && (
+                    <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                      scaleSource: {intent.scaleSource}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <div className="text-[11px] text-slate-400">Profile</div>
@@ -269,7 +468,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                             className="px-3 py-1.5 flex items-center justify-between text-xs"
                           >
                             <span className="text-slate-300">
-                              {EDGE_LABELS[idx] ?? `Edge ${idx + 1}`}
+                              {primaryBody.edges.length === 4 ? EDGE_LABELS[idx] : `Edge ${idx + 1}`}
                             </span>
                             <span className="font-mono tabular-nums text-white capitalize">
                               {edge.type}

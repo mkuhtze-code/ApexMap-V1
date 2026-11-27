@@ -2,7 +2,9 @@ import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type {
   EnvelopeIntent,
   EnvelopeIntentFlashingHint,
+  EnvelopeIntentPageInfo,
   TriageEdgeType,
+  TriagePageRole,
   TriagePoint2D,
   TriageVentedRidge,
   TriageWindZone
@@ -16,6 +18,7 @@ interface TextToken {
   yMm: number;
   widthMm: number;
   heightMm: number;
+  isRotated90: boolean;
 }
 
 interface TextLine {
@@ -85,13 +88,88 @@ function segLength(seg: VectorSegment): number {
   return Math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1);
 }
 
-function distToSegmentMm(pt: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }): number {
+function distToSegmentMm(
+  pt: { x: number; y: number },
+  a: { x: number; y: number },
+  b: { x: number; y: number }
+): number {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const len2 = dx * dx + dy * dy;
   if (len2 <= 1e-9) return Math.hypot(pt.x - a.x, pt.y - a.y);
   const t = Math.max(0, Math.min(1, ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / len2));
   return Math.hypot(pt.x - (a.x + t * dx), pt.y - (a.y + t * dy));
+}
+
+function isPointInPolygonMm(pt: TriagePoint2D, poly: TriagePoint2D[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x;
+    const yi = poly[i].y;
+    const xj = poly[j].x;
+    const yj = poly[j].y;
+    const intersect =
+      yi > pt.y !== yj > pt.y &&
+      pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function getLoopBounds(loop: TriagePoint2D[]): BoxRegion {
+  const xs = loop.map((p) => p.x);
+  const ys = loop.map((p) => p.y);
+  return {
+    minX: Math.min(...xs),
+    minY: Math.min(...ys),
+    maxX: Math.max(...xs),
+    maxY: Math.max(...ys)
+  };
+}
+
+function polygonSignedArea(poly: TriagePoint2D[]): number {
+  let area = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area / 2;
+}
+
+function simplifyCollinearLoop(poly: TriagePoint2D[], tolMm = 0.2): TriagePoint2D[] {
+  let pts = [...poly];
+  let changed = true;
+  while (changed && pts.length > 3) {
+    changed = false;
+    const nextPts: TriagePoint2D[] = [];
+    for (let i = 0; i < pts.length; i++) {
+      const prev = pts[(i - 1 + pts.length) % pts.length];
+      const cur = pts[i];
+      const next = pts[(i + 1) % pts.length];
+      const d = distToSegmentMm(cur, prev, next);
+      if (d <= tolMm && Math.hypot(next.x - prev.x, next.y - prev.y) > 0.2) {
+        changed = true;
+      } else {
+        nextPts.push(cur);
+      }
+    }
+    pts = nextPts;
+  }
+  return pts;
+}
+
+function rotateLoopToLowerLeft(poly: TriagePoint2D[]): TriagePoint2D[] {
+  if (poly.length === 0) return poly;
+  let bestIdx = 0;
+  for (let i = 1; i < poly.length; i++) {
+    const cur = poly[i];
+    const best = poly[bestIdx];
+    if (cur.y < best.y - 0.5 || (Math.abs(cur.y - best.y) <= 0.5 && cur.x < best.x)) {
+      bestIdx = i;
+    }
+  }
+  return [...poly.slice(bestIdx), ...poly.slice(0, bestIdx)];
 }
 
 function groupTextLines(tokens: TextToken[]): TextLine[] {
@@ -145,6 +223,292 @@ function groupTextLines(tokens: TextToken[]): TextLine[] {
     }
   }
   return splitLines;
+}
+
+/**
+ * Joins all text items sharing the same horizontal baseline (regardless of column spacing)
+ * and collapses split ratio characters such as "1" ":" "100" -> "1:100".
+ */
+function groupBaselineLines(tokens: TextToken[]): TextLine[] {
+  const sorted = [...tokens].sort((a, b) => b.yMm - a.yMm || a.xMm - b.xMm);
+  const rows: TextToken[][] = [];
+  for (const tok of sorted) {
+    const tol = Math.max(2.2, tok.heightMm * 0.55);
+    const existing = rows.find((row) => Math.abs(row[0].yMm - tok.yMm) <= tol);
+    if (existing) {
+      existing.push(tok);
+    } else {
+      rows.push([tok]);
+    }
+  }
+
+  return rows.map((row) => {
+    const ordered = [...row].sort((a, b) => a.xMm - b.xMm);
+    let combined = '';
+    let prevEndX: number | null = null;
+    for (const item of ordered) {
+      if (prevEndX !== null && item.xMm - prevEndX > 0.8) {
+        combined += ' ';
+      }
+      combined += item.text;
+      prevEndX = item.xMm + Math.max(item.widthMm, item.text.length * 1.4);
+    }
+    const normalized = combined
+      .replace(/\s+/g, ' ')
+      .replace(/\b1\s*:\s*(\d{1,4})\b/g, '1:$1')
+      .trim();
+    return {
+      text: normalized,
+      xMinMm: Math.min(...ordered.map((t) => t.xMm)),
+      xMaxMm: Math.max(...ordered.map((t) => t.xMm + Math.max(t.widthMm, t.text.length * 1.4))),
+      yMm: ordered.reduce((s, t) => s + t.yMm, 0) / ordered.length,
+      tokens: ordered
+    };
+  });
+}
+
+function classifyRoleFromText(titleText: string): TriagePageRole {
+  const t = titleText.trim();
+  if (!t) return 'other';
+  if (/\bdetails?\b/i.test(t) && !/roof\s*plan/i.test(t)) return 'other';
+  if (/\bsite\b/i.test(t)) return 'site';
+  if (/\broof\b/i.test(t)) return 'roof';
+  if (/\bfloor\b/i.test(t)) return 'floor';
+  if (/\belevation/i.test(t)) return 'elevation';
+  return 'other';
+}
+
+function extractPageTitle(
+  splitLines: TextLine[],
+  baselineLines: TextLine[],
+  pageNumber: number
+): string {
+  const candidates = [...splitLines, ...baselineLines];
+  const explicitTitles: string[] = [];
+  for (const line of candidates) {
+    const sheetMatch = line.text.match(
+      /^(?:Sheet|Drawing(?:\s+Title)?|Dwg(?:\s+Title)?|Title)\s*[:\-]\s*(.+)$/i
+    );
+    if (sheetMatch) {
+      const val = sheetMatch[1].trim();
+      if (val && !/NOT FOR CONSTRUCTION/i.test(val)) {
+        explicitTitles.push(val);
+      }
+    }
+  }
+
+  const roleExplicit = explicitTitles.find((t) => classifyRoleFromText(t) !== 'other' || /\bdetails?\b/i.test(t));
+  if (roleExplicit) return roleExplicit;
+
+  for (const line of splitLines) {
+    if (
+      line.text.length <= 90 &&
+      /(?:roof\s*plan|site\s*plan|floor\s*plan|elevations?|details?|sections?)/i.test(line.text) &&
+      !/^Scale bar/i.test(line.text)
+    ) {
+      return explicitTitles[0] && !/\b(?:site|floor|roof|elevation|detail)\b/i.test(explicitTitles[0])
+        ? `${explicitTitles[0]} — ${line.text}`
+        : line.text;
+    }
+  }
+
+  if (explicitTitles.length > 0) return explicitTitles[0];
+
+  let bestByHeight: { text: string; height: number } | null = null;
+  for (const line of splitLines) {
+    if (/TEST PLAN|NOT FOR CONSTRUCTION|GENERAL NOTES/i.test(line.text)) continue;
+    if (!/[A-Za-z]{3,}/.test(line.text)) continue;
+    const maxH = Math.max(...line.tokens.map((t) => t.heightMm));
+    if (!bestByHeight || maxH > bestByHeight.height) {
+      bestByHeight = { text: line.text, height: maxH };
+    }
+  }
+  if (bestByHeight && bestByHeight.height >= 3.2) {
+    return bestByHeight.text;
+  }
+
+  const firstText = splitLines.find(
+    (l) => l.text.length >= 4 && /[A-Za-z]{3,}/.test(l.text) && !/NOT FOR CONSTRUCTION/i.test(l.text)
+  );
+  return firstText ? firstText.text : `Page ${pageNumber}`;
+}
+
+function detectIsoSheetCode(pageWidthMm: number, pageHeightMm: number): string | null {
+  const longSide = Math.max(pageWidthMm, pageHeightMm);
+  const shortSide = Math.min(pageWidthMm, pageHeightMm);
+  const sizes: Array<{ code: string; w: number; h: number }> = [
+    { code: 'A0', w: 1189, h: 841 },
+    { code: 'A1', w: 841, h: 594 },
+    { code: 'A2', w: 594, h: 420 },
+    { code: 'A3', w: 420, h: 297 },
+    { code: 'A4', w: 297, h: 210 }
+  ];
+  for (const s of sizes) {
+    if (Math.abs(longSide - s.w) <= 25 && Math.abs(shortSide - s.h) <= 25) {
+      return s.code;
+    }
+  }
+  return null;
+}
+
+function extractScaleCandidates(
+  baselineLines: TextLine[],
+  splitLines: TextLine[],
+  pageWidthMm: number,
+  pageHeightMm: number
+): number[] {
+  const normalizeRatio = (s: string) => s.replace(/\b1\s*:\s*(\d{1,4})\b/g, '1:$1');
+  const searchLines = [
+    ...baselineLines.map((l) => normalizeRatio(l.text)),
+    ...splitLines.map((l) => normalizeRatio(l.text))
+  ];
+  const fullNormalized = searchLines.join('\n');
+  const candidates: number[] = [];
+  const pushDenom = (denom: number) => {
+    if (Number.isFinite(denom) && denom > 0 && !candidates.includes(denom)) {
+      candidates.push(denom);
+    }
+  };
+
+  // 1. Sheet-size qualified scale matching current page dimensions (e.g. "1:100 @ A3")
+  const sheetCode = detectIsoSheetCode(pageWidthMm, pageHeightMm);
+  if (sheetCode) {
+    const pageSizeRegex = new RegExp(`\\b1:(\\d{1,4})\\s*(?:@|at)\\s*${sheetCode}\\b`, 'ig');
+    for (const m of fullNormalized.matchAll(pageSizeRegex)) {
+      pushDenom(Number(m[1]));
+    }
+  }
+
+  // 2. Slash-separated multi-scale expressions e.g. "1:50 / 1:100" or "SCALE 1:50 / 1:100"
+  for (const text of searchLines) {
+    const slashMatches = [...text.matchAll(/\b1:(\d{1,4})\s*\/\s*1:(\d{1,4})\b/g)];
+    for (const m of slashMatches) {
+      pushDenom(Number(m[1]));
+      pushDenom(Number(m[2]));
+    }
+  }
+
+  // 3. Explicit SCALE keyword + ratio on same baseline (e.g. "SCALE 1:100", "Scale: 1:100")
+  for (const text of searchLines) {
+    const m =
+      text.match(/\bSCALE\b(?:\s*[:=])?\s*1:(\d{1,4})\b/i) ??
+      text.match(/\bSCALE\b[^\n]*\b1:(\d{1,4})\b/i);
+    if (m) {
+      pushDenom(Number(m[1]));
+    }
+  }
+
+  // 4. Ratio with paper size qualifier ("1:100 @ A1", "1:100 at A3")
+  for (const m of fullNormalized.matchAll(/\b1:(\d{1,4})\s*(?:@|at)\s*A[0-4]\b/ig)) {
+    pushDenom(Number(m[1]));
+  }
+
+  // 5. Scale bar / explanation text
+  for (const m of fullNormalized.matchAll(
+    /\b1:(\d{1,4})\b(?=[^\n]*(?:is drawn|mm on the page|scale))/ig
+  )) {
+    pushDenom(Number(m[1]));
+  }
+
+  // 6. Vertical title-block pair: "SCALE" directly above "1:100" (or "1:50 / 1:100")
+  const scaleHeaderLines = splitLines.filter((l) => /\bSCALE\b/i.test(l.text));
+  for (const hdr of scaleHeaderLines) {
+    const below = splitLines.find((l) => {
+      const dy = hdr.yMm - l.yMm;
+      const dxOverlap = l.xMaxMm >= hdr.xMinMm - 25 && l.xMinMm <= hdr.xMaxMm + 25;
+      return dy > 0.5 && dy <= 16 && dxOverlap && /\b1:\d{1,4}\b/.test(normalizeRatio(l.text));
+    });
+    if (below) {
+      for (const m of normalizeRatio(below.text).matchAll(/\b1:(\d{1,4})\b/g)) {
+        pushDenom(Number(m[1]));
+      }
+    }
+  }
+
+  // 7. Standalone standard architectural metric scale ratio (excludes e.g. 1:12 pitch)
+  for (const m of fullNormalized.matchAll(
+    /\b1:(10|20|25|50|75|100|125|150|200|250|300|400|500|1000)\b/g
+  )) {
+    pushDenom(Number(m[1]));
+  }
+
+  return candidates;
+}
+
+function extractWindZone(text: string): TriageWindZone | null {
+  const m = text.match(
+    /Wind\s*(?:zone|speed)?\s*[:=\-]?\s*(Extra\s*High|Very\s*High|High|Medium|Low|EH|VH|H|M|L)\b(?:\s*\((EH|VH|H|M|L)\))?/i
+  );
+  if (!m) {
+    const paren = text.match(/Wind\s*(?:zone)?[^\n]*\((EH|VH|H|M|L)\)/i);
+    if (paren) return paren[1].toUpperCase() as TriageWindZone;
+    return null;
+  }
+  const raw = (m[2] || m[1]).toUpperCase().replace(/\s+/g, ' ').trim();
+  if (raw === 'EXTRA HIGH' || raw === 'EH') return 'EH';
+  if (raw === 'VERY HIGH' || raw === 'VH') return 'VH';
+  if (raw === 'HIGH' || raw === 'H') return 'H';
+  if (raw === 'MEDIUM' || raw === 'M') return 'M';
+  if (raw === 'LOW' || raw === 'L') return 'L';
+  return null;
+}
+
+function extractPitchDeg(
+  splitLines: TextLine[],
+  baselineLines: TextLine[],
+  role: TriagePageRole
+): number | null {
+  const isIgnoredBoundaryRuleLine = (text: string) =>
+    /\b(?:HRB|Unitary\s+Plan|recession|height\s+in\s+relation\s+to\s+boundary)\b/i.test(text);
+
+  const safeLines = [...baselineLines, ...splitLines].filter(
+    (l) => !isIgnoredBoundaryRuleLine(l.text)
+  );
+
+  // 1. Explicit pitch note ("Pitch: 22.5 degrees", "Roof pitch 15°")
+  for (const l of safeLines) {
+    const m =
+      l.text.match(/\b(?:roof\s+)?pitch\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(?:degrees?|deg|°)/i) ??
+      l.text.match(/\b(\d+(?:\.\d+)?)\s*(?:degrees?|deg|°)\s*(?:roof\s+)?pitch\b/i);
+    if (m) {
+      const val = Number(m[1]);
+      if (Number.isFinite(val) && val > 0 && val < 85) return val;
+    }
+  }
+
+  // 2. Roof-plan fall arrow label (only on roof pages)
+  if (role === 'roof') {
+    for (const l of safeLines) {
+      if (/(?:north|wind|scale|hrb|boundary|recession|unitary|detail)/i.test(l.text)) continue;
+      // Match short fall-arrow annotation like "22.5°" or "15.0°"
+      const m = l.text.match(/(?:^|\s)(\d+(?:\.\d+)?)\s*°(?:\s|$)/);
+      if (m && l.text.length <= 24) {
+        const val = Number(m[1]);
+        if (Number.isFinite(val) && val > 0 && val < 85) return val;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractEaveHeightM(splitLines: TextLine[], baselineLines: TextLine[]): number | null {
+  const allLines = [...splitLines, ...baselineLines];
+  for (const l of allLines) {
+    if (!/\b(?:eave|eaves|fascia)\b/i.test(l.text)) continue;
+    if (/\b(?:HRB|recession|boundary|unitary)\b/i.test(l.text)) continue;
+    const mMetres = l.text.match(/(\d+(?:\.\d+)?)\s*m\b/i);
+    if (mMetres) {
+      const val = Number(mMetres[1]);
+      if (Number.isFinite(val) && val > 0 && val < 30) return val;
+    }
+    const mMm = l.text.match(/(\d{3,5})\s*mm\b/i);
+    if (mMm) {
+      const val = Number(mMm[1]) / 1000;
+      if (Number.isFinite(val) && val > 0 && val < 30) return val;
+    }
+  }
+  return null;
 }
 
 function extractVectorSegments(ops: { fnArray: number[]; argsArray: any[] }): VectorSegment[] {
@@ -392,6 +756,205 @@ function findClosedRectangles(segments: VectorSegment[], tol = 0.5): BoxRegion[]
   return boxes;
 }
 
+/**
+ * Extracts closed external perimeter loops (supporting rectangles, L/T/U shapes, and arbitrary polygons)
+ * from planar vector segments by pruning dangling degree<=1 edges, splitting T-junctions,
+ * and tracing the outer boundary face of each connected component.
+ */
+function extractClosedExternalLoops(
+  segments: VectorSegment[],
+  pageWidthMm: number,
+  pageHeightMm: number,
+  snapEps = 0.45
+): TriagePoint2D[][] {
+  if (segments.length < 3) return [];
+
+  const verts: TriagePoint2D[] = [];
+  const getOrAddVert = (x: number, y: number): number => {
+    for (let i = 0; i < verts.length; i++) {
+      if (Math.hypot(verts[i].x - x, verts[i].y - y) <= snapEps) {
+        return i;
+      }
+    }
+    verts.push({ x, y });
+    return verts.length - 1;
+  };
+
+  const rawEdges: Array<[number, number]> = [];
+  for (const seg of segments) {
+    if (segLength(seg) < 0.8) continue;
+    const u = getOrAddVert(seg.x1, seg.y1);
+    const v = getOrAddVert(seg.x2, seg.y2);
+    if (u !== v) rawEdges.push([u, v]);
+  }
+
+  // Split edges at any vertex lying on the interior of an edge (handles interior wall T-junctions)
+  const splitEdges: Array<[number, number]> = [];
+  for (const [u, v] of rawEdges) {
+    const a = verts[u];
+    const b = verts[v];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 <= 1e-6) continue;
+
+    const interiorHits: Array<{ idx: number; t: number }> = [];
+    for (let k = 0; k < verts.length; k++) {
+      if (k === u || k === v) continue;
+      const p = verts[k];
+      const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+      if (t <= 0.005 || t >= 0.995) continue;
+      const projX = a.x + t * dx;
+      const projY = a.y + t * dy;
+      if (Math.hypot(p.x - projX, p.y - projY) <= snapEps) {
+        interiorHits.push({ idx: k, t });
+      }
+    }
+
+    if (interiorHits.length === 0) {
+      splitEdges.push([u, v]);
+    } else {
+      interiorHits.sort((h1, h2) => h1.t - h2.t);
+      let prevIdx = u;
+      for (const hit of interiorHits) {
+        if (hit.idx !== prevIdx) {
+          splitEdges.push([prevIdx, hit.idx]);
+          prevIdx = hit.idx;
+        }
+      }
+      if (v !== prevIdx) splitEdges.push([prevIdx, v]);
+    }
+  }
+
+  // Deduplicate undirected edges
+  const adj = new Map<number, Set<number>>();
+  const addUndirected = (u: number, v: number) => {
+    if (u === v) return;
+    if (!adj.has(u)) adj.set(u, new Set());
+    if (!adj.has(v)) adj.set(v, new Set());
+    adj.get(u)!.add(v);
+    adj.get(v)!.add(u);
+  };
+  for (const [u, v] of splitEdges) addUndirected(u, v);
+
+  // Iteratively prune degree <= 1 vertices (removes witness lines, dimension ticks, dashed ridges)
+  const queue: number[] = [];
+  for (const [v, nbrs] of adj.entries()) {
+    if (nbrs.size <= 1) queue.push(v);
+  }
+  while (queue.length > 0) {
+    const v = queue.pop()!;
+    const nbrs = adj.get(v);
+    if (!nbrs) continue;
+    for (const n of nbrs) {
+      const nSet = adj.get(n);
+      if (nSet) {
+        nSet.delete(v);
+        if (nSet.size <= 1) queue.push(n);
+      }
+    }
+    adj.delete(v);
+  }
+
+  if (adj.size < 3) return [];
+
+  // Partition into connected components
+  const visitedComp = new Set<number>();
+  const components: number[][] = [];
+  for (const startV of adj.keys()) {
+    if (visitedComp.has(startV)) continue;
+    const comp: number[] = [];
+    const stack = [startV];
+    visitedComp.add(startV);
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      comp.push(cur);
+      for (const nxt of adj.get(cur) || []) {
+        if (!visitedComp.has(nxt)) {
+          visitedComp.add(nxt);
+          stack.push(nxt);
+        }
+      }
+    }
+    if (comp.length >= 3) components.push(comp);
+  }
+
+  const loops: TriagePoint2D[][] = [];
+
+  for (const comp of components) {
+    const compSet = new Set(comp);
+    // Build sorted CCW outgoing edge lists per vertex
+    const sortedNbrs = new Map<number, number[]>();
+    for (const u of comp) {
+      const nbrs = [...(adj.get(u) || [])].filter((v) => compSet.has(v));
+      nbrs.sort(
+        (a, b) =>
+          Math.atan2(verts[a].y - verts[u].y, verts[a].x - verts[u].x) -
+          Math.atan2(verts[b].y - verts[u].y, verts[b].x - verts[u].x)
+      );
+      sortedNbrs.set(u, nbrs);
+    }
+
+    const visitedHalf = new Set<string>();
+    const edgeKey = (u: number, v: number) => `${u}->${v}`;
+
+    let bestOuterLoop: TriagePoint2D[] | null = null;
+    let bestOuterAbsArea = 0;
+
+    for (const u of comp) {
+      for (const v of sortedNbrs.get(u) || []) {
+        if (visitedHalf.has(edgeKey(u, v))) continue;
+        const cycleVerts: TriagePoint2D[] = [];
+        let curU = u;
+        let curV = v;
+        let safety = 0;
+        let closed = false;
+
+        while (safety++ < comp.length * 4 + 10) {
+          const key = edgeKey(curU, curV);
+          if (visitedHalf.has(key)) {
+            if (curU === u && curV === v && cycleVerts.length >= 3) closed = true;
+            break;
+          }
+          visitedHalf.add(key);
+          cycleVerts.push(verts[curU]);
+
+          const nbrsAtV = sortedNbrs.get(curV) || [];
+          if (nbrsAtV.length === 0) break;
+          const revIdx = nbrsAtV.indexOf(curU);
+          if (revIdx === -1) break;
+          const nextIdx = (revIdx - 1 + nbrsAtV.length) % nbrsAtV.length;
+          curU = curV;
+          curV = nbrsAtV[nextIdx];
+        }
+
+        if (!closed || cycleVerts.length < 3) continue;
+        const sArea = polygonSignedArea(cycleVerts);
+        // Outer face of a planar component has negative signed area (CW traversal)
+        if (sArea < -1 && Math.abs(sArea) > bestOuterAbsArea) {
+          bestOuterAbsArea = Math.abs(sArea);
+          bestOuterLoop = [...cycleVerts].reverse();
+        }
+      }
+    }
+
+    if (bestOuterLoop && bestOuterLoop.length >= 3) {
+      const simplified = simplifyCollinearLoop(bestOuterLoop, 0.25);
+      if (simplified.length >= 3) {
+        const box = getLoopBounds(simplified);
+        const wMm = box.maxX - box.minX;
+        const hMm = box.maxY - box.minY;
+        const isSheetFrame = wMm > pageWidthMm * 0.78 && hMm > pageHeightMm * 0.78;
+        if (!isSheetFrame && wMm >= 8 && hMm >= 8) {
+          loops.push(rotateLoopToLowerLeft(simplified));
+        }
+      }
+    }
+  }
+
+  return loops.sort((a, b) => Math.abs(polygonSignedArea(b)) - Math.abs(polygonSignedArea(a)));
+}
+
 function findEnclosingBoxForText(
   allRects: BoxRegion[],
   lines: TextLine[],
@@ -426,13 +989,267 @@ function findEnclosingBoxForText(
   };
 }
 
+interface DimensionToken {
+  valM: number;
+  xMm: number;
+  yMm: number;
+  isRotated90: boolean;
+}
+
+function extractDimensionTokens(
+  tokens: TextToken[],
+  baselineLines: TextLine[],
+  titleBlockBox: BoxRegion | null,
+  detailBox: BoxRegion | null,
+  scaleBarBox: BoxRegion | null
+): DimensionToken[] {
+  const isIgnoredLine = (text: string) =>
+    /\b(?:HRB|Unitary\s+Plan|recession|height\s+in\s+relation\s+to\s+boundary|Eave\s+height|Pitch|Scale\s*bar|Wind\s*zone|Project:|Sheet:|Drawing:|Title:)\b/i.test(
+      text
+    );
+
+  // Build quick lookup from token object -> containing baseline line & ordered neighbors
+  const lineByToken = new Map<TextToken, TextLine>();
+  for (const line of baselineLines) {
+    for (const tok of line.tokens) {
+      lineByToken.set(tok, line);
+    }
+  }
+
+  const results: DimensionToken[] = [];
+
+  for (const tok of tokens) {
+    if (titleBlockBox && pointInBox(tok.xMm, tok.yMm, titleBlockBox)) continue;
+    if (detailBox && pointInBox(tok.xMm, tok.yMm, detailBox)) continue;
+    if (scaleBarBox && pointInBox(tok.xMm, tok.yMm, scaleBarBox)) continue;
+
+    const line = lineByToken.get(tok);
+    if (line && isIgnoredLine(line.text)) continue;
+
+    const raw = tok.text.trim();
+    // Skip explicit area tokens like "142.5m²" or "142.5m2" or degree tokens "22.5°"
+    if (/(?:m²|m2|sqm|sq\.?m|°|deg)$/i.test(raw)) continue;
+
+    // Parse length: (\d+\.\d+) -> metres, OR (\d{4,6}) -> millimetres
+    let valM: number | null = null;
+    const metreMatch = raw.match(/^(\d+\.\d+)(?:m)?$/i);
+    if (metreMatch) {
+      valM = Number(metreMatch[1]);
+    } else {
+      const mmMatch = raw.match(/^(\d{4,6})(?:mm)?$/i);
+      if (mmMatch) {
+        valM = Number(mmMatch[1]) / 1000;
+      }
+    }
+    if (valM === null || !Number.isFinite(valM) || valM <= 0) continue;
+
+    // Check immediate baseline neighbors to ignore m² values, DP numbers, and lot numbers
+    if (line) {
+      const ordered = [...line.tokens].sort((a, b) => a.xMm - b.xMm);
+      const idx = ordered.indexOf(tok);
+      const prev = idx > 0 ? ordered[idx - 1] : null;
+      const next = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
+
+      if (
+        prev &&
+        tok.xMm - (prev.xMm + Math.max(prev.widthMm, prev.text.length * 1.4)) <= 15 &&
+        /(?:D\.?P\.?|LOT|SEC(?:TION)?|CT|RL|FFL|FSL|NO\.?|#)$/i.test(prev.text.trim())
+      ) {
+        continue;
+      }
+      if (
+        next &&
+        next.xMm - (tok.xMm + Math.max(tok.widthMm, tok.text.length * 1.4)) <= 15 &&
+        /^(?:m²|m2|sqm|sq\.?m|°|deg|ha)$/i.test(next.text.trim())
+      ) {
+        continue;
+      }
+      if (/\b(?:LOT|D\.?P\.?)\b/i.test(line.text)) {
+        // Ignore lot/DP numbers on lines labelled Lot / DP unless clearly separated (>25mm away)
+        const nearLotOrDp = line.tokens.some(
+          (other) =>
+            other !== tok &&
+            /\b(?:LOT|D\.?P\.?)\b/i.test(other.text) &&
+            Math.abs(other.xMm - tok.xMm) <= 25
+        );
+        if (nearLotOrDp) continue;
+      }
+    }
+
+    results.push({
+      valM,
+      xMm: tok.xMm + tok.widthMm / 2,
+      yMm: tok.yMm + tok.heightMm / 2,
+      isRotated90: tok.isRotated90
+    });
+  }
+
+  return results;
+}
+
+function computeOverallDimensionChains(
+  dimTokens: DimensionToken[],
+  drawingSegments: VectorSegment[],
+  referenceBounds: BoxRegion | null
+): {
+  overallWidthM: number | null;
+  overallHeightM: number | null;
+  horizChainsM: number[];
+  vertChainsM: number[];
+} {
+  if (dimTokens.length === 0) {
+    return { overallWidthM: null, overallHeightM: null, horizChainsM: [], vertChainsM: [] };
+  }
+
+  const horizSegs = drawingSegments.filter((s) => Math.abs(s.y2 - s.y1) <= 1.0 && Math.abs(s.x2 - s.x1) >= 4);
+  const vertSegs = drawingSegments.filter((s) => Math.abs(s.x2 - s.x1) <= 1.0 && Math.abs(s.y2 - s.y1) >= 4);
+
+  const horizTokens: DimensionToken[] = [];
+  const vertTokens: DimensionToken[] = [];
+
+  for (const dt of dimTokens) {
+    if (dt.isRotated90) {
+      vertTokens.push(dt);
+      continue;
+    }
+    const nearHoriz = horizSegs.some(
+      (s) => distToSegmentMm({ x: dt.xMm, y: dt.yMm }, { x: s.x1, y: s.y1 }, { x: s.x2, y: s.y2 }) <= 14
+    );
+    const nearVert = vertSegs.some(
+      (s) => distToSegmentMm({ x: dt.xMm, y: dt.yMm }, { x: s.x1, y: s.y1 }, { x: s.x2, y: s.y2 }) <= 14
+    );
+    if (nearVert && !nearHoriz) {
+      vertTokens.push(dt);
+    } else if (nearHoriz && !nearVert) {
+      horizTokens.push(dt);
+    } else if (referenceBounds) {
+      const outsideLeftRight =
+        (dt.xMm < referenceBounds.minX - 1 || dt.xMm > referenceBounds.maxX + 1) &&
+        dt.yMm >= referenceBounds.minY - 5 &&
+        dt.yMm <= referenceBounds.maxY + 5;
+      const outsideTopBottom =
+        (dt.yMm < referenceBounds.minY - 1 || dt.yMm > referenceBounds.maxY + 1) &&
+        dt.xMm >= referenceBounds.minX - 5 &&
+        dt.xMm <= referenceBounds.maxX + 5;
+      if (outsideLeftRight && !outsideTopBottom) {
+        vertTokens.push(dt);
+      } else {
+        horizTokens.push(dt);
+      }
+    } else {
+      horizTokens.push(dt);
+    }
+  }
+
+  const groupChains = (items: DimensionToken[], axis: 'y' | 'x'): number[] => {
+    if (items.length === 0) return [];
+    const sorted = [...items].sort((a, b) => (axis === 'y' ? a.yMm - b.yMm : a.xMm - b.xMm));
+    const groups: DimensionToken[][] = [];
+    for (const it of sorted) {
+      const coord = axis === 'y' ? it.yMm : it.xMm;
+      const grp = groups.find(
+        (g) => Math.abs((axis === 'y' ? g[0].yMm : g[0].xMm) - coord) <= 4.8
+      );
+      if (grp) grp.push(it);
+      else groups.push([it]);
+    }
+    return groups.map((g) => roundM(g.reduce((sum, item) => sum + item.valM, 0)));
+  };
+
+  const horizChainsM = groupChains(horizTokens, 'y');
+  const vertChainsM = groupChains(vertTokens, 'x');
+  const overallWidthM = horizChainsM.length > 0 ? Math.max(...horizChainsM) : null;
+  const overallHeightM = vertChainsM.length > 0 ? Math.max(...vertChainsM) : null;
+
+  return { overallWidthM, overallHeightM, horizChainsM, vertChainsM };
+}
+
 export interface ReadVectorPdfOptions {
   workerSrc?: string;
   fixtureId?: string;
+  pageNumber?: number;
+  manualScaleDenom?: number;
+}
+
+interface ParsedPageText {
+  pageNumber: number;
+  page: any;
+  pageWidthMm: number;
+  pageHeightMm: number;
+  tokens: TextToken[];
+  lines: TextLine[];
+  baselineLines: TextLine[];
+  fullText: string;
+  baselineFullText: string;
+  title: string;
+  role: TriagePageRole;
+  isRoofPlan: boolean;
+  isDetailsSheet: boolean;
+}
+
+async function readPageTextSummary(doc: any, pageNumber: number): Promise<ParsedPageText> {
+  const page = await doc.getPage(pageNumber);
+  const viewport = page.getViewport({ scale: 1 });
+  const pageWidthMm = viewport.width * MM_PER_PT;
+  const pageHeightMm = viewport.height * MM_PER_PT;
+
+  const textContent = await page.getTextContent();
+  const tokens: TextToken[] = [];
+  for (const item of textContent.items) {
+    if (!('str' in item)) continue;
+    const raw = item.str;
+    if (!raw || !raw.trim()) continue;
+    const t = item.transform;
+    const isRotated90 = Math.abs(t[1]) > Math.abs(t[0]) * 1.5;
+    tokens.push({
+      text: raw.trim(),
+      xMm: t[4] * MM_PER_PT,
+      yMm: t[5] * MM_PER_PT,
+      widthMm: (item.width || 0) * MM_PER_PT,
+      heightMm: Math.hypot(t[2], t[3]) * MM_PER_PT || (item.height || 0) * MM_PER_PT,
+      isRotated90
+    });
+  }
+
+  const lines = groupTextLines(tokens);
+  const baselineLines = groupBaselineLines(tokens);
+  const fullText = lines.map((l) => l.text).join('\n');
+  const baselineFullText = baselineLines.map((l) => l.text).join('\n');
+  const title = extractPageTitle(lines, baselineLines, pageNumber);
+  const role = classifyRoleFromText(title);
+  const isRoofPlan = role === 'roof';
+  const isDetailsSheet = role === 'other' && /\bdetails?\b/i.test(title);
+
+  return {
+    pageNumber,
+    page,
+    pageWidthMm,
+    pageHeightMm,
+    tokens,
+    lines,
+    baselineLines,
+    fullText,
+    baselineFullText,
+    title,
+    role,
+    isRoofPlan,
+    isDetailsSheet
+  };
+}
+
+function chooseDefaultPage(summaries: ParsedPageText[]): ParsedPageText {
+  return (
+    summaries.find((p) => p.role === 'roof') ??
+    summaries.find((p) => p.role === 'floor') ??
+    summaries.find((p) => p.role === 'elevation') ??
+    summaries[0]
+  );
 }
 
 /**
- * Pure vector PDF triage reader (page 1 text items + vector line segments).
+ * Pure vector PDF triage reader.
+ * Classifies every page role from its title, prefers roof -> floor, matches closed external loops
+ * against overall horizontal/vertical dimension chains, and enforces boundary rules.
  * Never renders to pixels, never calls a vision model, never calls ApexMap geometry builders.
  */
 export async function readVectorPdf(
@@ -450,44 +1267,49 @@ export async function readVectorPdf(
     useWorkerFetch: false
   });
   const doc = await loadingTask.promise;
-  const page = await doc.getPage(1);
-  const viewport = page.getViewport({ scale: 1 });
-  const pageWidthMm = viewport.width * MM_PER_PT;
-  const pageHeightMm = viewport.height * MM_PER_PT;
+  const pageCount = Math.max(1, doc.numPages);
 
-  const textContent = await page.getTextContent();
-  const tokens: TextToken[] = [];
-  for (const item of textContent.items) {
-    if (!('str' in item)) continue;
-    const raw = item.str;
-    if (!raw || !raw.trim()) continue;
-    const t = item.transform;
-    tokens.push({
-      text: raw.trim(),
-      xMm: t[4] * MM_PER_PT,
-      yMm: t[5] * MM_PER_PT,
-      widthMm: (item.width || 0) * MM_PER_PT,
-      heightMm: Math.hypot(t[2], t[3]) * MM_PER_PT || (item.height || 0) * MM_PER_PT
-    });
+  const pageSummaries: ParsedPageText[] = [];
+  for (let p = 1; p <= pageCount; p++) {
+    pageSummaries.push(await readPageTextSummary(doc, p));
   }
 
-  const lines = groupTextLines(tokens);
-  const fullText = lines.map((l) => l.text).join('\n');
-  const evidence = lines.map((l) => ({ page: 1, text: l.text }));
+  const requestedPage =
+    options?.pageNumber !== undefined
+      ? Math.max(1, Math.min(pageCount, Math.round(options.pageNumber)))
+      : null;
+
+  const activeSummary =
+    (requestedPage ? pageSummaries.find((p) => p.pageNumber === requestedPage) : null) ??
+    chooseDefaultPage(pageSummaries);
+
+  const { page, pageWidthMm, pageHeightMm, tokens, lines, baselineLines, fullText, baselineFullText } =
+    activeSummary;
+  const selectedPage = activeSummary.pageNumber;
+  const pages: EnvelopeIntentPageInfo[] = pageSummaries.map((p) => ({
+    page: p.pageNumber,
+    title: p.title,
+    role: p.role,
+    isRoofPlan: p.isRoofPlan,
+    isDetailsSheet: p.isDetailsSheet
+  }));
+  const evidence = lines.map((l) => ({ page: selectedPage, text: l.text }));
 
   const opList = await page.getOperatorList();
   const allSegments = extractVectorSegments(opList);
   const allRects = findClosedRectangles(allSegments);
 
-  // Extract metadata strictly from printed text
+  // Extract metadata
   const fixtureMatch = fullText.match(/Project:\s*ApexMap Fixture House\s+(R\d+)/i);
   const fixtureId = options?.fixtureId ?? (fixtureMatch ? fixtureMatch[1].toUpperCase() : undefined);
 
-  const scaleMatch =
-    fullText.match(/\bScale\s*[:=]\s*1\s*:\s*(\d+)\b/i) ??
-    fullText.match(/\b1\s*:\s*(\d+)\b(?=[^\n]*(?:is drawn|mm on the page|scale))/i);
-  const scaleDenom = scaleMatch ? Number(scaleMatch[1]) : null;
-  const scale = scaleDenom && scaleDenom > 0 ? `1:${scaleDenom}` : null;
+  const scaleCandidates = extractScaleCandidates(baselineLines, lines, pageWidthMm, pageHeightMm);
+  const manualDenom =
+    options?.manualScaleDenom !== undefined &&
+    Number.isFinite(options.manualScaleDenom) &&
+    options.manualScaleDenom > 0
+      ? options.manualScaleDenom
+      : null;
 
   const northMatch = fullText.match(/\bNorth\s*[:=]?\s*up\b/i);
   const north: 'up' | null = northMatch ? 'up' : null;
@@ -497,30 +1319,17 @@ export async function readVectorPdf(
   else if (/\bTrapezoid(?:al)?\b/i.test(fullText)) profileFamily = 'trapezoidal';
   else if (/\bStanding\s*Seam\b/i.test(fullText)) profileFamily = 'standing_seam';
 
-  let windZone: TriageWindZone | null = null;
-  const windMatch = fullText.match(
-    /Wind\s*zone\s*[:=]?\s*(?:Extra\s*High|Very\s*High|High|Medium|Low)?\s*\(?(EH|VH|H|M|L)\)?/i
-  );
-  if (windMatch) {
-    windZone = windMatch[1].toUpperCase() as TriageWindZone;
+  // Read Wind Zone from active page first, then fall back across any page in the PDF set
+  let windZone: TriageWindZone | null = extractWindZone(baselineFullText) ?? extractWindZone(fullText);
+  if (!windZone) {
+    for (const summary of pageSummaries) {
+      windZone = extractWindZone(summary.baselineFullText) ?? extractWindZone(summary.fullText);
+      if (windZone) break;
+    }
   }
 
-  let pitchDeg: number | null = null;
-  const fallPitchMatch = fullText.match(/(\d+(?:\.\d+)?)\s*°/);
-  const notePitchMatch = fullText.match(/\bPitch\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(?:degrees?|deg|°)/i);
-  if (fallPitchMatch) {
-    pitchDeg = Number(fallPitchMatch[1]);
-  } else if (notePitchMatch) {
-    pitchDeg = Number(notePitchMatch[1]);
-  }
-
-  let eaveHeightM: number | null = null;
-  const eaveMatch =
-    fullText.match(/Eave\s*height[^0-9\n]*(\d+(?:\.\d+)?)\s*m\b/i) ??
-    fullText.match(/(\d+(?:\.\d+)?)\s*m\b[^\n]*(?:top of fascia|all eaves)/i);
-  if (eaveMatch) {
-    eaveHeightM = Number(eaveMatch[1]);
-  }
+  const pitchDeg = extractPitchDeg(lines, baselineLines, activeSummary.role);
+  const eaveHeightM = extractEaveHeightM(lines, baselineLines);
 
   let ventedRidge: TriageVentedRidge | null = null;
   const ventedMatch = fullText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
@@ -545,10 +1354,21 @@ export async function readVectorPdf(
     });
   }
 
+  const provisionalDenom = manualDenom ?? (scaleCandidates[0] ?? null);
+  const provisionalScaleSource: 'printed' | 'user' | null = manualDenom
+    ? 'user'
+    : provisionalDenom
+      ? 'printed'
+      : null;
+
   const baseIntent: EnvelopeIntent = {
     ...(fixtureId ? { fixtureId } : {}),
     scope: 'roof_takeoff',
-    scale,
+    scale: provisionalDenom ? `1:${provisionalDenom}` : null,
+    scaleSource: provisionalScaleSource,
+    selectedPage,
+    pageCount,
+    pages,
     units: 'm',
     north,
     profileFamily,
@@ -563,14 +1383,21 @@ export async function readVectorPdf(
     blockers: []
   };
 
-  if (!scale || !scaleDenom) {
+  if (!provisionalDenom) {
     return {
       ...baseIntent,
       blockers: ['missing scale']
     };
   }
 
-  const mmPerMetre = 1000 / scaleDenom;
+  // Never take an outline from site or other pages
+  if (activeSummary.role === 'site' || activeSummary.role === 'other') {
+    return {
+      ...baseIntent,
+      bodies: [],
+      blockers: ['no outline matched the overall dimensions']
+    };
+  }
 
   // Exclude sheet border, title block, flashing detail box, and scale bar boxes
   const titleBlockBox = findEnclosingBoxForText(allRects, lines, (l) =>
@@ -611,109 +1438,109 @@ export async function readVectorPdf(
     return true;
   });
 
-  const drawingRects = findClosedRectangles(drawingSegments).sort(
-    (a, b) => (b.maxX - b.minX) * (b.maxY - b.minY) - (a.maxX - a.minX) * (a.maxY - a.minY)
+  const externalLoops = extractClosedExternalLoops(drawingSegments, pageWidthMm, pageHeightMm);
+  const largestLoopBounds = externalLoops[0] ? getLoopBounds(externalLoops[0]) : null;
+
+  const dimTokens = extractDimensionTokens(
+    tokens,
+    baselineLines,
+    titleBlockBox,
+    detailBox,
+    scaleBarBox
+  );
+  const { overallWidthM, overallHeightM } = computeOverallDimensionChains(
+    dimTokens,
+    drawingSegments,
+    largestLoopBounds
   );
 
-  // Extract dimension numbers (mm, e.g. 12000, 7000) strictly from the drawing area
-  const drawingTokens = tokens.filter((tok) => {
-    if (titleBlockBox && pointInBox(tok.xMm, tok.yMm, titleBlockBox)) return false;
-    if (detailBox && pointInBox(tok.xMm, tok.yMm, detailBox)) return false;
-    if (scaleBarBox && pointInBox(tok.xMm, tok.yMm, scaleBarBox)) return false;
-    return /^\d{4,6}$/.test(tok.text);
-  });
+  // Resolve scale denominator (if multiple printed candidates e.g. "1:50 / 1:100", pick the one matching overall dimensions)
+  const candidateDenomsToTry = manualDenom ? [manualDenom] : scaleCandidates;
+  let chosenDenom = provisionalDenom;
+  let chosenLoop: TriagePoint2D[] | null = null;
 
-  const dimValuesM = drawingTokens.map((tok) => ({
-    valM: Number(tok.text) / 1000,
-    xMm: tok.xMm,
-    yMm: tok.yMm
-  }));
-
-  let chosenRect: BoxRegion | null = drawingRects[0] ?? null;
-
-  if (drawingRects.length > 0 && dimValuesM.length >= 2) {
-    // Prefer the largest closed rectangle matching the printed dimension strings within 0.05 m
-    const matching = drawingRects.find((rect) => {
-      const rwM = (rect.maxX - rect.minX) / mmPerMetre;
-      const rhM = (rect.maxY - rect.minY) / mmPerMetre;
-      const sortedRect = [rwM, rhM].sort((a, b) => a - b);
-      for (let i = 0; i < dimValuesM.length; i++) {
-        for (let j = i + 1; j < dimValuesM.length; j++) {
-          const sortedDims = [dimValuesM[i].valM, dimValuesM[j].valM].sort((a, b) => a - b);
-          if (
-            Math.abs(sortedRect[0] - sortedDims[0]) <= 0.05 &&
-            Math.abs(sortedRect[1] - sortedDims[1]) <= 0.05
-          ) {
-            return true;
-          }
-        }
-      }
-      return false;
-    });
-
-    if (!matching) {
-      return {
-        ...baseIntent,
-        bodies: [],
-        blockers: ['dimension mismatch']
-      };
+  const findMatchingLoopForDenom = (denom: number): TriagePoint2D[] | null => {
+    const mmPerMetre = 1000 / denom;
+    if (overallWidthM !== null && overallHeightM !== null) {
+      return (
+        externalLoops.find((loop) => {
+          const b = getLoopBounds(loop);
+          const wM = (b.maxX - b.minX) / mmPerMetre;
+          const hM = (b.maxY - b.minY) / mmPerMetre;
+          return Math.abs(wM - overallWidthM) <= 0.05 && Math.abs(hM - overallHeightM) <= 0.05;
+        }) ?? null
+      );
     }
-    chosenRect = matching;
+    if (overallWidthM !== null) {
+      return (
+        externalLoops.find((loop) => {
+          const b = getLoopBounds(loop);
+          const wM = (b.maxX - b.minX) / mmPerMetre;
+          return Math.abs(wM - overallWidthM) <= 0.05;
+        }) ?? null
+      );
+    }
+    if (overallHeightM !== null) {
+      return (
+        externalLoops.find((loop) => {
+          const b = getLoopBounds(loop);
+          const hM = (b.maxY - b.minY) / mmPerMetre;
+          return Math.abs(hM - overallHeightM) <= 0.05;
+        }) ?? null
+      );
+    }
+    return externalLoops[0] ?? null;
+  };
+
+  for (const denom of candidateDenomsToTry) {
+    const matched = findMatchingLoopForDenom(denom);
+    if (matched) {
+      chosenDenom = denom;
+      chosenLoop = matched;
+      break;
+    }
   }
 
-  if (!chosenRect) {
+  const finalScale = `1:${chosenDenom}`;
+  const finalIntent: EnvelopeIntent = {
+    ...baseIntent,
+    scale: finalScale
+  };
+
+  if (!chosenLoop) {
+    const blockers =
+      overallWidthM !== null || overallHeightM !== null
+        ? ['no outline matched the overall dimensions', 'dimension mismatch']
+        : ['no outline matched the overall dimensions'];
     return {
-      ...baseIntent,
+      ...finalIntent,
       bodies: [],
-      blockers: ['missing roof outline']
+      blockers
     };
   }
 
-  // Also check explicit dimension mismatch against the chosen rectangle if dimension tokens exist
-  const widthM = roundM((chosenRect.maxX - chosenRect.minX) / mmPerMetre);
-  const heightM = roundM((chosenRect.maxY - chosenRect.minY) / mmPerMetre);
-  if (dimValuesM.length >= 2) {
-    const nearXDim = dimValuesM.find(
-      (d) => d.xMm >= chosenRect!.minX - 5 && d.xMm <= chosenRect!.maxX + 5 && d.yMm < chosenRect!.minY
-    );
-    const nearYDim = dimValuesM.find(
-      (d) => d.yMm >= chosenRect!.minY - 5 && d.yMm <= chosenRect!.maxY + 5 && d.xMm < chosenRect!.minX
-    );
-    if (nearXDim && Math.abs(widthM - nearXDim.valM) > 0.05) {
-      return { ...baseIntent, bodies: [], blockers: ['dimension mismatch'] };
-    }
-    if (nearYDim && Math.abs(heightM - nearYDim.valM) > 0.05) {
-      return { ...baseIntent, bodies: [], blockers: ['dimension mismatch'] };
-    }
-  }
+  const mmPerMetre = 1000 / chosenDenom;
+  const loopBox = getLoopBounds(chosenLoop);
 
-  // Translate origin to lower-left corner (0, 0), counter-clockwise: South, East, North, West
-  const outline: TriagePoint2D[] = [
-    { x: 0, y: 0 },
-    { x: widthM, y: 0 },
-    { x: widthM, y: heightM },
-    { x: 0, y: heightM }
-  ];
-
-  const pageEdgesMm: Array<{ a: TriagePoint2D; b: TriagePoint2D }> = [
-    { a: { x: chosenRect.minX, y: chosenRect.minY }, b: { x: chosenRect.maxX, y: chosenRect.minY } }, // South
-    { a: { x: chosenRect.maxX, y: chosenRect.minY }, b: { x: chosenRect.maxX, y: chosenRect.maxY } }, // East
-    { a: { x: chosenRect.maxX, y: chosenRect.maxY }, b: { x: chosenRect.minX, y: chosenRect.maxY } }, // North
-    { a: { x: chosenRect.minX, y: chosenRect.maxY }, b: { x: chosenRect.minX, y: chosenRect.minY } } // West
-  ];
+  // Translate origin to bounding-box lower-left (0, 0) in metres
+  const outline: TriagePoint2D[] = chosenLoop.map((pt) => ({
+    x: roundM((pt.x - loopBox.minX) / mmPerMetre),
+    y: roundM((pt.y - loopBox.minY) / mmPerMetre)
+  }));
 
   const edgeLabelTokens = tokens.filter((tok) =>
     /^(EAVE|GABLE|WALL|APRON)$/i.test(tok.text.trim())
   );
 
   const classifyEdgeType = (edgeIdx: number): { type: TriageEdgeType; eaveHeightM?: number } => {
-    const edgeSeg = pageEdgesMm[edgeIdx];
+    const a = chosenLoop![edgeIdx];
+    const b = chosenLoop![(edgeIdx + 1) % chosenLoop!.length];
     let bestTok: TextToken | null = null;
     let bestDist = 25; // max 25 mm from edge
     for (const tok of edgeLabelTokens) {
       const cx = tok.xMm + tok.widthMm / 2;
       const cy = tok.yMm + tok.heightMm / 2;
-      const d = distToSegmentMm({ x: cx, y: cy }, edgeSeg.a, edgeSeg.b);
+      const d = distToSegmentMm({ x: cx, y: cy }, a, b);
       if (d < bestDist) {
         bestDist = d;
         bestTok = tok;
@@ -733,21 +1560,25 @@ export async function readVectorPdf(
     return { type: 'unclassified' };
   };
 
-  const edges = [0, 1, 2, 3].map((idx) => classifyEdgeType(idx));
+  const edges = chosenLoop.map((_, idx) => classifyEdgeType(idx));
 
-  // Detect interior structural ridge segments inside the roof rectangle
+  // Detect interior structural ridge segments strictly inside the chosen closed loop
   const interiorSegs = drawingSegments.filter((seg) => {
     const mx = (seg.x1 + seg.x2) / 2;
     const my = (seg.y1 + seg.y2) / 2;
-    const insideX = mx > chosenRect!.minX + 1.5 && mx < chosenRect!.maxX - 1.5;
-    const insideY = my > chosenRect!.minY + 1.5 && my < chosenRect!.maxY - 1.5;
-    if (!insideX || !insideY) return false;
-    const onBoundary =
-      (Math.abs(seg.y1 - chosenRect!.minY) <= 0.6 && Math.abs(seg.y2 - chosenRect!.minY) <= 0.6) ||
-      (Math.abs(seg.y1 - chosenRect!.maxY) <= 0.6 && Math.abs(seg.y2 - chosenRect!.maxY) <= 0.6) ||
-      (Math.abs(seg.x1 - chosenRect!.minX) <= 0.6 && Math.abs(seg.x2 - chosenRect!.minX) <= 0.6) ||
-      (Math.abs(seg.x1 - chosenRect!.maxX) <= 0.6 && Math.abs(seg.x2 - chosenRect!.maxX) <= 0.6);
-    return !onBoundary;
+    if (!isPointInPolygonMm({ x: mx, y: my }, chosenLoop!)) return false;
+
+    for (let i = 0; i < chosenLoop!.length; i++) {
+      const a = chosenLoop![i];
+      const b = chosenLoop![(i + 1) % chosenLoop!.length];
+      if (
+        distToSegmentMm({ x: seg.x1, y: seg.y1 }, a, b) <= 0.65 &&
+        distToSegmentMm({ x: seg.x2, y: seg.y2 }, a, b) <= 0.65
+      ) {
+        return false;
+      }
+    }
+    return true;
   });
 
   // Merge colinear horizontal/vertical interior spans (supports dashed lines or single strokes)
@@ -779,7 +1610,7 @@ export async function readVectorPdf(
 
   for (const hSpan of horizInterior) {
     const spanLen = hSpan.max - hSpan.min;
-    const rectW = chosenRect.maxX - chosenRect.minX;
+    const rectW = loopBox.maxX - loopBox.minX;
     const nearRidgeLabel = ridgeTokens.some(
       (rt) => Math.abs(rt.yMm - hSpan.coord) <= 12 && rt.xMm >= hSpan.min - 15 && rt.xMm <= hSpan.max + 15
     );
@@ -787,12 +1618,12 @@ export async function readVectorPdf(
       skeleton.push({
         type: 'ridge',
         from: {
-          x: roundM((hSpan.min - chosenRect.minX) / mmPerMetre),
-          y: roundM((hSpan.coord - chosenRect.minY) / mmPerMetre)
+          x: roundM((hSpan.min - loopBox.minX) / mmPerMetre),
+          y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
         },
         to: {
-          x: roundM((hSpan.max - chosenRect.minX) / mmPerMetre),
-          y: roundM((hSpan.coord - chosenRect.minY) / mmPerMetre)
+          x: roundM((hSpan.max - loopBox.minX) / mmPerMetre),
+          y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
         }
       });
     }
@@ -800,7 +1631,7 @@ export async function readVectorPdf(
 
   for (const vSpan of vertInterior) {
     const spanLen = vSpan.max - vSpan.min;
-    const rectH = chosenRect.maxY - chosenRect.minY;
+    const rectH = loopBox.maxY - loopBox.minY;
     const nearRidgeLabel = ridgeTokens.some(
       (rt) => Math.abs(rt.xMm - vSpan.coord) <= 12 && rt.yMm >= vSpan.min - 15 && rt.yMm <= vSpan.max + 15
     );
@@ -808,19 +1639,19 @@ export async function readVectorPdf(
       skeleton.push({
         type: 'ridge',
         from: {
-          x: roundM((vSpan.coord - chosenRect.minX) / mmPerMetre),
-          y: roundM((vSpan.min - chosenRect.minY) / mmPerMetre)
+          x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
+          y: roundM((vSpan.min - loopBox.minY) / mmPerMetre)
         },
         to: {
-          x: roundM((vSpan.coord - chosenRect.minX) / mmPerMetre),
-          y: roundM((vSpan.max - chosenRect.minY) / mmPerMetre)
+          x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
+          y: roundM((vSpan.max - loopBox.minY) / mmPerMetre)
         }
       });
     }
   }
 
   return {
-    ...baseIntent,
+    ...finalIntent,
     bodies: [
       {
         id: 'body-1',

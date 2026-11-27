@@ -37,10 +37,24 @@ export interface EnvelopeIntentOpening {
   center: TriagePoint2D;
 }
 
+export type TriagePageRole = 'site' | 'floor' | 'roof' | 'elevation' | 'other';
+
+export interface EnvelopeIntentPageInfo {
+  page: number;
+  title: string;
+  role: TriagePageRole;
+  isRoofPlan: boolean;
+  isDetailsSheet: boolean;
+}
+
 export interface EnvelopeIntent {
   fixtureId?: string;
   scope: 'roof_takeoff';
   scale: string | null;
+  scaleSource?: 'printed' | 'user' | null;
+  selectedPage?: number;
+  pageCount?: number;
+  pages?: EnvelopeIntentPageInfo[];
   units: 'm';
   north: 'up' | null;
   profileFamily: string | null;

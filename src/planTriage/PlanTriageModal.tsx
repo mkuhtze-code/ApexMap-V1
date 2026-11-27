@@ -19,7 +19,44 @@ function getGuidanceCopy(role?: string | null): string {
   if (role === 'site') {
     return 'Site plans have no roof outline. Choose the floor or roof plan page, or set the scale if it is only drawn in the title block.';
   }
-  return 'Details sheets have no roof outline. Choose the roof plan page, or set the scale if it is only drawn in the title block.';
+  if (role === 'details') {
+    return 'Details sheets have no roof outline. Choose the floor or roof plan page, or set the scale if it is only drawn in the title block.';
+  }
+  return 'This sheet has no matching roof outline. Choose the floor or roof plan page, or check the scale.';
+}
+
+function formatRoleLabel(role: string): string {
+  switch (role) {
+    case 'site':
+      return 'Site';
+    case 'floor':
+      return 'Floor';
+    case 'roof':
+      return 'Roof';
+    case 'elevation':
+      return 'Elev';
+    case 'details':
+      return 'Details';
+    default:
+      return 'Other';
+  }
+}
+
+function getRoleBadgeStyle(role: string): string {
+  switch (role) {
+    case 'roof':
+      return 'bg-emerald-950/80 border-emerald-600/50 text-emerald-300';
+    case 'floor':
+      return 'bg-sky-950/80 border-sky-600/50 text-sky-300';
+    case 'elevation':
+      return 'bg-indigo-950/70 border-indigo-500/40 text-indigo-300';
+    case 'site':
+      return 'bg-amber-950/70 border-amber-600/40 text-amber-300';
+    case 'details':
+      return 'bg-slate-800 border-slate-700 text-slate-300';
+    default:
+      return 'bg-slate-800 border-slate-700 text-slate-400';
+  }
 }
 
 export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
@@ -151,13 +188,29 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
   const activePageInfo =
     intent?.pages?.find((p) => p.page === intent.selectedPage) ?? null;
+  const recommendedPageInfo =
+    intent?.pages?.find(
+      (p) =>
+        p.page === intent.recommendedPage &&
+        (p.role === 'roof' || p.role === 'floor') &&
+        p.page !== intent.selectedPage
+    ) ??
+    intent?.pages?.find(
+      (p) => (p.role === 'roof' || p.role === 'floor') && p.page !== intent?.selectedPage
+    ) ??
+    null;
   const guidanceCopy = getGuidanceCopy(activePageInfo?.role);
+  const netRoofAreaMetric =
+    intent?.areas?.find((a) => /\bnet\s+roof\s+area\b/i.test(a.label)) ??
+    intent?.areas?.find((a) => !/\bsite\b/i.test(a.label)) ??
+    null;
   const areaEvidenceNotes =
     intent?.evidence.filter((ev) => /\barea\b/i.test(ev.text) && /\d/.test(ev.text)) ?? [];
   const nonScaleBlockers =
     intent?.blockers.filter((b) => b !== 'missing scale') ?? [];
   const isMissingScale = Boolean(intent && intent.blockers.includes('missing scale'));
   const hasRedBlockers = nonScaleBlockers.length > 0;
+  const warnings = intent?.warnings ?? [];
   const customDenomParsed = Number(customScaleInput.trim());
   const isCustomValid = Number.isFinite(customDenomParsed) && customDenomParsed > 0;
 
@@ -260,7 +313,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
           {!isReading && intent && (
             <>
-              {/* Page Picker (lists every page with its extracted title text) */}
+              {/* Page Picker (lists every page with role badge and highlights recommended geometry page) */}
               {intent.pages && intent.pages.length > 0 && (
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-[11px] text-slate-400">
@@ -271,9 +324,10 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                       Reading Page {intent.selectedPage ?? 1}
                     </span>
                   </div>
-                  <div className="max-h-36 overflow-y-auto divide-y divide-slate-800 border border-slate-800 rounded-xl bg-slate-950/60">
+                  <div className="max-h-40 overflow-y-auto divide-y divide-slate-800 border border-slate-800 rounded-xl bg-slate-950/60">
                     {intent.pages.map((p) => {
                       const isActive = p.page === (intent.selectedPage ?? 1);
+                      const isRecommended = p.page === intent.recommendedPage;
                       return (
                         <button
                           key={p.page}
@@ -281,20 +335,31 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                           onClick={() => handleSelectPage(p.page)}
                           className={`w-full px-3 py-2 text-left flex items-center justify-between gap-3 transition-colors cursor-pointer ${
                             isActive
-                              ? 'bg-sky-950/60 text-white'
-                              : 'hover:bg-slate-800/60 text-slate-300'
+                              ? 'bg-sky-950/70 text-white'
+                              : isRecommended
+                                ? 'bg-emerald-950/25 hover:bg-emerald-950/40 text-slate-100'
+                                : 'hover:bg-slate-800/60 text-slate-300'
                           }`}
                         >
-                          <div className="min-w-0 flex items-center gap-2.5">
+                          <div className="min-w-0 flex items-center gap-2">
                             <span className="font-mono tabular-nums text-[11px] font-semibold text-sky-400 shrink-0">
                               Page {p.page}
                             </span>
+                            <span
+                              className={`px-1.5 py-0.5 rounded border text-[10px] font-mono shrink-0 ${getRoleBadgeStyle(
+                                p.role
+                              )}`}
+                            >
+                              {formatRoleLabel(p.role)}
+                            </span>
                             <span className="truncate font-medium">{p.title}</span>
                           </div>
-                          <span className="text-[11px] font-mono shrink-0 text-slate-400">
-                            {p.role}
-                            {isActive ? ' · active' : ''}
-                          </span>
+                          <div className="flex items-center gap-2 text-[11px] font-mono shrink-0">
+                            {isRecommended && (
+                              <span className="text-emerald-400">Recommended</span>
+                            )}
+                            {isActive && <span className="text-sky-300">Active</span>}
+                          </div>
                         </button>
                       );
                     })}
@@ -364,10 +429,22 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
               {/* Non-Scale Blockers Banner (Red) */}
               {hasRedBlockers && (
-                <div className="p-3.5 rounded-xl bg-rose-950/75 border border-rose-500 text-rose-100 space-y-2">
-                  <div className="flex items-center gap-2 font-semibold text-rose-200">
-                    <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                    <span>Import blocked ({nonScaleBlockers.length})</span>
+                <div className="p-3.5 rounded-xl bg-rose-950/75 border border-rose-500 text-rose-100 space-y-2.5">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-2 font-semibold text-rose-200">
+                      <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                      <span>Import blocked ({nonScaleBlockers.length})</span>
+                    </div>
+                    {recommendedPageInfo && (
+                      <button
+                        type="button"
+                        onClick={() => handleSelectPage(recommendedPageInfo.page)}
+                        className="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold cursor-pointer transition-colors whitespace-nowrap shrink-0"
+                      >
+                        Use {recommendedPageInfo.role === 'roof' ? 'Roof' : 'Floor'} plan (page{' '}
+                        {recommendedPageInfo.page})
+                      </button>
+                    )}
                   </div>
                   <ul className="list-disc list-inside space-y-0.5 text-rose-200">
                     {nonScaleBlockers.map((blocker) => (
@@ -407,8 +484,23 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                 </div>
               )}
 
-              {/* Metadata Strip */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 border-b border-slate-800 pb-4">
+              {/* Non-Blocking Warnings */}
+              {warnings.length > 0 && (
+                <div className="p-3 rounded-xl bg-amber-950/50 border border-amber-500/60 text-amber-100 space-y-1">
+                  <div className="flex items-center gap-2 font-semibold text-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>Check notes ({warnings.length})</span>
+                  </div>
+                  <ul className="list-disc list-inside space-y-0.5 text-[11px] text-amber-200">
+                    {warnings.map((w) => (
+                      <li key={w}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Synthesized Plan Intelligence Strip */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 border-b border-slate-800 pb-4">
                 <div>
                   <div className="text-[11px] text-slate-400">Scale</div>
                   <div className="text-sm font-mono tabular-nums font-semibold text-white mt-0.5">
@@ -416,14 +508,16 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                   </div>
                   {intent.scaleSource && (
                     <div className="text-[11px] font-mono text-slate-400 mt-0.5">
-                      scaleSource: {intent.scaleSource}
+                      {intent.scaleSource}
                     </div>
                   )}
                 </div>
                 <div>
-                  <div className="text-[11px] text-slate-400">Profile</div>
-                  <div className="text-sm font-semibold text-white mt-0.5 capitalize">
-                    {intent.profileFamily ? intent.profileFamily.replace('_', ' ') : 'Unspecified'}
+                  <div className="text-[11px] text-slate-400">Pitch</div>
+                  <div className="text-sm font-mono tabular-nums font-semibold text-white mt-0.5">
+                    {intent.pitchDeg !== undefined && intent.pitchDeg !== null
+                      ? `${intent.pitchDeg}°`
+                      : 'Unspecified'}
                   </div>
                 </div>
                 <div>
@@ -433,10 +527,34 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                   </div>
                 </div>
                 <div>
-                  <div className="text-[11px] text-slate-400">Vented Ridge</div>
+                  <div className="text-[11px] text-slate-400">Net Roof Area</div>
                   <div className="text-sm font-mono tabular-nums font-semibold text-white mt-0.5">
-                    {intent.ventedRidge ?? 'Unspecified'}
+                    {netRoofAreaMetric ? `${netRoofAreaMetric.valueM2.toFixed(1)} m²` : 'Unspecified'}
                   </div>
+                  {netRoofAreaMetric && (
+                    <div className="text-[11px] font-mono text-slate-400 mt-0.5 truncate">
+                      p.{netRoofAreaMetric.page} · {netRoofAreaMetric.label}
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-400">Confidence</div>
+                  <div className="text-sm font-mono tabular-nums font-semibold text-white mt-0.5">
+                    {intent.confidence !== undefined
+                      ? `${Math.round(intent.confidence * 100)}%`
+                      : '—'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-400">Profile</div>
+                  <div className="text-sm font-semibold text-white mt-0.5 capitalize">
+                    {intent.profileFamily ? intent.profileFamily.replace('_', ' ') : 'Unspecified'}
+                  </div>
+                  {intent.ventedRidge && (
+                    <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                      {intent.ventedRidge}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -448,7 +566,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                       <div>
                         <div className="text-[11px] text-slate-400">Outline Size</div>
                         <div className="font-mono tabular-nums font-semibold text-white mt-0.5">
-                          {bodyBounds.widthM.toFixed(1)} m × {bodyBounds.heightM.toFixed(1)} m
+                          {bodyBounds.widthM.toFixed(2)} m × {bodyBounds.heightM.toFixed(2)} m
                         </div>
                       </div>
                       <div>
@@ -574,6 +692,25 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                       {areaEvidenceNotes.map((ev, idx) => (
                         <div key={idx} className="px-3 py-1.5 font-mono text-[11px] text-slate-300">
                           Page {ev.page}: {ev.text}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {intent.heights && intent.heights.length > 0 && (
+                  <div className="space-y-1">
+                    <div className="text-[11px] text-slate-400">Elevation &amp; Height Notes</div>
+                    <div className="border border-slate-800 rounded-lg divide-y divide-slate-800 bg-slate-950/60">
+                      {intent.heights.map((h, idx) => (
+                        <div
+                          key={idx}
+                          className="px-3 py-1.5 flex items-center justify-between font-mono tabular-nums text-[11px] text-slate-300"
+                        >
+                          <span className="uppercase text-slate-200">{h.kind}</span>
+                          <span>
+                            {h.valueM.toFixed(2)} m · Page {h.page}
+                          </span>
                         </div>
                       ))}
                     </div>

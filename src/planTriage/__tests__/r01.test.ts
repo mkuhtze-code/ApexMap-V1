@@ -207,6 +207,7 @@ async function main() {
   assert.equal(multiIntent.pageCount, 2);
   assert.equal(multiIntent.selectedPage, 2, 'Must default to Roof Plan page when Page 1 is Details');
   assert.equal(multiIntent.pages?.length, 2);
+  assert.equal(multiIntent.pages?.[0].role, 'details');
   assert.equal(multiIntent.pages?.[0].isDetailsSheet, true);
   assert.ok(/Mt Albert Details/i.test(multiIntent.pages?.[0].title ?? ''));
   assert.equal(multiIntent.pages?.[1].isRoofPlan, true);
@@ -413,6 +414,7 @@ async function main() {
     const blancheBytes = await doc.save();
     const blancheIntent = await readVectorPdf(blancheBytes);
     assert.equal(blancheIntent.selectedPage, 3, '28 Blanche Way must default to Page 3 Floor Plan');
+    assert.equal(blancheIntent.recommendedPage, 3);
     assert.equal(
       blancheIntent.pages?.map((p) => p.role).join(','),
       'site,site,floor,elevation,elevation'
@@ -423,18 +425,35 @@ async function main() {
     assert.equal(blancheIntent.windZone, 'L', 'Must extract LOW -> L cross-page');
     assert.equal(blancheIntent.profileFamily, null);
     assert.deepEqual(blancheIntent.blockers, []);
+    assert.equal(blancheIntent.warnings?.length ?? 0, 0);
+    assert.ok(
+      typeof blancheIntent.confidence === 'number' && blancheIntent.confidence >= 0.8,
+      'Must emit high confidence when scale, dims, pitch, wind & area align'
+    );
+    assert.ok(
+      blancheIntent.areas?.some(
+        (a) => /Net Roof Area/i.test(a.label) && Math.abs(a.valueM2 - 51.3) < 0.01 && a.page === 3
+      ),
+      'Must extract structured Net Roof Area 51.3 m² metric'
+    );
     assert.equal(blancheIntent.bodies.length, 1);
     assert.ok(Math.abs(Math.max(...blancheIntent.bodies[0].outline.map((p) => p.x)) - 10.33) <= 0.05);
     assert.ok(Math.abs(Math.max(...blancheIntent.bodies[0].outline.map((p) => p.y)) - 4.826) <= 0.05);
+
+    const blancheImported = importEnvelopeIntent(blancheIntent);
+    assert.equal(blancheImported.defaultPitchDeg, 45);
+    assert.equal(blancheImported.windZone, 'L');
+    assert.equal(blancheImported.level.outline.edges.length, 4);
 
     assert.ok(
       blancheIntent.evidence.some((e) => /51\.3\s*m/i.test(e.text)),
       'Must preserve Net Roof Area 51.3 m² in evidence'
     );
 
-    // Site page 1 must produce no body and emit clear site-plan blocker copy
+    // Site page 1 must produce no body, preserve recommendedPage=3, and emit clear site-plan blocker copy
     const blancheSiteIntent = await readVectorPdf(blancheBytes, { pageNumber: 1 });
     assert.equal(blancheSiteIntent.bodies.length, 0);
+    assert.equal(blancheSiteIntent.recommendedPage, 3);
     assert.ok(blancheSiteIntent.blockers[0]?.includes('site plan has no roof outline'));
 
     // Elevation page with "UNITARY PLAN" above "2.5m & 45°" (no "HIRB" on line 2) must still resolve 45°
@@ -452,6 +471,41 @@ async function main() {
     adjP2.drawText('2.5m & 45°', { x: mm(45), y: mm(201), size: 9, font: adjFont, color: rgb(0, 0, 0) });
     const adjIntent = await readVectorPdf(await adjDoc.save());
     assert.equal(adjIntent.pitchDeg, 45, 'Must extract 45° from line beneath UNITARY PLAN on elevation sheet');
+  }
+
+  // 6e. L1 synthesis: 0.25m dim tolerance + heights extraction + >15% area warning without blocking
+  {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.HelveticaBold);
+    const mm = (v: number) => (v * 72) / 25.4;
+
+    const floorP = doc.addPage([mm(420), mm(297)]);
+    floorP.drawText('FLOOR PLAN', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    floorP.drawText('Scale: 1:100', { x: mm(280), y: mm(16), size: 9, font, color: rgb(0, 0, 0) });
+    // Drawn 10.00m x 5.00m (= 50.0 m2), printed dims offset by 0.18m (within 0.25m tol)
+    floorP.drawRectangle({ x: mm(60), y: mm(100), width: mm(100), height: mm(50), borderWidth: 1, borderColor: rgb(0, 0, 0) });
+    floorP.drawText('10.180', { x: mm(100), y: mm(80), size: 9, font, color: rgb(0, 0, 0) });
+    floorP.drawText('4.850', { x: mm(36), y: mm(122), size: 9, font, color: rgb(0, 0, 0) });
+    // Deliberately off area (>15% discrepancy) -> warning only, never a blocker
+    floorP.drawText('Floor Area 80.0 m²', { x: mm(45), y: mm(50), size: 9, font, color: rgb(0, 0, 0) });
+    floorP.drawText('FFL 10.50m', { x: mm(45), y: mm(40), size: 9, font, color: rgb(0, 0, 0) });
+
+    const elevP = doc.addPage([mm(420), mm(297)]);
+    elevP.drawText('ELEVATIONS', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    elevP.drawText('HIRB 2.5m & 45°', { x: mm(45), y: mm(200), size: 9, font, color: rgb(0, 0, 0) });
+    elevP.drawText('Ridge height 5.40m', { x: mm(45), y: mm(190), size: 9, font, color: rgb(0, 0, 0) });
+
+    const l1Intent = await readVectorPdf(await doc.save());
+    assert.deepEqual(l1Intent.blockers, [], '0.25m dim match + >15% area diff must not block');
+    assert.equal(l1Intent.bodies.length, 1);
+    assert.ok((l1Intent.warnings?.length ?? 0) >= 1, 'Area mismatch >15% must emit warning');
+    assert.ok(l1Intent.heights?.some((h) => h.kind === 'ffl' && Math.abs(h.valueM - 10.5) < 0.01));
+    assert.ok(l1Intent.heights?.some((h) => h.kind === 'ridge' && Math.abs(h.valueM - 5.4) < 0.01));
+    assert.equal(
+      l1Intent.heights?.some((h) => Math.abs(h.valueM - 2.5) < 0.01),
+      false,
+      'HIRB 2.5m must not be classified as a building height'
+    );
   }
 
   // 7. importEnvelopeIntent maps onto ApexMap model without generating faces or calling skeleton solver

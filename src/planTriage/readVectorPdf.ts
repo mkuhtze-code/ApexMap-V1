@@ -1,7 +1,9 @@
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type {
   EnvelopeIntent,
+  EnvelopeIntentAreaMetric,
   EnvelopeIntentFlashingHint,
+  EnvelopeIntentHeightMetric,
   EnvelopeIntentPageInfo,
   TriageEdgeType,
   TriagePageRole,
@@ -270,7 +272,9 @@ function groupBaselineLines(tokens: TextToken[]): TextLine[] {
 function classifyRoleFromText(titleText: string): TriagePageRole {
   const t = titleText.trim();
   if (!t) return 'other';
-  if (/\bdetails?\b/i.test(t) && !/roof\s*plan/i.test(t)) return 'other';
+  if ((/\bdetails?\b/i.test(t) || /\bFD-\d+\b/i.test(t)) && !/roof\s*plan/i.test(t)) {
+    return 'details';
+  }
   if (/\bsite\b/i.test(t)) return 'site';
   if (/\broof\b/i.test(t)) return 'roof';
   if (/\bfloor\b/i.test(t)) return 'floor';
@@ -552,7 +556,7 @@ function extractEaveHeightM(splitLines: TextLine[], baselineLines: TextLine[]): 
   const allLines = [...splitLines, ...baselineLines];
   for (const l of allLines) {
     if (!/\b(?:eave|eaves|fascia)\b/i.test(l.text)) continue;
-    if (/\b(?:HRB|recession|boundary|unitary)\b/i.test(l.text)) continue;
+    if (/\b(?:H?IRB|recession|boundary|unitary)\b/i.test(l.text)) continue;
     const mMetres = l.text.match(/(\d+(?:\.\d+)?)\s*m\b/i);
     if (mMetres) {
       const val = Number(mMetres[1]);
@@ -565,6 +569,115 @@ function extractEaveHeightM(splitLines: TextLine[], baselineLines: TextLine[]): 
     }
   }
   return null;
+}
+
+function extractAreaMetrics(
+  splitLines: TextLine[],
+  baselineLines: TextLine[],
+  pageNumber: number
+): EnvelopeIntentAreaMetric[] {
+  const seen = new Set<string>();
+  const results: EnvelopeIntentAreaMetric[] = [];
+  const areaRegex =
+    /((?:(?:Net|Gross|Proposed|Existing|Total|Main|Upper|Lower|Site|Roof|Floor|Footprint|Building|Deck|Garage|Coverage)\s+)*Area|(?:Net|Gross|Proposed|Existing|Total|Main|Upper|Lower|Site|Roof|Floor|Footprint|Building|Deck|Garage)\s+(?:Coverage|Footprint))\s*[:=\-]?\s*(\d+(?:\.\d+)?)\s*(?:m²|m2|sqm|sq\.?\s*m)(?=$|[\s.,;)/])/gi;
+
+  for (const line of [...splitLines, ...baselineLines]) {
+    if (/\b(?:H?IRB|Unitary\s+Plan|recession|boundary)\b/i.test(line.text)) continue;
+    for (const m of line.text.matchAll(areaRegex)) {
+      const label = m[1].replace(/\s+/g, ' ').trim();
+      const valueM2 = Number(m[2]);
+      if (!label || !Number.isFinite(valueM2) || valueM2 <= 0) continue;
+      const key = `${pageNumber}|${label.toLowerCase()}|${valueM2}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ label, valueM2, page: pageNumber });
+    }
+  }
+  return results;
+}
+
+function extractHeightMetrics(
+  splitLines: TextLine[],
+  baselineLines: TextLine[],
+  pageNumber: number
+): EnvelopeIntentHeightMetric[] {
+  const seen = new Set<string>();
+  const results: EnvelopeIntentHeightMetric[] = [];
+  const pushMetric = (
+    kind: EnvelopeIntentHeightMetric['kind'],
+    rawNum: string,
+    unit: string | undefined,
+    raw: string
+  ) => {
+    let val = Number(rawNum);
+    if (!Number.isFinite(val) || val <= 0) return;
+    if (unit && unit.toLowerCase() === 'mm') val = val / 1000;
+    if (kind !== 'rl' && kind !== 'ffl' && val >= 40) return;
+    const rounded = roundM(val);
+    const key = `${pageNumber}|${kind}|${rounded}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    results.push({ kind, valueM: rounded, page: pageNumber, raw });
+  };
+
+  for (const line of [...splitLines, ...baselineLines]) {
+    const text = line.text;
+    if (/\b(?:H?IRB|Unitary\s+Plan|recession|boundary)\b/i.test(text)) continue;
+
+    let matchedSpecific = false;
+    const fflMatch = text.match(/\bF\.?F\.?L\.?\s*[:=@]?\s*[+]?\s*(\d+(?:\.\d+)?)\s*(mm|m)?\b/i);
+    if (fflMatch) {
+      pushMetric('ffl', fflMatch[1], fflMatch[2], fflMatch[0]);
+      matchedSpecific = true;
+    }
+
+    const eaveMatch = text.match(
+      /\b(?:eave|eaves|fascia)(?:\s+height)?(?:\s+RL)?\s*[:=@]?\s*(\d+(?:\.\d+)?)\s*(mm|m)\b/i
+    );
+    if (eaveMatch) {
+      pushMetric('eave', eaveMatch[1], eaveMatch[2], eaveMatch[0]);
+      matchedSpecific = true;
+    }
+
+    const ridgeMatch = text.match(
+      /\b(?:ridge|apex)(?:\s+(?:height|RL))?\s*[:=@]?\s*(\d+(?:\.\d+)?)\s*(mm|m)\b/i
+    );
+    if (ridgeMatch) {
+      pushMetric('ridge', ridgeMatch[1], ridgeMatch[2], ridgeMatch[0]);
+      matchedSpecific = true;
+    }
+
+    if (!matchedSpecific) {
+      const rlMatch = text.match(/\bR\.?L\.?\s*[:=@]?\s*(\d+(?:\.\d+)?)\s*(mm|m)?\b/i);
+      if (rlMatch) {
+        pushMetric('rl', rlMatch[1], rlMatch[2], rlMatch[0]);
+      }
+    }
+  }
+  return results;
+}
+
+function extractFlashingHintsFromLines(
+  lines: TextLine[],
+  defaultVentedRidge: TriageVentedRidge | null
+): EnvelopeIntentFlashingHint[] {
+  const hints: EnvelopeIntentFlashingHint[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const fdMatch = lines[i].text.match(/\b(FD-\d+)\s+([A-Z]+)\s*[:\-]\s*(.+)/i);
+    if (!fdMatch) continue;
+    const chunkText = [lines[i].text, lines[i + 1]?.text ?? ''].join(' ');
+    const coverMatch = chunkText.match(/Cover\s+(\d+(?:\.\d+)?)\s*mm/i);
+    const fdVentedMatch = chunkText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
+    hints.push({
+      detail: fdMatch[1].toUpperCase(),
+      kind: fdMatch[2].toLowerCase(),
+      coverMm: coverMatch ? Number(coverMatch[1]) : null,
+      ventedRidge: fdVentedMatch
+        ? ((fdVentedMatch[1].toUpperCase() === 'RV10P' ? 'RV10P' : 'none') as TriageVentedRidge)
+        : defaultVentedRidge
+    });
+  }
+  return hints;
 }
 
 function extractVectorSegments(ops: { fnArray: number[]; argsArray: any[] }): VectorSegment[] {
@@ -1260,6 +1373,29 @@ interface ParsedPageText {
   role: TriagePageRole;
   isRoofPlan: boolean;
   isDetailsSheet: boolean;
+  scaleCandidates: number[];
+  windZone: TriageWindZone | null;
+  explicitPitchDeg: number | null;
+  unitaryPitchDeg: number | null;
+  eaveHeightM: number | null;
+  profileFamily: string | null;
+  ventedRidge: TriageVentedRidge | null;
+  areas: EnvelopeIntentAreaMetric[];
+  heights: EnvelopeIntentHeightMetric[];
+  flashingHints: EnvelopeIntentFlashingHint[];
+}
+
+function extractProfileFamily(fullText: string): string | null {
+  if (/\bCorrugate\b/i.test(fullText)) return 'corrugate';
+  if (/\bTrapezoid(?:al)?\b/i.test(fullText)) return 'trapezoidal';
+  if (/\bStanding\s*Seam\b/i.test(fullText)) return 'standing_seam';
+  return null;
+}
+
+function extractVentedRidge(fullText: string): TriageVentedRidge | null {
+  const ventedMatch = fullText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
+  if (!ventedMatch) return null;
+  return (ventedMatch[1].toUpperCase() === 'RV10P' ? 'RV10P' : 'none') as TriageVentedRidge;
 }
 
 async function readPageTextSummary(doc: any, pageNumber: number): Promise<ParsedPageText> {
@@ -1293,7 +1429,19 @@ async function readPageTextSummary(doc: any, pageNumber: number): Promise<Parsed
   const title = extractPageTitle(lines, baselineLines, pageWidthMm, pageHeightMm, pageNumber);
   const role = classifyRoleFromText(title);
   const isRoofPlan = role === 'roof';
-  const isDetailsSheet = role === 'other' && /\bdetails?\b/i.test(title);
+  const isDetailsSheet = role === 'details';
+
+  const scaleCandidates = extractScaleCandidates(baselineLines, lines, pageWidthMm, pageHeightMm);
+  const windZone = extractWindZone(baselineFullText) ?? extractWindZone(fullText);
+  const explicitPitchDeg = extractPitchDeg(lines, baselineLines, role);
+  const unitaryPitchDeg =
+    role === 'elevation' ? extractElevationUnitaryPitchDeg(lines, baselineLines) : null;
+  const eaveHeightM = extractEaveHeightM(lines, baselineLines);
+  const profileFamily = extractProfileFamily(fullText);
+  const ventedRidge = extractVentedRidge(fullText);
+  const areas = extractAreaMetrics(lines, baselineLines, pageNumber);
+  const heights = extractHeightMetrics(lines, baselineLines, pageNumber);
+  const flashingHints = extractFlashingHintsFromLines(lines, ventedRidge);
 
   return {
     pageNumber,
@@ -1308,24 +1456,49 @@ async function readPageTextSummary(doc: any, pageNumber: number): Promise<Parsed
     title,
     role,
     isRoofPlan,
-    isDetailsSheet
+    isDetailsSheet,
+    scaleCandidates,
+    windZone,
+    explicitPitchDeg,
+    unitaryPitchDeg,
+    eaveHeightM,
+    profileFamily,
+    ventedRidge,
+    areas,
+    heights,
+    flashingHints
   };
 }
 
-function chooseDefaultPage(summaries: ParsedPageText[]): ParsedPageText {
+function chooseRecommendedPage(summaries: ParsedPageText[]): ParsedPageText {
+  const roofPages = summaries.filter((p) => p.role === 'roof');
+  if (roofPages.length > 0) {
+    return roofPages.find((p) => p.scaleCandidates.length > 0) ?? roofPages[0];
+  }
+
+  const floorPages = summaries.filter((p) => p.role === 'floor');
+  if (floorPages.length > 0) {
+    return floorPages.find((p) => p.scaleCandidates.length > 0) ?? floorPages[0];
+  }
+
+  const scaledOtherPlan = summaries.find(
+    (p) => p.role === 'other' && p.scaleCandidates.length > 0
+  );
+  if (scaledOtherPlan) return scaledOtherPlan;
+
   return (
-    summaries.find((p) => p.role === 'roof') ??
-    summaries.find((p) => p.role === 'floor') ??
     summaries.find((p) => p.role === 'elevation') ??
+    summaries.find((p) => p.role !== 'site' && p.role !== 'details') ??
     summaries[0]
   );
 }
 
 /**
  * Pure vector PDF triage reader.
- * Classifies every page role from its title, prefers roof -> floor, matches closed external loops
- * against overall horizontal/vertical dimension chains, and enforces boundary rules.
- * Never renders to pixels, never calls a vision model, never calls ApexMap geometry builders.
+ * Scans every page first for roles, scale candidates, pitch, wind, areas, heights, and flashing details,
+ * chooses the recommended geometry page (roof -> floor -> best non-site candidate),
+ * matches closed external loops against overall dimension chains (0.25 m tol + axis swap + area/aspect fallback),
+ * and never calls a vision model or ApexMap geometry builders.
  */
 export async function readVectorPdf(
   pdfInput: Uint8Array | ArrayBuffer,
@@ -1344,10 +1517,14 @@ export async function readVectorPdf(
   const doc = await loadingTask.promise;
   const pageCount = Math.max(1, doc.numPages);
 
+  // 1. Scan all pages first for roles & set-wide metrics
   const pageSummaries: ParsedPageText[] = [];
   for (let p = 1; p <= pageCount; p++) {
     pageSummaries.push(await readPageTextSummary(doc, p));
   }
+
+  const recommendedSummary = chooseRecommendedPage(pageSummaries);
+  const recommendedPage = recommendedSummary.pageNumber;
 
   const requestedPage =
     options?.pageNumber !== undefined
@@ -1356,10 +1533,9 @@ export async function readVectorPdf(
 
   const activeSummary =
     (requestedPage ? pageSummaries.find((p) => p.pageNumber === requestedPage) : null) ??
-    chooseDefaultPage(pageSummaries);
+    recommendedSummary;
 
-  const { page, pageWidthMm, pageHeightMm, tokens, lines, baselineLines, fullText, baselineFullText } =
-    activeSummary;
+  const { page, pageWidthMm, pageHeightMm, tokens, lines, fullText } = activeSummary;
   const selectedPage = activeSummary.pageNumber;
   const pages: EnvelopeIntentPageInfo[] = pageSummaries.map((p) => ({
     page: p.pageNumber,
@@ -1368,17 +1544,39 @@ export async function readVectorPdf(
     isRoofPlan: p.isRoofPlan,
     isDetailsSheet: p.isDetailsSheet
   }));
-  const evidence = lines.map((l) => ({ page: selectedPage, text: l.text }));
+
+  // Build evidence from active page lines plus key cross-page metric lines
+  const evidence: Array<{ page: number; text: string }> = lines.map((l) => ({
+    page: selectedPage,
+    text: l.text
+  }));
+  const seenEvidence = new Set(evidence.map((e) => `${e.page}|${e.text}`));
+  for (const summary of pageSummaries) {
+    if (summary.pageNumber === selectedPage) continue;
+    for (const l of summary.lines) {
+      if (
+        /\b(?:Wind\s*zone|UNITARY\s+PLAN|HIRB|pitch|eave|fascia|F\.?F\.?L\.?|ridge|Area|FD-\d+)\b/i.test(
+          l.text
+        )
+      ) {
+        const key = `${summary.pageNumber}|${l.text}`;
+        if (!seenEvidence.has(key)) {
+          seenEvidence.add(key);
+          evidence.push({ page: summary.pageNumber, text: l.text });
+        }
+      }
+    }
+  }
 
   const opList = await page.getOperatorList();
   const allSegments = extractVectorSegments(opList);
   const allRects = findClosedRectangles(allSegments);
 
-  // Extract metadata
+  // Synthesize set-level metadata (preferring active page, falling back across the set)
   const fixtureMatch = fullText.match(/Project:\s*ApexMap Fixture House\s+(R\d+)/i);
   const fixtureId = options?.fixtureId ?? (fixtureMatch ? fixtureMatch[1].toUpperCase() : undefined);
 
-  const scaleCandidates = extractScaleCandidates(baselineLines, lines, pageWidthMm, pageHeightMm);
+  const scaleCandidates = activeSummary.scaleCandidates;
   const manualDenom =
     options?.manualScaleDenom !== undefined &&
     Number.isFinite(options.manualScaleDenom) &&
@@ -1389,73 +1587,76 @@ export async function readVectorPdf(
   const northMatch = fullText.match(/\bNorth\s*[:=]?\s*up\b/i);
   const north: 'up' | null = northMatch ? 'up' : null;
 
-  let profileFamily: string | null = null;
-  if (/\bCorrugate\b/i.test(fullText)) profileFamily = 'corrugate';
-  else if (/\bTrapezoid(?:al)?\b/i.test(fullText)) profileFamily = 'trapezoidal';
-  else if (/\bStanding\s*Seam\b/i.test(fullText)) profileFamily = 'standing_seam';
+  const profileFamily =
+    activeSummary.profileFamily ??
+    pageSummaries.find((s) => s.profileFamily !== null)?.profileFamily ??
+    null;
 
-  // Read Wind Zone from active page first, then fall back across any page in the PDF set
-  let windZone: TriageWindZone | null = extractWindZone(baselineFullText) ?? extractWindZone(fullText);
-  if (!windZone) {
-    for (const summary of pageSummaries) {
-      windZone = extractWindZone(summary.baselineFullText) ?? extractWindZone(summary.fullText);
-      if (windZone) break;
-    }
-  }
+  const windZone =
+    activeSummary.windZone ?? pageSummaries.find((s) => s.windZone !== null)?.windZone ?? null;
 
-  let pitchDeg = extractPitchDeg(lines, baselineLines, activeSummary.role);
+  let pitchDeg: number | null = activeSummary.explicitPitchDeg;
   if (pitchDeg === null) {
-    // Cross-page explicit pitch search (roof -> elevation -> floor)
     const orderedSummaries = [
       ...pageSummaries.filter((s) => s.role === 'roof'),
       ...pageSummaries.filter((s) => s.role === 'elevation'),
-      ...pageSummaries.filter((s) => s.role === 'floor')
+      ...pageSummaries.filter((s) => s.role === 'floor'),
+      ...pageSummaries.filter((s) => s.role === 'other')
     ];
     for (const summary of orderedSummaries) {
-      pitchDeg = extractPitchDeg(summary.lines, summary.baselineLines, summary.role);
-      if (pitchDeg !== null) break;
+      if (summary.explicitPitchDeg !== null) {
+        pitchDeg = summary.explicitPitchDeg;
+        break;
+      }
     }
   }
   if (pitchDeg === null) {
-    // Elevation sheets on NZ concept sets often specify roof slope on "UNITARY PLAN / HIRB 2.5m & 45°"
     for (const summary of pageSummaries) {
-      if (summary.role !== 'elevation') continue;
-      pitchDeg = extractElevationUnitaryPitchDeg(summary.lines, summary.baselineLines);
-      if (pitchDeg !== null) break;
+      if (summary.role === 'elevation' && summary.unitaryPitchDeg !== null) {
+        pitchDeg = summary.unitaryPitchDeg;
+        break;
+      }
     }
   }
 
-  let eaveHeightM = extractEaveHeightM(lines, baselineLines);
+  let eaveHeightM: number | null = activeSummary.eaveHeightM;
   if (eaveHeightM === null) {
     for (const summary of pageSummaries) {
-      if (summary.role === 'site' || summary.role === 'other') continue;
-      eaveHeightM = extractEaveHeightM(summary.lines, summary.baselineLines);
-      if (eaveHeightM !== null) break;
+      if (summary.role === 'site' || summary.role === 'details' || summary.role === 'other') continue;
+      if (summary.eaveHeightM !== null) {
+        eaveHeightM = summary.eaveHeightM;
+        break;
+      }
     }
   }
 
-  let ventedRidge: TriageVentedRidge | null = null;
-  const ventedMatch = fullText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
-  if (ventedMatch) {
-    ventedRidge = (ventedMatch[1].toUpperCase() === 'RV10P' ? 'RV10P' : 'none') as TriageVentedRidge;
+  const ventedRidge =
+    activeSummary.ventedRidge ??
+    pageSummaries.find((s) => s.ventedRidge !== null)?.ventedRidge ??
+    null;
+
+  // Aggregate flashing hints (active page first, then unique FD-xx codes from other pages)
+  const flashingHints: EnvelopeIntentFlashingHint[] = [...activeSummary.flashingHints];
+  const seenFd = new Set(flashingHints.map((h) => h.detail));
+  for (const summary of pageSummaries) {
+    if (summary.pageNumber === selectedPage) continue;
+    for (const hint of summary.flashingHints) {
+      if (!seenFd.has(hint.detail)) {
+        seenFd.add(hint.detail);
+        flashingHints.push(hint);
+      }
+    }
   }
 
-  const flashingHints: EnvelopeIntentFlashingHint[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const fdMatch = lines[i].text.match(/\b(FD-\d+)\s+([A-Z]+)\s*[:\-]\s*(.+)/i);
-    if (!fdMatch) continue;
-    const chunkText = [lines[i].text, lines[i + 1]?.text ?? ''].join(' ');
-    const coverMatch = chunkText.match(/Cover\s+(\d+(?:\.\d+)?)\s*mm/i);
-    const fdVentedMatch = chunkText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
-    flashingHints.push({
-      detail: fdMatch[1].toUpperCase(),
-      kind: fdMatch[2].toLowerCase(),
-      coverMm: coverMatch ? Number(coverMatch[1]) : null,
-      ventedRidge: fdVentedMatch
-        ? ((fdVentedMatch[1].toUpperCase() === 'RV10P' ? 'RV10P' : 'none') as TriageVentedRidge)
-        : ventedRidge
-    });
-  }
+  // Aggregate area & height metrics (active page first, then rest of set)
+  const areas: EnvelopeIntentAreaMetric[] = [
+    ...activeSummary.areas,
+    ...pageSummaries.filter((s) => s.pageNumber !== selectedPage).flatMap((s) => s.areas)
+  ];
+  const heights: EnvelopeIntentHeightMetric[] = [
+    ...activeSummary.heights,
+    ...pageSummaries.filter((s) => s.pageNumber !== selectedPage).flatMap((s) => s.heights)
+  ];
 
   const provisionalDenom = manualDenom ?? (scaleCandidates[0] ?? null);
   const provisionalScaleSource: 'printed' | 'user' | null = manualDenom
@@ -1470,6 +1671,7 @@ export async function readVectorPdf(
     scale: provisionalDenom ? `1:${provisionalDenom}` : null,
     scaleSource: provisionalScaleSource,
     selectedPage,
+    recommendedPage,
     pageCount,
     pages,
     units: 'm',
@@ -1479,6 +1681,8 @@ export async function readVectorPdf(
     ventedRidge,
     eaveHeightM,
     pitchDeg,
+    ...(areas.length > 0 ? { areas } : {}),
+    ...(heights.length > 0 ? { heights } : {}),
     bodies: [],
     flashingHints,
     openings: [],
@@ -1489,23 +1693,28 @@ export async function readVectorPdf(
   if (!provisionalDenom) {
     return {
       ...baseIntent,
+      confidence: 0,
       blockers: ['missing scale']
     };
   }
 
-  // Never take an outline from site or other pages
+  // Never take an outline from site, details, or other non-plan sheets
   if (activeSummary.role === 'site') {
     return {
       ...baseIntent,
+      confidence: 0,
       bodies: [],
       blockers: ['site plan has no roof outline — switch to the floor or roof plan sheet']
     };
   }
-  if (activeSummary.role === 'other') {
+  if (activeSummary.role === 'details' || activeSummary.role === 'other') {
     return {
       ...baseIntent,
+      confidence: 0,
       bodies: [],
-      blockers: ['details or non-plan sheet has no roof outline — switch to the floor or roof plan sheet']
+      blockers: [
+        'details or non-plan sheet has no roof outline — switch to the floor or roof plan sheet'
+      ]
     };
   }
 
@@ -1564,49 +1773,124 @@ export async function readVectorPdf(
     largestLoopBounds
   );
 
-  // Resolve scale denominator (if multiple printed candidates e.g. "1:50 / 1:100", pick the one matching overall dimensions)
+  // Building area metrics on active page (excluding site area) for fallback & confidence checks
+  const buildingAreasOnPage = activeSummary.areas.filter((a) => !/\bsite\b/i.test(a.label));
+  const buildingAreasSet = areas.filter((a) => !/\bsite\b/i.test(a.label));
+
+  type LoopMatchQuality = 'tight' | 'relaxed' | 'swapped' | 'area_aspect' | 'unconstrained';
+  interface LoopMatchResult {
+    loop: TriagePoint2D[];
+    quality: LoopMatchQuality;
+  }
+
   const candidateDenomsToTry = manualDenom ? [manualDenom] : scaleCandidates;
   let chosenDenom = provisionalDenom;
   let chosenLoop: TriagePoint2D[] | null = null;
+  let chosenQuality: LoopMatchQuality = 'unconstrained';
 
-  const findMatchingLoopForDenom = (denom: number): TriagePoint2D[] | null => {
+  const findMatchingLoopForDenom = (denom: number): LoopMatchResult | null => {
+    if (externalLoops.length === 0) return null;
     const mmPerMetre = 1000 / denom;
+    const measure = (loop: TriagePoint2D[]) => {
+      const b = getLoopBounds(loop);
+      const wM = (b.maxX - b.minX) / mmPerMetre;
+      const hM = (b.maxY - b.minY) / mmPerMetre;
+      const areaM2 = Math.abs(polygonSignedArea(loop)) / (mmPerMetre * mmPerMetre);
+      return { wM, hM, areaM2 };
+    };
+
+    const areaMatches = (areaM2: number, a: EnvelopeIntentAreaMetric, tolRatio = 0.15) => {
+      const flatDiff = Math.abs(areaM2 - a.valueM2) / a.valueM2;
+      if (flatDiff <= tolRatio) return true;
+      if (pitchDeg !== null && /\broof\b/i.test(a.label)) {
+        const slopedM2 = areaM2 / Math.max(0.25, Math.cos((pitchDeg * Math.PI) / 180));
+        if (Math.abs(slopedM2 - a.valueM2) / a.valueM2 <= tolRatio) return true;
+      }
+      return false;
+    };
+
     if (overallWidthM !== null && overallHeightM !== null) {
-      return (
-        externalLoops.find((loop) => {
-          const b = getLoopBounds(loop);
-          const wM = (b.maxX - b.minX) / mmPerMetre;
-          const hM = (b.maxY - b.minY) / mmPerMetre;
-          return Math.abs(wM - overallWidthM) <= 0.05 && Math.abs(hM - overallHeightM) <= 0.05;
-        }) ?? null
-      );
+      const tight = externalLoops.find((loop) => {
+        const { wM, hM } = measure(loop);
+        return Math.abs(wM - overallWidthM) <= 0.05 && Math.abs(hM - overallHeightM) <= 0.05;
+      });
+      if (tight) return { loop: tight, quality: 'tight' };
+
+      const relaxed = externalLoops.find((loop) => {
+        const { wM, hM } = measure(loop);
+        return Math.abs(wM - overallWidthM) <= 0.25 && Math.abs(hM - overallHeightM) <= 0.25;
+      });
+      if (relaxed) return { loop: relaxed, quality: 'relaxed' };
+
+      const swapped = externalLoops.find((loop) => {
+        const { wM, hM } = measure(loop);
+        return Math.abs(wM - overallHeightM) <= 0.25 && Math.abs(hM - overallWidthM) <= 0.25;
+      });
+      if (swapped) return { loop: swapped, quality: 'swapped' };
+
+      if (buildingAreasOnPage.length > 0) {
+        const targetAspect =
+          Math.max(overallWidthM, overallHeightM) /
+          Math.max(0.1, Math.min(overallWidthM, overallHeightM));
+        const areaAspect = externalLoops.find((loop) => {
+          const { wM, hM, areaM2 } = measure(loop);
+          const loopAspect = Math.max(wM, hM) / Math.max(0.1, Math.min(wM, hM));
+          const aspectOk = Math.abs(loopAspect - targetAspect) / targetAspect <= 0.15;
+          return aspectOk && buildingAreasOnPage.some((a) => areaMatches(areaM2, a, 0.15));
+        });
+        if (areaAspect) return { loop: areaAspect, quality: 'area_aspect' };
+      }
+      return null;
     }
+
     if (overallWidthM !== null) {
-      return (
-        externalLoops.find((loop) => {
-          const b = getLoopBounds(loop);
-          const wM = (b.maxX - b.minX) / mmPerMetre;
-          return Math.abs(wM - overallWidthM) <= 0.05;
-        }) ?? null
-      );
+      const tight = externalLoops.find((loop) => Math.abs(measure(loop).wM - overallWidthM) <= 0.05);
+      if (tight) return { loop: tight, quality: 'tight' };
+      const relaxed = externalLoops.find((loop) => Math.abs(measure(loop).wM - overallWidthM) <= 0.25);
+      if (relaxed) return { loop: relaxed, quality: 'relaxed' };
+      const swapped = externalLoops.find((loop) => Math.abs(measure(loop).hM - overallWidthM) <= 0.25);
+      if (swapped) return { loop: swapped, quality: 'swapped' };
+      if (buildingAreasOnPage.length > 0) {
+        const areaMatch = externalLoops.find((loop) =>
+          buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.15))
+        );
+        if (areaMatch) return { loop: areaMatch, quality: 'area_aspect' };
+      }
+      return null;
     }
+
     if (overallHeightM !== null) {
-      return (
-        externalLoops.find((loop) => {
-          const b = getLoopBounds(loop);
-          const hM = (b.maxY - b.minY) / mmPerMetre;
-          return Math.abs(hM - overallHeightM) <= 0.05;
-        }) ?? null
-      );
+      const tight = externalLoops.find((loop) => Math.abs(measure(loop).hM - overallHeightM) <= 0.05);
+      if (tight) return { loop: tight, quality: 'tight' };
+      const relaxed = externalLoops.find((loop) => Math.abs(measure(loop).hM - overallHeightM) <= 0.25);
+      if (relaxed) return { loop: relaxed, quality: 'relaxed' };
+      const swapped = externalLoops.find((loop) => Math.abs(measure(loop).wM - overallHeightM) <= 0.25);
+      if (swapped) return { loop: swapped, quality: 'swapped' };
+      if (buildingAreasOnPage.length > 0) {
+        const areaMatch = externalLoops.find((loop) =>
+          buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.15))
+        );
+        if (areaMatch) return { loop: areaMatch, quality: 'area_aspect' };
+      }
+      return null;
     }
-    return externalLoops[0] ?? null;
+
+    if (buildingAreasOnPage.length > 0) {
+      const areaMatch = externalLoops.find((loop) =>
+        buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.2))
+      );
+      if (areaMatch) return { loop: areaMatch, quality: 'area_aspect' };
+    }
+
+    return { loop: externalLoops[0], quality: 'unconstrained' };
   };
 
   for (const denom of candidateDenomsToTry) {
     const matched = findMatchingLoopForDenom(denom);
     if (matched) {
       chosenDenom = denom;
-      chosenLoop = matched;
+      chosenLoop = matched.loop;
+      chosenQuality = matched.quality;
       break;
     }
   }
@@ -1624,6 +1908,7 @@ export async function readVectorPdf(
         : ['no outline matched the overall dimensions'];
     return {
       ...finalIntent,
+      confidence: 0,
       bodies: [],
       blockers
     };
@@ -1631,6 +1916,40 @@ export async function readVectorPdf(
 
   const mmPerMetre = 1000 / chosenDenom;
   const loopBox = getLoopBounds(chosenLoop);
+  const polyAreaM2 = Math.abs(polygonSignedArea(chosenLoop)) / (mmPerMetre * mmPerMetre);
+
+  // Confidence check: compare extracted polygon area against printed area labels (warn if >15% off; never block)
+  const warnings: string[] = [];
+  let areaVerified = false;
+  const refAreaMetric = buildingAreasOnPage[0] ?? buildingAreasSet[0] ?? null;
+  if (refAreaMetric && polyAreaM2 > 0) {
+    const flatDiff = Math.abs(polyAreaM2 - refAreaMetric.valueM2) / refAreaMetric.valueM2;
+    let bestDiff = flatDiff;
+    if (pitchDeg !== null && /\broof\b/i.test(refAreaMetric.label)) {
+      const slopedM2 = polyAreaM2 / Math.max(0.25, Math.cos((pitchDeg * Math.PI) / 180));
+      const slopedDiff = Math.abs(slopedM2 - refAreaMetric.valueM2) / refAreaMetric.valueM2;
+      bestDiff = Math.min(flatDiff, slopedDiff);
+    }
+    if (bestDiff > 0.15) {
+      warnings.push(
+        `Printed ${refAreaMetric.label} (${refAreaMetric.valueM2.toFixed(1)} m²) differs by ${Math.round(
+          bestDiff * 100
+        )}% from extracted outline (${polyAreaM2.toFixed(1)} m²).`
+      );
+    } else {
+      areaVerified = true;
+    }
+  }
+
+  let confidence = 0.55;
+  if (chosenQuality === 'tight') confidence += 0.2;
+  else if (chosenQuality === 'relaxed') confidence += 0.14;
+  else if (chosenQuality === 'swapped' || chosenQuality === 'area_aspect') confidence += 0.08;
+  if (pitchDeg !== null) confidence += 0.1;
+  if (windZone !== null) confidence += 0.05;
+  if (areaVerified) confidence += 0.1;
+  if (warnings.length > 0) confidence -= 0.15;
+  confidence = Math.round(Math.max(0.1, Math.min(0.99, confidence)) * 100) / 100;
 
   // Translate origin to bounding-box lower-left (0, 0) in metres
   const outline: TriagePoint2D[] = chosenLoop.map((pt) => ({
@@ -1762,6 +2081,8 @@ export async function readVectorPdf(
 
   return {
     ...finalIntent,
+    confidence,
+    ...(warnings.length > 0 ? { warnings } : {}),
     bodies: [
       {
         id: 'body-1',

@@ -37,7 +37,7 @@ export interface EnvelopeIntentOpening {
   center: TriagePoint2D;
 }
 
-export type TriagePageRole = 'site' | 'floor' | 'roof' | 'elevation' | 'other';
+export type TriagePageRole = 'site' | 'floor' | 'roof' | 'elevation' | 'details' | 'other';
 
 export interface EnvelopeIntentPageInfo {
   page: number;
@@ -47,12 +47,26 @@ export interface EnvelopeIntentPageInfo {
   isDetailsSheet: boolean;
 }
 
+export interface EnvelopeIntentAreaMetric {
+  label: string;
+  valueM2: number;
+  page: number;
+}
+
+export interface EnvelopeIntentHeightMetric {
+  kind: 'ffl' | 'eave' | 'ridge' | 'rl';
+  valueM: number;
+  page: number;
+  raw?: string;
+}
+
 export interface EnvelopeIntent {
   fixtureId?: string;
   scope: 'roof_takeoff';
   scale: string | null;
   scaleSource?: 'printed' | 'user' | null;
   selectedPage?: number;
+  recommendedPage?: number;
   pageCount?: number;
   pages?: EnvelopeIntentPageInfo[];
   units: 'm';
@@ -62,6 +76,10 @@ export interface EnvelopeIntent {
   ventedRidge: TriageVentedRidge | null;
   eaveHeightM?: number | null;
   pitchDeg?: number | null;
+  areas?: EnvelopeIntentAreaMetric[];
+  heights?: EnvelopeIntentHeightMetric[];
+  confidence?: number;
+  warnings?: string[];
   bodies: EnvelopeIntentBody[];
   flashingHints: EnvelopeIntentFlashingHint[];
   openings: EnvelopeIntentOpening[];

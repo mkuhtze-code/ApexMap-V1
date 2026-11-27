@@ -356,6 +356,104 @@ async function main() {
     assert.equal(Math.max(...lIntent.bodies[0].outline.map((p) => p.y)), 8);
   }
 
+  // 6d. 28 Blanche Way 5-page NZ concept set:
+  // Page 1 Existing Site (A01), Page 2 Proposed Site (A02), Page 3 Floor Plan (A10, 10.330x4.826 + Net Roof Area 51.3 m2),
+  // Page 4 Elevations E1 & E2 (A20, UNITARY PLAN / HIRB 2.5m & 45°, Wind Zone LOW), Page 5 Elevations E3 & E4 (A21)
+  {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.HelveticaBold);
+    const mm = (v: number) => (v * 72) / 25.4;
+
+    const p1 = doc.addPage([mm(420), mm(297)]);
+    p1.drawText('LOT 78 DP 612345', { x: mm(30), y: mm(260), size: 12, font, color: rgb(0, 0, 0) });
+    p1.drawText('EXISTING SITE PLAN (A01)', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    p1.drawText('Scale: 1:200', { x: mm(280), y: mm(16), size: 9, font, color: rgb(0, 0, 0) });
+
+    const p2 = doc.addPage([mm(420), mm(297)]);
+    p2.drawText('PROPOSED SITE PLAN (A02)', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    p2.drawText('Scale: 1:200', { x: mm(280), y: mm(16), size: 9, font, color: rgb(0, 0, 0) });
+
+    const p3 = doc.addPage([mm(420), mm(297)]);
+    // Put title block labels on same Y (80mm) as horizontal dim string to verify cross-column isolation
+    p3.drawText('FLOOR PLAN (A10)', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    p3.drawText('1:100 / 1:50', { x: mm(280), y: mm(16), size: 9, font, color: rgb(0, 0, 0) });
+    p3.drawText('Sheet: A10', { x: mm(310), y: mm(80), size: 9, font, color: rgb(0, 0, 0) });
+    p3.drawText('Net Roof Area 51.3 m²', { x: mm(45), y: mm(50), size: 9, font, color: rgb(0, 0, 0) });
+
+    const x0 = 60;
+    const y0 = 100;
+    const x1 = x0 + 103.3;
+    const y1 = y0 + 48.26;
+    // Draw filled rectangle footprint (like Archicad/Revit solid wall loop)
+    p3.drawRectangle({
+      x: mm(x0),
+      y: mm(y0),
+      width: mm(103.3),
+      height: mm(48.26),
+      borderWidth: 1.2,
+      borderColor: rgb(0, 0, 0)
+    });
+    p3.drawLine({ start: { x: mm(x0), y: mm(84) }, end: { x: mm(x1), y: mm(84) }, thickness: 0.6, color: rgb(0.3, 0.3, 0.3) });
+    p3.drawText('10.330', { x: mm(x0 + 45), y: mm(80), size: 9, font, color: rgb(0, 0, 0) });
+    p3.drawLine({ start: { x: mm(x0 - 12), y: mm(y0) }, end: { x: mm(x0 - 12), y: mm(y1) }, thickness: 0.6, color: rgb(0.3, 0.3, 0.3) });
+    p3.drawText('4.826', { x: mm(x0 - 24), y: mm(y0 + 22), size: 9, font, color: rgb(0, 0, 0) });
+
+    const p4 = doc.addPage([mm(420), mm(297)]);
+    p4.drawText('REFER TO SITE PLAN FOR BOUNDARIES', { x: mm(40), y: mm(260), size: 9, font, color: rgb(0, 0, 0) });
+    p4.drawText('ELEVATIONS E1 & E2 (A20)', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    p4.drawText('Scale: 1:100', { x: mm(280), y: mm(16), size: 9, font, color: rgb(0, 0, 0) });
+    p4.drawText('UNITARY PLAN', { x: mm(45), y: mm(210), size: 9, font, color: rgb(0, 0, 0) });
+    p4.drawText('HIRB 2.5m & 45°', { x: mm(45), y: mm(200), size: 9, font, color: rgb(0, 0, 0) });
+    p4.drawText('Wind Zone LOW', { x: mm(45), y: mm(185), size: 9, font, color: rgb(0, 0, 0) });
+
+    const p5 = doc.addPage([mm(420), mm(297)]);
+    p5.drawText('ELEVATIONS E3 & E4 (A21)', { x: mm(280), y: mm(25), size: 11, font, color: rgb(0, 0, 0) });
+    p5.drawText('Scale: 1:100', { x: mm(280), y: mm(16), size: 9, font, color: rgb(0, 0, 0) });
+
+    const blancheBytes = await doc.save();
+    const blancheIntent = await readVectorPdf(blancheBytes);
+    assert.equal(blancheIntent.selectedPage, 3, '28 Blanche Way must default to Page 3 Floor Plan');
+    assert.equal(
+      blancheIntent.pages?.map((p) => p.role).join(','),
+      'site,site,floor,elevation,elevation'
+    );
+    assert.equal(blancheIntent.scale, '1:100');
+    assert.equal(blancheIntent.scaleSource, 'printed');
+    assert.equal(blancheIntent.pitchDeg, 45, 'Must extract 45° from Elevation UNITARY PLAN / HIRB');
+    assert.equal(blancheIntent.windZone, 'L', 'Must extract LOW -> L cross-page');
+    assert.equal(blancheIntent.profileFamily, null);
+    assert.deepEqual(blancheIntent.blockers, []);
+    assert.equal(blancheIntent.bodies.length, 1);
+    assert.ok(Math.abs(Math.max(...blancheIntent.bodies[0].outline.map((p) => p.x)) - 10.33) <= 0.05);
+    assert.ok(Math.abs(Math.max(...blancheIntent.bodies[0].outline.map((p) => p.y)) - 4.826) <= 0.05);
+
+    assert.ok(
+      blancheIntent.evidence.some((e) => /51\.3\s*m/i.test(e.text)),
+      'Must preserve Net Roof Area 51.3 m² in evidence'
+    );
+
+    // Site page 1 must produce no body and emit clear site-plan blocker copy
+    const blancheSiteIntent = await readVectorPdf(blancheBytes, { pageNumber: 1 });
+    assert.equal(blancheSiteIntent.bodies.length, 0);
+    assert.ok(blancheSiteIntent.blockers[0]?.includes('site plan has no roof outline'));
+
+    // Elevation page with "UNITARY PLAN" above "2.5m & 45°" (no "HIRB" on line 2) must still resolve 45°
+    const adjDoc = await PDFDocument.create();
+    const adjFont = await adjDoc.embedFont(StandardFonts.HelveticaBold);
+    const adjP1 = adjDoc.addPage([mm(420), mm(297)]);
+    adjP1.drawText('FLOOR PLAN (A10)', { x: mm(280), y: mm(25), size: 11, font: adjFont, color: rgb(0, 0, 0) });
+    adjP1.drawText('Scale: 1:100', { x: mm(280), y: mm(16), size: 9, font: adjFont, color: rgb(0, 0, 0) });
+    adjP1.drawRectangle({ x: mm(60), y: mm(100), width: mm(100), height: mm(50), borderWidth: 1, borderColor: rgb(0, 0, 0) });
+    adjP1.drawText('10.000', { x: mm(100), y: mm(80), size: 9, font: adjFont, color: rgb(0, 0, 0) });
+    adjP1.drawText('5.000', { x: mm(36), y: mm(122), size: 9, font: adjFont, color: rgb(0, 0, 0) });
+    const adjP2 = adjDoc.addPage([mm(420), mm(297)]);
+    adjP2.drawText('ELEVATIONS (A20)', { x: mm(280), y: mm(25), size: 11, font: adjFont, color: rgb(0, 0, 0) });
+    adjP2.drawText('UNITARY PLAN', { x: mm(45), y: mm(210), size: 9, font: adjFont, color: rgb(0, 0, 0) });
+    adjP2.drawText('2.5m & 45°', { x: mm(45), y: mm(201), size: 9, font: adjFont, color: rgb(0, 0, 0) });
+    const adjIntent = await readVectorPdf(await adjDoc.save());
+    assert.equal(adjIntent.pitchDeg, 45, 'Must extract 45° from line beneath UNITARY PLAN on elevation sheet');
+  }
+
   // 7. importEnvelopeIntent maps onto ApexMap model without generating faces or calling skeleton solver
   const existingPlaneCount = 0;
   const imported = importEnvelopeIntent(intent);

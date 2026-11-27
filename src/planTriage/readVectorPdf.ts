@@ -281,6 +281,8 @@ function classifyRoleFromText(titleText: string): TriagePageRole {
 function extractPageTitle(
   splitLines: TextLine[],
   baselineLines: TextLine[],
+  pageWidthMm: number,
+  pageHeightMm: number,
   pageNumber: number
 ): string {
   const candidates = [...splitLines, ...baselineLines];
@@ -291,32 +293,50 @@ function extractPageTitle(
     );
     if (sheetMatch) {
       const val = sheetMatch[1].trim();
-      if (val && !/NOT FOR CONSTRUCTION/i.test(val)) {
+      if (val && !/NOT FOR CONSTRUCTION/i.test(val) && !/\bLOT\s+\d+\s+D\.?P\.?/i.test(val)) {
         explicitTitles.push(val);
       }
     }
   }
 
-  const roleExplicit = explicitTitles.find((t) => classifyRoleFromText(t) !== 'other' || /\bdetails?\b/i.test(t));
+  const roleExplicit = explicitTitles.find(
+    (t) => classifyRoleFromText(t) !== 'other' || /\bdetails?\b/i.test(t)
+  );
   if (roleExplicit) return roleExplicit;
 
-  for (const line of splitLines) {
-    if (
-      line.text.length <= 90 &&
-      /(?:roof\s*plan|site\s*plan|floor\s*plan|elevations?|details?|sections?)/i.test(line.text) &&
-      !/^Scale bar/i.test(line.text)
-    ) {
-      return explicitTitles[0] && !/\b(?:site|floor|roof|elevation|detail)\b/i.test(explicitTitles[0])
-        ? `${explicitTitles[0]} — ${line.text}`
-        : line.text;
-    }
+  const isSheetTitleLine = (l: TextLine) =>
+    l.text.length <= 90 &&
+    /(?:roof\s*plan|(?:existing|proposed)?\s*site\s*plan|floor\s*plan|elevations?|details?|sections?)/i.test(
+      l.text
+    ) &&
+    !/^(?:Scale bar|NOTE|REFER TO|SEE )/i.test(l.text);
+
+  const isInTitleBlockZone = (l: TextLine) =>
+    l.yMm <= pageHeightMm * 0.3 || l.xMaxMm >= pageWidthMm * 0.65;
+
+  // Prefer sheet title lines inside title block zone or large heading font
+  const titleBlockMatches = splitLines.filter(
+    (l) =>
+      isSheetTitleLine(l) &&
+      (isInTitleBlockZone(l) || Math.max(...l.tokens.map((t) => t.heightMm)) >= 3.2)
+  );
+  const pickedTitleLine =
+    titleBlockMatches[0] ?? splitLines.find((l) => isSheetTitleLine(l)) ?? null;
+
+  if (pickedTitleLine) {
+    return explicitTitles[0] &&
+      !/\b(?:site|floor|roof|elevation|detail)\b/i.test(explicitTitles[0])
+      ? `${explicitTitles[0]} — ${pickedTitleLine.text}`
+      : pickedTitleLine.text;
   }
 
   if (explicitTitles.length > 0) return explicitTitles[0];
 
   let bestByHeight: { text: string; height: number } | null = null;
   for (const line of splitLines) {
-    if (/TEST PLAN|NOT FOR CONSTRUCTION|GENERAL NOTES/i.test(line.text)) continue;
+    if (/TEST PLAN|NOT FOR CONSTRUCTION|GENERAL NOTES|\bLOT\s+\d+\s+D\.?P\.?/i.test(line.text)) {
+      continue;
+    }
     if (!/[A-Za-z]{3,}/.test(line.text)) continue;
     const maxH = Math.max(...line.tokens.map((t) => t.heightMm));
     if (!bestByHeight || maxH > bestByHeight.height) {
@@ -328,7 +348,10 @@ function extractPageTitle(
   }
 
   const firstText = splitLines.find(
-    (l) => l.text.length >= 4 && /[A-Za-z]{3,}/.test(l.text) && !/NOT FOR CONSTRUCTION/i.test(l.text)
+    (l) =>
+      l.text.length >= 4 &&
+      /[A-Za-z]{3,}/.test(l.text) &&
+      !/NOT FOR CONSTRUCTION|\bLOT\s+\d+\s+D\.?P\.?/i.test(l.text)
   );
   return firstText ? firstText.text : `Page ${pageNumber}`;
 }
@@ -459,7 +482,7 @@ function extractPitchDeg(
   role: TriagePageRole
 ): number | null {
   const isIgnoredBoundaryRuleLine = (text: string) =>
-    /\b(?:HRB|Unitary\s+Plan|recession|height\s+in\s+relation\s+to\s+boundary)\b/i.test(text);
+    /\b(?:H?IRB|Unitary\s+Plan|recession|height\s+in\s+relation\s+to\s+boundary)\b/i.test(text);
 
   const safeLines = [...baselineLines, ...splitLines].filter(
     (l) => !isIgnoredBoundaryRuleLine(l.text)
@@ -479,7 +502,7 @@ function extractPitchDeg(
   // 2. Roof-plan fall arrow label (only on roof pages)
   if (role === 'roof') {
     for (const l of safeLines) {
-      if (/(?:north|wind|scale|hrb|boundary|recession|unitary|detail)/i.test(l.text)) continue;
+      if (/(?:north|wind|scale|hirb|hrb|boundary|recession|unitary|detail)/i.test(l.text)) continue;
       // Match short fall-arrow annotation like "22.5°" or "15.0°"
       const m = l.text.match(/(?:^|\s)(\d+(?:\.\d+)?)\s*°(?:\s|$)/);
       if (m && l.text.length <= 24) {
@@ -489,6 +512,39 @@ function extractPitchDeg(
     }
   }
 
+  return null;
+}
+
+/**
+ * Fallback pitch reader for NZ elevation sheets where pitch is only stated on a
+ * "UNITARY PLAN / HIRB 2.5m & 45°" callout on an elevation page.
+ */
+function extractElevationUnitaryPitchDeg(splitLines: TextLine[], baselineLines: TextLine[]): number | null {
+  const all = [...splitLines, ...baselineLines];
+  const headerLines = all.filter((l) => /\b(?:UNITARY\s+PLAN|HIRB)\b/i.test(l.text));
+  if (headerLines.length === 0) return null;
+
+  for (const l of headerLines) {
+    const m = l.text.match(/(\d+(?:\.\d+)?)\s*°/);
+    if (m) {
+      const val = Number(m[1]);
+      if (Number.isFinite(val) && val > 0 && val < 85) return val;
+    }
+  }
+
+  for (const h of headerLines) {
+    for (const candidate of splitLines) {
+      if (candidate === h) continue;
+      if (Math.abs(candidate.yMm - h.yMm) > 15) continue;
+      const horizGap = Math.max(0, candidate.xMinMm - h.xMaxMm, h.xMinMm - candidate.xMaxMm);
+      if (horizGap > 35) continue;
+      const m = candidate.text.match(/(\d+(?:\.\d+)?)\s*°/);
+      if (m) {
+        const val = Number(m[1]);
+        if (Number.isFinite(val) && val > 0 && val < 85) return val;
+      }
+    }
+  }
   return null;
 }
 
@@ -607,7 +663,8 @@ function extractVectorSegments(ops: { fnArray: number[]; argsArray: any[] }): Ve
       ctm = mulCtm(ctm, args as number[]);
     } else if (fn === OPS.constructPath && Array.isArray(args)) {
       const paintOp = args[0] as number;
-      if (strokeOps.has(paintOp)) {
+      const isFillOnly = paintOp === OPS.fill || paintOp === OPS.eoFill;
+      if (strokeOps.has(paintOp) || isFillOnly) {
         const dataArr = args[1] || [];
         const constructed: VectorSegment[] = [];
         for (const chunk of dataArr) {
@@ -615,7 +672,16 @@ function extractVectorSegments(ops: { fnArray: number[]; argsArray: any[] }): Ve
             parseSubOps(chunk, ctm, constructed);
           }
         }
-        segments.push(...constructed);
+        if (strokeOps.has(paintOp)) {
+          segments.push(...constructed);
+        } else if (constructed.length >= 3) {
+          const xs = constructed.flatMap((s) => [s.x1, s.x2]);
+          const ys = constructed.flatMap((s) => [s.y1, s.y2]);
+          const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+          if (span >= 8) {
+            segments.push(...constructed);
+          }
+        }
       }
     } else if (fn === OPS.moveTo && Array.isArray(args)) {
       const p = applyCtm(ctm, args[0], args[1]);
@@ -641,7 +707,17 @@ function extractVectorSegments(ops: { fnArray: number[]; argsArray: any[] }): Ve
     } else if (strokeOps.has(fn)) {
       segments.push(...pending);
       pending = [];
-    } else if (fn === OPS.fill || fn === OPS.eoFill || fn === OPS.endPath) {
+    } else if (fn === OPS.fill || fn === OPS.eoFill) {
+      if (pending.length >= 3) {
+        const xs = pending.flatMap((s) => [s.x1, s.x2]);
+        const ys = pending.flatMap((s) => [s.y1, s.y2]);
+        const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+        if (span >= 8) {
+          segments.push(...pending);
+        }
+      }
+      pending = [];
+    } else if (fn === OPS.endPath) {
       pending = [];
     }
   }
@@ -998,19 +1074,19 @@ interface DimensionToken {
 
 function extractDimensionTokens(
   tokens: TextToken[],
-  baselineLines: TextLine[],
+  splitLines: TextLine[],
   titleBlockBox: BoxRegion | null,
   detailBox: BoxRegion | null,
   scaleBarBox: BoxRegion | null
 ): DimensionToken[] {
   const isIgnoredLine = (text: string) =>
-    /\b(?:HRB|Unitary\s+Plan|recession|height\s+in\s+relation\s+to\s+boundary|Eave\s+height|Pitch|Scale\s*bar|Wind\s*zone|Project:|Sheet:|Drawing:|Title:)\b/i.test(
+    /\b(?:H?IRB|Unitary\s+Plan|recession|height\s+in\s+relation\s+to\s+boundary|Eave\s+height|Pitch|Scale\s*bar|Wind\s*zone|Project:|Sheet:|Drawing:|Title:|(?:Net\s+)?(?:Roof|Floor|Site|Total)\s+Area)\b/i.test(
       text
     );
 
-  // Build quick lookup from token object -> containing baseline line & ordered neighbors
+  // Use column-split lines so title-block labels on the right never poison drawing dimensions on the left
   const lineByToken = new Map<TextToken, TextLine>();
-  for (const line of baselineLines) {
+  for (const line of splitLines) {
     for (const tok of line.tokens) {
       lineByToken.set(tok, line);
     }
@@ -1043,7 +1119,7 @@ function extractDimensionTokens(
     }
     if (valM === null || !Number.isFinite(valM) || valM <= 0) continue;
 
-    // Check immediate baseline neighbors to ignore m² values, DP numbers, and lot numbers
+    // Check immediate neighbors on the same column-split line to ignore m² values, DP numbers, and lot numbers
     if (line) {
       const ordered = [...line.tokens].sort((a, b) => a.xMm - b.xMm);
       const idx = ordered.indexOf(tok);
@@ -1053,7 +1129,7 @@ function extractDimensionTokens(
       if (
         prev &&
         tok.xMm - (prev.xMm + Math.max(prev.widthMm, prev.text.length * 1.4)) <= 15 &&
-        /(?:D\.?P\.?|LOT|SEC(?:TION)?|CT|RL|FFL|FSL|NO\.?|#)$/i.test(prev.text.trim())
+        /(?:D\.?P\.?|LOT|SEC(?:TION)?|CT|RL|FFL|FSL|AREA|NO\.?|#)$/i.test(prev.text.trim())
       ) {
         continue;
       }
@@ -1065,7 +1141,6 @@ function extractDimensionTokens(
         continue;
       }
       if (/\b(?:LOT|D\.?P\.?)\b/i.test(line.text)) {
-        // Ignore lot/DP numbers on lines labelled Lot / DP unless clearly separated (>25mm away)
         const nearLotOrDp = line.tokens.some(
           (other) =>
             other !== tok &&
@@ -1215,7 +1290,7 @@ async function readPageTextSummary(doc: any, pageNumber: number): Promise<Parsed
   const baselineLines = groupBaselineLines(tokens);
   const fullText = lines.map((l) => l.text).join('\n');
   const baselineFullText = baselineLines.map((l) => l.text).join('\n');
-  const title = extractPageTitle(lines, baselineLines, pageNumber);
+  const title = extractPageTitle(lines, baselineLines, pageWidthMm, pageHeightMm, pageNumber);
   const role = classifyRoleFromText(title);
   const isRoofPlan = role === 'roof';
   const isDetailsSheet = role === 'other' && /\bdetails?\b/i.test(title);
@@ -1328,8 +1403,36 @@ export async function readVectorPdf(
     }
   }
 
-  const pitchDeg = extractPitchDeg(lines, baselineLines, activeSummary.role);
-  const eaveHeightM = extractEaveHeightM(lines, baselineLines);
+  let pitchDeg = extractPitchDeg(lines, baselineLines, activeSummary.role);
+  if (pitchDeg === null) {
+    // Cross-page explicit pitch search (roof -> elevation -> floor)
+    const orderedSummaries = [
+      ...pageSummaries.filter((s) => s.role === 'roof'),
+      ...pageSummaries.filter((s) => s.role === 'elevation'),
+      ...pageSummaries.filter((s) => s.role === 'floor')
+    ];
+    for (const summary of orderedSummaries) {
+      pitchDeg = extractPitchDeg(summary.lines, summary.baselineLines, summary.role);
+      if (pitchDeg !== null) break;
+    }
+  }
+  if (pitchDeg === null) {
+    // Elevation sheets on NZ concept sets often specify roof slope on "UNITARY PLAN / HIRB 2.5m & 45°"
+    for (const summary of pageSummaries) {
+      if (summary.role !== 'elevation') continue;
+      pitchDeg = extractElevationUnitaryPitchDeg(summary.lines, summary.baselineLines);
+      if (pitchDeg !== null) break;
+    }
+  }
+
+  let eaveHeightM = extractEaveHeightM(lines, baselineLines);
+  if (eaveHeightM === null) {
+    for (const summary of pageSummaries) {
+      if (summary.role === 'site' || summary.role === 'other') continue;
+      eaveHeightM = extractEaveHeightM(summary.lines, summary.baselineLines);
+      if (eaveHeightM !== null) break;
+    }
+  }
 
   let ventedRidge: TriageVentedRidge | null = null;
   const ventedMatch = fullText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
@@ -1391,11 +1494,18 @@ export async function readVectorPdf(
   }
 
   // Never take an outline from site or other pages
-  if (activeSummary.role === 'site' || activeSummary.role === 'other') {
+  if (activeSummary.role === 'site') {
     return {
       ...baseIntent,
       bodies: [],
-      blockers: ['no outline matched the overall dimensions']
+      blockers: ['site plan has no roof outline — switch to the floor or roof plan sheet']
+    };
+  }
+  if (activeSummary.role === 'other') {
+    return {
+      ...baseIntent,
+      bodies: [],
+      blockers: ['details or non-plan sheet has no roof outline — switch to the floor or roof plan sheet']
     };
   }
 
@@ -1443,7 +1553,7 @@ export async function readVectorPdf(
 
   const dimTokens = extractDimensionTokens(
     tokens,
-    baselineLines,
+    lines,
     titleBlockBox,
     detailBox,
     scaleBarBox

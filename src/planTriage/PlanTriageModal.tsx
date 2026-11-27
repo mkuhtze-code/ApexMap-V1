@@ -14,8 +14,13 @@ interface PlanTriageModalProps {
 
 const EDGE_LABELS = ['South', 'East', 'North', 'West'];
 const PRESET_SCALES = [50, 100, 200] as const;
-const GUIDANCE_COPY =
-  'Details sheets have no roof outline. Choose the roof plan page, or set the scale if it is only drawn in the title block.';
+
+function getGuidanceCopy(role?: string | null): string {
+  if (role === 'site') {
+    return 'Site plans have no roof outline. Choose the floor or roof plan page, or set the scale if it is only drawn in the title block.';
+  }
+  return 'Details sheets have no roof outline. Choose the roof plan page, or set the scale if it is only drawn in the title block.';
+}
 
 export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
   isOpen,
@@ -146,6 +151,9 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
   const activePageInfo =
     intent?.pages?.find((p) => p.page === intent.selectedPage) ?? null;
+  const guidanceCopy = getGuidanceCopy(activePageInfo?.role);
+  const areaEvidenceNotes =
+    intent?.evidence.filter((ev) => /\barea\b/i.test(ev.text) && /\d/.test(ev.text)) ?? [];
   const nonScaleBlockers =
     intent?.blockers.filter((b) => b !== 'missing scale') ?? [];
   const isMissingScale = Boolean(intent && intent.blockers.includes('missing scale'));
@@ -349,7 +357,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
                   <p className="text-[11px] text-slate-300 leading-relaxed">
                     Read Page {intent.selectedPage ?? 1} of {intent.pageCount ?? 1}
-                    {activePageInfo ? ` (${activePageInfo.title})` : ''}. {GUIDANCE_COPY}
+                    {activePageInfo ? ` (${activePageInfo.title})` : ''}. {guidanceCopy}
                   </p>
                 </div>
               )}
@@ -368,7 +376,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                   </ul>
                   <p className="text-[11px] text-rose-200/90 leading-relaxed pt-1 border-t border-rose-500/30">
                     Read Page {intent.selectedPage ?? 1} of {intent.pageCount ?? 1}
-                    {activePageInfo ? ` (${activePageInfo.title})` : ''}. {GUIDANCE_COPY}
+                    {activePageInfo ? ` (${activePageInfo.title})` : ''}. {guidanceCopy}
                   </p>
                   {intent.scaleSource === 'user' && (
                     <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -532,29 +540,44 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                 </div>
               )}
 
-              {/* Flashing Hints */}
-              <div className="border-t border-slate-800 pt-3.5 space-y-1.5">
-                <div className="text-[11px] text-slate-400">Flashing Hints</div>
-                {intent.flashingHints.length > 0 ? (
-                  <div className="divide-y divide-slate-800 border border-slate-800 rounded-lg">
-                    {intent.flashingHints.map((hint, idx) => (
-                      <div
-                        key={idx}
-                        className="px-3 py-2 flex items-center justify-between gap-2 text-xs"
-                      >
-                        <span className="font-mono font-semibold text-white">
-                          {hint.detail} · {hint.kind}
-                        </span>
-                        <span className="font-mono tabular-nums text-slate-300">
-                          {hint.coverMm !== null ? `Cover ${hint.coverMm} mm` : 'Cover n/a'}
-                          {' · '}
-                          {hint.ventedRidge === 'RV10P' ? 'RV10P' : 'Std ridge'}
-                        </span>
-                      </div>
-                    ))}
+              {/* Flashing Hints & Area Evidence */}
+              <div className="border-t border-slate-800 pt-3.5 space-y-3">
+                <div className="space-y-1.5">
+                  <div className="text-[11px] text-slate-400">Flashing Hints</div>
+                  {intent.flashingHints.length > 0 ? (
+                    <div className="divide-y divide-slate-800 border border-slate-800 rounded-lg">
+                      {intent.flashingHints.map((hint, idx) => (
+                        <div
+                          key={idx}
+                          className="px-3 py-2 flex items-center justify-between gap-2 text-xs"
+                        >
+                          <span className="font-mono font-semibold text-white">
+                            {hint.detail} · {hint.kind}
+                          </span>
+                          <span className="font-mono tabular-nums text-slate-300">
+                            {hint.coverMm !== null ? `Cover ${hint.coverMm} mm` : 'Cover n/a'}
+                            {' · '}
+                            {hint.ventedRidge === 'RV10P' ? 'RV10P' : 'Std ridge'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-slate-400">No flashing detail boxes detected.</div>
+                  )}
+                </div>
+
+                {areaEvidenceNotes.length > 0 && (
+                  <div className="space-y-1">
+                    <div className="text-[11px] text-slate-400">Area Evidence</div>
+                    <div className="border border-slate-800 rounded-lg divide-y divide-slate-800 bg-slate-950/60">
+                      {areaEvidenceNotes.map((ev, idx) => (
+                        <div key={idx} className="px-3 py-1.5 font-mono text-[11px] text-slate-300">
+                          Page {ev.page}: {ev.text}
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                ) : (
-                  <div className="text-slate-400">No flashing detail boxes detected.</div>
                 )}
               </div>
             </>

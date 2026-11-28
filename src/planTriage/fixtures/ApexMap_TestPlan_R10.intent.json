@@ -1,0 +1,31 @@
+{
+  "fixtureId": "R10",
+  "scope": "roof_takeoff",
+  "scale": "1:200",
+  "units": "m",
+  "north": null,
+  "profileFamily": "standing_seam",
+  "windZone": "EH",
+  "ventedRidge": "RV10P",
+  "eaveHeightM": 3,
+  "pitchDeg": 12,
+  "bodies": [
+    {
+      "id": "body-1",
+      "outline": [[0, 0], [18, 0], [18, 9], [0, 9]],
+      "holes": [],
+      "edges": [
+        { "type": "eave", "eaveHeightM": 3 },
+        { "type": "gable" },
+        { "type": "eave", "eaveHeightM": 3 },
+        { "type": "gable" }
+      ],
+      "skeleton": [{ "type": "ridge", "from": [0, 4.5], "to": [18, 4.5] }]
+    }
+  ],
+  "flashingHints": [
+    { "detail": "FD-02", "kind": "apron", "coverMm": 225, "ventedRidge": "RV10P" }
+  ],
+  "openings": [],
+  "blockers": []
+}

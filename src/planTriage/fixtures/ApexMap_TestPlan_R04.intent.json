@@ -1,0 +1,29 @@
+{
+  "fixtureId": "R04",
+  "scope": "roof_takeoff",
+  "scale": "1:100",
+  "units": "m",
+  "north": "up",
+  "profileFamily": "trapezoidal",
+  "windZone": "M",
+  "ventedRidge": "none",
+  "eaveHeightM": 2.4,
+  "pitchDeg": 8,
+  "bodies": [
+    {
+      "id": "body-1",
+      "outline": [[0, 0], [11, 0], [11, 7], [0, 7]],
+      "holes": [],
+      "edges": [
+        { "type": "eave", "eaveHeightM": 2.4 },
+        { "type": "gable" },
+        { "type": "eave", "eaveHeightM": 3.2 },
+        { "type": "gable" }
+      ],
+      "skeleton": []
+    }
+  ],
+  "flashingHints": [],
+  "openings": [],
+  "blockers": []
+}

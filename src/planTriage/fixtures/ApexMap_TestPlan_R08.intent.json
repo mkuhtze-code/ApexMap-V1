@@ -1,0 +1,29 @@
+{
+  "fixtureId": "R08",
+  "scope": "roof_takeoff",
+  "scale": "1:100",
+  "units": "m",
+  "north": "up",
+  "profileFamily": null,
+  "windZone": "M",
+  "ventedRidge": null,
+  "eaveHeightM": null,
+  "pitchDeg": null,
+  "bodies": [
+    {
+      "id": "body-1",
+      "outline": [[0, 0], [12.5, 0], [12.5, 6.5], [0, 6.5]],
+      "holes": [],
+      "edges": [
+        { "type": "unclassified" },
+        { "type": "unclassified" },
+        { "type": "unclassified" },
+        { "type": "unclassified" }
+      ],
+      "skeleton": []
+    }
+  ],
+  "flashingHints": [],
+  "openings": [],
+  "blockers": []
+}

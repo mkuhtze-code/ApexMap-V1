@@ -1,0 +1,16 @@
+{
+  "fixtureId": "R07",
+  "scope": "roof_takeoff",
+  "scale": null,
+  "units": "m",
+  "north": "up",
+  "profileFamily": "corrugate",
+  "windZone": "M",
+  "ventedRidge": null,
+  "eaveHeightM": 2.7,
+  "pitchDeg": 22.5,
+  "bodies": [],
+  "flashingHints": [],
+  "openings": [],
+  "blockers": ["missing scale"]
+}

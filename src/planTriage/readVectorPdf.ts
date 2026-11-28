@@ -4,10 +4,12 @@ import type {
   EnvelopeIntentAreaMetric,
   EnvelopeIntentFlashingHint,
   EnvelopeIntentHeightMetric,
+  EnvelopeIntentOpening,
   EnvelopeIntentPageInfo,
   TriageEdgeType,
   TriagePageRole,
   TriagePoint2D,
+  TriageSkeletonType,
   TriageVentedRidge,
   TriageWindZone
 } from './types';
@@ -557,6 +559,7 @@ function extractEaveHeightM(splitLines: TextLine[], baselineLines: TextLine[]): 
   for (const l of allLines) {
     if (!/\b(?:eave|eaves|fascia)\b/i.test(l.text)) continue;
     if (/\b(?:H?IRB|recession|boundary|unitary)\b/i.test(l.text)) continue;
+    if (/\b(?:high|low)\s+eave\b/i.test(l.text)) continue;
     const mMetres = l.text.match(/(\d+(?:\.\d+)?)\s*m\b/i);
     if (mMetres) {
       const val = Number(mMetres[1]);
@@ -569,6 +572,30 @@ function extractEaveHeightM(splitLines: TextLine[], baselineLines: TextLine[]): 
     }
   }
   return null;
+}
+
+function extractHighLowEaveHeights(
+  splitLines: TextLine[],
+  baselineLines: TextLine[]
+): { highEaveHeightM: number | null; lowEaveHeightM: number | null } {
+  let highEaveHeightM: number | null = null;
+  let lowEaveHeightM: number | null = null;
+  for (const l of [...splitLines, ...baselineLines]) {
+    if (/\b(?:H?IRB|recession|boundary|unitary)\b/i.test(l.text)) continue;
+    const highMatch = l.text.match(/\bhigh\s+eave\b[^0-9]*(\d+(?:\.\d+)?)\s*(mm|m)\b/i);
+    if (highMatch && highEaveHeightM === null) {
+      const raw = Number(highMatch[1]);
+      const val = highMatch[2].toLowerCase() === 'mm' ? raw / 1000 : raw;
+      if (Number.isFinite(val) && val > 0 && val < 30) highEaveHeightM = roundM(val);
+    }
+    const lowMatch = l.text.match(/\blow\s+eave\b[^0-9]*(\d+(?:\.\d+)?)\s*(mm|m)\b/i);
+    if (lowMatch && lowEaveHeightM === null) {
+      const raw = Number(lowMatch[1]);
+      const val = lowMatch[2].toLowerCase() === 'mm' ? raw / 1000 : raw;
+      if (Number.isFinite(val) && val > 0 && val < 30) lowEaveHeightM = roundM(val);
+    }
+  }
+  return { highEaveHeightM, lowEaveHeightM };
 }
 
 function extractAreaMetrics(
@@ -663,9 +690,18 @@ function extractFlashingHintsFromLines(
 ): EnvelopeIntentFlashingHint[] {
   const hints: EnvelopeIntentFlashingHint[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const fdMatch = lines[i].text.match(/\b(FD-\d+)\s+([A-Z]+)\s*[:\-]\s*(.+)/i);
+    const hdr = lines[i];
+    const fdMatch = hdr.text.match(/\b(FD-\d+)\s+([A-Z]+)\s*[:\-]\s*(.+)/i);
     if (!fdMatch) continue;
-    const chunkText = [lines[i].text, lines[i + 1]?.text ?? ''].join(' ');
+    const continuation = lines
+      .filter((l) => {
+        if (l === hdr) return false;
+        const dy = hdr.yMm - l.yMm;
+        const xOverlap = l.xMaxMm >= hdr.xMinMm - 15 && l.xMinMm <= hdr.xMaxMm + 25;
+        return dy > 0.5 && dy <= 16 && xOverlap && !/\bFD-\d+\b/i.test(l.text);
+      })
+      .sort((a, b) => b.yMm - a.yMm);
+    const chunkText = [hdr.text, ...continuation.slice(0, 2).map((l) => l.text)].join(' ');
     const coverMatch = chunkText.match(/Cover\s+(\d+(?:\.\d+)?)\s*mm/i);
     const fdVentedMatch = chunkText.match(/Vented\s*ridge\s*[:=]?\s*(none|RV10P)\b/i);
     hints.push({
@@ -1619,6 +1655,11 @@ export async function readVectorPdf(
     }
   }
 
+  const { highEaveHeightM, lowEaveHeightM } = extractHighLowEaveHeights(
+    lines,
+    activeSummary.baselineLines
+  );
+
   let eaveHeightM: number | null = activeSummary.eaveHeightM;
   if (eaveHeightM === null) {
     for (const summary of pageSummaries) {
@@ -1628,6 +1669,9 @@ export async function readVectorPdf(
         break;
       }
     }
+  }
+  if (eaveHeightM === null && lowEaveHeightM !== null) {
+    eaveHeightM = lowEaveHeightM;
   }
 
   const ventedRidge =
@@ -2019,54 +2063,240 @@ export async function readVectorPdf(
     y: roundM((pt.y - loopBox.minY) / mmPerMetre)
   }));
 
-  const edgeLabelTokens = tokens.filter((tok) =>
-    /^(EAVE|GABLE|WALL|APRON)$/i.test(tok.text.trim())
-  );
+  interface EdgeLabelCandidate {
+    kind: 'eave' | 'gable' | 'wall' | 'apron';
+    cx: number;
+    cy: number;
+    eaveHeightM?: number;
+  }
+
+  const edgeLabelCandidates: EdgeLabelCandidate[] = [];
+  const coveredTokens = new Set<TextToken>();
+
+  for (const line of lines) {
+    if (titleBlockBox && pointInBox(line.xMinMm, line.yMm, titleBlockBox)) continue;
+    if (detailBox && pointInBox(line.xMinMm, line.yMm, detailBox)) continue;
+    if (scaleBarBox && pointInBox(line.xMinMm, line.yMm, scaleBarBox)) continue;
+    const trimmed = line.text.trim();
+    const m = trimmed.match(
+      /^(?:(HIGH|LOW)\s+)?(EAVE|GABLE|WALL|APRON)(?:\s*[:=]?\s*(\d+(?:\.\d+)?)\s*m)?$/i
+    );
+    if (!m) continue;
+    for (const tok of line.tokens) coveredTokens.add(tok);
+    const tier = m[1]?.toUpperCase();
+    const kind = m[2].toLowerCase() as EdgeLabelCandidate['kind'];
+    const inlineHeight = m[3] ? roundM(Number(m[3])) : undefined;
+    const tierHeight =
+      inlineHeight ??
+      (tier === 'HIGH'
+        ? highEaveHeightM ?? undefined
+        : tier === 'LOW'
+          ? lowEaveHeightM ?? undefined
+          : eaveHeightM ?? undefined);
+    edgeLabelCandidates.push({
+      kind,
+      cx: (line.xMinMm + line.xMaxMm) / 2,
+      cy: line.yMm + (line.tokens[0]?.heightMm ?? 3) / 2,
+      ...(kind === 'eave' && tierHeight !== undefined ? { eaveHeightM: tierHeight } : {})
+    });
+  }
+
+  for (const tok of tokens) {
+    if (coveredTokens.has(tok)) continue;
+    const m = tok.text.trim().match(/^(EAVE|GABLE|WALL|APRON)$/i);
+    if (!m) continue;
+    const kind = m[1].toLowerCase() as EdgeLabelCandidate['kind'];
+    edgeLabelCandidates.push({
+      kind,
+      cx: tok.xMm + tok.widthMm / 2,
+      cy: tok.yMm + tok.heightMm / 2,
+      ...(kind === 'eave' && eaveHeightM !== null ? { eaveHeightM } : {})
+    });
+  }
 
   const classifyEdgeType = (edgeIdx: number): { type: TriageEdgeType; eaveHeightM?: number } => {
     const a = chosenLoop![edgeIdx];
     const b = chosenLoop![(edgeIdx + 1) % chosenLoop!.length];
-    let bestTok: TextToken | null = null;
+    let bestCand: EdgeLabelCandidate | null = null;
     let bestDist = 25; // max 25 mm from edge
-    for (const tok of edgeLabelTokens) {
-      const cx = tok.xMm + tok.widthMm / 2;
-      const cy = tok.yMm + tok.heightMm / 2;
-      const d = distToSegmentMm({ x: cx, y: cy }, a, b);
+    for (const cand of edgeLabelCandidates) {
+      const d = distToSegmentMm({ x: cand.cx, y: cand.cy }, a, b);
       if (d < bestDist) {
         bestDist = d;
-        bestTok = tok;
+        bestCand = cand;
       }
     }
-    if (!bestTok) return { type: 'unclassified' };
-    const upper = bestTok.text.trim().toUpperCase();
-    if (upper === 'EAVE') {
+    if (!bestCand) return { type: 'unclassified' };
+    if (bestCand.kind === 'eave') {
       return {
         type: 'eave',
-        ...(eaveHeightM !== null ? { eaveHeightM } : {})
+        ...(bestCand.eaveHeightM !== undefined ? { eaveHeightM: bestCand.eaveHeightM } : {})
       };
     }
-    if (upper === 'GABLE') return { type: 'gable' };
-    if (upper === 'WALL') return { type: 'wall' };
-    if (upper === 'APRON') return { type: 'apron' };
-    return { type: 'unclassified' };
+    return { type: bestCand.kind };
   };
 
   const edges = chosenLoop.map((_, idx) => classifyEdgeType(idx));
 
-  // Detect interior structural ridge segments strictly inside the chosen closed loop
+  // Extract interior closed loops strictly inside chosenLoop (holes vs skylight/penetration boxes)
+  const isLoopStrictlyInsideChosen = (loop: TriagePoint2D[]): boolean => {
+    if (loop.length < 3) return false;
+    const b = getLoopBounds(loop);
+    if (
+      b.minX <= loopBox.minX + 0.5 &&
+      b.maxX >= loopBox.maxX - 0.5 &&
+      b.minY <= loopBox.minY + 0.5 &&
+      b.maxY >= loopBox.maxY - 0.5
+    ) {
+      return false;
+    }
+    return loop.every((pt) => {
+      if (!isPointInPolygonMm(pt, chosenLoop!)) return false;
+      for (let i = 0; i < chosenLoop!.length; i++) {
+        const a = chosenLoop![i];
+        const bPt = chosenLoop![(i + 1) % chosenLoop!.length];
+        if (distToSegmentMm(pt, a, bPt) < 0.8) return false;
+      }
+      return true;
+    });
+  };
+
+  const innerLoops = externalLoops.filter((loop) => isLoopStrictlyInsideChosen(loop));
+
+  // Detect openings (SKYLIGHT / PENETRATION) on roof sheets
+  const openings: EnvelopeIntentOpening[] = [];
+  const consumedInnerLoopIdxs = new Set<number>();
+
+  if (activeSummary.role === 'roof') {
+    const openingMarkers = lines.filter((line) => {
+      if (titleBlockBox && pointInBox(line.xMinMm, line.yMm, titleBlockBox)) return false;
+      if (detailBox && pointInBox(line.xMinMm, line.yMm, detailBox)) return false;
+      if (scaleBarBox && pointInBox(line.xMinMm, line.yMm, scaleBarBox)) return false;
+      if (/\b(?:no\s+skylights|no\s+roof\s+penetrations)\b/i.test(line.text)) return false;
+      return /\b(?:SKYLIGHT|PENETRATION)\b/i.test(line.text);
+    });
+
+    for (const marker of openingMarkers) {
+      const mx = (marker.xMinMm + marker.xMaxMm) / 2;
+      const my = marker.yMm + (marker.tokens[0]?.heightMm ?? 3) / 2;
+      const openingType: EnvelopeIntentOpening['type'] = /\bSKYLIGHT\b/i.test(marker.text)
+        ? 'skylight'
+        : 'penetration';
+
+      // Prefer an enclosing or nearby inner rectangle/loop inside chosenLoop
+      let matchedInnerIdx = -1;
+      let bestInnerDist = 25;
+      innerLoops.forEach((loop, idx) => {
+        const b = getLoopBounds(loop);
+        const areaM2 = Math.abs(polygonSignedArea(loop)) / (mmPerMetre * mmPerMetre);
+        if (areaM2 > polyAreaM2 * 0.25) return;
+        const inside = isPointInPolygonMm({ x: mx, y: my }, loop);
+        const cx = (b.minX + b.maxX) / 2;
+        const cy = (b.minY + b.maxY) / 2;
+        const d = inside ? 0 : Math.hypot(cx - mx, cy - my);
+        if (d < bestInnerDist) {
+          bestInnerDist = d;
+          matchedInnerIdx = idx;
+        }
+      });
+
+      let centerPtMm: TriagePoint2D | null = null;
+      if (matchedInnerIdx !== -1) {
+        consumedInnerLoopIdxs.add(matchedInnerIdx);
+        const b = getLoopBounds(innerLoops[matchedInnerIdx]);
+        centerPtMm = { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 };
+      } else {
+        let bestRect: BoxRegion | null = null;
+        let bestRectDist = 25;
+        for (const r of allRects) {
+          const areaM2 = ((r.maxX - r.minX) * (r.maxY - r.minY)) / (mmPerMetre * mmPerMetre);
+          if (areaM2 > polyAreaM2 * 0.25 || areaM2 > 6) continue;
+          if (
+            !isPointInPolygonMm({ x: r.minX, y: r.minY }, chosenLoop) ||
+            !isPointInPolygonMm({ x: r.maxX, y: r.maxY }, chosenLoop)
+          ) {
+            continue;
+          }
+          const inside = pointInBox(mx, my, r, 0);
+          const cx = (r.minX + r.maxX) / 2;
+          const cy = (r.minY + r.maxY) / 2;
+          const d = inside ? 0 : Math.hypot(cx - mx, cy - my);
+          if (d < bestRectDist) {
+            bestRectDist = d;
+            bestRect = r;
+          }
+        }
+        if (bestRect) {
+          centerPtMm = {
+            x: (bestRect.minX + bestRect.maxX) / 2,
+            y: (bestRect.minY + bestRect.maxY) / 2
+          };
+        } else if (isPointInPolygonMm({ x: mx, y: my }, chosenLoop)) {
+          centerPtMm = { x: mx, y: my };
+        }
+      }
+
+      if (centerPtMm) {
+        const center = {
+          x: roundM((centerPtMm.x - loopBox.minX) / mmPerMetre),
+          y: roundM((centerPtMm.y - loopBox.minY) / mmPerMetre)
+        };
+        const dup = openings.some(
+          (o) =>
+            o.type === openingType &&
+            Math.hypot(o.center.x - center.x, o.center.y - center.y) <= 0.4
+        );
+        if (!dup) openings.push({ type: openingType, center });
+      }
+    }
+  }
+
+  // Remaining inner loops explicitly labeled COURTYARD/VOID/HOLE or sizable unconsumed loops (>= 2 m2) become holes
+  const courtyardLabelLines = lines.filter((l) => /\b(?:COURTYARD|VOID|HOLE|ATRIUM)\b/i.test(l.text));
+  const holeLoopsMm: TriagePoint2D[][] = [];
+  if (activeSummary.role === 'roof') {
+    innerLoops.forEach((loop, idx) => {
+      if (consumedInnerLoopIdxs.has(idx)) return;
+      const b = getLoopBounds(loop);
+      const areaM2 = Math.abs(polygonSignedArea(loop)) / (mmPerMetre * mmPerMetre);
+      const hasCourtyardLabel = courtyardLabelLines.some((l) => {
+        const cx = (l.xMinMm + l.xMaxMm) / 2;
+        const cy = l.yMm + (l.tokens[0]?.heightMm ?? 3) / 2;
+        return (
+          isPointInPolygonMm({ x: cx, y: cy }, loop) ||
+          Math.hypot(cx - (b.minX + b.maxX) / 2, cy - (b.minY + b.maxY) / 2) <= 20
+        );
+      });
+      if (hasCourtyardLabel || areaM2 >= 2) {
+        holeLoopsMm.push(loop);
+      }
+    });
+  }
+
+  const holes: TriagePoint2D[][] = holeLoopsMm.map((loop) =>
+    loop.map((pt) => ({
+      x: roundM((pt.x - loopBox.minX) / mmPerMetre),
+      y: roundM((pt.y - loopBox.minY) / mmPerMetre)
+    }))
+  );
+
+  // Detect interior structural skeleton segments strictly inside the chosen closed loop
+  const excludesEdgeOfLoops = [chosenLoop, ...innerLoops];
   const interiorSegs = drawingSegments.filter((seg) => {
     const mx = (seg.x1 + seg.x2) / 2;
     const my = (seg.y1 + seg.y2) / 2;
     if (!isPointInPolygonMm({ x: mx, y: my }, chosenLoop!)) return false;
 
-    for (let i = 0; i < chosenLoop!.length; i++) {
-      const a = chosenLoop![i];
-      const b = chosenLoop![(i + 1) % chosenLoop!.length];
-      if (
-        distToSegmentMm({ x: seg.x1, y: seg.y1 }, a, b) <= 0.65 &&
-        distToSegmentMm({ x: seg.x2, y: seg.y2 }, a, b) <= 0.65
-      ) {
-        return false;
+    for (const poly of excludesEdgeOfLoops) {
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i];
+        const b = poly[(i + 1) % poly.length];
+        if (
+          distToSegmentMm({ x: seg.x1, y: seg.y1 }, a, b) <= 0.65 &&
+          distToSegmentMm({ x: seg.x2, y: seg.y2 }, a, b) <= 0.65
+        ) {
+          return false;
+        }
       }
     }
     return true;
@@ -2097,10 +2327,60 @@ export async function readVectorPdf(
   );
 
   const ridgeTokens = tokens.filter((tok) => /^RIDGE$/i.test(tok.text.trim()));
+  const hipTokens = tokens.filter((tok) => /^HIP$/i.test(tok.text.trim()));
+  const valleyTokens = tokens.filter((tok) => /^VALLEY$/i.test(tok.text.trim()));
+  const pitchDegreeTokens = tokens.filter((tok) => /^\d+(?:\.\d+)?°$/.test(tok.text.trim()));
   const skeleton: EnvelopeIntent['bodies'][number]['skeleton'] = [];
 
+  const pushUniqueSkeleton = (
+    type: TriageSkeletonType,
+    fromMm: TriagePoint2D,
+    toMm: TriagePoint2D
+  ) => {
+    const from = {
+      x: roundM((fromMm.x - loopBox.minX) / mmPerMetre),
+      y: roundM((fromMm.y - loopBox.minY) / mmPerMetre)
+    };
+    const to = {
+      x: roundM((toMm.x - loopBox.minX) / mmPerMetre),
+      y: roundM((toMm.y - loopBox.minY) / mmPerMetre)
+    };
+    if (Math.hypot(to.x - from.x, to.y - from.y) < 0.2) return;
+    const dup = skeleton.some(
+      (s) =>
+        s.type === type &&
+        ((Math.hypot(s.from.x - from.x, s.from.y - from.y) <= 0.15 &&
+          Math.hypot(s.to.x - to.x, s.to.y - to.y) <= 0.15) ||
+          (Math.hypot(s.from.x - to.x, s.from.y - to.y) <= 0.15 &&
+            Math.hypot(s.to.x - from.x, s.to.y - from.y) <= 0.15))
+    );
+    if (!dup) skeleton.push({ type, from, to });
+  };
+
+  // Helper to ignore fall arrows (axis span adjacent to degree pitch token + short chevron tip and no RIDGE label)
+  const hasFallArrowSignature = (p1: TriagePoint2D, p2: TriagePoint2D): boolean => {
+    const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+    const nearPitch = pitchDegreeTokens.some(
+      (pt) => Math.hypot(pt.xMm + pt.widthMm / 2 - mid.x, pt.yMm + pt.heightMm / 2 - mid.y) <= 14
+    );
+    if (!nearPitch) return false;
+    return drawingSegments.some((seg) => {
+      const len = segLength(seg);
+      if (len < 1 || len > 7) return false;
+      const d1 = Math.min(
+        Math.hypot(seg.x1 - p1.x, seg.y1 - p1.y),
+        Math.hypot(seg.x2 - p1.x, seg.y2 - p1.y)
+      );
+      const d2 = Math.min(
+        Math.hypot(seg.x1 - p2.x, seg.y1 - p2.y),
+        Math.hypot(seg.x2 - p2.x, seg.y2 - p2.y)
+      );
+      return d1 <= 1.2 || d2 <= 1.2;
+    });
+  };
+
   // Skeleton gate (CRITICAL):
-  // - Roof sheets run length-based ridge heuristics (>=50% bbox span OR adjacent RIDGE token)
+  // - Roof sheets run length-based ridge/hip/valley heuristics OR explicit RIDGE/HIP/VALLEY tokens
   // - Floor proxy sheets NEVER convert interior partition walls into ridges; only explicit RIDGE-labeled spans allowed
   // - All other sheet roles emit empty skeleton
   const allowLengthRidgeHeuristic = activeSummary.role === 'roof';
@@ -2113,18 +2393,13 @@ export async function readVectorPdf(
       const nearRidgeLabel = ridgeTokens.some(
         (rt) => Math.abs(rt.yMm - hSpan.coord) <= 12 && rt.xMm >= hSpan.min - 15 && rt.xMm <= hSpan.max + 15
       );
-      if ((allowLengthRidgeHeuristic && spanLen >= rectW * 0.5) || nearRidgeLabel) {
-        skeleton.push({
-          type: 'ridge',
-          from: {
-            x: roundM((hSpan.min - loopBox.minX) / mmPerMetre),
-            y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
-          },
-          to: {
-            x: roundM((hSpan.max - loopBox.minX) / mmPerMetre),
-            y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
-          }
-        });
+      const pFrom = { x: hSpan.min, y: hSpan.coord };
+      const pTo = { x: hSpan.max, y: hSpan.coord };
+      if (
+        !hasFallArrowSignature(pFrom, pTo) &&
+        (nearRidgeLabel || (allowLengthRidgeHeuristic && spanLen >= rectW * 0.5))
+      ) {
+        pushUniqueSkeleton('ridge', pFrom, pTo);
       }
     }
 
@@ -2134,31 +2409,75 @@ export async function readVectorPdf(
       const nearRidgeLabel = ridgeTokens.some(
         (rt) => Math.abs(rt.xMm - vSpan.coord) <= 12 && rt.yMm >= vSpan.min - 15 && rt.yMm <= vSpan.max + 15
       );
-      if ((allowLengthRidgeHeuristic && spanLen >= rectH * 0.5) || nearRidgeLabel) {
-        skeleton.push({
-          type: 'ridge',
-          from: {
-            x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
-            y: roundM((vSpan.min - loopBox.minY) / mmPerMetre)
-          },
-          to: {
-            x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
-            y: roundM((vSpan.max - loopBox.minY) / mmPerMetre)
+      const pFrom = { x: vSpan.coord, y: vSpan.min };
+      const pTo = { x: vSpan.coord, y: vSpan.max };
+      if (
+        !hasFallArrowSignature(pFrom, pTo) &&
+        (nearRidgeLabel || (allowLengthRidgeHeuristic && spanLen >= rectH * 0.5))
+      ) {
+        pushUniqueSkeleton('ridge', pFrom, pTo);
+      }
+    }
+
+    // Diagonal hip & valley detection (roof sheets only)
+    if (allowLengthRidgeHeuristic) {
+      const diagSegs = interiorSegs.filter(
+        (s) => Math.abs(s.x2 - s.x1) > 0.5 && Math.abs(s.y2 - s.y1) > 0.5 && segLength(s) >= 8
+      );
+      for (const s of diagSegs) {
+        const a = { x: s.x1, y: s.y1 };
+        const b = { x: s.x2, y: s.y2 };
+
+        let bestValleyDist = Infinity;
+        for (const vt of valleyTokens) {
+          const d = distToSegmentMm({ x: vt.xMm + vt.widthMm / 2, y: vt.yMm + vt.heightMm / 2 }, a, b);
+          if (d < bestValleyDist) bestValleyDist = d;
+        }
+        let bestHipDist = Infinity;
+        for (const ht of hipTokens) {
+          const d = distToSegmentMm({ x: ht.xMm + ht.widthMm / 2, y: ht.yMm + ht.heightMm / 2 }, a, b);
+          if (d < bestHipDist) bestHipDist = d;
+        }
+
+        if (bestValleyDist <= 15 && bestValleyDist <= bestHipDist) {
+          pushUniqueSkeleton('valley', a, b);
+          continue;
+        }
+        if (bestHipDist <= 15) {
+          pushUniqueSkeleton('hip', a, b);
+          continue;
+        }
+
+        // Unlabeled structural roof diagonals snapped cleanly to perimeter vertices (convex -> hip, reflex -> valley)
+        let cornerIdx = -1;
+        for (let i = 0; i < chosenLoop.length; i++) {
+          const v = chosenLoop[i];
+          if (Math.hypot(v.x - a.x, v.y - a.y) <= 1.5 || Math.hypot(v.x - b.x, v.y - b.y) <= 1.5) {
+            cornerIdx = i;
+            break;
           }
-        });
+        }
+        if (cornerIdx !== -1) {
+          const prev = chosenLoop[(cornerIdx - 1 + chosenLoop.length) % chosenLoop.length];
+          const cur = chosenLoop[cornerIdx];
+          const next = chosenLoop[(cornerIdx + 1) % chosenLoop.length];
+          const cross = (cur.x - prev.x) * (next.y - cur.y) - (cur.y - prev.y) * (next.x - cur.x);
+          pushUniqueSkeleton(cross < -1e-3 ? 'valley' : 'hip', a, b);
+        }
       }
     }
   }
 
   return {
     ...finalIntent,
+    openings,
     confidence,
     ...(warnings.length > 0 ? { warnings } : {}),
     bodies: [
       {
         id: 'body-1',
         outline,
-        holes: [],
+        holes,
         edges,
         skeleton,
         pitchDeg

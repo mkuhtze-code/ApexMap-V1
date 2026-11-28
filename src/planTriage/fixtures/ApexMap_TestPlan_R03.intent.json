@@ -1,0 +1,35 @@
+{
+  "fixtureId": "R03",
+  "scope": "roof_takeoff",
+  "scale": "1:100",
+  "units": "m",
+  "north": "up",
+  "profileFamily": "corrugate",
+  "windZone": "H",
+  "ventedRidge": "none",
+  "eaveHeightM": 2.7,
+  "pitchDeg": 25,
+  "bodies": [
+    {
+      "id": "body-1",
+      "outline": [[0, 0], [12, 0], [12, 8], [0, 8]],
+      "holes": [],
+      "edges": [
+        { "type": "eave", "eaveHeightM": 2.7 },
+        { "type": "eave", "eaveHeightM": 2.7 },
+        { "type": "eave", "eaveHeightM": 2.7 },
+        { "type": "eave", "eaveHeightM": 2.7 }
+      ],
+      "skeleton": [
+        { "type": "ridge", "from": [3, 4], "to": [9, 4] },
+        { "type": "hip", "from": [0, 0], "to": [3, 4] },
+        { "type": "hip", "from": [12, 0], "to": [9, 4] },
+        { "type": "hip", "from": [12, 8], "to": [9, 4] },
+        { "type": "hip", "from": [0, 8], "to": [3, 4] }
+      ]
+    }
+  ],
+  "flashingHints": [],
+  "openings": [],
+  "blockers": []
+}

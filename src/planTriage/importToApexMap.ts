@@ -76,11 +76,31 @@ export function importEnvelopeIntent(intent: EnvelopeIntent): ImportedEnvelopeMo
     };
   });
 
+  const holes = body.holes.map((ring, holeIdx) => {
+    const holeEdges: PlanEdge[] = ring.map((pt, edgeIdx) => {
+      const next = ring[(edgeIdx + 1) % ring.length];
+      return {
+        id: `edge-hole-${holeIdx + 1}-${edgeIdx + 1}`,
+        from: { x: pt.x, y: pt.y },
+        to: { x: next.x, y: next.y },
+        type: 'outline',
+        eaveHeightM: defaultEaveHeightM,
+        levelId
+      };
+    });
+    return {
+      id: `hole-${holeIdx + 1}`,
+      points: ring.map((p) => ({ x: p.x, y: p.y })),
+      edges: holeEdges
+    };
+  });
+
   const outline: RoofOutline = {
     id: `outline-triage-${intent.fixtureId || 'imported'}`,
     levelId,
     points: body.outline.map((p) => ({ x: p.x, y: p.y })),
-    edges
+    edges,
+    ...(holes.length > 0 ? { holes } : {})
   };
 
   const skeleton: SkeletonLine[] = body.skeleton.map((s, idx) => ({

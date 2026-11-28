@@ -1781,12 +1781,13 @@ export async function readVectorPdf(
   interface LoopMatchResult {
     loop: TriagePoint2D[];
     quality: LoopMatchQuality;
+    dimDeltaM: number | null;
   }
 
   const candidateDenomsToTry = manualDenom ? [manualDenom] : scaleCandidates;
   let chosenDenom = provisionalDenom;
   let chosenLoop: TriagePoint2D[] | null = null;
-  let chosenQuality: LoopMatchQuality = 'unconstrained';
+  let chosenDimDeltaM: number | null = null;
 
   const findMatchingLoopForDenom = (denom: number): LoopMatchResult | null => {
     if (externalLoops.length === 0) return null;
@@ -1796,10 +1797,10 @@ export async function readVectorPdf(
       const wM = (b.maxX - b.minX) / mmPerMetre;
       const hM = (b.maxY - b.minY) / mmPerMetre;
       const areaM2 = Math.abs(polygonSignedArea(loop)) / (mmPerMetre * mmPerMetre);
-      return { wM, hM, areaM2 };
+      return { wM, hM, areaM2, vertexCount: loop.length };
     };
 
-    const areaMatches = (areaM2: number, a: EnvelopeIntentAreaMetric, tolRatio = 0.15) => {
+    const areaMatches = (areaM2: number, a: EnvelopeIntentAreaMetric, tolRatio = 0.12) => {
       const flatDiff = Math.abs(areaM2 - a.valueM2) / a.valueM2;
       if (flatDiff <= tolRatio) return true;
       if (pitchDeg !== null && /\broof\b/i.test(a.label)) {
@@ -1809,80 +1810,143 @@ export async function readVectorPdf(
       return false;
     };
 
+    const pickPreferred = (
+      candidates: Array<{ loop: TriagePoint2D[]; err: number; areaM2: number }>
+    ): { loop: TriagePoint2D[]; err: number } | null => {
+      if (candidates.length === 0) return null;
+      candidates.sort((a, b) => {
+        const errDiff = Math.round((a.err - b.err) * 50) / 50; // bucket within 0.02 m
+        if (errDiff !== 0) return errDiff;
+        if (a.loop.length !== b.loop.length) return a.loop.length - b.loop.length;
+        return b.areaM2 - a.areaM2;
+      });
+      return { loop: candidates[0].loop, err: candidates[0].err };
+    };
+
+    const nonInternalLoops = externalLoops.filter((loop) => {
+      if (overallWidthM !== null && overallHeightM !== null) {
+        const { areaM2 } = measure(loop);
+        return areaM2 >= overallWidthM * overallHeightM * 0.25;
+      }
+      return true;
+    });
+
     if (overallWidthM !== null && overallHeightM !== null) {
-      const tight = externalLoops.find((loop) => {
-        const { wM, hM } = measure(loop);
-        return Math.abs(wM - overallWidthM) <= 0.05 && Math.abs(hM - overallHeightM) <= 0.05;
-      });
-      if (tight) return { loop: tight, quality: 'tight' };
+      const collect = (
+        predicate: (m: ReturnType<typeof measure>) => number | null
+      ) => {
+        const out: Array<{ loop: TriagePoint2D[]; err: number; areaM2: number }> = [];
+        for (const loop of nonInternalLoops) {
+          const m = measure(loop);
+          const err = predicate(m);
+          if (err !== null) out.push({ loop, err, areaM2: m.areaM2 });
+        }
+        return pickPreferred(out);
+      };
 
-      const relaxed = externalLoops.find((loop) => {
-        const { wM, hM } = measure(loop);
-        return Math.abs(wM - overallWidthM) <= 0.25 && Math.abs(hM - overallHeightM) <= 0.25;
-      });
-      if (relaxed) return { loop: relaxed, quality: 'relaxed' };
+      const tight = collect((m) =>
+        Math.abs(m.wM - overallWidthM) <= 0.05 && Math.abs(m.hM - overallHeightM) <= 0.05
+          ? Math.max(Math.abs(m.wM - overallWidthM), Math.abs(m.hM - overallHeightM))
+          : null
+      );
+      if (tight) return { loop: tight.loop, quality: 'tight', dimDeltaM: tight.err };
 
-      const swapped = externalLoops.find((loop) => {
-        const { wM, hM } = measure(loop);
-        return Math.abs(wM - overallHeightM) <= 0.25 && Math.abs(hM - overallWidthM) <= 0.25;
-      });
-      if (swapped) return { loop: swapped, quality: 'swapped' };
+      const relaxed = collect((m) =>
+        Math.abs(m.wM - overallWidthM) <= 0.25 && Math.abs(m.hM - overallHeightM) <= 0.25
+          ? Math.max(Math.abs(m.wM - overallWidthM), Math.abs(m.hM - overallHeightM))
+          : null
+      );
+      if (relaxed) return { loop: relaxed.loop, quality: 'relaxed', dimDeltaM: relaxed.err };
+
+      const swapped = collect((m) =>
+        Math.abs(m.wM - overallHeightM) <= 0.25 && Math.abs(m.hM - overallWidthM) <= 0.25
+          ? Math.max(Math.abs(m.wM - overallHeightM), Math.abs(m.hM - overallWidthM))
+          : null
+      );
+      if (swapped) return { loop: swapped.loop, quality: 'swapped', dimDeltaM: swapped.err };
 
       if (buildingAreasOnPage.length > 0) {
         const targetAspect =
           Math.max(overallWidthM, overallHeightM) /
           Math.max(0.1, Math.min(overallWidthM, overallHeightM));
-        const areaAspect = externalLoops.find((loop) => {
-          const { wM, hM, areaM2 } = measure(loop);
-          const loopAspect = Math.max(wM, hM) / Math.max(0.1, Math.min(wM, hM));
-          const aspectOk = Math.abs(loopAspect - targetAspect) / targetAspect <= 0.15;
-          return aspectOk && buildingAreasOnPage.some((a) => areaMatches(areaM2, a, 0.15));
+        const areaAspect = collect((m) => {
+          const loopAspect = Math.max(m.wM, m.hM) / Math.max(0.1, Math.min(m.wM, m.hM));
+          const aspectDiff = Math.abs(loopAspect - targetAspect) / targetAspect;
+          const areaOk = buildingAreasOnPage.some((a) => areaMatches(m.areaM2, a, 0.12));
+          return aspectDiff <= 0.2 && areaOk ? aspectDiff : null;
         });
-        if (areaAspect) return { loop: areaAspect, quality: 'area_aspect' };
+        if (areaAspect) return { loop: areaAspect.loop, quality: 'area_aspect', dimDeltaM: null };
       }
       return null;
     }
 
     if (overallWidthM !== null) {
-      const tight = externalLoops.find((loop) => Math.abs(measure(loop).wM - overallWidthM) <= 0.05);
-      if (tight) return { loop: tight, quality: 'tight' };
-      const relaxed = externalLoops.find((loop) => Math.abs(measure(loop).wM - overallWidthM) <= 0.25);
-      if (relaxed) return { loop: relaxed, quality: 'relaxed' };
-      const swapped = externalLoops.find((loop) => Math.abs(measure(loop).hM - overallWidthM) <= 0.25);
-      if (swapped) return { loop: swapped, quality: 'swapped' };
+      const collect = (predicate: (m: ReturnType<typeof measure>) => number | null) => {
+        const out: Array<{ loop: TriagePoint2D[]; err: number; areaM2: number }> = [];
+        for (const loop of nonInternalLoops) {
+          const m = measure(loop);
+          const err = predicate(m);
+          if (err !== null) out.push({ loop, err, areaM2: m.areaM2 });
+        }
+        return pickPreferred(out);
+      };
+      const tight = collect((m) => (Math.abs(m.wM - overallWidthM) <= 0.05 ? Math.abs(m.wM - overallWidthM) : null));
+      if (tight) return { loop: tight.loop, quality: 'tight', dimDeltaM: tight.err };
+      const relaxed = collect((m) => (Math.abs(m.wM - overallWidthM) <= 0.25 ? Math.abs(m.wM - overallWidthM) : null));
+      if (relaxed) return { loop: relaxed.loop, quality: 'relaxed', dimDeltaM: relaxed.err };
+      const swapped = collect((m) => (Math.abs(m.hM - overallWidthM) <= 0.25 ? Math.abs(m.hM - overallWidthM) : null));
+      if (swapped) return { loop: swapped.loop, quality: 'swapped', dimDeltaM: swapped.err };
       if (buildingAreasOnPage.length > 0) {
-        const areaMatch = externalLoops.find((loop) =>
-          buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.15))
+        const areaMatch = collect((m) =>
+          buildingAreasOnPage.some((a) => areaMatches(m.areaM2, a, 0.12)) ? 0.15 : null
         );
-        if (areaMatch) return { loop: areaMatch, quality: 'area_aspect' };
+        if (areaMatch) return { loop: areaMatch.loop, quality: 'area_aspect', dimDeltaM: null };
       }
       return null;
     }
 
     if (overallHeightM !== null) {
-      const tight = externalLoops.find((loop) => Math.abs(measure(loop).hM - overallHeightM) <= 0.05);
-      if (tight) return { loop: tight, quality: 'tight' };
-      const relaxed = externalLoops.find((loop) => Math.abs(measure(loop).hM - overallHeightM) <= 0.25);
-      if (relaxed) return { loop: relaxed, quality: 'relaxed' };
-      const swapped = externalLoops.find((loop) => Math.abs(measure(loop).wM - overallHeightM) <= 0.25);
-      if (swapped) return { loop: swapped, quality: 'swapped' };
+      const collect = (predicate: (m: ReturnType<typeof measure>) => number | null) => {
+        const out: Array<{ loop: TriagePoint2D[]; err: number; areaM2: number }> = [];
+        for (const loop of nonInternalLoops) {
+          const m = measure(loop);
+          const err = predicate(m);
+          if (err !== null) out.push({ loop, err, areaM2: m.areaM2 });
+        }
+        return pickPreferred(out);
+      };
+      const tight = collect((m) => (Math.abs(m.hM - overallHeightM) <= 0.05 ? Math.abs(m.hM - overallHeightM) : null));
+      if (tight) return { loop: tight.loop, quality: 'tight', dimDeltaM: tight.err };
+      const relaxed = collect((m) => (Math.abs(m.hM - overallHeightM) <= 0.25 ? Math.abs(m.hM - overallHeightM) : null));
+      if (relaxed) return { loop: relaxed.loop, quality: 'relaxed', dimDeltaM: relaxed.err };
+      const swapped = collect((m) => (Math.abs(m.wM - overallHeightM) <= 0.25 ? Math.abs(m.wM - overallHeightM) : null));
+      if (swapped) return { loop: swapped.loop, quality: 'swapped', dimDeltaM: swapped.err };
       if (buildingAreasOnPage.length > 0) {
-        const areaMatch = externalLoops.find((loop) =>
-          buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.15))
+        const areaMatch = collect((m) =>
+          buildingAreasOnPage.some((a) => areaMatches(m.areaM2, a, 0.12)) ? 0.15 : null
         );
-        if (areaMatch) return { loop: areaMatch, quality: 'area_aspect' };
+        if (areaMatch) return { loop: areaMatch.loop, quality: 'area_aspect', dimDeltaM: null };
       }
       return null;
     }
 
     if (buildingAreasOnPage.length > 0) {
-      const areaMatch = externalLoops.find((loop) =>
-        buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.2))
-      );
-      if (areaMatch) return { loop: areaMatch, quality: 'area_aspect' };
+      const areaCandidates = nonInternalLoops
+        .filter((loop) =>
+          buildingAreasOnPage.some((a) => areaMatches(measure(loop).areaM2, a, 0.2))
+        )
+        .map((loop) => ({ loop, err: 0, areaM2: measure(loop).areaM2 }));
+      const picked = pickPreferred(areaCandidates);
+      if (picked) return { loop: picked.loop, quality: 'area_aspect', dimDeltaM: null };
     }
 
-    return { loop: externalLoops[0], quality: 'unconstrained' };
+    const fallbackPool = nonInternalLoops.length > 0 ? nonInternalLoops : externalLoops;
+    const preferredFallback = pickPreferred(
+      fallbackPool.map((loop) => ({ loop, err: 0, areaM2: measure(loop).areaM2 }))
+    );
+    return preferredFallback
+      ? { loop: preferredFallback.loop, quality: 'unconstrained', dimDeltaM: null }
+      : null;
   };
 
   for (const denom of candidateDenomsToTry) {
@@ -1890,7 +1954,7 @@ export async function readVectorPdf(
     if (matched) {
       chosenDenom = denom;
       chosenLoop = matched.loop;
-      chosenQuality = matched.quality;
+      chosenDimDeltaM = matched.dimDeltaM;
       break;
     }
   }
@@ -1920,7 +1984,6 @@ export async function readVectorPdf(
 
   // Confidence check: compare extracted polygon area against printed area labels (warn if >15% off; never block)
   const warnings: string[] = [];
-  let areaVerified = false;
   const refAreaMetric = buildingAreasOnPage[0] ?? buildingAreasSet[0] ?? null;
   if (refAreaMetric && polyAreaM2 > 0) {
     const flatDiff = Math.abs(polyAreaM2 - refAreaMetric.valueM2) / refAreaMetric.valueM2;
@@ -1936,19 +1999,18 @@ export async function readVectorPdf(
           bestDiff * 100
         )}% from extracted outline (${polyAreaM2.toFixed(1)} m²).`
       );
-    } else {
-      areaVerified = true;
     }
   }
 
-  let confidence = 0.55;
-  if (chosenQuality === 'tight') confidence += 0.2;
-  else if (chosenQuality === 'relaxed') confidence += 0.14;
-  else if (chosenQuality === 'swapped' || chosenQuality === 'area_aspect') confidence += 0.08;
+  // Deterministic confidence (0–1):
+  // Start 0.5 + 0.15 (roof) or 0.1 (floor w/ area) + 0.15 (dim match <= 0.1m) + 0.1 (pitch) + 0.05 (wind) - 0.2 (>15% area mismatch)
+  let confidence = 0.5;
+  if (activeSummary.role === 'roof') confidence += 0.15;
+  else if (activeSummary.role === 'floor' && buildingAreasSet.length > 0) confidence += 0.1;
+  if (chosenDimDeltaM !== null && chosenDimDeltaM <= 0.1) confidence += 0.15;
   if (pitchDeg !== null) confidence += 0.1;
   if (windZone !== null) confidence += 0.05;
-  if (areaVerified) confidence += 0.1;
-  if (warnings.length > 0) confidence -= 0.15;
+  if (warnings.length > 0) confidence -= 0.2;
   confidence = Math.round(Math.max(0.1, Math.min(0.99, confidence)) * 100) / 100;
 
   // Translate origin to bounding-box lower-left (0, 0) in metres
@@ -2037,45 +2099,54 @@ export async function readVectorPdf(
   const ridgeTokens = tokens.filter((tok) => /^RIDGE$/i.test(tok.text.trim()));
   const skeleton: EnvelopeIntent['bodies'][number]['skeleton'] = [];
 
-  for (const hSpan of horizInterior) {
-    const spanLen = hSpan.max - hSpan.min;
-    const rectW = loopBox.maxX - loopBox.minX;
-    const nearRidgeLabel = ridgeTokens.some(
-      (rt) => Math.abs(rt.yMm - hSpan.coord) <= 12 && rt.xMm >= hSpan.min - 15 && rt.xMm <= hSpan.max + 15
-    );
-    if (spanLen >= rectW * 0.5 || nearRidgeLabel) {
-      skeleton.push({
-        type: 'ridge',
-        from: {
-          x: roundM((hSpan.min - loopBox.minX) / mmPerMetre),
-          y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
-        },
-        to: {
-          x: roundM((hSpan.max - loopBox.minX) / mmPerMetre),
-          y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
-        }
-      });
-    }
-  }
+  // Skeleton gate (CRITICAL):
+  // - Roof sheets run length-based ridge heuristics (>=50% bbox span OR adjacent RIDGE token)
+  // - Floor proxy sheets NEVER convert interior partition walls into ridges; only explicit RIDGE-labeled spans allowed
+  // - All other sheet roles emit empty skeleton
+  const allowLengthRidgeHeuristic = activeSummary.role === 'roof';
+  const allowLabeledRidgeOnly = activeSummary.role === 'floor' && ridgeTokens.length > 0;
 
-  for (const vSpan of vertInterior) {
-    const spanLen = vSpan.max - vSpan.min;
-    const rectH = loopBox.maxY - loopBox.minY;
-    const nearRidgeLabel = ridgeTokens.some(
-      (rt) => Math.abs(rt.xMm - vSpan.coord) <= 12 && rt.yMm >= vSpan.min - 15 && rt.yMm <= vSpan.max + 15
-    );
-    if (spanLen >= rectH * 0.5 || nearRidgeLabel) {
-      skeleton.push({
-        type: 'ridge',
-        from: {
-          x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
-          y: roundM((vSpan.min - loopBox.minY) / mmPerMetre)
-        },
-        to: {
-          x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
-          y: roundM((vSpan.max - loopBox.minY) / mmPerMetre)
-        }
-      });
+  if (allowLengthRidgeHeuristic || allowLabeledRidgeOnly) {
+    for (const hSpan of horizInterior) {
+      const spanLen = hSpan.max - hSpan.min;
+      const rectW = loopBox.maxX - loopBox.minX;
+      const nearRidgeLabel = ridgeTokens.some(
+        (rt) => Math.abs(rt.yMm - hSpan.coord) <= 12 && rt.xMm >= hSpan.min - 15 && rt.xMm <= hSpan.max + 15
+      );
+      if ((allowLengthRidgeHeuristic && spanLen >= rectW * 0.5) || nearRidgeLabel) {
+        skeleton.push({
+          type: 'ridge',
+          from: {
+            x: roundM((hSpan.min - loopBox.minX) / mmPerMetre),
+            y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
+          },
+          to: {
+            x: roundM((hSpan.max - loopBox.minX) / mmPerMetre),
+            y: roundM((hSpan.coord - loopBox.minY) / mmPerMetre)
+          }
+        });
+      }
+    }
+
+    for (const vSpan of vertInterior) {
+      const spanLen = vSpan.max - vSpan.min;
+      const rectH = loopBox.maxY - loopBox.minY;
+      const nearRidgeLabel = ridgeTokens.some(
+        (rt) => Math.abs(rt.xMm - vSpan.coord) <= 12 && rt.yMm >= vSpan.min - 15 && rt.yMm <= vSpan.max + 15
+      );
+      if ((allowLengthRidgeHeuristic && spanLen >= rectH * 0.5) || nearRidgeLabel) {
+        skeleton.push({
+          type: 'ridge',
+          from: {
+            x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
+            y: roundM((vSpan.min - loopBox.minY) / mmPerMetre)
+          },
+          to: {
+            x: roundM((vSpan.coord - loopBox.minX) / mmPerMetre),
+            y: roundM((vSpan.max - loopBox.minY) / mmPerMetre)
+          }
+        });
+      }
     }
   }
 

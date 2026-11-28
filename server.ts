@@ -5,6 +5,11 @@ import express from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  PLAN_TRIAGE_DIAGNOSIS_SYSTEM_INSTRUCTION,
+  sanitizeTriageDiagnosis,
+  type TriageDiagnosisPayload
+} from './src/planTriage/triageDiagnosisShared';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1244,6 +1249,84 @@ INSTRUCTIONS:
       aiPatches: req.body?.deterministicPatches || [],
       fallback: true
     });
+  }
+});
+
+/**
+ * 11. Plan Triage Text-Only Gemini Diagnosis
+ * Analyzes structured vector/text facts extracted by readVectorPdf (never PDF bytes)
+ * and returns a strict JSON TriageDiagnosis, degrading cleanly to null when key is missing.
+ */
+app.post('/api/ai/plan-triage-diagnose', async (req, res) => {
+  try {
+    const payload = req.body?.payload as TriageDiagnosisPayload | undefined;
+    if (!payload || !Array.isArray(payload.pages)) {
+      return res.status(400).json({ available: false, reason: 'invalid_payload', diagnosis: null });
+    }
+
+    if (!ai) {
+      return res.json({ available: false, reason: 'missing_api_key', diagnosis: null });
+    }
+
+    const requestedModel = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+    const model =
+      requestedModel === 'gemini-4-hydrogen' || requestedModel === 'gemini-3.1-flash-lite'
+        ? requestedModel
+        : 'gemini-4-hydrogen';
+
+    const response = await ai.models.generateContent({
+      model,
+      contents: `Analyze these structured facts extracted from a multi-page architectural plan PDF:\n${JSON.stringify(
+        payload
+      )}`,
+      config: {
+        systemInstruction: PLAN_TRIAGE_DIAGNOSIS_SYSTEM_INSTRUCTION,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            recommendedPage: { type: Type.INTEGER, nullable: true },
+            recommendedRole: { type: Type.STRING, nullable: true },
+            pitchDeg: { type: Type.NUMBER, nullable: true },
+            pitchSource: { type: Type.STRING, nullable: true },
+            windZone: { type: Type.STRING, nullable: true },
+            skeletonPolicy: { type: Type.STRING },
+            confidence: { type: Type.NUMBER },
+            summary: { type: Type.STRING },
+            actions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING },
+                  page: { type: Type.INTEGER },
+                  denom: { type: Type.INTEGER },
+                  deg: { type: Type.NUMBER }
+                },
+                required: ['type']
+              }
+            },
+            warnings: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            }
+          },
+          required: ['skeletonPolicy', 'confidence', 'summary', 'actions', 'warnings']
+        }
+      }
+    });
+
+    const parsed = JSON.parse((response.text ?? '{}').trim());
+    const diagnosis = sanitizeTriageDiagnosis(parsed, payload);
+    if (!diagnosis) {
+      return res.json({ available: false, reason: 'invalid_response', diagnosis: null });
+    }
+
+    return res.json({ available: true, diagnosis });
+  } catch (error) {
+    console.error('Server Gemini Plan Triage diagnosis error:', error);
+    return res.json({ available: false, reason: 'diagnosis_failed', diagnosis: null });
   }
 });
 

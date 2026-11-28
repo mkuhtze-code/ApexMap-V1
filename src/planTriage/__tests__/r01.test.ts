@@ -5,6 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { readVectorPdf } from '../readVectorPdf';
 import { importEnvelopeIntent } from '../importToApexMap';
+import {
+  applyDiagnosisMerge,
+  buildTriageDiagnosisPayload,
+  diagnoseWithGemini,
+  sanitizeTriageDiagnosis
+} from '../diagnoseWithGemini';
 import { buildR01FixturePdfBytes } from '../fixtures/generateR01FixturePdf';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -119,6 +125,7 @@ async function main() {
   assert.equal(intent.ventedRidge, truth.ventedRidge);
   assert.equal(intent.eaveHeightM, truth.eaveHeightM);
   assert.equal(intent.pitchDeg, truth.pitchDeg);
+  assert.equal(intent.confidence, 0.95, 'R01 deterministic confidence must equal 0.95');
 
   assert.equal(intent.bodies.length, 1, 'R01 must emit exactly one roof body');
   const body = intent.bodies[0];
@@ -318,6 +325,11 @@ async function main() {
     const ys = floorOutline.map((p) => p.y);
     assert.ok(Math.abs(Math.max(...xs) - 10.33) <= 0.05, 'Floor width must be 10.330 m');
     assert.ok(Math.abs(Math.max(...ys) - 4.826) <= 0.05, 'Floor height must be 4.826 m');
+    assert.equal(
+      floorIntent.bodies[0].skeleton.length,
+      0,
+      'Floor plan internal partition walls must NEVER become ridges'
+    );
   }
 
   // 6c. Non-rectangular L-shape closed external loop matching overall chains
@@ -427,8 +439,8 @@ async function main() {
     assert.deepEqual(blancheIntent.blockers, []);
     assert.equal(blancheIntent.warnings?.length ?? 0, 0);
     assert.ok(
-      typeof blancheIntent.confidence === 'number' && blancheIntent.confidence >= 0.8,
-      'Must emit high confidence when scale, dims, pitch, wind & area align'
+      typeof blancheIntent.confidence === 'number' && blancheIntent.confidence === 0.9,
+      '28 Blanche Way deterministic confidence must equal 0.90'
     );
     assert.ok(
       blancheIntent.areas?.some(
@@ -437,6 +449,7 @@ async function main() {
       'Must extract structured Net Roof Area 51.3 m² metric'
     );
     assert.equal(blancheIntent.bodies.length, 1);
+    assert.equal(blancheIntent.bodies[0].skeleton.length, 0, '28 Blanche Way floor proxy must have empty skeleton');
     assert.ok(Math.abs(Math.max(...blancheIntent.bodies[0].outline.map((p) => p.x)) - 10.33) <= 0.05);
     assert.ok(Math.abs(Math.max(...blancheIntent.bodies[0].outline.map((p) => p.y)) - 4.826) <= 0.05);
 
@@ -444,6 +457,7 @@ async function main() {
     assert.equal(blancheImported.defaultPitchDeg, 45);
     assert.equal(blancheImported.windZone, 'L');
     assert.equal(blancheImported.level.outline.edges.length, 4);
+    assert.equal(blancheImported.level.skeleton.length, 0);
 
     assert.ok(
       blancheIntent.evidence.some((e) => /51\.3\s*m/i.test(e.text)),
@@ -508,6 +522,144 @@ async function main() {
     );
   }
 
+  // 6f. Beast Mode: skeleton gate (floor spiderweb vs roof vs RIDGE-labeled floor), loop preference, and Gemini diagnosis layer
+  {
+    const mm = (v: number) => (v * 72) / 25.4;
+    const opts = { thickness: 1.4, color: rgb(0, 0, 0) };
+
+    const buildSpiderwebDoc = async (title: string, labelRidge: boolean) => {
+      const doc = await PDFDocument.create();
+      const page = doc.addPage([mm(420), mm(297)]);
+      const font = await doc.embedFont(StandardFonts.HelveticaBold);
+      page.drawText(title, { x: mm(260), y: mm(40), size: 11, font, color: rgb(0, 0, 0) });
+      page.drawText('Scale: 1:100', { x: mm(260), y: mm(28), size: 9, font, color: rgb(0, 0, 0) });
+
+      const x0 = 60;
+      const y0 = 100;
+      const x1 = 160;
+      const y1 = 160; // 10m x 6m
+      page.drawRectangle({ x: mm(x0), y: mm(y0), width: mm(100), height: mm(60), borderWidth: 1.4, borderColor: rgb(0, 0, 0) });
+      // Three long internal lines spanning >60% of both axes
+      page.drawLine({ start: { x: mm(x0 + 5), y: mm(y0 + 30) }, end: { x: mm(x1 - 5), y: mm(y0 + 30) }, ...opts });
+      page.drawLine({ start: { x: mm(x0 + 10), y: mm(y0 + 15) }, end: { x: mm(x1 - 10), y: mm(y0 + 15) }, ...opts });
+      page.drawLine({ start: { x: mm(x0 + 50), y: mm(y0 + 5) }, end: { x: mm(x0 + 50), y: mm(y1 - 5) }, ...opts });
+      if (labelRidge) {
+        page.drawText('RIDGE', { x: mm(x0 + 15), y: mm(y0 + 32), size: 8, font, color: rgb(0, 0, 0) });
+      }
+      page.drawText('10.000', { x: mm(105), y: mm(82), size: 9, font, color: rgb(0, 0, 0) });
+      page.drawText('6.000', { x: mm(38), y: mm(128), size: 9, font, color: rgb(0, 0, 0) });
+      return doc.save();
+    };
+
+    const floorSpiderIntent = await readVectorPdf(await buildSpiderwebDoc('FLOOR PLAN', false));
+    assert.equal(floorSpiderIntent.bodies.length, 1);
+    assert.equal(floorSpiderIntent.bodies[0].skeleton.length, 0, 'Floor plan with long partition walls must emit empty skeleton');
+
+    const roofSpiderIntent = await readVectorPdf(await buildSpiderwebDoc('ROOF PLAN', false));
+    assert.equal(roofSpiderIntent.bodies.length, 1);
+    assert.ok(roofSpiderIntent.bodies[0].skeleton.length >= 2, 'Roof plan must detect ridge lines');
+
+    const floorLabeledIntent = await readVectorPdf(await buildSpiderwebDoc('FLOOR PLAN', true));
+    assert.equal(floorLabeledIntent.bodies.length, 1);
+    assert.equal(floorLabeledIntent.bodies[0].skeleton.length, 1, 'Floor plan with explicit RIDGE label preserves only labeled span');
+
+    // Loop preference: 4-vertex simple perimeter beats noisier 8-vertex inner/notched loop with identical outer bbox
+    {
+      const doc = await PDFDocument.create();
+      const page = doc.addPage([mm(420), mm(297)]);
+      const font = await doc.embedFont(StandardFonts.HelveticaBold);
+      page.drawText('ROOF PLAN', { x: mm(260), y: mm(40), size: 11, font, color: rgb(0, 0, 0) });
+      page.drawText('Scale: 1:100', { x: mm(260), y: mm(28), size: 9, font, color: rgb(0, 0, 0) });
+      // Clean 4-vertex 10m x 5m rectangle
+      page.drawRectangle({ x: mm(50), y: mm(100), width: mm(100), height: mm(50), borderWidth: 1.4, borderColor: rgb(0, 0, 0) });
+      // Noisier 8-vertex stepped/notched loop offset with almost identical 10.0m x 5.0m bounds
+      const noisyPts = [
+        [200, 100], [300, 100], [300, 120], [295, 120],
+        [295, 135], [300, 135], [300, 150], [200, 150]
+      ];
+      for (let i = 0; i < noisyPts.length; i++) {
+        const a = noisyPts[i];
+        const b = noisyPts[(i + 1) % noisyPts.length];
+        page.drawLine({ start: { x: mm(a[0]), y: mm(a[1]) }, end: { x: mm(b[0]), y: mm(b[1]) }, ...opts });
+      }
+      page.drawText('10.000', { x: mm(95), y: mm(82), size: 9, font, color: rgb(0, 0, 0) });
+      page.drawText('5.000', { x: mm(30), y: mm(125), size: 9, font, color: rgb(0, 0, 0) });
+
+      const loopPrefIntent = await readVectorPdf(await doc.save());
+      assert.equal(loopPrefIntent.bodies.length, 1);
+      assert.equal(loopPrefIntent.bodies[0].outline.length, 4, 'Must prefer 4-vertex clean outer perimeter over noisier 8-vertex loop');
+    }
+
+    // Gemini diagnosis shared payload/sanitizer/merge + graceful null degradation
+    const manyEvidence = Array.from({ length: 65 }, (_, i) => ({
+      page: 1,
+      text: `Note ${i}: ` + 'x'.repeat(180)
+    }));
+    const draftForDiag = {
+      ...floorSpiderIntent,
+      pages: [
+        { page: 1, title: 'SITE PLAN', role: 'site' as const, isRoofPlan: false, isDetailsSheet: false },
+        { page: 2, title: 'FLOOR PLAN', role: 'floor' as const, isRoofPlan: false, isDetailsSheet: false }
+      ],
+      selectedPage: 2,
+      pitchDeg: null,
+      windZone: null,
+      bodies: [
+        {
+          ...floorSpiderIntent.bodies[0],
+          pitchDeg: null,
+          skeleton: [
+            { type: 'ridge' as const, from: { x: 1, y: 3 }, to: { x: 9, y: 3 } }
+          ]
+        }
+      ],
+      evidence: manyEvidence
+    };
+
+    const payload = buildTriageDiagnosisPayload(draftForDiag);
+    assert.ok(payload.evidence.length <= 40, 'Diagnosis payload must cap evidence at 40 items');
+    assert.ok(payload.evidence.every((e) => e.text.length <= 120), 'Each evidence line capped at 120 chars');
+
+    const sanitized = sanitizeTriageDiagnosis(
+      {
+        recommendedPage: 1, // bad suggestion (site page) -> sanitizer must correct to page 2 (floor)
+        recommendedRole: 'site',
+        pitchDeg: 45,
+        pitchSource: 'Elevation A20 UNITARY PLAN HIRB 45°',
+        windZone: 'L',
+        skeletonPolicy: 'from_vectors', // floor w/o RIDGE evidence -> sanitizer must force empty_on_floor_proxy
+        confidence: 0.91,
+        summary: 'Use Floor Plan page 2; pitch 45 deg from elevation HIRB.',
+        actions: [
+          { type: 'selectPage', page: 1 }, // site target must be filtered out
+          { type: 'clearSkeleton' },
+          { type: 'setPitch', deg: 45 }
+        ],
+        warnings: []
+      },
+      payload
+    );
+    assert.ok(sanitized !== null);
+    assert.equal(sanitized!.recommendedPage, 2, 'Sanitizer must never recommend site page when floor/roof exists');
+    assert.equal(sanitized!.skeletonPolicy, 'empty_on_floor_proxy');
+    assert.equal(
+      sanitized!.actions.some((a) => a.type === 'selectPage' && a.page === 1),
+      false,
+      'Sanitizer must drop selectPage actions targeting site sheets'
+    );
+
+    const outlineBefore = JSON.stringify(draftForDiag.bodies[0].outline);
+    const merged = applyDiagnosisMerge(draftForDiag, sanitized);
+    assert.equal(merged.pitchDeg, 45, 'Merge fills missing pitchDeg');
+    assert.equal(merged.windZone, 'L', 'Merge fills missing windZone');
+    assert.equal(merged.bodies[0].skeleton.length, 0, 'Merge enforces empty skeleton on floor proxy');
+    assert.equal(JSON.stringify(merged.bodies[0].outline), outlineBefore, 'Merge must never mutate outline coordinates');
+    assert.equal(applyDiagnosisMerge(draftForDiag, null), draftForDiag, 'Null diagnosis leaves draft unchanged');
+
+    const offlineDiag = await diagnoseWithGemini(draftForDiag);
+    assert.equal(offlineDiag, null, 'diagnoseWithGemini must degrade cleanly to null when offline/unconfigured');
+  }
+
   // 7. importEnvelopeIntent maps onto ApexMap model without generating faces or calling skeleton solver
   const existingPlaneCount = 0;
   const imported = importEnvelopeIntent(intent);
@@ -529,18 +681,23 @@ async function main() {
   assert.equal(imported.defaultPitchDeg, 22.5);
   assert.equal(existingPlaneCount, 0, 'importEnvelopeIntent must not build faces or increase plane count');
 
-  // 8. Boundary guarantee: planTriage reader & adapter never call solver/playbook
+  // 8. Boundary guarantee: planTriage reader, adapter & client diagnosis never call solver/playbook or import @google/genai
   const triageDir = path.resolve(__dirname, '..');
   const stripComments = (src: string) =>
     src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
   const readerCode = stripComments(readFileSync(path.join(triageDir, 'readVectorPdf.ts'), 'utf8'));
   const adapterCode = stripComments(readFileSync(path.join(triageDir, 'importToApexMap.ts'), 'utf8'));
+  const diagClientCode = stripComments(readFileSync(path.join(triageDir, 'diagnoseWithGemini.ts'), 'utf8'));
+  const diagSharedCode = stripComments(readFileSync(path.join(triageDir, 'triageDiagnosisShared.ts'), 'utf8'));
   for (const banned of ['generateSkeletonLines', 'ensureFaces', 'runTakeoffPlaybook']) {
     assert.equal(readerCode.includes(banned), false, `readVectorPdf.ts must not reference ${banned}`);
     assert.equal(adapterCode.includes(banned), false, `importToApexMap.ts must not reference ${banned}`);
   }
+  for (const code of [readerCode, adapterCode, diagClientCode, diagSharedCode]) {
+    assert.equal(code.includes('@google/genai'), false, 'Client planTriage modules must never import @google/genai');
+  }
 
-  console.log('✓ All Plan Triage R01 fixture, real-plan-set, loop, chain, pitch/wind & boundary assertions passed!');
+  console.log('✓ All Plan Triage R01 fixture, real-plan-set, skeleton gate, loop, diagnosis & boundary assertions passed!');
 }
 
 main().catch((err) => {

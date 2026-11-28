@@ -1,9 +1,15 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Check, FileText, Upload, X } from 'lucide-react';
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import r01FixturePdfUrl from './fixtures/ApexMap_TestPlan_R01.pdf?url';
 import { readVectorPdf } from './readVectorPdf';
 import { importEnvelopeIntent, type ImportedEnvelopeModel } from './importToApexMap';
+import {
+  applyDiagnosisMerge,
+  diagnoseWithGemini,
+  type TriageDiagnosis,
+  type TriageDiagnosisAction
+} from './diagnoseWithGemini';
 import type { EnvelopeIntent } from './types';
 
 interface PlanTriageModalProps {
@@ -72,6 +78,36 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
   const [intent, setIntent] = useState<EnvelopeIntent | null>(null);
   const [isReading, setIsReading] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
+  const [diagnosis, setDiagnosis] = useState<TriageDiagnosis | null>(null);
+  const [isDiagnosing, setIsDiagnosing] = useState(false);
+  const [hasAttemptedDiagnosis, setHasAttemptedDiagnosis] = useState(false);
+  const [appliedActions, setAppliedActions] = useState<string[]>([]);
+
+  const readSeqRef = useRef(0);
+  const diagAbortRef = useRef<AbortController | null>(null);
+  const diagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelPendingDiagnosis = () => {
+    if (diagTimerRef.current !== null) {
+      clearTimeout(diagTimerRef.current);
+      diagTimerRef.current = null;
+    }
+    if (diagAbortRef.current) {
+      diagAbortRef.current.abort();
+      diagAbortRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) {
+      readSeqRef.current += 1;
+      cancelPendingDiagnosis();
+      setIsDiagnosing(false);
+    }
+    return () => {
+      cancelPendingDiagnosis();
+    };
+  }, [isOpen]);
 
   const primaryBody = intent?.bodies[0] ?? null;
   const bodyBounds = React.useMemo(() => {
@@ -94,11 +130,48 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
 
   if (!isOpen) return null;
 
+  const scheduleDiagnosis = (extracted: EnvelopeIntent, seq: number) => {
+    cancelPendingDiagnosis();
+    setDiagnosis(null);
+    setHasAttemptedDiagnosis(false);
+    setAppliedActions([]);
+    setIsDiagnosing(true);
+
+    const controller = new AbortController();
+    diagAbortRef.current = controller;
+
+    diagTimerRef.current = setTimeout(async () => {
+      diagTimerRef.current = null;
+      try {
+        const diag = await diagnoseWithGemini(extracted, { signal: controller.signal });
+        if (controller.signal.aborted || seq !== readSeqRef.current) return;
+        setDiagnosis(diag);
+        if (diag) {
+          setIntent((prev) => {
+            if (!prev || seq !== readSeqRef.current) return prev;
+            return applyDiagnosisMerge(prev, diag);
+          });
+        }
+      } finally {
+        if (!controller.signal.aborted && seq === readSeqRef.current) {
+          setIsDiagnosing(false);
+          setHasAttemptedDiagnosis(true);
+        }
+      }
+    }, 200);
+  };
+
   const parseBuffer = async (
     bytes: Uint8Array,
     label: string,
     opts?: { pageNumber?: number; manualScaleDenom?: number }
   ) => {
+    const seq = ++readSeqRef.current;
+    cancelPendingDiagnosis();
+    setDiagnosis(null);
+    setIsDiagnosing(false);
+    setHasAttemptedDiagnosis(false);
+    setAppliedActions([]);
     setIsReading(true);
     setReadError(null);
     setSourceName(label);
@@ -111,13 +184,18 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
           ? { manualScaleDenom: opts.manualScaleDenom }
           : {})
       });
+      if (seq !== readSeqRef.current) return;
       setIntent(extracted);
       setSelectedPage(extracted.selectedPage);
+      scheduleDiagnosis(extracted, seq);
     } catch (err) {
+      if (seq !== readSeqRef.current) return;
       setIntent(null);
       setReadError(err instanceof Error ? err.message : 'Unable to read vector PDF.');
     } finally {
-      setIsReading(false);
+      if (seq === readSeqRef.current) {
+        setIsReading(false);
+      }
     }
   };
 
@@ -186,12 +264,79 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
     onClose();
   };
 
+  const handleClearSkeleton = () => {
+    setIntent((prev) =>
+      prev
+        ? {
+            ...prev,
+            bodies: prev.bodies.map((b) => ({ ...b, skeleton: [] }))
+          }
+        : prev
+    );
+    setAppliedActions((prev) => (prev.includes('clearSkeleton') ? prev : [...prev, 'clearSkeleton']));
+  };
+
+  const getDiagnosisActionKey = (action: TriageDiagnosisAction): string => {
+    switch (action.type) {
+      case 'selectPage':
+        return `selectPage:${action.page}`;
+      case 'setScale':
+        return `setScale:${action.denom}`;
+      case 'clearSkeleton':
+        return 'clearSkeleton';
+      case 'setPitch':
+        return `setPitch:${action.deg}`;
+    }
+  };
+
+  const getDiagnosisActionLabel = (action: TriageDiagnosisAction): string => {
+    switch (action.type) {
+      case 'selectPage':
+        return `Switch to Page ${action.page}`;
+      case 'setScale':
+        return `Set 1:${action.denom}`;
+      case 'clearSkeleton':
+        return 'Clear false ridges';
+      case 'setPitch':
+        return `Apply ${action.deg}° pitch`;
+    }
+  };
+
+  const handleApplyDiagnosisAction = async (action: TriageDiagnosisAction) => {
+    const key = getDiagnosisActionKey(action);
+    switch (action.type) {
+      case 'selectPage':
+        await handleSelectPage(action.page);
+        return;
+      case 'setScale':
+        await handleApplyManualScale(action.denom);
+        return;
+      case 'clearSkeleton':
+        handleClearSkeleton();
+        return;
+      case 'setPitch':
+        setIntent((prev) =>
+          prev
+            ? {
+                ...prev,
+                pitchDeg: action.deg,
+                bodies: prev.bodies.map((b) => ({ ...b, pitchDeg: action.deg }))
+              }
+            : prev
+        );
+        setAppliedActions((prev) => (prev.includes(key) ? prev : [...prev, key]));
+        return;
+    }
+  };
+
+  const effectiveRecommendedPage = diagnosis?.recommendedPage ?? intent?.recommendedPage;
+
   const activePageInfo =
     intent?.pages?.find((p) => p.page === intent.selectedPage) ?? null;
   const recommendedPageInfo =
     intent?.pages?.find(
       (p) =>
-        p.page === intent.recommendedPage &&
+        p.page === effectiveRecommendedPage &&
         (p.role === 'roof' || p.role === 'floor') &&
         p.page !== intent.selectedPage
     ) ??
@@ -200,6 +345,11 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
     ) ??
     null;
   const guidanceCopy = getGuidanceCopy(activePageInfo?.role);
+  const showManualClearFalseRidges = Boolean(
+    (primaryBody?.skeleton.length ?? 0) > 0 &&
+      (activePageInfo?.role === 'floor' || diagnosis?.skeletonPolicy === 'empty_on_floor_proxy') &&
+      !diagnosis?.actions.some((a) => a.type === 'clearSkeleton')
+  );
   const netRoofAreaMetric =
     intent?.areas?.find((a) => /\bnet\s+roof\s+area\b/i.test(a.label)) ??
     intent?.areas?.find((a) => !/\bsite\b/i.test(a.label)) ??
@@ -327,7 +477,7 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                   <div className="max-h-40 overflow-y-auto divide-y divide-slate-800 border border-slate-800 rounded-xl bg-slate-950/60">
                     {intent.pages.map((p) => {
                       const isActive = p.page === (intent.selectedPage ?? 1);
-                      const isRecommended = p.page === intent.recommendedPage;
+                      const isRecommended = p.page === effectiveRecommendedPage;
                       return (
                         <button
                           key={p.page}
@@ -496,6 +646,85 @@ export const PlanTriageModal: React.FC<PlanTriageModalProps> = ({
                       <li key={w}>{w}</li>
                     ))}
                   </ul>
+                </div>
+              )}
+
+              {/* Gemini Diagnosis Panel (advisory overlay, non-blocking) */}
+              {(isDiagnosing || diagnosis || hasAttemptedDiagnosis) && (
+                <div className="rounded-xl border border-slate-800 bg-slate-950/75 p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+                      Gemini Diagnosis
+                    </span>
+                    {diagnosis && (
+                      <div className="flex items-center gap-2 font-mono tabular-nums text-[11px] text-slate-400">
+                        <span>{diagnosis.skeletonPolicy}</span>
+                        <span>·</span>
+                        <span>{Math.round(diagnosis.confidence * 100)}%</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {isDiagnosing && (
+                    <p className="text-xs text-slate-400">Analyzing plan set with Gemini...</p>
+                  )}
+
+                  {!isDiagnosing && !diagnosis && hasAttemptedDiagnosis && (
+                    <p className="text-xs text-slate-500">Diagnosis unavailable</p>
+                  )}
+
+                  {!isDiagnosing && diagnosis && (
+                    <div className="space-y-2.5">
+                      <p className="text-xs text-slate-200 leading-relaxed">{diagnosis.summary}</p>
+
+                      {diagnosis.pitchSource && (
+                        <div className="text-[11px] font-mono text-slate-400">
+                          Pitch source: {diagnosis.pitchSource}
+                        </div>
+                      )}
+
+                      {diagnosis.warnings.length > 0 && (
+                        <ul className="list-disc list-inside space-y-0.5 text-[11px] text-amber-300">
+                          {diagnosis.warnings.map((w) => (
+                            <li key={w}>{w}</li>
+                          ))}
+                        </ul>
+                      )}
+
+                      {(diagnosis.actions.length > 0 || showManualClearFalseRidges) && (
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          {diagnosis.actions.map((action) => {
+                            const key = getDiagnosisActionKey(action);
+                            const isApplied = appliedActions.includes(key);
+                            return (
+                              <button
+                                key={key}
+                                type="button"
+                                disabled={isApplied}
+                                onClick={() => handleApplyDiagnosisAction(action)}
+                                className={`px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors cursor-pointer disabled:cursor-default ${
+                                  isApplied
+                                    ? 'bg-emerald-950/60 border-emerald-700/60 text-emerald-300'
+                                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-100'
+                                }`}
+                              >
+                                {isApplied ? `Applied: ${getDiagnosisActionLabel(action)}` : getDiagnosisActionLabel(action)}
+                              </button>
+                            );
+                          })}
+                          {showManualClearFalseRidges && (
+                            <button
+                              type="button"
+                              onClick={handleClearSkeleton}
+                              className="px-3 py-1.5 rounded-lg border border-amber-600/60 bg-amber-950/40 hover:bg-amber-900/50 text-amber-200 text-xs font-semibold cursor-pointer transition-colors"
+                            >
+                              Clear false ridges
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
